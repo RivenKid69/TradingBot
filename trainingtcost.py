@@ -2,16 +2,15 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import yaml
+from pydantic import BaseModel
+from legacy_sandbox_config import load_config as load_sandbox_config
 
 
-@dataclass
-class DynSpreadCfg:
+class DynSpreadCfg(BaseModel):
     base_bps: float = 3.0
     alpha_vol: float = 0.5
     beta_illiquidity: float = 1.0
@@ -21,21 +20,10 @@ class DynSpreadCfg:
     min_bps: float = 1.0
     max_bps: float = 25.0
 
-    @classmethod
-    def from_yaml(cls, sandbox_yaml_path: str) -> "DynSpreadCfg":
-        with open(sandbox_yaml_path, "r", encoding="utf-8") as f:
-            y = yaml.safe_load(f) or {}
-        d = dict(y.get("dynamic_spread", {}) or {})
-        return cls(
-            base_bps=float(d.get("base_bps", 3.0)),
-            alpha_vol=float(d.get("alpha_vol", 0.5)),
-            beta_illiquidity=float(d.get("beta_illiquidity", 1.0)),
-            vol_mode=str(d.get("vol_mode", "hl")),
-            liq_col=str(d.get("liq_col", "number_of_trades")),
-            liq_ref=float(d.get("liq_ref", 1000.0)),
-            min_bps=float(d.get("min_bps", 1.0)),
-            max_bps=float(d.get("max_bps", 25.0)),
-        )
+
+def load_dyn_spread_config(path: str) -> DynSpreadCfg:
+    cfg = load_sandbox_config(path)
+    return DynSpreadCfg(**(cfg.dynamic_spread or {}))
 
 
 def _vol_factor(row: pd.Series, *, ref: float, vol_mode: str, last_ref: Optional[float]) -> Tuple[float, float]:
@@ -112,7 +100,7 @@ def effective_return_series(
       - fees_bps_total
       - y_eff_<h>  (если задан threshold)
     """
-    cfg = DynSpreadCfg.from_yaml(sandbox_yaml_path)
+    cfg = load_dyn_spread_config(sandbox_yaml_path)
 
     # сортировка и группировка
     df = df.sort_values([symbol_col, ts_col]).reset_index(drop=True)
