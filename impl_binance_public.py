@@ -8,7 +8,8 @@ impl_binance_public.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence
+from decimal import Decimal
+from typing import Iterator, List, Optional, Sequence
 import json
 import queue
 import threading
@@ -17,10 +18,11 @@ import asyncio
 
 try:
     import websockets  # type: ignore
-except Exception as e:
+except Exception:
     websockets = None  # type: ignore
 
-from market_data_port import Bar, MarketEvent, EventKind, MarketDataSource, binance_tf, ensure_timeframe, to_ms
+from core_models import Bar, Tick
+from core_contracts import MarketDataSource
 
 
 _BINANCE_WS = "wss://stream.binance.com:9443/stream"
@@ -35,61 +37,56 @@ class BinanceWSConfig:
 
 
 class BinancePublicBarSource(MarketDataSource):
-    """
-    Синхронный источник. Внутри поднимает поток с asyncio-клиентом.
-    Поддерживает множественную подписку на kline для набора символов.
-    """
+    """Синхронный источник баров Binance через публичный WebSocket."""
+
     def __init__(self, timeframe: str, cfg: Optional[BinanceWSConfig] = None) -> None:
         ensure_timeframe(timeframe)
         if websockets is None:
             raise RuntimeError("Module 'websockets' is required for BinancePublicBarSource")
         self._tf = binance_tf(timeframe)
+        self._interval_ms = timeframe_to_ms(timeframe)
         self._cfg = cfg or BinanceWSConfig()
         self._symbols: List[str] = []
-        self._opened = False
 
-        self._q: "queue.Queue[MarketEvent]" = queue.Queue(maxsize=10000)
+        self._q: "queue.Queue[Bar]" = queue.Queue(maxsize=10000)
         self._stop = threading.Event()
         self._thr: Optional[threading.Thread] = None
 
-    def open(self) -> None:
-        self._opened = True
+    def stream_bars(self, symbols: Sequence[str], interval_ms: int) -> Iterator[Bar]:
+        if interval_ms != self._interval_ms:
+            raise ValueError(
+                f"Timeframe mismatch. Source={self._interval_ms}ms, requested={interval_ms}ms"
+            )
+        if not symbols:
+            raise ValueError("No symbols provided")
 
-    def subscribe(self, symbols: Sequence[str], *, timeframe: Optional[str] = None) -> None:
-        if timeframe and binance_tf(timeframe) != self._tf:
-            raise ValueError(f"Timeframe mismatch. Source={self._tf}, requested={timeframe}")
-        self._symbols = [s.lower() for s in symbols]  # binance expects lower-case
+        self._symbols = [s.lower() for s in symbols]
 
-    def iter_events(self) -> Iterator[MarketEvent]:
-        if not self._opened:
-            raise RuntimeError("Source not opened")
-        if not self._symbols:
-            raise ValueError("No symbols subscribed")
-
-        # запуск фонового клиента
+        self._stop.clear()
         self._thr = threading.Thread(target=self._run_loop, name="binance-ws", daemon=True)
         self._thr.start()
 
         try:
             while not self._stop.is_set():
                 try:
-                    ev = self._q.get(timeout=0.5)
-                    yield ev
+                    bar = self._q.get(timeout=0.5)
+                    yield bar
                 except queue.Empty:
                     continue
         finally:
             self.close()
 
+    def stream_ticks(self, symbols: Sequence[str]) -> Iterator[Tick]:
+        return iter([])
+
     def close(self) -> None:
         self._stop.set()
         if self._thr and self._thr.is_alive():
             self._thr.join(timeout=5.0)
-        self._opened = False
 
     # ----- internal -----
 
     def _streams(self) -> List[str]:
-        # пример: "btcusdt@kline_1m"
         return [f"{s}@kline_{self._tf}" for s in self._symbols]
 
     async def _client(self) -> None:
@@ -109,32 +106,26 @@ class BinancePublicBarSource(MarketDataSource):
     def _handle_message(self, raw: str) -> None:
         try:
             d = json.loads(raw)
-            payload = d.get("data") or d  # single or multiplexed
+            payload = d.get("data") or d
             if "k" not in payload:
                 return
             k = payload["k"]
-            # см. https://binance-docs.github.io/apidocs/spot/en/#kline-candlestick-streams
             bar = Bar(
                 ts=int(k["t"]),
                 symbol=str(k["s"]).upper(),
-                timeframe=self._tf,
-                open=float(k["o"]),
-                high=float(k["h"]),
-                low=float(k["l"]),
-                close=float(k["c"]),
-                volume=float(k["v"]),
-                bid=None,
-                ask=None,
-                n_trades=int(k.get("n", 0)),
-                vendor=self._cfg.vendor,
-                meta={"event_time": int(payload.get("E", 0)), "closed": bool(k.get("x", False))},
+                open=Decimal(k["o"]),
+                high=Decimal(k["h"]),
+                low=Decimal(k["l"]),
+                close=Decimal(k["c"]),
+                volume_base=Decimal(k["v"]),
+                trades=int(k.get("n", 0)),
+                is_final=bool(k.get("x", False)),
             )
-            ev = MarketEvent(kind=EventKind.BAR, bar=bar)
             try:
-                self._q.put_nowait(ev)
+                self._q.put_nowait(bar)
             except queue.Full:
                 _ = self._q.get_nowait()
-                self._q.put_nowait(ev)
+                self._q.put_nowait(bar)
         except Exception:
             pass
 
@@ -142,8 +133,48 @@ class BinancePublicBarSource(MarketDataSource):
         try:
             asyncio.run(self._client())
         except RuntimeError:
-            # если уже есть цикл, создаём новый
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(self._client())
             loop.close()
+
+
+# ----- utilities -----
+
+_VALID_TF = {
+    "1s",
+    "5s",
+    "10s",
+    "15s",
+    "30s",
+    "1m",
+    "3m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "4h",
+    "6h",
+    "8h",
+    "12h",
+    "1d",
+}
+
+
+def ensure_timeframe(tf: str) -> str:
+    tf = str(tf).lower()
+    if tf not in _VALID_TF:
+        raise ValueError(f"Unsupported timeframe: {tf}")
+    return tf
+
+
+def timeframe_to_ms(tf: str) -> int:
+    tf = ensure_timeframe(tf)
+    mult = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    return int(tf[:-1]) * mult[tf[-1]]
+
+
+def binance_tf(tf: str) -> str:
+    tf = ensure_timeframe(tf)
+    return tf.lower()

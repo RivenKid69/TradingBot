@@ -7,13 +7,16 @@ impl_offline_data.py
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 import glob
 import os
 
 import pandas as pd  # предполагается в зависимостях
 
-from market_data_port import Bar, MarketEvent, EventKind, MarketDataSource, ensure_timeframe, to_ms
+from core_models import Bar, Tick
+from core_contracts import MarketDataSource
 
 
 @dataclass
@@ -37,60 +40,111 @@ class OfflineCSVConfig:
 class OfflineCSVBarSource(MarketDataSource):
     def __init__(self, cfg: OfflineCSVConfig) -> None:
         self.cfg = cfg
-        self._symbols: List[str] = []
-        self._opened = False
-        self._files: List[str] = []
         ensure_timeframe(self.cfg.timeframe)
 
-    def open(self) -> None:
+    def stream_bars(self, symbols: Sequence[str], interval_ms: int) -> Iterator[Bar]:
+        if interval_ms != timeframe_to_ms(self.cfg.timeframe):
+            raise ValueError(
+                f"Timeframe mismatch. Source={self.cfg.timeframe}, requested={interval_ms}ms"
+            )
+
+        symbols_u = list(dict.fromkeys([s.upper() for s in symbols]))
+
         files: List[str] = []
         for p in self.cfg.paths:
             files.extend(glob.glob(p))
         files = [f for f in files if os.path.isfile(f)]
         if not files:
             raise FileNotFoundError(f"No CSV files matched: {self.cfg.paths}")
-        self._files = sorted(files)
-        self._opened = True
 
-    def subscribe(self, symbols: Sequence[str], *, timeframe: Optional[str] = None) -> None:
-        if timeframe and ensure_timeframe(timeframe) != self.cfg.timeframe:
-            raise ValueError(f"Timeframe mismatch. Source={self.cfg.timeframe}, requested={timeframe}")
-        self._symbols = list(dict.fromkeys([s.upper() for s in symbols]))
+        cols = [
+            self.cfg.ts_col,
+            self.cfg.symbol_col,
+            self.cfg.o_col,
+            self.cfg.h_col,
+            self.cfg.l_col,
+            self.cfg.c_col,
+            self.cfg.v_col,
+        ]
+        if self.cfg.n_trades_col:
+            cols.append(self.cfg.n_trades_col)
 
-    def iter_events(self) -> Iterator[MarketEvent]:
-        if not self._opened:
-            raise RuntimeError("Source not opened")
-
-        cols = [self.cfg.ts_col, self.cfg.symbol_col, self.cfg.o_col, self.cfg.h_col,
-                self.cfg.l_col, self.cfg.c_col, self.cfg.v_col]
-        opt = [self.cfg.bid_col, self.cfg.ask_col, self.cfg.n_trades_col]
-        cols += [c for c in opt if c]
-
-        for path in self._files:
+        for path in sorted(files):
             df = pd.read_csv(path, usecols=lambda c: c in cols)
             if self.cfg.sort_by_ts and self.cfg.ts_col in df.columns:
                 df = df.sort_values(self.cfg.ts_col, kind="mergesort")
             for _, r in df.iterrows():
                 sym = str(r[self.cfg.symbol_col]).upper()
-                if self._symbols and sym not in self._symbols:
+                if symbols_u and sym not in symbols_u:
                     continue
-                bar = Bar(
+                yield Bar(
                     ts=to_ms(r[self.cfg.ts_col]),
                     symbol=sym,
-                    timeframe=self.cfg.timeframe,
-                    open=float(r[self.cfg.o_col]),
-                    high=float(r[self.cfg.h_col]),
-                    low=float(r[self.cfg.l_col]),
-                    close=float(r[self.cfg.c_col]),
-                    volume=float(r[self.cfg.v_col]),
-                    bid=(None if not self.cfg.bid_col else float(r[self.cfg.bid_col])),
-                    ask=(None if not self.cfg.ask_col else float(r[self.cfg.ask_col])),
-                    n_trades=(None if not self.cfg.n_trades_col else int(r[self.cfg.n_trades_col])),
-                    vendor=self.cfg.vendor,
-                    meta={"file": os.path.basename(path)},
+                    open=Decimal(str(r[self.cfg.o_col])),
+                    high=Decimal(str(r[self.cfg.h_col])),
+                    low=Decimal(str(r[self.cfg.l_col])),
+                    close=Decimal(str(r[self.cfg.c_col])),
+                    volume_base=Decimal(str(r[self.cfg.v_col])),
+                    trades=(
+                        None
+                        if not self.cfg.n_trades_col
+                        else int(r[self.cfg.n_trades_col])
+                    ),
+                    is_final=True,
                 )
-                yield MarketEvent(kind=EventKind.BAR, bar=bar)
 
-    def close(self) -> None:
-        self._opened = False
-        self._files = []
+    def stream_ticks(self, symbols: Sequence[str]) -> Iterator[Tick]:
+        return iter([])
+
+
+# ----- utilities -----
+
+_VALID_TF = {
+    "1s",
+    "5s",
+    "10s",
+    "15s",
+    "30s",
+    "1m",
+    "3m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "4h",
+    "6h",
+    "8h",
+    "12h",
+    "1d",
+}
+
+
+def ensure_timeframe(tf: str) -> str:
+    tf = str(tf).lower()
+    if tf not in _VALID_TF:
+        raise ValueError(f"Unsupported timeframe: {tf}")
+    return tf
+
+
+def timeframe_to_ms(tf: str) -> int:
+    tf = ensure_timeframe(tf)
+    mult = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    return int(tf[:-1]) * mult[tf[-1]]
+
+
+def to_ms(dt: Any) -> int:
+    if isinstance(dt, int):
+        return dt
+    if isinstance(dt, float):
+        return int(dt)
+    if isinstance(dt, str):
+        try:
+            return int(datetime.fromisoformat(dt.replace("Z", "+00:00")).timestamp() * 1000)
+        except Exception as e:
+            raise ValueError(f"Cannot parse datetime string: {dt}") from e
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    raise TypeError(f"Unsupported datetime type: {type(dt)}")
