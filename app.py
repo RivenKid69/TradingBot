@@ -11,6 +11,14 @@ import pandas as pd
 import streamlit as st
 import yaml
 
+from core_config import load_config, load_config_from_str
+from ingest_config import load_config as load_ingest_config, load_config_from_str as parse_ingest_config
+from legacy_sandbox_config import (
+    load_config as load_sandbox_config,
+    load_config_from_str as parse_sandbox_config,
+    SandboxConfig,
+)
+
 from services.utils_app import (
     ensure_dir as _ensure_dir,
     run_cmd,
@@ -23,15 +31,12 @@ from services.utils_app import (
     append_row_csv,
     load_signals_full,
 )
-from service_backtest import ServiceBacktest, BacktestConfig
+from service_backtest import BacktestConfig, from_config as backtest_from_config
 from service_train import ServiceTrain, TrainConfig
 from offline_feature_pipe import OfflineFeaturePipe
 from transformers import FeatureSpec
 from service_signal_runner import ServiceSignalRunner, RunnerConfig
 from service_eval import ServiceEval, EvalConfig
-import importlib
-from execution_sim import ExecutionSimulator
-from sandbox.sim_adapter import SimAdapter
 
 
 # --------------------------- Utility ---------------------------
@@ -133,57 +138,29 @@ def build_all_pipeline(
 # --------------------------- Service wrappers ---------------------------
 
 def run_backtest_from_yaml(cfg_path: str, default_out: str) -> str:
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    with open(cfg["sim_config_path"], "r", encoding="utf-8") as f:
-        sim_cfg = yaml.safe_load(f)
+    cfg: SandboxConfig = load_sandbox_config(cfg_path)
+    sim_cfg = load_config(cfg.sim_config_path)
 
-    sim = ExecutionSimulator(
-        symbol=cfg.get("symbol", "BTCUSDT"),
-        latency_steps=int(cfg.get("latency_steps", 0)),
-        filters_path=sim_cfg["filters"]["path"],
-        enforce_ppbs=sim_cfg["filters"]["enforce_percent_price_by_side"],
-        strict_filters=sim_cfg["filters"]["strict"],
-        fees_config=sim_cfg.get("fees", {}),
-        funding_config=sim_cfg.get("funding", {}),
-        slippage_config=sim_cfg.get("slippage", {}),
-        execution_config=sim_cfg.get("execution", {}),
-        latency_config=sim_cfg.get("latency", {}),
-        pnl_config=sim_cfg.get("pnl", {}),
-        risk_config=sim_cfg.get("risk", {}),
-        logging_config=sim_cfg.get("logging", {}),
-    )
-
-    strat_cfg = cfg.get("strategy", {})
-    module = strat_cfg.get("module", "strategies.momentum")
-    clsname = strat_cfg.get("class", "MomentumStrategy")
-    params = strat_cfg.get("params", {})
-    m = importlib.import_module(module)
-    Strat = getattr(m, clsname)
-    strat = Strat()
-    if hasattr(strat, "setup"):
-        strat.setup(params)
-
-    bridge = SimAdapter(sim, cfg.get("symbol", "BTCUSDT"))
     sb_cfg = BacktestConfig(
-        dynamic_spread_config=cfg.get("dynamic_spread", {}),
-        exchange_specs_path=cfg.get("exchange_specs_path", None),
-        guards_config=cfg.get("sim_guards", {}),
-        signal_cooldown_s=int(cfg.get("min_signal_gap_s", 0)),
-        no_trade_config=cfg.get("no_trade", {}),
+        dynamic_spread_config=cfg.dynamic_spread,
+        exchange_specs_path=cfg.exchange_specs_path,
+        guards_config=cfg.sim_guards,
+        signal_cooldown_s=int(cfg.min_signal_gap_s),
+        no_trade_config=cfg.no_trade,
     )
-    service = ServiceBacktest(strat, bridge, sb_cfg)
 
-    data_cfg = cfg["data"]
-    path = data_cfg["path"]
+    data_cfg = cfg.data
+    path = data_cfg.path
     df = pd.read_parquet(path) if path.lower().endswith(".parquet") else pd.read_csv(path)
-    reports = service.run(
+    reports = backtest_from_config(
+        sim_cfg,
         df,
-        ts_col=data_cfg.get("ts_col", "ts_ms"),
-        symbol_col=data_cfg.get("symbol_col", "symbol"),
-        price_col=data_cfg.get("price_col", "ref_price"),
+        ts_col=data_cfg.ts_col,
+        symbol_col=data_cfg.symbol_col,
+        price_col=data_cfg.price_col,
+        svc_cfg=sb_cfg,
     )
-    out_path = cfg.get("out_reports", default_out)
+    out_path = cfg.out_reports or default_out
     _ensure_dir(out_path)
     if out_path.lower().endswith(".parquet"):
         pd.DataFrame(reports).to_parquet(out_path, index=False)
@@ -408,8 +385,7 @@ with tabs[6]:
     with st.expander("Параметры стратегии (сохранить в configs/realtime.yaml)", expanded=False):
         try:
             import copy
-            with open(cfg_realtime, "r", encoding="utf-8") as f:
-                rt_cfg = yaml.safe_load(f) or {}
+            rt_cfg = load_config(cfg_realtime).model_dump()
             st.write("Текущая стратегия:")
             strat = rt_cfg.get("strategy", {}) or {}
             st.code(json.dumps(strat, ensure_ascii=False, indent=2), language="json")
@@ -678,8 +654,7 @@ with tabs[10]:
             if st.button("Записать model_path в configs/realtime.yaml", type="primary", key="mt_set_model_a"):
                 try:
                     import copy
-                    with open(cfg_realtime, "r", encoding="utf-8") as f:
-                        rt_cfg = yaml.safe_load(f) or {}
+                    rt_cfg = load_config(cfg_realtime).model_dump()
                     new_cfg = copy.deepcopy(rt_cfg)
                     new_cfg.setdefault("strategy", {}).setdefault("params", {})
                     new_cfg["strategy"]["params"]["model_path"] = str(model_art)
@@ -793,8 +768,7 @@ with tabs[10]:
             if st.button("Записать model_path в configs/realtime.yaml (baseline)", type="primary", key="mt_set_model_b"):
                 try:
                     import copy
-                    with open(cfg_realtime, "r", encoding="utf-8") as f:
-                        rt_cfg = yaml.safe_load(f) or {}
+                    rt_cfg = load_config(cfg_realtime).model_dump()
                     new_cfg = copy.deepcopy(rt_cfg)
                     new_cfg.setdefault("strategy", {}).setdefault("params", {})
                     new_cfg["strategy"]["params"]["model_path"] = str(chosen) if pkls else ""
@@ -854,10 +828,17 @@ with tabs[11]:
     with col_actions[0]:
         if st.button("Проверить YAML", type="primary", key="yaml_editor_check"):
             try:
-                data = yaml.safe_load(content) if content.strip() else {}
+                fname = os.path.basename(path).lower()
+                if not content.strip():
+                    data = {}
+                elif fname == "ingest.yaml":
+                    data = parse_ingest_config(content).model_dump()
+                elif fname == "sandbox.yaml":
+                    data = parse_sandbox_config(content).model_dump()
+                else:
+                    data = load_config_from_str(content).model_dump()
                 st.success("YAML синтаксически корректен")
                 # базовая валидация по типичным ключам
-                fname = os.path.basename(path).lower()
                 issues = []
 
                 if fname == "ingest.yaml":
@@ -871,7 +852,6 @@ with tabs[11]:
                         if not isinstance(data, dict) or k not in data:
                             issues.append(f"нет ключа '{k}'")
                 elif fname == "sim.yaml":
-                    # мягкая проверка: ожидаем наличие хотя бы одного из блоков
                     soft_any = any(k in (data or {}) for k in ["fees", "slippage", "risk", "pnl", "leakguard"])
                     if not soft_any:
                         issues.append("не найден ни один из ожидаемых блоков: fees/slippage/risk/pnl/leakguard")
@@ -893,8 +873,14 @@ with tabs[11]:
     with col_actions[1]:
         if st.button("Сохранить", type="secondary", key="yaml_editor_save"):
             try:
-                # проверим синтаксис перед сохранением
-                _ = yaml.safe_load(content) if content.strip() else {}
+                fname = os.path.basename(path).lower()
+                if content.strip():
+                    if fname == "ingest.yaml":
+                        parse_ingest_config(content)
+                    elif fname == "sandbox.yaml":
+                        parse_sandbox_config(content)
+                    else:
+                        load_config_from_str(content)
                 _ensure_dir(path)
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(content)
@@ -1010,8 +996,7 @@ with tabs[12]:
     current = {}
     try:
         if os.path.exists(cfg_sim):
-            with open(cfg_sim, "r", encoding="utf-8") as f:
-                current = yaml.safe_load(f) or {}
+            current = load_config(cfg_sim).model_dump()
     except Exception as e:
         st.error(f"Не удалось прочитать {cfg_sim}: {e}")
         current = {}
@@ -1101,8 +1086,7 @@ with tabs[12]:
         if st.button("Проверить структуру", key="sim_check"):
             issues = []
             try:
-                with open(cfg_sim, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
+                data = load_config(cfg_sim).model_dump()
                 # мягкая проверка ожидаемых ключей
                 for sect in ["fees", "slippage", "pnl", "leakguard", "risk"]:
                     if sect not in data:
@@ -1257,8 +1241,7 @@ with tabs[13]:
     current_cfg = {}
     try:
         if os.path.exists(cfg_sandbox):
-            with open(cfg_sandbox, "r", encoding="utf-8") as f:
-                current_cfg = yaml.safe_load(f) or {}
+            current_cfg = load_sandbox_config(cfg_sandbox).model_dump()
     except Exception as e:
         st.error(f"Не удалось прочитать {cfg_sandbox}: {e}")
         current_cfg = {}
