@@ -31,15 +31,13 @@ core_ → impl_ → service_ → strategy_ → scripts_
 Пример запуска обучения:
 
 ```python
-from transformers import FeatureSpec
-from offline_feature_pipe import OfflineFeaturePipe
-from service_train import ServiceTrain, TrainConfig
+from core_config import CommonRunConfig
+from service_train import from_config, TrainConfig
 
-spec = FeatureSpec(lookbacks_prices=[5, 15, 60], rsi_period=14)
-fp = OfflineFeaturePipe(spec, price_col="ref_price")
+cfg_run = CommonRunConfig(...)
 trainer = ...
 cfg = TrainConfig(input_path="data/train.parquet")
-ServiceTrain(fp, trainer, cfg).run()
+from_config(cfg_run, trainer=trainer, train_cfg=cfg)
 ```
 =======
 ## Проверка паритета фич

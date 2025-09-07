@@ -3,6 +3,17 @@
 services/service_signal_runner.py
 Онлайн-оркестратор: MarketDataSource -> FeaturePipe -> Strategy -> RiskGuards -> TradeExecutor.
 Не содержит бизнес-логики, только склейка компонентов.
+
+Пример использования через конфиг:
+
+```python
+from core_config import CommonRunConfig
+from service_signal_runner import from_config
+
+cfg = CommonRunConfig(...)
+for report in from_config(cfg):
+    print(report)
+```
 """
 
 from __future__ import annotations
@@ -14,6 +25,8 @@ from sandbox.sim_adapter import SimAdapter, DecisionsProvider  # исп. как 
 from core_models import Bar
 from core_contracts import FeaturePipe
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
+from core_config import CommonRunConfig
+import di_registry
 
 
 class Strategy(Protocol):
@@ -63,3 +76,30 @@ class ServiceSignalRunner:
         provider = _Provider(self.feature_pipe, self.strategy, self.risk_guards)
         for rep in self.adapter.run_events(provider):
             yield rep
+
+
+def from_config(cfg: CommonRunConfig, svc_cfg: RunnerConfig | None = None) -> Iterator[Dict[str, Any]]:
+    """Build dependencies from ``cfg`` and run :class:`ServiceSignalRunner`.
+
+    Parameters
+    ----------
+    cfg:
+        Runtime configuration describing component graph.
+    svc_cfg:
+        Optional additional service configuration.
+
+    Returns
+    -------
+    Iterator[Dict[str, Any]]
+        Stream of execution reports produced by the service.
+    """
+    container = di_registry.build_graph(cfg.components, cfg)
+    adapter: SimAdapter = container["executor"]
+    fp: FeaturePipe = container["feature_pipe"]
+    strat: Strategy = container["strategy"]
+    guards: RiskGuards | None = container.get("risk_guards")
+    service = ServiceSignalRunner(adapter, fp, strat, guards, svc_cfg)
+    return service.run()
+
+
+__all__ = ["RunnerConfig", "ServiceSignalRunner", "from_config"]
