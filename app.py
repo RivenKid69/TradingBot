@@ -25,6 +25,8 @@ from services.utils_app import (
 )
 from service_backtest import ServiceBacktest, BacktestConfig
 from service_train import ServiceTrain, TrainConfig
+from offline_feature_pipe import OfflineFeaturePipe
+from transformers import FeatureSpec
 from service_signal_runner import ServiceSignalRunner, RunnerConfig
 from service_eval import ServiceEval, EvalConfig
 import importlib
@@ -707,7 +709,8 @@ with tabs[10]:
         with col1:
             st.markdown("**Параметры обучения**")
             train_data = st.text_input("Путь к train.parquet/csv (--data)", value="data/train.parquet", key="mt_data_b")
-            label_col = st.text_input("Колонка таргета (--label-col)", value="label", key="mt_label_b")
+            price_col = st.text_input("Колонка цены (--price-col)", value="ref_price", key="mt_price_b")
+            label_col = st.text_input("Колонка таргета (--label-col)", value="", key="mt_label_b")
             task = st.selectbox("Тип задачи (--task)", options=["classification", "regression"], index=0, key="mt_task_b")
             threshold = st.text_input("Порог для классификации (--threshold)", value="0.0", key="mt_thr_b")
             positive_rule = st.selectbox("Правило положительного класса (--positive-rule)", options=["gt", "ge"], index=0, key="mt_posrule_b")
@@ -728,19 +731,6 @@ with tabs[10]:
         run_cols = st.columns(2)
         with run_cols[0]:
             if st.button("Запустить baseline-тренер", type="primary", key="mt_run_b"):
-                class IdentityFeaturePipe:
-                    def warmup(self):
-                        pass
-
-                    def fit(self, df: pd.DataFrame):
-                        pass
-
-                    def transform_df(self, df: pd.DataFrame) -> pd.DataFrame:
-                        return df
-
-                    def make_targets(self, df: pd.DataFrame):
-                        return df[label_col] if label_col in df.columns else None
-
                 class DummyTrainer:
                     def __init__(self, mtype: str):
                         self.mtype = mtype
@@ -755,7 +745,8 @@ with tabs[10]:
                             json.dump(self.info, f)
                         return path
 
-                fp = IdentityFeaturePipe()
+                spec = FeatureSpec(lookbacks_prices=[5, 15, 60], rsi_period=14)
+                fp = OfflineFeaturePipe(spec, price_col=price_col, label_col=(label_col or None))
                 trainer = DummyTrainer(model_type)
                 fmt = "parquet" if train_data.endswith(".parquet") else "csv"
                 cfg_train = TrainConfig(
