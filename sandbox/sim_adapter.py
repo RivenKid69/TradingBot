@@ -2,17 +2,47 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Protocol, Callable
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Protocol
 
 from execution_sim import ExecutionSimulator, SimStepReport as ExecReport  # type: ignore
 from action_proto import ActionType
-from core_models import as_dict
-import event_bus
+from core_models import Bar, as_dict
 from compat_shims import sim_report_dict_to_core_exec_reports
-from decimal import Decimal
 from event_bus import log_trade_exec as _bus_log_trade_exec
-from market_data_port import MarketDataSource, MarketEvent, EventKind, Bar, ensure_timeframe
+from core_contracts import MarketDataSource
 from order_shims import OrderContext, decisions_to_orders
+
+_TF_MS = {
+    "1s": 1_000,
+    "5s": 5_000,
+    "10s": 10_000,
+    "15s": 15_000,
+    "30s": 30_000,
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+    "6h": 21_600_000,
+    "8h": 28_800_000,
+    "12h": 43_200_000,
+    "1d": 86_400_000,
+}
+
+
+def _ensure_timeframe(tf: str) -> str:
+    tf = str(tf).lower()
+    if tf not in _TF_MS:
+        raise ValueError(f"Unsupported timeframe: {tf}")
+    return tf
+
+
+def _timeframe_to_ms(tf: str) -> int:
+    tf = _ensure_timeframe(tf)
+    return _TF_MS[tf]
 
 class DecisionsProvider(Protocol):
     def on_bar(self, bar: Bar) -> Sequence[Any]: ...
@@ -25,7 +55,8 @@ class SimAdapter:
     def __init__(self, sim: ExecutionSimulator, *, symbol: str, timeframe: str, source: MarketDataSource):
         self.sim = sim
         self.symbol = str(symbol).upper()
-        self.timeframe = ensure_timeframe(timeframe)
+        self.timeframe = _ensure_timeframe(timeframe)
+        self.interval_ms = _timeframe_to_ms(self.timeframe)
         self.source = source
 
 
@@ -79,54 +110,44 @@ class SimAdapter:
 
     def run_events(self, provider: "DecisionsProvider") -> Iterator[Dict[str, Any]]:
         """
-        Итерация по источнику событий.
+        Итерация по источнику баров.
         Для каждого BAR:
           - получаем решения из provider.on_bar(bar)
           - выполняем шаг симуляции через self.step(...)
           - возвращаем отчёт симулятора, расширенный служебными полями
         """
-        self.source.open()
-        self.source.subscribe([self.symbol], timeframe=self.timeframe)
-        try:
-            for ev in self.source.iter_events():
-                if ev.kind != EventKind.BAR or ev.bar is None:
-                    continue
-                bar = ev.bar
-                if bar.symbol != self.symbol or bar.timeframe != self.timeframe:
-                    continue
+        for bar in self.source.stream_bars([self.symbol], self.interval_ms):
+            if bar.symbol != self.symbol:
+                continue
 
-                decisions = list(provider.on_bar(bar) or [])
+            decisions = list(provider.on_bar(bar) or [])
 
-                # эвристики для vol_factor и liquidity
-                vol_factor = (float(bar.volume) if bar.volume is not None else None)
-                liquidity = "NORMAL"
+            vol_factor = float(bar.volume_base) if bar.volume_base is not None else None
+            liquidity = "NORMAL"
 
-                rep = self.step(
-                    ts_ms=int(bar.ts),
-                    ref_price=float(bar.close),
-                    bid=(None if bar.bid is None else float(bar.bid)),
-                    ask=(None if bar.ask is None else float(bar.ask)),
-                    vol_factor=vol_factor,
-                    liquidity=liquidity,
-                    decisions=decisions,
-                )
+            rep = self.step(
+                ts_ms=int(bar.ts),
+                ref_price=float(bar.close),
+                bid=None,
+                ask=None,
+                vol_factor=vol_factor,
+                liquidity=liquidity,
+                decisions=decisions,
+            )
 
-                # дополнительно прикладываем стандартизованные заказы
-                ctx = OrderContext(
-                    ts_ms=int(bar.ts),
-                    symbol=bar.symbol,
-                    ref_price=float(bar.close),
-                    max_position_abs_base=1.0,
-                    tick_size=None,
-                    price_offset_ticks=0,
-                    tif="GTC",
-                    client_tag=None,
-                    round_qty_fn=None,
-                )
-                orders = decisions_to_orders(decisions, ctx)
-                rep["symbol"] = bar.symbol
-                rep["ts_ms"] = int(bar.ts)
-                rep["core_orders"] = ([as_dict(o) for o in orders] if orders else [])
-                yield rep
-        finally:
-            self.source.close()
+            ctx = OrderContext(
+                ts_ms=int(bar.ts),
+                symbol=bar.symbol,
+                ref_price=float(bar.close),
+                max_position_abs_base=1.0,
+                tick_size=None,
+                price_offset_ticks=0,
+                tif="GTC",
+                client_tag=None,
+                round_qty_fn=None,
+            )
+            orders = decisions_to_orders(decisions, ctx)
+            rep["symbol"] = bar.symbol
+            rep["ts_ms"] = int(bar.ts)
+            rep["core_orders"] = ([as_dict(o) for o in orders] if orders else [])
+            yield rep
