@@ -3,6 +3,20 @@
 services/service_train.py
 Сервис подготовки данных (офлайн) и запуска обучения модели.
 Оркестрация: OfflineData -> FeaturePipe(offl) -> Dataset -> Trainer.fit -> сохранение артефактов.
+
+Пример использования
+--------------------
+```python
+from transformers import FeatureSpec
+from offline_feature_pipe import OfflineFeaturePipe
+from service_train import ServiceTrain, TrainConfig
+
+spec = FeatureSpec(lookbacks_prices=[5, 15, 60], rsi_period=14)
+fp = OfflineFeaturePipe(spec, price_col="ref_price")
+trainer = ...  # реализация Trainer
+cfg = TrainConfig(input_path="data/train.parquet")
+ServiceTrain(fp, trainer, cfg).run()
+```
 """
 
 from __future__ import annotations
