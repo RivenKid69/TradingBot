@@ -25,39 +25,66 @@ def _read_any(path: str) -> pd.DataFrame:
 
 def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize trades to TradeLogRow schema:
-    ts, run_id, symbol, side, order_type, price, quantity, fee, fee_asset, pnl,
-    exec_status, liquidity, client_order_id, order_id, meta_json.
-    Only TradeLogRow format is supported.
+    Normalize trades to unified schema:
+    ts, run_id, symbol, side, order_type, price, quantity, fee, fee_asset, pnl, exec_status, liquidity, client_order_id, order_id, meta_json
+    Supports legacy schema: ts, price, volume, side, agent_flag, order_id
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=[
-            "ts","run_id","symbol","side","order_type","price","quantity",
-            "fee","fee_asset","pnl","exec_status","liquidity",
-            "client_order_id","order_id","meta_json"
-        ])
+        return pd.DataFrame(columns=["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"])
 
-    required = {"ts","run_id","symbol","side","order_type","price","quantity"}
     cols = set(df.columns)
-    missing = required - cols
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
 
+    # Unified already
+    if {"ts","run_id","symbol","side","order_type","price","quantity"}.issubset(cols):
+        df = df.copy()
+        for c in ["fee","pnl"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        # ensure required cols exist
+        for c in ["fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]:
+            if c not in df.columns:
+                df[c] = None
+        return df[["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]]
+
+    # Legacy -> map
+    if {"ts","price","volume","side"}.issubset(cols):
+        out = pd.DataFrame()
+        out["ts"] = pd.to_numeric(df["ts"], errors="coerce").astype("Int64")
+        out["run_id"] = ""
+        out["symbol"] = "UNKNOWN"
+        out["side"] = df["side"].astype(str).str.upper()
+        out["order_type"] = "MARKET"
+        out["price"] = pd.to_numeric(df["price"], errors="coerce")
+        out["quantity"] = pd.to_numeric(df["volume"], errors="coerce")
+        out["fee"] = 0.0
+        out["fee_asset"] = None
+        out["pnl"] = None
+        out["exec_status"] = "FILLED"
+        out["liquidity"] = "UNKNOWN"
+        out["client_order_id"] = None
+        out["order_id"] = df["order_id"] if "order_id" in df.columns else None
+        out["meta_json"] = "{}"
+        return out
+
+    # Unknown schema -> attempt minimal
     df = df.copy()
-    for c in ["fee","pnl","price","quantity"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["ts"] = pd.to_numeric(df["ts"], errors="coerce").astype("Int64")
-    # ensure optional columns exist
-    for c in ["fee","fee_asset","pnl","exec_status","liquidity",
-              "client_order_id","order_id","meta_json"]:
+    if "ts" not in df.columns:
+        df["ts"] = pd.NA
+    if "price" not in df.columns:
+        df["price"] = pd.NA
+    if "quantity" not in df.columns:
+        if "volume" in df.columns:
+            df["quantity"] = pd.to_numeric(df["volume"], errors="coerce")
+        else:
+            df["quantity"] = pd.NA
+    df["run_id"] = ""
+    df["symbol"] = "UNKNOWN"
+    df["side"] = df.get("side", "BUY")
+    df["order_type"] = df.get("order_type", "MARKET")
+    for c in ["fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]:
         if c not in df.columns:
             df[c] = None
-    return df[[
-        "ts","run_id","symbol","side","order_type","price","quantity",
-        "fee","fee_asset","pnl","exec_status","liquidity",
-        "client_order_id","order_id","meta_json"
-    ]]
+    return df[["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]]
 
 
 def _bucket_ts_ms(ts_ms: pd.Series, *, bar_seconds: int) -> pd.Series:
@@ -69,7 +96,7 @@ def _bucket_ts_ms(ts_ms: pd.Series, *, bar_seconds: int) -> pd.Series:
 def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str, bar_seconds: int = 60) -> Tuple[str, str]:
     """
     Aggregates trade logs into per-bar and per-day summaries.
-    - trades_path: path or glob to log_trades_*.csv (TradeLogRow format)
+    - trades_path: path or glob to log_trades_*.csv (unified) or legacy trades.csv
     - reports_path: optional path/glob to equity reports (csv/parquet) — if present, we will attach equity at bar ends
     - out_bars, out_days: output CSV paths
     Returns (out_bars, out_days).
@@ -138,7 +165,7 @@ def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str,
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Aggregate execution logs into per-bar and per-day summaries.")
-    p.add_argument("--trades", required=True, help="Path or glob to TradeLogRow logs (log_trades_*.csv). Only TradeLogRow format is supported.")
+    p.add_argument("--trades", required=True, help="Path or glob to unified Exec logs (log_trades_*.csv). Legacy trades.csv is supported but deprecated.")
     p.add_argument("--reports", default="", help="Optional path or glob to equity reports (csv/parquet)")
     p.add_argument("--out-bars", default="logs/agg_bars.csv", help="Output CSV path for per-bar aggregation")
     p.add_argument("--out-days", default="logs/agg_days.csv", help="Output CSV path for per-day aggregation")
