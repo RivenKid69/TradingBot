@@ -63,7 +63,7 @@ def detect_layer(filename: str) -> Optional[str]:
                 "quantizer.py", "fees.py", "slippage.py", "latency.py", "risk.py", "risk_guard.py", "event_bus.py"):
         return "impl"
     # core: новые core_* + существующие core_constants.*
-    if base.startswith("core") or base in ("core_constants.py", "coreprice_scale.py", "coreconstants.py"):
+    if base.startswith("core") or base in ("core_constants.py", "coreprice_scale.py"):
         return "core"
     return None
 

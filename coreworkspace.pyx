@@ -5,6 +5,7 @@ from libc.stdlib cimport malloc, free  # (Optional: if using C memory allocation
 from libcpp.vector cimport vector      # (Not used, but available if needed for C++ structures)
 
 # Import Python-level constants (ensuring no other project modules are used).
+import core_constants as constants
 from core_constants cimport PRICE_SCALE, MarketRegime
 
 cdef class SimulationWorkspace:
