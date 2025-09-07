@@ -10,6 +10,7 @@ from dataclasses import dataclass, asdict
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple, Union, Protocol
 from enum import Enum
 from datetime import datetime, timezone
+from utils_time import parse_time_to_ms
 
 
 class EventKind(str, Enum):
@@ -111,16 +112,21 @@ def ensure_timeframe(tf: str) -> str:
     return tf
 
 def to_ms(dt: Union[int, float, str, datetime]) -> int:
-    if isinstance(dt, int):
-        return dt
-    if isinstance(dt, float):
-        return int(dt)
+    """Return Unix timestamp in milliseconds.
+
+    Numeric inputs may represent either seconds or milliseconds; values
+    below ``10_000_000_000`` are assumed to be seconds and are multiplied by
+    ``1000``. String inputs are delegated to :func:`utils_time.parse_time_to_ms`
+    for parsing, and :class:`datetime` objects are converted assuming UTC if
+    timezone information is missing.
+    """
+    if isinstance(dt, (int, float)):
+        v = float(dt)
+        if v < 10_000_000_000:
+            v *= 1000
+        return int(v)
     if isinstance(dt, str):
-        # ISO 8601
-        try:
-            return int(datetime.fromisoformat(dt.replace("Z", "+00:00")).timestamp() * 1000)
-        except Exception as e:
-            raise ValueError(f"Cannot parse datetime string: {dt}") from e
+        return parse_time_to_ms(dt)
     if isinstance(dt, datetime):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
