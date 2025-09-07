@@ -20,6 +20,31 @@ core_ → impl_ → service_ → strategy_ → scripts_
 
 Общий план развития проекта приведён в файле [План.txt](План.txt).
 
+## Конфигурации запусков
+
+Конфигурации описываются в формате YAML. Для загрузки и валидации
+используйте функцию `load_config`:
+
+```yaml
+# configs/run_sim.yaml
+mode: sim
+components:
+  market_data:
+    target: impl_offline_data:OfflineCSVBarSource
+    params: {paths: ["data/sample.csv"], timeframe: "1m"}
+  executor:
+    target: impl_sim_executor:SimExecutor
+    params: {symbol: "BTCUSDT"}
+data:
+  symbols: ["BTCUSDT"]
+  timeframe: "1m"
+```
+
+```python
+from core_config import load_config
+
+cfg = load_config("configs/run_sim.yaml")
+```
 
 ## ServiceTrain
 
