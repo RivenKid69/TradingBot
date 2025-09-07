@@ -70,6 +70,6 @@ risk:
 logging:
   enabled: true
   format: "csv"                 # "csv" | "parquet"
-  trades_path: "logs/sim_trades.csv"
+  trades_path: "logs/log_trades_<runid>.csv"
   reports_path: "logs/sim_reports.csv"
   flush_every: 1000

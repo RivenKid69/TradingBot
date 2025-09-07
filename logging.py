@@ -22,7 +22,7 @@ class LogConfig:
     """
     enabled: bool = True
     format: str = "csv"
-    trades_path: str = "logs/sim_trades.csv"
+    trades_path: str = "logs/log_trades_<runid>.csv"
     reports_path: str = "logs/sim_reports.csv"
     flush_every: int = 1000
 
@@ -31,7 +31,7 @@ class LogConfig:
         return cls(
             enabled=bool(d.get("enabled", True)),
             format=str(d.get("format", "csv")).lower(),
-            trades_path=str(d.get("trades_path", "logs/trades.csv")),
+            trades_path=str(d.get("trades_path", "logs/log_trades_<runid>.csv")),
             reports_path=str(d.get("reports_path", "logs/reports.csv")),
             flush_every=int(d.get("flush_every", 1000)),
         )

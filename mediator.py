@@ -105,7 +105,7 @@ class Mediator:
 
         # EventBus
         try:
-            event_bus.configure(level=event_level, write_legacy=False)
+            event_bus.configure(level=event_level)
         except Exception:
             pass
 

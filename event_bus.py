@@ -1,6 +1,5 @@
 # event_bus.py
 # Лёгкая шина событий с потокобезопасной записью:
-# - trades.csv (legacy, опционально): ts,price,volume,side,agent_flag,order_id
 # - log_trades_<runid>.csv (UNIFIED CSV: ts,run_id,symbol,side,order_type,price,quantity,fee,fee_asset,pnl,exec_status,liquidity,client_order_id,order_id,meta_json)
 # - risk.jsonl (по строке JSON на событие риска)
 # Поддерживает много процессов через multiprocessing.Lock.
@@ -26,17 +25,13 @@ class _BusState:
         "level",
         "root",
         "run_dir",
-        "trades_path",
         "risk_path",
-        "trades_file",
         "risk_file",
-        "csv_writer",
         "unified_path",
         "unified_file",
         "unified_writer",
         "run_id",
         "default_symbol",
-        "write_legacy",
         "lock",
         "initialized",
     )
@@ -45,17 +40,13 @@ class _BusState:
         self.level = EventLevel.NONE
         self.root = "logs"
         self.run_dir = None
-        self.trades_path = None
         self.risk_path = None
-        self.trades_file = None
         self.risk_file = None
-        self.csv_writer = None
         self.unified_path = None
         self.unified_file = None
         self.unified_writer = None
         self.run_id = ""
         self.default_symbol = None
-        self.write_legacy = False
         self.lock = Lock()
         self.initialized = False
 
@@ -71,19 +62,12 @@ def _ensure_open():
         ts = time.strftime("%Y%m%d_%H%M%S")
         _STATE.run_dir = os.path.join(_STATE.root, f"run_{ts}")
         os.makedirs(_STATE.run_dir, exist_ok=True)
-        _STATE.trades_path = os.path.join(_STATE.run_dir, "trades.csv")
         _STATE.risk_path = os.path.join(_STATE.run_dir, "risk.jsonl")
 
         # unified log path / defaults
         _STATE.unified_path = os.path.join(_STATE.run_dir, f"log_trades_{ts}.csv")
         _STATE.run_id = ts
         _STATE.default_symbol = getattr(_STATE, "default_symbol", None)
-
-        # trades.csv c заголовком (опционально)
-        if _STATE.write_legacy and not getattr(_STATE, "trades_file", None):
-            _STATE.trades_file = open(_STATE.trades_path, "a", newline="", encoding="utf-8")
-            _STATE.csv_writer = csv.writer(_STATE.trades_file)
-            _STATE.csv_writer.writerow(["ts", "price", "volume", "side", "agent_flag", "order_id"])
 
         # unified CSV c заголовком
         if not hasattr(_STATE, "unified_file"):
@@ -105,7 +89,6 @@ def configure(
     root: str = "logs",
     run_id: str | None = None,
     default_symbol: str | None = None,
-    write_legacy: bool = False,
 ) -> str:
     """
     Настройка уровня логирования и корневой директории.
@@ -115,7 +98,6 @@ def configure(
     _STATE.root = str(root)
     _STATE.run_id = str(run_id) if run_id is not None else ""
     _STATE.default_symbol = str(default_symbol) if default_symbol is not None else None
-    _STATE.write_legacy = bool(write_legacy)
 
 def set_defaults(*, run_id: str | None = None, default_symbol: str | None = None) -> None:
     if run_id is not None:
@@ -138,13 +120,7 @@ def log_trade(ts: int, price: float, volume: float, is_buy: bool, agent_flag: bo
     _ensure_open()
     side = "B" if is_buy else "S"
     with _STATE.lock:
-        if _STATE.write_legacy and _STATE.csv_writer and _STATE.trades_file:
-            _STATE.csv_writer.writerow([int(ts), float(price), float(volume), side, int(bool(agent_flag)), "" if order_id is None else int(order_id)])
-            _STATE.trades_file.flush()
-
-        # Записываем unified-CSV (best-effort маппинг)
-
-        # Дополнительно дублируем запись в unified-CSV (best-effort маппинг)
+        # Запись в unified-CSV (best-effort маппинг)
         sym = _STATE.default_symbol or "UNKNOWN"
         side_str = "BUY" if is_buy else "SELL"
         try:
@@ -190,7 +166,6 @@ def log_trade_exec(er) -> None:
     """
     Удобная запись ExecReport/TradeLogRow/словаря в unified-CSV.
     Формат er: core_models.ExecReport | core_models.TradeLogRow | dict совместимой схемы.
-    Ничего из legacy-CSV не трогаем.
     """
     if _STATE.level <= EventLevel.NONE:
         return
@@ -281,11 +256,11 @@ def flush():
         return
     with _STATE.lock:
         try:
-            _STATE.trades_file.flush()
+            _STATE.risk_file.flush()
         except Exception:
             pass
         try:
-            _STATE.risk_file.flush()
+            _STATE.unified_file.flush()
         except Exception:
             pass
 
@@ -295,14 +270,11 @@ def close():
         return
     with _STATE.lock:
         try:
-            if getattr(_STATE, "trades_file", None):
-                tf = getattr(_STATE, "trades_file", None)
-                if tf:
-                    tf.close()
+            _STATE.risk_file.close()
         except Exception:
             pass
         try:
-            _STATE.risk_file.close()
+            _STATE.unified_file.close()
         except Exception:
             pass
         _STATE.initialized = False

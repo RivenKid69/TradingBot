@@ -73,9 +73,7 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
     if "price" not in df.columns:
         df["price"] = pd.NA
     if "quantity" not in df.columns:
-        if "qty" in df.columns:
-            df["quantity"] = pd.to_numeric(df["qty"], errors="coerce")
-        elif "volume" in df.columns:
+        if "volume" in df.columns:
             df["quantity"] = pd.to_numeric(df["volume"], errors="coerce")
         else:
             df["quantity"] = pd.NA
