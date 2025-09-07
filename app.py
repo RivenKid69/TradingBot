@@ -5,178 +5,34 @@ import os
 import sys
 import json
 import time
-import signal
-import platform
-import subprocess
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 import yaml
 
+from services.utils_app import (
+    ensure_dir as _ensure_dir,
+    run_cmd,
+    start_background,
+    stop_background,
+    background_running,
+    tail_file,
+    read_json,
+    read_csv,
+    append_row_csv,
+    load_signals_full,
+)
+from service_backtest import ServiceBacktest, BacktestConfig
+from service_train import ServiceTrain, TrainConfig
+from service_signal_runner import ServiceSignalRunner, RunnerConfig
+from service_eval import ServiceEval, EvalConfig
+import importlib
+from execution_sim import ExecutionSimulator
+from sandbox.sim_adapter import SimAdapter
+
 
 # --------------------------- Utility ---------------------------
-
-def _ensure_dir(path: str) -> None:
-    d = os.path.dirname(path) if os.path.splitext(path)[1] else path
-    if d:
-        os.makedirs(d, exist_ok=True)
-
-
-def run_cmd(cmd: List[str], cwd: Optional[str] = None, log_path: Optional[str] = None) -> int:
-    """
-    Блокирующий запуск команды. Возвращает returncode.
-    Если указан log_path — stdout и stderr пишутся в файл.
-    """
-    st.write(f"```bash\n{' '.join(cmd)}\n```")
-    if log_path:
-        _ensure_dir(log_path)
-        with open(log_path, "a", encoding="utf-8", newline="") as f:
-            f.write(f"\n$ {' '.join(cmd)}\n")
-            f.flush()
-            proc = subprocess.run(cmd, cwd=cwd, stdout=f, stderr=f, text=True)
-            return int(proc.returncode)
-    else:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-        st.code(proc.stdout or "", language="bash")
-        if proc.stderr:
-            st.error(proc.stderr)
-        return int(proc.returncode)
-
-
-def start_background(cmd: List[str], pid_file: str, log_file: str) -> int:
-    """
-    Неблокирующий запуск (для сигналера). PID сохраняется в pid_file.
-    Логи пишутся в log_file (append).
-    """
-    _ensure_dir(pid_file)
-    _ensure_dir(log_file)
-    if os.path.exists(pid_file):
-        raise RuntimeError("Процесс уже запущен (есть PID файл). Сначала остановите его.")
-
-    logf = open(log_file, "a", encoding="utf-8", newline="")
-    if platform.system() == "Windows":
-        # CREATE_NEW_PROCESS_GROUP = 0x00000200
-        creationflags = 0x00000200
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, creationflags=creationflags)
-    else:
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, preexec_fn=os.setsid)
-    with open(pid_file, "w", encoding="utf-8") as f:
-        f.write(str(proc.pid))
-    return int(proc.pid)
-
-
-def stop_background(pid_file: str) -> bool:
-    """
-    Останавливает процесс по PID из pid_file.
-    """
-    if not os.path.exists(pid_file):
-        return False
-    try:
-        with open(pid_file, "r", encoding="utf-8") as f:
-            pid = int(f.read().strip())
-    except Exception:
-        os.remove(pid_file)
-        return False
-
-    try:
-        if platform.system() == "Windows":
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except Exception:
-        pass
-    try:
-        os.remove(pid_file)
-    except Exception:
-        pass
-    return True
-
-
-def background_running(pid_file: str) -> bool:
-    if not os.path.exists(pid_file):
-        return False
-    try:
-        with open(pid_file, "r", encoding="utf-8") as f:
-            pid = int(f.read().strip())
-        # Пробуем послать нулевой сигнал (POSIX) или проверим через tasklist на Windows
-        if platform.system() == "Windows":
-            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True)
-            return str(pid) in (out.stdout or "")
-        else:
-            os.kill(pid, 0)
-            return True
-    except Exception:
-        try:
-            os.remove(pid_file)
-        except Exception:
-            pass
-        return False
-
-
-def tail_file(path: str, n: int = 200) -> str:
-    if not os.path.exists(path):
-        return ""
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()[-n:]
-        return "".join(lines)
-    except Exception:
-        return ""
-
-
-def read_json(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def read_csv(path: str, n: int = 200) -> pd.DataFrame:
-    if not os.path.exists(path):
-        return pd.DataFrame()
-    try:
-        df = pd.read_csv(path)
-        if len(df) > n:
-            return df.tail(n).reset_index(drop=True)
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-def signal_uid(row: Dict[str, Any]) -> str:
-    ts = str(int(row.get("ts_ms", 0)))
-    sym = str(row.get("symbol", "")).upper()
-    fh = str(row.get("features_hash", ""))
-    side = str(row.get("side", ""))
-    vol = str(row.get("volume_frac", ""))
-    return f"{ts}_{sym}_{fh}_{side}_{vol}"
-
-
-def append_row_csv(path: str, header: List[str], row: List[Any]) -> None:
-    _ensure_dir(path)
-    exists = os.path.exists(path)
-    with open(path, "a", encoding="utf-8", newline="") as f:
-        import csv as _csv
-        w = _csv.writer(f)
-        if not exists:
-            w.writerow(header)
-        w.writerow(row)
-
-
-def load_signals_full(path: str, max_rows: int = 500) -> pd.DataFrame:
-    df = read_csv(path, n=max_rows)
-    if df.empty:
-        return df
-    # гарантированно добавим uid (не меняем файл на диске)
-    try:
-        if "uid" not in df.columns:
-            df["uid"] = df.apply(lambda r: signal_uid(r.to_dict()), axis=1)
-    except Exception:
-        pass
-    return df
 
 def build_all_pipeline(
         *,
@@ -271,6 +127,67 @@ def build_all_pipeline(
             except Exception as e:
                 st.error(str(e))
 
+
+# --------------------------- Service wrappers ---------------------------
+
+def run_backtest_from_yaml(cfg_path: str, default_out: str) -> str:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    with open(cfg["sim_config_path"], "r", encoding="utf-8") as f:
+        sim_cfg = yaml.safe_load(f)
+
+    sim = ExecutionSimulator(
+        symbol=cfg.get("symbol", "BTCUSDT"),
+        latency_steps=int(cfg.get("latency_steps", 0)),
+        filters_path=sim_cfg["filters"]["path"],
+        enforce_ppbs=sim_cfg["filters"]["enforce_percent_price_by_side"],
+        strict_filters=sim_cfg["filters"]["strict"],
+        fees_config=sim_cfg.get("fees", {}),
+        funding_config=sim_cfg.get("funding", {}),
+        slippage_config=sim_cfg.get("slippage", {}),
+        execution_config=sim_cfg.get("execution", {}),
+        latency_config=sim_cfg.get("latency", {}),
+        pnl_config=sim_cfg.get("pnl", {}),
+        risk_config=sim_cfg.get("risk", {}),
+        logging_config=sim_cfg.get("logging", {}),
+    )
+
+    strat_cfg = cfg.get("strategy", {})
+    module = strat_cfg.get("module", "strategies.momentum")
+    clsname = strat_cfg.get("class", "MomentumStrategy")
+    params = strat_cfg.get("params", {})
+    m = importlib.import_module(module)
+    Strat = getattr(m, clsname)
+    strat = Strat()
+    if hasattr(strat, "setup"):
+        strat.setup(params)
+
+    bridge = SimAdapter(sim, cfg.get("symbol", "BTCUSDT"))
+    sb_cfg = BacktestConfig(
+        dynamic_spread_config=cfg.get("dynamic_spread", {}),
+        exchange_specs_path=cfg.get("exchange_specs_path", None),
+        guards_config=cfg.get("sim_guards", {}),
+        signal_cooldown_s=int(cfg.get("min_signal_gap_s", 0)),
+        no_trade_config=cfg.get("no_trade", {}),
+    )
+    service = ServiceBacktest(strat, bridge, sb_cfg)
+
+    data_cfg = cfg["data"]
+    path = data_cfg["path"]
+    df = pd.read_parquet(path) if path.lower().endswith(".parquet") else pd.read_csv(path)
+    reports = service.run(
+        df,
+        ts_col=data_cfg.get("ts_col", "ts_ms"),
+        symbol_col=data_cfg.get("symbol_col", "symbol"),
+        price_col=data_cfg.get("price_col", "ref_price"),
+    )
+    out_path = cfg.get("out_reports", default_out)
+    _ensure_dir(out_path)
+    if out_path.lower().endswith(".parquet"):
+        pd.DataFrame(reports).to_parquet(out_path, index=False)
+    else:
+        pd.DataFrame(reports).to_csv(out_path, index=False)
+    return out_path
 
 # --------------------------- Streamlit UI ---------------------------
 
@@ -438,14 +355,14 @@ with tabs[3]:
 # --------------------------- Tab: Sandbox Backtest ---------------------------
 
 with tabs[4]:
-    st.subheader("Бэктест песочницы (run_sandbox.py)")
+    st.subheader("Бэктест песочницы (ServiceBacktest)")
+    default_rep = os.path.join(logs_dir, "sandbox_reports.csv")
     if st.button("Запустить бэктест", type="primary"):
-        rc = run_cmd([sys.executable, "scripts/run_sandbox.py", "--config", cfg_sandbox],
-                     log_path=os.path.join(logs_dir, "sandbox.log"))
-        if rc == 0:
-            st.success("Бэктест завершён")
-        else:
-            st.error(f"run_sandbox завершился с кодом {rc}")
+        try:
+            out = run_backtest_from_yaml(cfg_sandbox, default_rep)
+            st.success(f"Бэктест завершён, отчёт: {out}")
+        except Exception as e:
+            st.error(str(e))
 
     st.caption("Текущий configs/sandbox.yaml:")
     try:
@@ -457,26 +374,21 @@ with tabs[4]:
 # --------------------------- Tab: Evaluate ---------------------------
 
 with tabs[5]:
-    st.subheader("Оценка эффективности (evaluate_performance.py)")
-    capital = st.number_input("capital_base", min_value=1.0, value=10_000.0, step=100.0)
-    rf = st.number_input("rf_annual", min_value=0.0, value=0.0, step=0.01)
-    out_md = st.text_input("Выход markdown", value=os.path.join(logs_dir, "metrics.md"))
-
+    st.subheader("Оценка эффективности (ServiceEval)")
+    artifacts_dir_eval = st.text_input("Каталог артефактов", value=os.path.join(logs_dir, "eval"))
     if st.button("Посчитать метрики", type="primary"):
-        rc = run_cmd([
-            sys.executable, "scripts/evaluate_performance.py",
-            "--trades", trades_path,
-            "--reports", reports_path,
-            "--out-json", metrics_json,
-            "--out-md", out_md,
-            "--equity-png", equity_png,
-            "--capital-base", str(float(capital)),
-            "--rf-annual", str(float(rf)),
-        ], log_path=os.path.join(logs_dir, "evaluate.log"))
-        if rc == 0:
-            st.success("Метрики готовы")
-        else:
-            st.error(f"evaluate_performance завершился с кодом {rc}")
+        cfg_eval = EvalConfig(
+            trades_csv=trades_path,
+            equity_csv=reports_path,
+            artifacts_dir=artifacts_dir_eval,
+        )
+        try:
+            svc = ServiceEval(cfg_eval)
+            res = svc.run()
+            pd.Series(res["metrics"]).to_json(metrics_json, force_ascii=False)
+            st.success(f"Метрики готовы, отчёт: {res['report_path']}")
+        except Exception as e:
+            st.error(str(e))
 
     st.divider()
     st.subheader("metrics.json (если есть)")
@@ -552,6 +464,39 @@ with tabs[6]:
         st.dataframe(sig_df, use_container_width=True)
     else:
         st.info("Сигналы пока не найдены.")
+
+    st.divider()
+    st.markdown("### Демо ServiceSignalRunner")
+    if st.button("Запустить демо ServiceSignalRunner"):
+        class DummyAdapter:
+            def run_events(self, provider):
+                from core_models import Bar
+                for i in range(3):
+                    bar = Bar(symbol="BTCUSDT", ts=i, open=0.0, high=0.0, low=0.0, close=100.0 + i, volume_base=1.0)
+                    provider.on_bar(bar)
+                    yield {"ts_ms": i, "symbol": "BTCUSDT"}
+
+        class DummyFP:
+            def warmup(self):
+                pass
+
+            def on_bar(self, bar):
+                return {"ref_price": float(bar.close)}
+
+        class DummyStrat:
+            def on_features(self, feats):
+                pass
+
+            def decide(self, ctx):
+                return []
+
+        try:
+            adapter = DummyAdapter()
+            runner = ServiceSignalRunner(adapter, DummyFP(), DummyStrat(), None, RunnerConfig())
+            list(runner.run())
+            st.success("ServiceSignalRunner выполнен (демо)")
+        except Exception as e:
+            st.error(str(e))
 
 with tabs[7]:
     st.subheader("Очередь на исполнение (manual approve)")
@@ -783,26 +728,50 @@ with tabs[10]:
         run_cols = st.columns(2)
         with run_cols[0]:
             if st.button("Запустить baseline-тренер", type="primary", key="mt_run_b"):
-                rc = run_cmd([
-                    sys.executable, "scripts/train_baseline.py",
-                    "--data", train_data,
-                    "--label-col", label_col,
-                    "--task", task,
-                    "--threshold", str(threshold),
-                    "--positive-rule", positive_rule,
-                    "--drop-cols", drop_cols,
-                    "--features-prefixes", prefixes,
-                    "--test-size", str(float(test_size)),
-                    "--random-state", str(int(random_state)),
-                    "--model", model_type,
-                    "--out-dir", out_dir,
-                    "--model-name", model_name,
-                    "--metrics-json", metrics_json,
-                ], log_path=train_log)
-                if rc == 0:
-                    st.success("Обучение завершено успешно (baseline)")
-                else:
-                    st.error(f"Обучение завершилось с кодом {rc}")
+                class IdentityFeaturePipe:
+                    def warmup(self):
+                        pass
+
+                    def fit(self, df: pd.DataFrame):
+                        pass
+
+                    def transform_df(self, df: pd.DataFrame) -> pd.DataFrame:
+                        return df
+
+                    def make_targets(self, df: pd.DataFrame):
+                        return df[label_col] if label_col in df.columns else None
+
+                class DummyTrainer:
+                    def __init__(self, mtype: str):
+                        self.mtype = mtype
+                        self.info: Dict[str, Any] = {}
+
+                    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None):
+                        self.info = {"model": self.mtype, "n": len(X)}
+
+                    def save(self, path: str) -> str:
+                        _ensure_dir(path)
+                        with open(path, "w", encoding="utf-8") as f:
+                            json.dump(self.info, f)
+                        return path
+
+                fp = IdentityFeaturePipe()
+                trainer = DummyTrainer(model_type)
+                fmt = "parquet" if train_data.endswith(".parquet") else "csv"
+                cfg_train = TrainConfig(
+                    input_path=train_data,
+                    input_format=fmt,
+                    artifacts_dir=out_dir,
+                    dataset_name="train_dataset",
+                    model_name=model_name,
+                )
+                try:
+                    svc = ServiceTrain(fp, trainer, cfg_train)
+                    res = svc.run()
+                    pd.Series({"n_samples": res["n_samples"], "n_features": res["n_features"]}).to_json(metrics_json)
+                    st.success(f"Обучение завершено, модель: {res['model_path']}")
+                except Exception as e:
+                    st.error(str(e))
 
         with run_cols[1]:
             if st.button("Показать train_metrics.json (baseline)", key="mt_showmetrics_b"):
