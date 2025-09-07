@@ -161,7 +161,7 @@ def calibrate(
 
 def main():
     ap = argparse.ArgumentParser(description="Калибровка параметров T-cost (base_bps, alpha_vol, beta_illiquidity) по историческим данным.")
-    ap.add_argument("--config", default="configs/sandbox.yaml", help="Путь к sandbox.yaml")
+    ap.add_argument("--config", default="configs/legacy_sandbox.yaml", help="Путь к legacy_sandbox.yaml")
     ap.add_argument("--data", default="", help="Путь к данным (если пусто — берём из config.data.path)")
     ap.add_argument("--ts_col", default="", help="Колонка времени (по умолчанию из конфигурации)")
     ap.add_argument("--symbol_col", default="", help="Колонка символа (по умолчанию из конфигурации)")

@@ -1,0 +1,18 @@
+components:
+  market_data:
+    target: impl_binance_public:BinancePublicBarSource
+    params:
+      timeframe: "1m"
+  executor:
+    target: impl_sim_executor:SimExecutor
+    params:
+      symbol: "BTCUSDT"
+  feature_pipe:
+    target: offline_feature_pipe:OfflineFeaturePipe
+    params: {}
+  strategy:
+    target: momentum:MomentumStrategy
+    params: {}
+  risk_guards:
+    target: impl_risk_basic:RiskBasicImpl
+    params: {}

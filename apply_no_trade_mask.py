@@ -34,7 +34,7 @@ def main():
     ap = argparse.ArgumentParser(description="Применить no_trade-маску к датасету: удалить запрещённые строки или пометить weight=0.")
     ap.add_argument("--data", required=True, help="Входной датасет (CSV/Parquet) с колонкой ts_ms (UTC, миллисекунды).")
     ap.add_argument("--out", default="", help="Выходной файл. По умолчанию рядом, с суффиксом _masked.")
-    ap.add_argument("--sandbox_config", default="configs/sandbox.yaml", help="Путь к sandbox.yaml (раздел no_trade).")
+    ap.add_argument("--sandbox_config", default="configs/legacy_sandbox.yaml", help="Путь к legacy_sandbox.yaml (раздел no_trade).")
     ap.add_argument("--ts_col", default="ts_ms", help="Колонка метки времени в мс UTC.")
     ap.add_argument("--mode", choices=["drop", "weight"], default="drop", help="drop — удалить строки; weight — оставить и добавить train_weight=0.")
     args = ap.parse_args()
