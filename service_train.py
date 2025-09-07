@@ -4,18 +4,16 @@ services/service_train.py
 Сервис подготовки данных (офлайн) и запуска обучения модели.
 Оркестрация: OfflineData -> FeaturePipe(offl) -> Dataset -> Trainer.fit -> сохранение артефактов.
 
-Пример использования
---------------------
+Пример использования через конфиг
+---------------------------------
 ```python
-from transformers import FeatureSpec
-from offline_feature_pipe import OfflineFeaturePipe
-from service_train import ServiceTrain, TrainConfig
+from core_config import CommonRunConfig
+from service_train import from_config, TrainConfig
 
-spec = FeatureSpec(lookbacks_prices=[5, 15, 60], rsi_period=14)
-fp = OfflineFeaturePipe(spec, price_col="ref_price")
+cfg_run = CommonRunConfig(...)
 trainer = ...  # реализация Trainer
-cfg = TrainConfig(input_path="data/train.parquet")
-ServiceTrain(fp, trainer, cfg).run()
+train_cfg = TrainConfig(input_path="data/train.parquet")
+from_config(cfg_run, trainer=trainer, train_cfg=train_cfg)
 ```
 """
 
@@ -29,6 +27,8 @@ import pandas as pd
 
 from services.utils_config import snapshot_config  # снапшот конфигурации
 from core_contracts import FeaturePipe as BaseFeaturePipe
+from core_config import CommonRunConfig
+import di_registry
 
 
 class FeaturePipe(BaseFeaturePipe, Protocol):
@@ -121,3 +121,24 @@ class ServiceTrain:
             "n_samples": int(len(X)),
             "n_features": int(len(X.columns)),
         }
+
+
+def from_config(cfg: CommonRunConfig, *, trainer: Trainer, train_cfg: TrainConfig) -> Dict[str, Any]:
+    """Build dependencies from ``cfg`` and run :class:`ServiceTrain`.
+
+    Parameters
+    ----------
+    cfg: CommonRunConfig
+        Runtime configuration with component declarations.
+    trainer: Trainer
+        Instance implementing :class:`Trainer` protocol.
+    train_cfg: TrainConfig
+        Configuration specific to training process.
+    """
+    container = di_registry.build_graph(cfg.components, cfg)
+    fp: FeaturePipe = container["feature_pipe"]  # type: ignore[assignment]
+    service = ServiceTrain(fp, trainer, train_cfg)
+    return service.run()
+
+
+__all__ = ["TrainConfig", "ServiceTrain", "from_config"]

@@ -1,5 +1,17 @@
 # -*- coding: utf-8 -*-
-"""Service for evaluating strategy performance."""
+"""Service for evaluating strategy performance.
+
+Example
+-------
+```python
+from core_config import CommonRunConfig
+from service_eval import from_config, EvalConfig
+
+cfg = CommonRunConfig(...)
+eval_cfg = EvalConfig(trades_path="trades.csv", reports_path="reports.csv")
+metrics = from_config(cfg, eval_cfg)
+```
+"""
 
 from __future__ import annotations
 
@@ -11,6 +23,8 @@ from typing import Dict
 import pandas as pd
 
 from services.metrics import calculate_metrics, read_any, plot_equity_curve
+from core_config import CommonRunConfig
+import di_registry
 
 
 @dataclass
@@ -82,5 +96,12 @@ class ServiceEval:
         return metrics
 
 
-__all__ = ["EvalConfig", "ServiceEval"]
+def from_config(cfg: CommonRunConfig, eval_cfg: EvalConfig) -> Dict[str, Dict[str, float]]:
+    """Run :class:`ServiceEval` using dependencies described in ``cfg``."""
+    di_registry.build_graph(cfg.components, cfg)
+    service = ServiceEval(eval_cfg)
+    return service.run()
+
+
+__all__ = ["EvalConfig", "ServiceEval", "from_config"]
 

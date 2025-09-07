@@ -2,6 +2,17 @@
 """
 services/service_backtest.py
 Оркестратор офлайн-бэктеста. Минимальная склейка компонентов.
+
+Пример использования через конфиг:
+
+```python
+from core_config import CommonRunConfig
+from service_backtest import from_config
+
+cfg = CommonRunConfig(...)
+df = ...  # pandas.DataFrame с ценами
+reports = from_config(cfg, df)
+```
 """
 
 from __future__ import annotations
@@ -15,6 +26,8 @@ from sandbox.backtest_adapter import BacktestAdapter
 from sandbox.sim_adapter import SimAdapter
 from strategies.base import BaseStrategy  # существующий контракт стратегии
 from services.utils_config import snapshot_config  # сохранение снапшота конфига
+from core_config import CommonRunConfig
+import di_registry
 
 
 @dataclass
@@ -70,3 +83,35 @@ class ServiceBacktest:
         if self.cfg.snapshot_config_path and self.cfg.artifacts_dir:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
         return self._bt.run(df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col)
+
+
+def from_config(
+    cfg: CommonRunConfig,
+    df: pd.DataFrame,
+    *,
+    ts_col: str = "ts_ms",
+    symbol_col: str = "symbol",
+    price_col: str = "ref_price",
+    svc_cfg: BacktestConfig | None = None,
+) -> List[Dict[str, Any]]:
+    """Run :class:`ServiceBacktest` using dependencies from ``cfg``.
+
+    Parameters
+    ----------
+    cfg: CommonRunConfig
+        Configuration describing components to build.
+    df: pandas.DataFrame
+        Input price data for backtesting.
+    ts_col, symbol_col, price_col:
+        Column names of timestamp, symbol and price respectively.
+    svc_cfg: BacktestConfig, optional
+        Additional service configuration.
+    """
+    container = di_registry.build_graph(cfg.components, cfg)
+    strat: BaseStrategy = container["strategy"]
+    sim: ExecutionSimulator = container["executor"]  # type: ignore[assignment]
+    service = ServiceBacktest(strat, sim, svc_cfg)
+    return service.run(df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col)
+
+
+__all__ = ["BacktestConfig", "ServiceBacktest", "from_config"]
