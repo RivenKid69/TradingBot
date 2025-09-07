@@ -26,18 +26,17 @@ def _read_any(path: str) -> pd.DataFrame:
 def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize trades to unified schema:
-    ts, run_id, symbol, side, order_type, price, qty, fee, fee_asset, pnl, exec_status, liquidity, client_order_id, order_id, meta_json
+    ts, run_id, symbol, side, order_type, price, quantity, fee, fee_asset, pnl, exec_status, liquidity, client_order_id, order_id, meta_json
     Supports legacy schema: ts, price, volume, side, agent_flag, order_id
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=["ts","run_id","symbol","side","order_type","price","qty","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"])
+        return pd.DataFrame(columns=["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"])
 
     cols = set(df.columns)
 
     # Unified already
     if {"ts","run_id","symbol","side","order_type","price","quantity"}.issubset(cols):
         df = df.copy()
-        df = df.rename(columns={"quantity":"qty"})
         for c in ["fee","pnl"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -45,7 +44,7 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
         for c in ["fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]:
             if c not in df.columns:
                 df[c] = None
-        return df[["ts","run_id","symbol","side","order_type","price","qty","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]]
+        return df[["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]]
 
     # Legacy -> map
     if {"ts","price","volume","side"}.issubset(cols):
@@ -56,7 +55,7 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
         out["side"] = df["side"].astype(str).str.upper()
         out["order_type"] = "MARKET"
         out["price"] = pd.to_numeric(df["price"], errors="coerce")
-        out["qty"] = pd.to_numeric(df["volume"], errors="coerce")
+        out["quantity"] = pd.to_numeric(df["volume"], errors="coerce")
         out["fee"] = 0.0
         out["fee_asset"] = None
         out["pnl"] = None
@@ -73,13 +72,13 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
         df["ts"] = pd.NA
     if "price" not in df.columns:
         df["price"] = pd.NA
-    if "qty" not in df.columns:
-        if "quantity" in df.columns:
-            df["qty"] = pd.to_numeric(df["quantity"], errors="coerce")
+    if "quantity" not in df.columns:
+        if "qty" in df.columns:
+            df["quantity"] = pd.to_numeric(df["qty"], errors="coerce")
         elif "volume" in df.columns:
-            df["qty"] = pd.to_numeric(df["volume"], errors="coerce")
+            df["quantity"] = pd.to_numeric(df["volume"], errors="coerce")
         else:
-            df["qty"] = pd.NA
+            df["quantity"] = pd.NA
     df["run_id"] = ""
     df["symbol"] = "UNKNOWN"
     df["side"] = df.get("side", "BUY")
@@ -87,7 +86,7 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]:
         if c not in df.columns:
             df[c] = None
-    return df[["ts","run_id","symbol","side","order_type","price","qty","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]]
+    return df[["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]]
 
 
 def _bucket_ts_ms(ts_ms: pd.Series, *, bar_seconds: int) -> pd.Series:
@@ -115,7 +114,7 @@ def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str,
 
     # Ensure numeric types
     trades["price"] = pd.to_numeric(trades["price"], errors="coerce")
-    trades["qty"] = pd.to_numeric(trades["qty"], errors="coerce")
+    trades["quantity"] = pd.to_numeric(trades["quantity"], errors="coerce")
     trades["ts"] = pd.to_numeric(trades["ts"], errors="coerce").astype("Int64")
     trades["side_sign"] = trades["side"].astype(str).map(lambda s: 1 if s.upper()=="BUY" else -1)
 
@@ -124,11 +123,11 @@ def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str,
     g = trades.groupby(["symbol","ts_bucket"], as_index=False)
 
     def _agg(df: pd.DataFrame) -> pd.Series:
-        qty_abs = df["qty"].abs().sum()
-        notional = (df["price"] * df["qty"].abs()).sum()
+        qty_abs = df["quantity"].abs().sum()
+        notional = (df["price"] * df["quantity"].abs()).sum()
         vwap = float(notional / qty_abs) if qty_abs and math.isfinite(notional) else float("nan")
-        buy_qty = df.loc[df["side_sign"]>0, "qty"].abs().sum()
-        sell_qty = df.loc[df["side_sign"]<0, "qty"].abs().sum()
+        buy_qty = df.loc[df["side_sign"]>0, "quantity"].abs().sum()
+        sell_qty = df.loc[df["side_sign"]<0, "quantity"].abs().sum()
         n_trades = int(len(df))
         fee_sum = float(pd.to_numeric(df["fee"], errors="coerce").fillna(0.0).sum()) if "fee" in df.columns else 0.0
         return pd.Series({
@@ -149,12 +148,12 @@ def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str,
     trades["day"] = (trades["ts"].astype("Int64") // day_ms) * day_ms
     gd = trades.groupby(["symbol","day"], as_index=False)
     days = gd.apply(lambda df: pd.Series({
-        "volume": float(df["qty"].abs().sum()),
+        "volume": float(df["quantity"].abs().sum()),
         "trades": int(len(df)),
-        "buy_qty": float(df.loc[df["side_sign"]>0, "qty"].abs().sum()),
-        "sell_qty": float(df.loc[df["side_sign"]<0, "qty"].abs().sum()),
+        "buy_qty": float(df.loc[df["side_sign"]>0, "quantity"].abs().sum()),
+        "sell_qty": float(df.loc[df["side_sign"]<0, "quantity"].abs().sum()),
         "fee_total": float(pd.to_numeric(df["fee"], errors="coerce").fillna(0.0).sum()) if "fee" in df.columns else 0.0,
-        "vwap": float(((df["price"] * df["qty"].abs()).sum() / df["qty"].abs().sum())) if df["qty"].abs().sum() else float("nan"),
+        "vwap": float(((df["price"] * df["quantity"].abs()).sum() / df["quantity"].abs().sum())) if df["quantity"].abs().sum() else float("nan"),
     }))
     days = days.rename(columns={"day":"ts"})
     days["ts"] = days["ts"].astype("Int64")
