@@ -28,10 +28,10 @@ import time
 import pandas as pd
 
 from services.utils_config import snapshot_config  # снапшот конфигурации
+from core_contracts import FeaturePipe as BaseFeaturePipe
 
 
-class FeaturePipe(Protocol):
-    def warmup(self) -> None: ...
+class FeaturePipe(BaseFeaturePipe, Protocol):
     def fit(self, df: pd.DataFrame) -> None: ...
     def transform_df(self, df: pd.DataFrame) -> pd.DataFrame: ...
     # опционально: целевая переменная

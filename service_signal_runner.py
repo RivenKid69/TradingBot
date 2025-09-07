@@ -12,12 +12,8 @@ from typing import Any, Dict, Optional, Sequence, Iterator, Protocol
 
 from sandbox.sim_adapter import SimAdapter, DecisionsProvider  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
+from core_contracts import FeaturePipe
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
-
-
-class FeaturePipe(Protocol):
-    def warmup(self) -> None: ...
-    def on_bar(self, bar: Bar) -> Dict[str, Any]: ...
 
 
 class Strategy(Protocol):

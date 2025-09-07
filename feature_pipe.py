@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, TYPE_CHECKING
+from typing import Any, Dict, Iterable, List
 
 from transformers import FeatureSpec, OnlineFeatureTransformer
 from core_models import Bar
-
-if TYPE_CHECKING:
-    from core_contracts import FeaturePipe as FeaturePipeProtocol
+from core_contracts import FeaturePipe as FeaturePipeProtocol  # noqa: F401
 
 @dataclass
 class FeatureConfig:

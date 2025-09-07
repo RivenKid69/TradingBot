@@ -57,10 +57,10 @@ class FeaturePipe(Protocol):
     def reset(self) -> None:
         ...
 
-    def on_bar(self, bar: Bar) -> Optional[Mapping[str, Any]]:
+    def warmup(self) -> None:
         ...
 
-    def on_tick(self, tick: Tick) -> Optional[Mapping[str, Any]]:
+    def on_bar(self, bar: Bar) -> Optional[Mapping[str, Any]]:
         ...
 
 
