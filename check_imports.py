@@ -56,7 +56,7 @@ def detect_layer(filename: str) -> Optional[str]:
     # strategy файлы проекта могут иметь имена вроде momentum.py — разрешим маппинг
     if base in ("momentum.py", "base.py", "no_trade.py"):
         return "strategy"
-    if base in ("signal_runner.py", "prepare_and_run.py", "run_realtime_signaler.py", "run_sandbox.py", "app.py"):
+    if base in ("prepare_and_run.py", "run_realtime_signaler.py", "run_sandbox.py", "app.py"):
         return "scripts"
     # impl: известные имена существующих реализаций
     if base in ("execution_sim.py", "binance_ws.py", "binance_public.py", "sim_adapter.py",

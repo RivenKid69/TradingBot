@@ -1,19 +1,63 @@
-# scripts/run_realtime_signaler.py
+"""Run realtime signaler using ServiceSignalRunner.
+
+This script wires together a market data source, feature pipeline,
+strategy and optional guards, then passes them into
+:class:`ServiceSignalRunner`. It demonstrates configuring the service
+purely via dependencies without relying on the legacy ``SignalRunner``
+class.
+"""
+
 from __future__ import annotations
 
 import argparse
-import asyncio
 import importlib
-import os
 from typing import Any, Dict, List
 
 import yaml
 
-from binance_public import BinancePublicClient
-from signal_runner import SignalRunner
+from impl_binance_public import BinancePublicBarSource
+from execution_sim import ExecutionSimulator
+from sandbox.sim_adapter import SimAdapter
+from service_signal_runner import ServiceSignalRunner
+from feature_pipe import FeatureConfig, FeaturePipe
 
 
-def main():
+class _FeaturePipeWrapper:
+    """Adapter to use legacy FeaturePipe with ServiceSignalRunner."""
+
+    def __init__(self, cfg: Dict[str, Any]):
+        self._pipe = FeaturePipe(FeatureConfig(**cfg))
+
+    def warmup(self) -> None:  # pragma: no cover - no warmup needed for realtime
+        pass
+
+    def on_bar(self, bar):
+        feats = self._pipe.on_kline(
+            {
+                "symbol": bar.symbol,
+                "close": float(bar.close),
+                "close_time": int(bar.ts),
+            }
+        )
+        return feats or {}
+
+
+class _HistoryGuard:
+    """Blocks decisions until enough history bars accumulated."""
+
+    def __init__(self, min_history_bars: int = 0) -> None:
+        self._min = int(min_history_bars)
+        self._cnt: Dict[str, int] = {}
+
+    def apply(self, ts_ms: int, symbol: str, decisions):
+        c = self._cnt.get(symbol, 0) + 1
+        self._cnt[symbol] = c
+        if c < self._min:
+            return []
+        return decisions
+
+
+def main() -> None:
     p = argparse.ArgumentParser(description="Run realtime signaler (public Binance WS, no keys).")
     p.add_argument("--config", default="configs/realtime.yaml", help="Путь к YAML конфигу")
     args = p.parse_args()
@@ -22,40 +66,34 @@ def main():
         cfg: Dict[str, Any] = yaml.safe_load(f)
 
     symbols: List[str] = [str(s).upper() for s in cfg.get("symbols", [])]
+    if not symbols:
+        raise ValueError("At least one symbol must be provided")
     interval: str = str(cfg.get("interval", "1m"))
-    out_csv: str = str(cfg.get("out_csv", "logs/signals.csv"))
-    min_gap: int = int(cfg.get("min_signal_gap_s", 300))
-    backfill_on_gap: bool = bool(cfg.get("backfill_on_gap", True))
-    market: str = str(cfg.get("market", "futures")).lower()
 
-    strat = cfg.get("strategy", {})
-    strat_mod = str(strat.get("module", "strategies.momentum"))
-    strat_cls = str(strat.get("class", "MomentumStrategy"))
-    strat_params = dict(strat.get("params", {}))
+    strat_cfg = cfg.get("strategy", {}) or {}
+    strat_mod = str(strat_cfg.get("module", "strategies.momentum"))
+    strat_cls = str(strat_cfg.get("class", "MomentumStrategy"))
+    strat_params = dict(strat_cfg.get("params", {}))
+    strategy = getattr(importlib.import_module(strat_mod), strat_cls)(**strat_params)
 
-    feats = cfg.get("features", {})
-    features_cfg = {
-        "lookbacks_prices": list(feats.get("lookbacks_prices", [5, 15, 60])),
-        "rsi_period": int(feats.get("rsi_period", 14)),
+    feats_cfg = cfg.get("features", {}) or {}
+    fp_cfg = {
+        "lookbacks_prices": list(feats_cfg.get("lookbacks_prices", [5, 15, 60])),
+        "rsi_period": int(feats_cfg.get("rsi_period", 14)),
     }
+    feature_pipe = _FeaturePipeWrapper(fp_cfg)
 
-    rest = BinancePublicClient()
+    guards_cfg = cfg.get("guards", {}) or {}
+    guards = _HistoryGuard(int(guards_cfg.get("min_history_bars", 0)))
 
-    runner = SignalRunner(
-        symbols=symbols,
-        interval=interval,
-        strategy_module=strat_mod,
-        strategy_class=strat_cls,
-        strategy_params=strat_params,
-        features_cfg=features_cfg,
-        out_csv=out_csv,
-        min_signal_gap_s=min_gap,
-        backfill_on_gap=backfill_on_gap,
-        rest_client=rest,
-    )
+    source = BinancePublicBarSource(interval)
+    sim = ExecutionSimulator(symbol=symbols[0])
+    adapter = SimAdapter(sim, symbol=symbols[0], timeframe=interval, source=source)
 
-    # Запуск бесконечного цикла
-    asyncio.run(runner.start())
+    runner = ServiceSignalRunner(adapter, feature_pipe, strategy, guards)
+
+    for report in runner.run():
+        print(report)
 
 
 if __name__ == "__main__":
