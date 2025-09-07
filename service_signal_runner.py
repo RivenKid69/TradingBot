@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence, Iterator, Protocol
 
 from sandbox.sim_adapter import SimAdapter, DecisionsProvider  # исп. как TradeExecutor-подобный мост
-from market_data_port import Bar
+from core_models import Bar
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 
 
