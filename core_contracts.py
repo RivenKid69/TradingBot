@@ -107,10 +107,10 @@ class DecisionContext:
     """
     Контекст принятия решения, который может предоставлять BacktestEngine/сервис.
     Обязательные ключи: ts (int ms), symbol (str).
-    Дополнительно: position (Position), limits (PortfolioLimits).
+    Дополнительно: position (Position), limits (PortfolioLimits), extra (Dict[str, Any]).
     """
     ts: int
     symbol: str
     position: Optional[Position] = None
     limits: Optional[PortfolioLimits] = None
-    extra: Dict[str, Any] = None  # type: ignore[assignment]
+    extra: Optional[Dict[str, Any]] = None
