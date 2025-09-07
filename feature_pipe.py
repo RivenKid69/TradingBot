@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, Iterable, List, TYPE_CHECKING
 
 from transformers import FeatureSpec, OnlineFeatureTransformer
+from core_models import Bar
 
 if TYPE_CHECKING:
     from core_contracts import FeaturePipe as FeaturePipeProtocol
@@ -24,18 +25,30 @@ class FeatureConfig:
 
 
 class FeaturePipe:
-    """
-    Потоковый адаптер, делегирующий в общий онлайновый трансформер.
-    На вход: закрытая 1m kline (dict из binance_ws).
-    На выход: features dict, без утечек во время.
-    """
-    def __init__(self, cfg: FeatureConfig) -> None:
-        spec = FeatureSpec(lookbacks_prices=list(cfg.lookbacks_prices or [5, 15, 60]), rsi_period=int(cfg.rsi_period))
-        self._tr = OnlineFeatureTransformer(spec)
+    """Потоковый адаптер для :class:`OnlineFeatureTransformer`.
 
-    def on_kline(self, kline: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        sym = str(kline["symbol"]).upper()
-        close = float(kline["close"])
-        ts_ms = int(kline["close_time"])
-        feats = self._tr.update(symbol=sym, ts_ms=ts_ms, close=close)
+    На вход принимает объекты :class:`Bar` и возвращает словарь признаков,
+    вычисленных без утечек во времени.
+    """
+
+    def __init__(self, cfg: FeatureConfig) -> None:
+        self._spec = FeatureSpec(
+            lookbacks_prices=list(cfg.lookbacks_prices or [5, 15, 60]),
+            rsi_period=int(cfg.rsi_period),
+        )
+        self._tr = OnlineFeatureTransformer(self._spec)
+
+    def reset(self) -> None:
+        """Сброс внутреннего состояния трансформера."""
+        self._tr = OnlineFeatureTransformer(self._spec)
+
+    def warmup(self, bars: Iterable[Bar] = ()) -> None:
+        """Прогрев трансформера историческими барами."""
+        self.reset()
+        for b in bars:
+            self._tr.update(symbol=b.symbol.upper(), ts_ms=int(b.ts), close=float(b.close))
+
+    def on_bar(self, bar: Bar) -> Dict[str, Any]:
+        """Обработка очередного бара."""
+        feats = self._tr.update(symbol=bar.symbol.upper(), ts_ms=int(bar.ts), close=float(bar.close))
         return feats

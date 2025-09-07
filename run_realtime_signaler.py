@@ -22,26 +22,6 @@ from service_signal_runner import ServiceSignalRunner
 from feature_pipe import FeatureConfig, FeaturePipe
 
 
-class _FeaturePipeWrapper:
-    """Adapter to use legacy FeaturePipe with ServiceSignalRunner."""
-
-    def __init__(self, cfg: Dict[str, Any]):
-        self._pipe = FeaturePipe(FeatureConfig(**cfg))
-
-    def warmup(self) -> None:  # pragma: no cover - no warmup needed for realtime
-        pass
-
-    def on_bar(self, bar):
-        feats = self._pipe.on_kline(
-            {
-                "symbol": bar.symbol,
-                "close": float(bar.close),
-                "close_time": int(bar.ts),
-            }
-        )
-        return feats or {}
-
-
 class _HistoryGuard:
     """Blocks decisions until enough history bars accumulated."""
 
@@ -81,7 +61,7 @@ def main() -> None:
         "lookbacks_prices": list(feats_cfg.get("lookbacks_prices", [5, 15, 60])),
         "rsi_period": int(feats_cfg.get("rsi_period", 14)),
     }
-    feature_pipe = _FeaturePipeWrapper(fp_cfg)
+    feature_pipe = FeaturePipe(FeatureConfig(**fp_cfg))
 
     guards_cfg = cfg.get("guards", {}) or {}
     guards = _HistoryGuard(int(guards_cfg.get("min_history_bars", 0)))

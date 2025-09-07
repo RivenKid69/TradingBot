@@ -20,6 +20,7 @@ core_ → impl_ → service_ → strategy_ → scripts_
 
 Общий план развития проекта приведён в файле [План.txt](План.txt).
 
+
 ## ServiceTrain
 
 `ServiceTrain` подготавливает датасет и запускает обучение модели.  Он
@@ -40,3 +41,16 @@ trainer = ...
 cfg = TrainConfig(input_path="data/train.parquet")
 ServiceTrain(fp, trainer, cfg).run()
 ```
+=======
+## Проверка паритета фич
+
+Для валидации соответствия оффлайн и онлайнового расчёта признаков используйте скрипт `check_feature_parity.py`.
+
+Пример запуска:
+
+```
+python check_feature_parity.py --data path/to/prices.csv --threshold 1e-6
+```
+
+Скрипт вычисляет признаки обоими способами и сообщает о строках, где абсолютное различие превышает `--threshold`. При отсутствии расхождений выводится подтверждение паритета.
+
