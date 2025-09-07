@@ -1,3 +1,13 @@
+mode: live
+run_id: live-run
+logs_dir: logs
+artifacts_dir: artifacts
+api:
+  api_key: null
+  api_secret: null
+data:
+  symbols: ["BTCUSDT"]
+  timeframe: "1m"
 components:
   market_data:
     target: impl_binance_public:BinancePublicBarSource

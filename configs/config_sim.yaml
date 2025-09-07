@@ -1,3 +1,10 @@
+mode: sim
+run_id: sim-run
+logs_dir: logs
+artifacts_dir: artifacts
+data:
+  symbols: ["BTCUSDT"]
+  timeframe: "1m"
 components:
   market_data:
     target: impl_offline_data:OfflineCSVBarSource
