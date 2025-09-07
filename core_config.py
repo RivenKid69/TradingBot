@@ -8,6 +8,8 @@ Pydantic-модели конфигураций: sim/live/train/eval + декла
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, List, Mapping, Union
+
+import yaml
 from pydantic import BaseModel, Field, validator
 
 
@@ -111,3 +113,39 @@ class EvalConfig(CommonRunConfig):
     mode: str = Field(default="eval")
     input: EvalInputConfig
     metrics: List[str] = Field(default_factory=lambda: ["sharpe", "sortino", "mdd", "pnl"])
+
+
+def load_config(path: str) -> CommonRunConfig:
+    """Загрузить конфигурацию запуска из YAML-файла."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    mode = data.get("mode")
+    mapping = {
+        "sim": SimulationConfig,
+        "live": LiveConfig,
+        "train": TrainConfig,
+        "eval": EvalConfig,
+    }
+    cfg_cls = mapping.get(mode)
+    if cfg_cls is None:
+        raise ValueError(f"Unknown mode: {mode}")
+    return cfg_cls(**data)
+
+
+__all__ = [
+    "ComponentSpec",
+    "Components",
+    "CommonRunConfig",
+    "SimulationDataConfig",
+    "SimulationConfig",
+    "LiveAPIConfig",
+    "LiveDataConfig",
+    "LiveConfig",
+    "TrainDataConfig",
+    "ModelConfig",
+    "TrainConfig",
+    "EvalInputConfig",
+    "EvalConfig",
+    "load_config",
+]
