@@ -1,0 +1,40 @@
+# configs/realtime.yaml
+market: "futures"             # "spot" или "futures" (используется для бэкапа REST в backfill)
+symbols:
+  - "BTCUSDT"
+interval: "1m"
+
+calibrator:
+  enabled: false
+  path: "models/calibrator.json"
+  apply_to: "score"
+  out_field: "score_calibrated"
+
+no_trade:
+  funding_buffer_min: 5
+  daily_utc:
+    - "00:00-00:05"
+    - "08:00-08:05"
+    - "16:00-16:05"
+  custom_ms: []
+
+guards:
+  min_history_bars: 180
+  gap_cooldown_bars: 10
+  gap_threshold_ms: 90000
+
+strategy:
+  module: "strategies.momentum"
+  class: "MomentumStrategy"
+  params:
+    lookback: 5
+    threshold: 0.0
+    order_qty: 0.001
+
+features:
+  lookbacks_prices: [5, 15, 60]
+  rsi_period: 14
+
+out_csv: "logs/signals.csv"
+min_signal_gap_s: 300
+backfill_on_gap: true

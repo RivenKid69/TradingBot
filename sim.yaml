@@ -1,0 +1,75 @@
+# configs/sim.yaml
+filters:
+  path: "data/binance_filters.json"
+  enforce_percent_price_by_side: true
+  strict: true
+
+fees:
+  maker_bps: 1.0
+  taker_bps: 5.0
+  use_bnb_discount: false
+  maker_discount_mult: 1.0
+  taker_discount_mult: 1.0
+
+funding:
+  enabled: false
+  rate_source: "const"
+  const_rate_per_interval: 0.0
+  interval_seconds: 28800
+  align_to_epoch: true
+  curve: {}
+
+slippage:
+  k: 0.8
+  min_half_spread_bps: 0.0
+  default_spread_bps: 2.0
+  eps: 1.0e-12
+
+execution:
+  algo: "TWAP"
+  twap:
+    parts: 6
+    child_interval_s: 600
+  pov:
+    participation: 0.10
+    child_interval_s: 60
+    min_child_notional: 20.0
+
+latency:
+  base_ms: 250
+  jitter_ms: 50
+  spike_p: 0.01
+  spike_mult: 5.0
+  timeout_ms: 2500
+  retries: 1
+  seed: 0
+
+pnl:
+  mark_to: "side"   # "side" = для лонга bid, для шорта ask; также поддерживаются "mid", "bid", "ask"
+
+leakguard:
+  decision_delay_ms: 0
+  min_lookback_ms: 0
+
+labels:
+  horizon_ms: 60000
+  price_col: "price"
+  returns: "log"
+
+risk:
+  enabled: true
+  max_abs_position_qty: 0.0
+  max_abs_position_notional: 0.0
+  max_order_notional: 0.0
+  max_orders_per_min: 60
+  max_orders_window_s: 60
+  daily_loss_limit: 0.0
+  pause_seconds_on_violation: 300
+  daily_reset_utc_hour: 0
+
+logging:
+  enabled: true
+  format: "csv"                 # "csv" | "parquet"
+  trades_path: "logs/sim_trades.csv"
+  reports_path: "logs/sim_reports.csv"
+  flush_every: 1000

@@ -1,0 +1,59 @@
+# configs/sandbox.yaml
+mode: "backtest"
+symbol: "BTCUSDT"
+latency_steps: 0
+sim_config_path: "configs/sim.yaml"
+
+# Биржевые спецификации (tickSize/stepSize/minNotional), получаем скриптом fetch_exchange_specs.py
+exchange_specs_path: "data/exchange_specs.json"
+
+# Гварды симуляции: блокировка сигналов
+#   - min_history_bars: холодный старт (минимум баров истории до разрешения сигналов)
+#   - gap_cooldown_bars: пауза после обнаружения гэпа
+#   - gap_threshold_ms: (опционально) считаем гэпом, если Δt > gap_threshold_ms. Если не задан, используем 90_000 мс для 1m.
+sim_guards:
+  min_history_bars: 180
+  gap_cooldown_bars: 10
+  gap_threshold_ms: 90000
+
+# Частотный кулдаун сигналов (в секундах), как в realtime.yaml → min_signal_gap_s
+min_signal_gap_s: 300
+
+# Чёрные окна (UTC): не выдавать сигналы в указанные интервалы и вокруг funding (каждые 8ч: 00:00/08:00/16:00 UTC)
+no_trade:
+  funding_buffer_min: 5
+  daily_utc:
+    - "00:00-00:05"
+    - "08:00-08:05"
+    - "16:00-16:05"
+  custom_ms: []   # список явных окон [{start_ts_ms: ..., end_ts_ms: ...}]
+
+strategy:
+  module: "strategies.momentum"
+  class: "MomentumStrategy"
+  params:
+    lookback: 5
+    threshold: 0.0
+    order_qty: 0.001
+
+data:
+  path: "data/train.parquet"   # или любой CSV/Parquet с колонками: ts_ms, symbol, ref_price(+фичи)
+  ts_col: "ts_ms"
+  symbol_col: "symbol"
+  price_col: "ref_price"
+
+# Динамический спред/слиппедж без стакана:
+#   - вычисляем vol_factor и liquidity из данных
+#   - строим синтетические bid/ask по формуле ниже и подаём их в сим
+dynamic_spread:
+  enabled: true
+  base_bps: 3.0                 # базовый спред в bps (0.01% = 1 bps)
+  alpha_vol: 0.5                # множитель чувствительности к волатильности
+  beta_illiquidity: 1.0         # множитель штрафа за низкую ликвидность
+  vol_mode: "hl"                # "hl" = (high-low)/close; "ret" = |log return|
+  liq_col: "number_of_trades"   # "number_of_trades" или "volume" (если нет trades)
+  liq_ref: 1000.0               # опорный уровень ликвидности за 1 минуту
+  min_bps: 1.0                  # нижняя граница итогового спреда
+  max_bps: 25.0                 # верхняя граница итогового спреда
+
+out_reports: "logs/sandbox_reports.csv"
