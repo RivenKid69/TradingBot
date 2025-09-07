@@ -1,30 +1,24 @@
 # training/no_trade.py
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import yaml
+from pydantic import BaseModel, Field
 
 
-@dataclass
-class NoTradeConfig:
+class NoTradeConfig(BaseModel):
     funding_buffer_min: int = 0
-    daily_utc: List[str] = None
-    custom_ms: List[Dict[str, int]] = None
+    daily_utc: List[str] = Field(default_factory=list)
+    custom_ms: List[Dict[str, int]] = Field(default_factory=list)
 
-    @classmethod
-    def from_yaml(cls, sandbox_yaml_path: str) -> "NoTradeConfig":
-        with open(sandbox_yaml_path, "r", encoding="utf-8") as f:
-            y = yaml.safe_load(f) or {}
-        d = dict(y.get("no_trade", {}) or {})
-        return cls(
-            funding_buffer_min=int(d.get("funding_buffer_min", 0)),
-            daily_utc=list(d.get("daily_utc", []) or []),
-            custom_ms=list(d.get("custom_ms", []) or []),
-        )
+
+def load_no_trade_config(path: str) -> NoTradeConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        y = yaml.safe_load(f) or {}
+    return NoTradeConfig(**(y.get("no_trade", {}) or {}))
 
 
 def _parse_daily_windows_min(windows: List[str]) -> List[Tuple[int, int]]:
@@ -95,7 +89,7 @@ def compute_no_trade_mask(
       True  — строка попадает в «запрещённое» окно (no_trade), её надо исключить из обучения;
       False — строку можно использовать в train/val.
     """
-    cfg = NoTradeConfig.from_yaml(sandbox_yaml_path)
+    cfg = load_no_trade_config(sandbox_yaml_path)
     ts = pd.to_numeric(df[ts_col], errors="coerce").astype("Int64").astype("float").astype("int64")
 
     daily_min = _parse_daily_windows_min(cfg.daily_utc or [])

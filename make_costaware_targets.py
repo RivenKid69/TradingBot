@@ -3,12 +3,24 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import yaml
+from pydantic import BaseModel, Field
 
 from training.tcost import effective_return_series
+
+
+class SimFeesConfig(BaseModel):
+    fees_bps_total: Optional[float] = None
+    fees: Dict[str, Any] = Field(default_factory=dict)
+
+
+def load_sim_fees_config(path: str) -> SimFeesConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return SimFeesConfig(**data)
 
 
 def _read_table(path: str) -> pd.DataFrame:
@@ -43,18 +55,17 @@ def _try_read_fees_bps_total(sim_yaml_path: Optional[str]) -> Optional[float]:
     if not sim_yaml_path or not os.path.exists(sim_yaml_path):
         return None
     try:
-        with open(sim_yaml_path, "r", encoding="utf-8") as f:
-            y = yaml.safe_load(f) or {}
+        cfg = load_sim_fees_config(sim_yaml_path)
     except Exception:
         return None
 
-    if "fees_bps_total" in y:
+    if cfg.fees_bps_total is not None:
         try:
-            return float(y["fees_bps_total"])
+            return float(cfg.fees_bps_total)
         except Exception:
             pass
 
-    fees = y.get("fees", {})
+    fees = cfg.fees
     try:
         maker = float(fees.get("maker_bps", 0.0))
         taker = float(fees.get("taker_bps", 0.0))

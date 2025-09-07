@@ -10,11 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yaml
-
-
-def _load_cfg(path: str) -> Dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+from legacy_sandbox_config import load_config as load_sandbox_config
 
 
 def _ensure_dir(path: str) -> None:
@@ -176,23 +172,23 @@ def main():
     ap.add_argument("--dry_run", action="store_true", help="Не записывать конфиг, только расчёт")
     args = ap.parse_args()
 
-    cfg = _load_cfg(args.config)
-    dpath = args.data or (((cfg.get("data") or {}).get("path")) or "")
+    cfg = load_sandbox_config(args.config)
+    dpath = args.data or (cfg.data.path if cfg.data else "")
     if not dpath or not os.path.exists(dpath):
         raise FileNotFoundError(f"Не найден файл данных: {dpath!r}")
 
-    ts_col = args.ts_col or ((cfg.get("data") or {}).get("ts_col") or "ts_ms")
-    sym_col = args.symbol_col or ((cfg.get("data") or {}).get("symbol_col") or "symbol")
-    price_col = args.price_col or ((cfg.get("data") or {}).get("price_col") or "ref_price")
+    ts_col = args.ts_col or (cfg.data.ts_col if cfg.data else "ts_ms")
+    sym_col = args.symbol_col or (cfg.data.symbol_col if cfg.data else "symbol")
+    price_col = args.price_col or (cfg.data.price_col if cfg.data else "ref_price")
 
-    dspread = cfg.get("dynamic_spread") or {}
+    dspread = cfg.dynamic_spread or {}
     vol_mode = args.vol_mode or str(dspread.get("vol_mode", "hl"))
     liq_col = args.liq_col or str(dspread.get("liq_col", "number_of_trades"))
     liq_ref = float(args.liq_ref or float(dspread.get("liq_ref", 1000.0)))
 
     df = pd.read_parquet(dpath) if dpath.endswith(".parquet") else pd.read_csv(dpath)
     if sym_col not in df.columns:
-        df[sym_col] = (cfg.get("symbol") or "BTCUSDT")
+        df[sym_col] = cfg.symbol
 
     # калибровка одна на все символы (или отфильтруй заранее по cfg.symbol)
     params, stats = calibrate(
@@ -207,7 +203,7 @@ def main():
 
     # обновление конфига
     out_cfg_path = args.out_cfg or args.config
-    updated = dict(cfg)
+    updated = cfg.model_dump()
     updated.setdefault("dynamic_spread", {})
     updated["dynamic_spread"]["base_bps"] = float(params["base_bps"])
     updated["dynamic_spread"]["alpha_vol"] = float(params["alpha_vol"])
