@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 impl_binance_public.py
-Источник рыночных данных Binance Public WS. Выдаёт MarketEvent(BAR) по kline.
+Источник рыночных данных Binance Public WS. Выдаёт Bar через интерфейс MarketDataSource.
 Работает синхронно через внутренний поток, который обслуживает asyncio + websockets.
 """
 
@@ -20,7 +20,9 @@ try:
 except Exception as e:
     websockets = None  # type: ignore
 
-from market_data_port import Bar, MarketEvent, EventKind, MarketDataSource, binance_tf, ensure_timeframe, to_ms
+from core_contracts import MarketDataSource
+from core_models import Bar, to_decimal
+from market_utils import binance_tf, ensure_timeframe, timeframe_to_ms
 
 
 _BINANCE_WS = "wss://stream.binance.com:9443/stream"
@@ -35,10 +37,8 @@ class BinanceWSConfig:
 
 
 class BinancePublicBarSource(MarketDataSource):
-    """
-    Синхронный источник. Внутри поднимает поток с asyncio-клиентом.
-    Поддерживает множественную подписку на kline для набора символов.
-    """
+    """Synchronous Binance WebSocket bar source implementing MarketDataSource."""
+
     def __init__(self, timeframe: str, cfg: Optional[BinanceWSConfig] = None) -> None:
         ensure_timeframe(timeframe)
         if websockets is None:
@@ -46,45 +46,30 @@ class BinancePublicBarSource(MarketDataSource):
         self._tf = binance_tf(timeframe)
         self._cfg = cfg or BinanceWSConfig()
         self._symbols: List[str] = []
-        self._opened = False
 
-        self._q: "queue.Queue[MarketEvent]" = queue.Queue(maxsize=10000)
+        self._q: "queue.Queue[Bar]" = queue.Queue(maxsize=10000)
         self._stop = threading.Event()
         self._thr: Optional[threading.Thread] = None
 
-    def open(self) -> None:
-        self._opened = True
-
-    def subscribe(self, symbols: Sequence[str], *, timeframe: Optional[str] = None) -> None:
-        if timeframe and binance_tf(timeframe) != self._tf:
-            raise ValueError(f"Timeframe mismatch. Source={self._tf}, requested={timeframe}")
+    def stream_bars(self, symbols: Sequence[str], interval_ms: int) -> Iterator[Bar]:
+        if interval_ms != timeframe_to_ms(self._tf):
+            raise ValueError(f"Timeframe mismatch. Source={self._tf}, requested_ms={interval_ms}")
         self._symbols = [s.lower() for s in symbols]  # binance expects lower-case
 
-    def iter_events(self) -> Iterator[MarketEvent]:
-        if not self._opened:
-            raise RuntimeError("Source not opened")
-        if not self._symbols:
-            raise ValueError("No symbols subscribed")
-
-        # запуск фонового клиента
         self._thr = threading.Thread(target=self._run_loop, name="binance-ws", daemon=True)
         self._thr.start()
 
         try:
             while not self._stop.is_set():
                 try:
-                    ev = self._q.get(timeout=0.5)
-                    yield ev
+                    bar = self._q.get(timeout=0.5)
+                    yield bar
                 except queue.Empty:
                     continue
         finally:
-            self.close()
-
-    def close(self) -> None:
-        self._stop.set()
-        if self._thr and self._thr.is_alive():
-            self._thr.join(timeout=5.0)
-        self._opened = False
+            self._stop.set()
+            if self._thr and self._thr.is_alive():
+                self._thr.join(timeout=5.0)
 
     # ----- internal -----
 
@@ -113,28 +98,22 @@ class BinancePublicBarSource(MarketDataSource):
             if "k" not in payload:
                 return
             k = payload["k"]
-            # см. https://binance-docs.github.io/apidocs/spot/en/#kline-candlestick-streams
             bar = Bar(
                 ts=int(k["t"]),
                 symbol=str(k["s"]).upper(),
-                timeframe=self._tf,
-                open=float(k["o"]),
-                high=float(k["h"]),
-                low=float(k["l"]),
-                close=float(k["c"]),
-                volume=float(k["v"]),
-                bid=None,
-                ask=None,
-                n_trades=int(k.get("n", 0)),
-                vendor=self._cfg.vendor,
-                meta={"event_time": int(payload.get("E", 0)), "closed": bool(k.get("x", False))},
+                open=to_decimal(k["o"]),
+                high=to_decimal(k["h"]),
+                low=to_decimal(k["l"]),
+                close=to_decimal(k["c"]),
+                volume_base=to_decimal(k["v"]),
+                trades=int(k.get("n", 0)),
+                is_final=bool(k.get("x", False)),
             )
-            ev = MarketEvent(kind=EventKind.BAR, bar=bar)
             try:
-                self._q.put_nowait(ev)
+                self._q.put_nowait(bar)
             except queue.Full:
                 _ = self._q.get_nowait()
-                self._q.put_nowait(ev)
+                self._q.put_nowait(bar)
         except Exception:
             pass
 

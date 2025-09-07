@@ -6,12 +6,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Protoco
 
 from execution_sim import ExecutionSimulator, SimStepReport as ExecReport  # type: ignore
 from action_proto import ActionType
-from core_models import as_dict
+from core_models import as_dict, Bar
 import event_bus
 from compat_shims import sim_report_dict_to_core_exec_reports
-from decimal import Decimal
 from event_bus import log_trade_exec as _bus_log_trade_exec
-from market_data_port import MarketDataSource, MarketEvent, EventKind, Bar, ensure_timeframe
+from core_contracts import MarketDataSource
+from market_utils import ensure_timeframe, timeframe_to_ms
 from order_shims import OrderContext, decisions_to_orders
 
 class DecisionsProvider(Protocol):
@@ -26,6 +26,7 @@ class SimAdapter:
         self.sim = sim
         self.symbol = str(symbol).upper()
         self.timeframe = ensure_timeframe(timeframe)
+        self.interval_ms = timeframe_to_ms(self.timeframe)
         self.source = source
 
 
@@ -85,48 +86,35 @@ class SimAdapter:
           - выполняем шаг симуляции через self.step(...)
           - возвращаем отчёт симулятора, расширенный служебными полями
         """
-        self.source.open()
-        self.source.subscribe([self.symbol], timeframe=self.timeframe)
-        try:
-            for ev in self.source.iter_events():
-                if ev.kind != EventKind.BAR or ev.bar is None:
-                    continue
-                bar = ev.bar
-                if bar.symbol != self.symbol or bar.timeframe != self.timeframe:
-                    continue
+        for bar in self.source.stream_bars([self.symbol], self.interval_ms):
+            decisions = list(provider.on_bar(bar) or [])
 
-                decisions = list(provider.on_bar(bar) or [])
+            vol_factor = float(bar.volume_base) if getattr(bar, "volume_base", None) is not None else None
+            liquidity = "NORMAL"
 
-                # эвристики для vol_factor и liquidity
-                vol_factor = (float(bar.volume) if bar.volume is not None else None)
-                liquidity = "NORMAL"
+            rep = self.step(
+                ts_ms=int(bar.ts),
+                ref_price=float(bar.close),
+                bid=None,
+                ask=None,
+                vol_factor=vol_factor,
+                liquidity=liquidity,
+                decisions=decisions,
+            )
 
-                rep = self.step(
-                    ts_ms=int(bar.ts),
-                    ref_price=float(bar.close),
-                    bid=(None if bar.bid is None else float(bar.bid)),
-                    ask=(None if bar.ask is None else float(bar.ask)),
-                    vol_factor=vol_factor,
-                    liquidity=liquidity,
-                    decisions=decisions,
-                )
-
-                # дополнительно прикладываем стандартизованные заказы
-                ctx = OrderContext(
-                    ts_ms=int(bar.ts),
-                    symbol=bar.symbol,
-                    ref_price=float(bar.close),
-                    max_position_abs_base=1.0,
-                    tick_size=None,
-                    price_offset_ticks=0,
-                    tif="GTC",
-                    client_tag=None,
-                    round_qty_fn=None,
-                )
-                orders = decisions_to_orders(decisions, ctx)
-                rep["symbol"] = bar.symbol
-                rep["ts_ms"] = int(bar.ts)
-                rep["core_orders"] = ([as_dict(o) for o in orders] if orders else [])
-                yield rep
-        finally:
-            self.source.close()
+            ctx = OrderContext(
+                ts_ms=int(bar.ts),
+                symbol=bar.symbol,
+                ref_price=float(bar.close),
+                max_position_abs_base=1.0,
+                tick_size=None,
+                price_offset_ticks=0,
+                tif="GTC",
+                client_tag=None,
+                round_qty_fn=None,
+            )
+            orders = decisions_to_orders(decisions, ctx)
+            rep["symbol"] = bar.symbol
+            rep["ts_ms"] = int(bar.ts)
+            rep["core_orders"] = ([as_dict(o) for o in orders] if orders else [])
+            yield rep
