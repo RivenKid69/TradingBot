@@ -34,7 +34,7 @@ def _write_table(df: pd.DataFrame, path: str) -> None:
 
 def _try_read_fees_bps_total(sim_yaml_path: Optional[str]) -> Optional[float]:
     """
-    Пытаемся считать комиссии из configs/sim.yaml.
+    Пытаемся считать комиссии из configs/config_sim.yaml.
     Поддерживаем варианты:
       fees_bps_total: <float>      # уже готовая «кругорейсовая» комиссия
       fees: { maker_bps, taker_bps, roundtrip_mode: "taker"|"maker"|"mixed" }
@@ -73,8 +73,8 @@ def main():
     ap = argparse.ArgumentParser(description="Сделать cost-aware таргет (eff_ret_h и, опционально, y_eff_h) с учётом комиссий и динамич. спреда.")
     ap.add_argument("--data", required=True, help="Путь к входным данным (CSV/Parquet) с колонками ts_ms,symbol,ref_price,(high/low или ret_1m), ликвидность (number_of_trades или volume)")
     ap.add_argument("--out", default="", help="Путь к выходному файлу (CSV/Parquet). По умолчанию — рядом с суффиксом _costaware.")
-    ap.add_argument("--sandbox_config", default="configs/sandbox.yaml", help="Путь к sandbox.yaml (берём dynamic_spread)")
-    ap.add_argument("--sim_config", default="configs/sim.yaml", help="Путь к sim.yaml (пытаемся взять комиссии)")
+    ap.add_argument("--sandbox_config", default="configs/legacy_sandbox.yaml", help="Путь к legacy_sandbox.yaml (берём dynamic_spread)")
+    ap.add_argument("--sim_config", default="configs/config_sim.yaml", help="Путь к config_sim.yaml (пытаемся взять комиссии)")
     ap.add_argument("--fees_bps_total", type=float, default=None, help="Кругорейсовая комиссия в bps (перебивает sim.yaml)")
     ap.add_argument("--horizon_bars", type=int, default=60, help="Горизонт таргета в барах")
     ap.add_argument("--threshold", type=float, default=None, help="Порог для бинарной метки (если задан — добавим y_eff_h)")

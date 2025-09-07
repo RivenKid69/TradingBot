@@ -14,7 +14,7 @@ from services.utils_sandbox import build_strategy, read_df
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Strategy sandbox runner")
-    p.add_argument("--config", default="configs/sandbox.yaml", help="Путь к YAML-конфигу песочницы")
+    p.add_argument("--config", default="configs/legacy_sandbox.yaml", help="Путь к YAML-конфигу песочницы")
     args = p.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:

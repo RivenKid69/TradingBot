@@ -39,7 +39,7 @@ class _HistoryGuard:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Run realtime signaler (public Binance WS, no keys).")
-    p.add_argument("--config", default="configs/realtime.yaml", help="Путь к YAML конфигу")
+    p.add_argument("--config", default="configs/config_live.yaml", help="Путь к YAML конфигу")
     args = p.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:

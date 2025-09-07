@@ -87,7 +87,7 @@ def _in_custom_window(ts_ms: np.ndarray, windows: List[Dict[str, int]]) -> np.nd
 def compute_no_trade_mask(
     df: pd.DataFrame,
     *,
-    sandbox_yaml_path: str = "configs/sandbox.yaml",
+    sandbox_yaml_path: str = "configs/legacy_sandbox.yaml",
     ts_col: str = "ts_ms",
 ) -> pd.Series:
     """
