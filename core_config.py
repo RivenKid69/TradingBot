@@ -133,6 +133,22 @@ def load_config(path: str) -> CommonRunConfig:
     return cfg_cls(**data)
 
 
+def load_config_from_str(content: str) -> CommonRunConfig:
+    """Parse configuration from YAML string."""
+    data = yaml.safe_load(content) or {}
+    mode = data.get("mode")
+    mapping = {
+        "sim": SimulationConfig,
+        "live": LiveConfig,
+        "train": TrainConfig,
+        "eval": EvalConfig,
+    }
+    cfg_cls = mapping.get(mode)
+    if cfg_cls is None:
+        raise ValueError(f"Unknown mode: {mode}")
+    return cfg_cls(**data)
+
+
 __all__ = [
     "ComponentSpec",
     "Components",
@@ -148,4 +164,5 @@ __all__ = [
     "EvalInputConfig",
     "EvalConfig",
     "load_config",
+    "load_config_from_str",
 ]

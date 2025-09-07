@@ -5,9 +5,9 @@ import argparse
 import os
 import sys
 import subprocess
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
-import yaml
+from ingest_config import load_config, IngestConfig
 
 
 _INTERVAL_MS = {
@@ -57,37 +57,32 @@ def main():
     parser.add_argument("--config", default="configs/ingest.yaml", help="Путь к YAML конфигу")
     args = parser.parse_args()
 
-    with open(args.config, "r", encoding="utf-8") as f:
-        cfg: Dict = yaml.safe_load(f)
+    cfg: IngestConfig = load_config(args.config)
 
-    symbols: List[str] = [str(s).upper() for s in cfg.get("symbols", [])]
+    symbols: List[str] = [s.upper() for s in cfg.symbols]
     if not symbols:
         raise SystemExit("В конфиге не указаны symbols")
 
-    market: str = str(cfg.get("market", "spot")).lower()
+    market: str = cfg.market.lower()
     if market not in ("spot", "futures"):
         raise SystemExit("market должен быть 'spot' или 'futures'")
 
-    intervals: List[str] = [str(i) for i in cfg.get("intervals", ["1m"])]
-    aggregate_to: List[str] = [str(i) for i in cfg.get("aggregate_to", [])]
+    intervals: List[str] = cfg.intervals
+    aggregate_to: List[str] = cfg.aggregate_to
 
-    period = cfg.get("period", {})
-    start = str(period.get("start"))
-    end = str(period.get("end"))
+    start = cfg.period.start
+    end = cfg.period.end
     if not start or not end:
         raise SystemExit("period.start и period.end обязательны")
 
-    paths = cfg.get("paths", {})
-    klines_dir = str(paths.get("klines_dir", "data/klines"))
-    futures_dir = str(paths.get("futures_dir", "data/futures"))
-    prices_out = str(paths.get("prices_out", "data/prices.parquet"))
+    klines_dir = cfg.paths.klines_dir
+    futures_dir = cfg.paths.futures_dir
+    prices_out = cfg.paths.prices_out
 
-    fut_cfg = cfg.get("futures", {})
-    mark_interval = str(fut_cfg.get("mark_interval", "1m"))
+    mark_interval = cfg.futures.mark_interval
 
-    slow = cfg.get("slowness", {})
-    api_limit = int(slow.get("api_limit", 1500))
-    sleep_ms = int(slow.get("sleep_ms", 350))
+    api_limit = cfg.slowness.api_limit
+    sleep_ms = cfg.slowness.sleep_ms
 
     # 1) Ingest klines для всех символов и всех указанных интервалов
     for sym in symbols:
