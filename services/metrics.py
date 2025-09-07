@@ -5,6 +5,9 @@ import math
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, Tuple, Optional
 
+import glob
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -49,6 +52,73 @@ class TradeMetrics:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def read_any(path: str) -> pd.DataFrame:
+    """Read CSV/Parquet file(s) supporting glob patterns."""
+    if not path:
+        return pd.DataFrame()
+    if any(ch in path for ch in ["*", "?", "["]):
+        parts = glob.glob(path)
+        dfs = [read_any(p) for p in parts]
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    if path.lower().endswith(".parquet"):
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
+def safe_read_csv(path: Optional[str]) -> pd.DataFrame:
+    """Wrapper around :func:`read_any` that returns empty DF on failure."""
+    try:
+        return read_any(path) if path else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def equity_from_trades(
+    trades: pd.DataFrame,
+    *,
+    ts_col: str = "ts_ms",
+    pnl_col: str = "pnl",
+    equity_col: str = "equity",
+) -> pd.DataFrame:
+    """Build equity curve from trades with per-trade pnl."""
+    if trades is None or trades.empty or pnl_col not in trades.columns:
+        return pd.DataFrame(columns=[ts_col, equity_col])
+    t = trades.sort_values(ts_col).copy()
+    t[equity_col] = t[pnl_col].astype(float).cumsum()
+    return t[[ts_col, equity_col]]
+
+
+def turnover_from_trades(trades: pd.DataFrame, capital_base: float) -> float:
+    """Estimate portfolio turnover from trades."""
+    if trades is None or trades.empty or capital_base <= 0:
+        return float("nan")
+    notional = trades["notional"].astype(float) if "notional" in trades.columns else None
+    if notional is None:
+        return float("nan")
+    gross = float(notional.abs().sum())
+    return float(gross / float(capital_base))
+
+
+def plot_equity_curve(reports: pd.DataFrame, out_path: str) -> None:
+    """Save equity curve to ``out_path`` if possible."""
+    if reports is None or reports.empty:
+        return
+    import matplotlib.pyplot as plt  # defer heavy import
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    r = reports.sort_values("ts_ms")
+    x = r["ts_ms"].values.astype("int64")
+    y = r["equity"].values.astype(float)
+    plt.figure(figsize=(12, 5))
+    plt.plot(x, y)
+    plt.xlabel("ts_ms")
+    plt.ylabel("equity")
+    plt.title("Equity curve")
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
 
 
 def _safe(v: float) -> float:
@@ -269,3 +339,23 @@ def compute_equity_metrics(
         fees_sum=float(fees_sum),
         funding_cashflow_sum=float(funding_sum),
     )
+
+
+def calculate_metrics(
+    trades: pd.DataFrame,
+    equity: pd.DataFrame,
+    *,
+    ts_col: str = "ts_ms",
+    pnl_col: str = "pnl",
+    equity_col: str = "equity",
+    capital_base: float = 10_000.0,
+    rf_annual: float = 0.0,
+) -> Dict[str, Any]:
+    """Convenience wrapper returning both trade and equity metrics."""
+    if ts_col != "ts_ms" or equity_col != "equity":
+        equity = equity.rename(columns={ts_col: "ts_ms", equity_col: "equity"})
+    eqm = compute_equity_metrics(equity, capital_base=capital_base, rf_annual=rf_annual)
+    trm = compute_trade_metrics(trades)
+    eqd = eqm.to_dict()
+    eqd["turnover"] = float(turnover_from_trades(trades, capital_base))
+    return {"equity": eqd, "trades": trm.to_dict()}

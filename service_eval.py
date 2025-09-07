@@ -1,66 +1,86 @@
 # -*- coding: utf-8 -*-
-"""
-services/service_eval.py
-Сервис оценки: читает логи трейдов и equity, считает метрики, сохраняет отчёт.
-"""
+"""Service for evaluating strategy performance."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+import json
 import os
-import time
-import pandas as pd
-import numpy as np
+from dataclasses import dataclass
+from typing import Dict
 
-from services.utils_config import snapshot_config
-from services.metrics import calculate_metrics, equity_from_trades, safe_read_csv
+import pandas as pd
+
+from services.metrics import calculate_metrics, read_any, plot_equity_curve
 
 
 @dataclass
 class EvalConfig:
-    trades_csv: Optional[str] = None          # стандартизированный лог сделок
-    equity_csv: Optional[str] = None          # кривая equity (если есть готовая)
-    artifacts_dir: str = "artifacts"          # куда сохранить отчёт/копии
-    snapshot_config_path: Optional[str] = None
+    """Configuration for :class:`ServiceEval`."""
 
-    # имена колонок в логах
-    ts_col: str = "ts_ms"
-    pnl_col: str = "pnl"
-    side_col: str = "side"
-    price_col: str = "price"
-    qty_col: str = "qty"
-    equity_col: str = "equity"
+    trades_path: str
+    reports_path: str
+    out_json: str = "logs/metrics.json"
+    out_md: str = "logs/metrics.md"
+    equity_png: str = "logs/equity.png"
+    capital_base: float = 10_000.0
+    rf_annual: float = 0.0
 
 
 class ServiceEval:
+    """High-level service that reads logs, computes metrics and stores artefacts."""
+
     def __init__(self, cfg: EvalConfig):
         self.cfg = cfg
 
-    def run(self) -> Dict[str, Any]:
-        os.makedirs(self.cfg.artifacts_dir, exist_ok=True)
-        if self.cfg.snapshot_config_path:
-            snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
+    def run(self) -> Dict[str, Dict[str, float]]:
+        trades = read_any(self.cfg.trades_path)
+        reports = read_any(self.cfg.reports_path)
 
-        # загрузка логов
-        trades = safe_read_csv(self.cfg.trades_csv) if self.cfg.trades_csv else pd.DataFrame()
-        equity = safe_read_csv(self.cfg.equity_csv) if self.cfg.equity_csv else pd.DataFrame()
+        if set([
+            "ts",
+            "run_id",
+            "symbol",
+            "side",
+            "order_type",
+            "price",
+            "quantity",
+        ]).issubset(set(trades.columns)):
+            trades = trades.rename(columns={"quantity": "qty"})
+        if "side" in trades.columns:
+            trades["side"] = trades["side"].astype(str).str.upper()
 
-        # если нет готовой equity — синтезируем из логов pnl
-        if equity.empty:
-            equity = equity_from_trades(trades, ts_col=self.cfg.ts_col, pnl_col=self.cfg.pnl_col, equity_col=self.cfg.equity_col)
+        metrics = calculate_metrics(
+            trades,
+            reports,
+            capital_base=float(self.cfg.capital_base),
+            rf_annual=float(self.cfg.rf_annual),
+        )
 
-        # метрики
-        metrics = calculate_metrics(trades, equity, ts_col=self.cfg.ts_col, pnl_col=self.cfg.pnl_col, equity_col=self.cfg.equity_col)
+        os.makedirs(os.path.dirname(self.cfg.out_json) or ".", exist_ok=True)
+        with open(self.cfg.out_json, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-        # сохраняем отчёт
-        ts = int(time.time())
-        rep_path = os.path.join(self.cfg.artifacts_dir, f"report_eval_{ts}.json")
-        pd.Series(metrics).to_json(rep_path, force_ascii=False)
+        os.makedirs(os.path.dirname(self.cfg.out_md) or ".", exist_ok=True)
+        with open(self.cfg.out_md, "w", encoding="utf-8") as f:
+            f.write("# Performance Metrics\n\n")
+            f.write("## Equity\n")
+            for k, v in metrics["equity"].items():
+                f.write(f"- **{k}**: {v}\n")
+            f.write("\n## Trades\n")
+            for k, v in metrics["trades"].items():
+                f.write(f"- **{k}**: {v}\n")
 
-        return {
-            "report_path": rep_path,
-            "metrics": metrics,
-            "n_trades": int(len(trades)) if not trades.empty else 0,
-            "n_equity_points": int(len(equity)) if not equity.empty else 0,
-        }
+        try:
+            plot_equity_curve(reports, self.cfg.equity_png)
+        except Exception:
+            pass
+
+        print(f"Wrote metrics JSON -> {self.cfg.out_json}")
+        print(f"Wrote metrics MD   -> {self.cfg.out_md}")
+        print(f"Wrote equity PNG   -> {self.cfg.equity_png}")
+
+        return metrics
+
+
+__all__ = ["EvalConfig", "ServiceEval"]
+
