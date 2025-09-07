@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import pandas as pd
 
+from execution_sim import ExecutionSimulator  # type: ignore
 from sandbox.backtest_adapter import BacktestAdapter
 from sandbox.sim_adapter import SimAdapter
 from strategies.base import BaseStrategy  # существующий контракт стратегии
@@ -18,6 +19,8 @@ from services.utils_config import snapshot_config  # сохранение сна
 
 @dataclass
 class BacktestConfig:
+    symbol: str = "BTCUSDT"
+    timeframe: str = "1m"
     exchange_specs_path: Optional[str] = None
     dynamic_spread_config: Optional[Dict[str, Any]] = None
     guards_config: Optional[Dict[str, Any]] = None
@@ -31,10 +34,27 @@ class ServiceBacktest:
     """
     Сервис работает через BacktestAdapter, который использует SimAdapter.step.
     """
-    def __init__(self, strategy: BaseStrategy, sim_bridge: SimAdapter, cfg: Optional[BacktestConfig] = None) -> None:
+
+    class _EmptySource:
+        """Заглушка источника данных для SimAdapter."""
+
+        def stream_bars(self, symbols, interval_ms):  # pragma: no cover - простая заглушка
+            return iter(())
+
+        def stream_ticks(self, symbols):  # pragma: no cover - простая заглушка
+            return iter(())
+
+    def __init__(self, strategy: BaseStrategy, sim: ExecutionSimulator, cfg: Optional[BacktestConfig] = None) -> None:
         self.strategy = strategy
-        self.sim_bridge = sim_bridge
+        self.sim = sim
         self.cfg = cfg or BacktestConfig()
+
+        self.sim_bridge = SimAdapter(
+            sim,
+            symbol=self.cfg.symbol,
+            timeframe=self.cfg.timeframe,
+            source=self._EmptySource(),
+        )
 
         self._bt = BacktestAdapter(
             strategy=self.strategy,

@@ -2,36 +2,17 @@
 from __future__ import annotations
 
 import argparse
-import importlib
-import json
 import os
-from typing import Any, Dict
 
 import pandas as pd
 import yaml
 
-from execution_sim import ExecutionSimulator, SimStepReport as ExecReport  # type: ignore
-from action_proto import ActionProto, ActionType
-from sandbox.backtest_adapter import BacktestAdapter
-from sandbox.sim_adapter import SimAdapter
-from strategies.base import BaseStrategy
+from execution_sim import ExecutionSimulator  # type: ignore
+from service_backtest import BacktestConfig, ServiceBacktest
+from services.utils_sandbox import build_strategy, read_df
 
 
-def _read_df(path: str) -> pd.DataFrame:
-    if path.lower().endswith(".parquet"):
-        return pd.read_parquet(path)
-    return pd.read_csv(path)
-
-
-def _build_strategy(mod: str, cls: str, params: Dict[str, Any]) -> BaseStrategy:
-    m = importlib.import_module(mod)
-    Cls = getattr(m, cls)
-    s: BaseStrategy = Cls()
-    s.setup(params or {})
-    return s
-
-
-def main():
+def main() -> None:
     p = argparse.ArgumentParser(description="Strategy sandbox runner")
     p.add_argument("--config", default="configs/sandbox.yaml", help="Путь к YAML-конфигу песочницы")
     args = p.parse_args()
@@ -60,7 +41,7 @@ def main():
     )
 
     # стратегия
-    strat = _build_strategy(
+    strat = build_strategy(
         cfg["strategy"]["module"],
         cfg["strategy"]["class"],
         cfg["strategy"].get("params", {}),
@@ -68,22 +49,23 @@ def main():
 
     # бэктест
     data_cfg = cfg["data"]
-    df = _read_df(data_cfg["path"])
+    df = read_df(data_cfg["path"])
     ts_col = data_cfg.get("ts_col", "ts_ms")
     sym_col = data_cfg.get("symbol_col", "symbol")
     price_col = data_cfg.get("price_col", "ref_price")
 
-    bridge = SimAdapter(sim, cfg.get("symbol", "BTCUSDT"))
-    bt = BacktestAdapter(
-        strat,
-        bridge,
+    bt_cfg = BacktestConfig(
+        symbol=cfg.get("symbol", "BTCUSDT"),
+        timeframe=data_cfg.get("timeframe", "1m"),
         dynamic_spread_config=cfg.get("dynamic_spread", {}),
         exchange_specs_path=cfg.get("exchange_specs_path", "data/exchange_specs.json"),
         guards_config=cfg.get("sim_guards", {}),
         signal_cooldown_s=int(cfg.get("min_signal_gap_s", 0)),
         no_trade_config=cfg.get("no_trade", {}),
     )
-    reports = bt.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
+
+    svc = ServiceBacktest(strategy=strat, sim=sim, cfg=bt_cfg)
+    reports = svc.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
 
     # сохранить
     out_path = cfg.get("out_reports", "logs/sandbox_reports.csv")
