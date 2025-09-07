@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 
 from core_config import load_config
-from service_eval import EvalConfig, EvalServiceConfig, from_config
+from service_eval import EvalConfig, from_config
 
 
 def main() -> None:
@@ -29,9 +29,10 @@ def main() -> None:
         equity_png=f"{cfg.logs_dir}/equity.png",
         capital_base=10_000.0,
         rf_annual=0.0,
+        snapshot_config_path=args.config,
+        artifacts_dir=cfg.artifacts_dir,
     )
-    svc_cfg = EvalServiceConfig(snapshot_config_path=args.config, artifacts_dir=cfg.artifacts_dir)
-    from_config(cfg, eval_cfg, svc_cfg=svc_cfg)
+    from_config(cfg, eval_cfg)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
