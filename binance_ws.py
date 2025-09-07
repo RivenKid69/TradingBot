@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, List
+
+from decimal import Decimal
 
 import websockets
+
+from core_models import Bar
 
 
 class BinanceWS:
@@ -20,7 +23,7 @@ class BinanceWS:
         *,
         symbols: List[str],
         interval: str = "1m",
-        on_kline_closed: Callable[[Dict[str, Any]], Awaitable[None]],
+        on_bar: Callable[[Bar], Awaitable[None]],
         base_url: str = "wss://stream.binance.com:9443",
         reconnect_initial_delay_s: float = 1.0,
         reconnect_max_delay_s: float = 60.0,
@@ -28,7 +31,7 @@ class BinanceWS:
     ) -> None:
         self.symbols = [s.strip().upper() for s in symbols if s.strip()]
         self.interval = str(interval)
-        self.on_kline_closed = on_kline_closed
+        self.on_bar = on_bar
         self.base_url = base_url.rstrip("/")
         self.reconnect_initial_delay_s = float(reconnect_initial_delay_s)
         self.reconnect_max_delay_s = float(reconnect_max_delay_s)
@@ -71,23 +74,20 @@ class BinanceWS:
                         # kline закрыта? поле 'x' == True
                         if bool(k.get("x", False)):
                             try:
-                                out = {
-                                    "symbol": str(k.get("s", "")).upper(),
-                                    "interval": str(k.get("i", "")),
-                                    "open_time": int(k.get("t", 0)),
-                                    "close_time": int(k.get("T", 0)),
-                                    "open": float(k.get("o", 0.0)),
-                                    "high": float(k.get("h", 0.0)),
-                                    "low": float(k.get("l", 0.0)),
-                                    "close": float(k.get("c", 0.0)),
-                                    "volume": float(k.get("v", 0.0)),
-                                    "trades": int(k.get("n", 0)),
-                                    "taker_buy_base": float(k.get("V", 0.0)),
-                                    "taker_buy_quote": float(k.get("Q", 0.0)),
-                                }
+                                bar = Bar(
+                                    ts=int(k.get("t", 0)),
+                                    symbol=str(k.get("s", "")).upper(),
+                                    open=Decimal(k.get("o", 0.0)),
+                                    high=Decimal(k.get("h", 0.0)),
+                                    low=Decimal(k.get("l", 0.0)),
+                                    close=Decimal(k.get("c", 0.0)),
+                                    volume_base=Decimal(k.get("v", 0.0)),
+                                    trades=int(k.get("n", 0)),
+                                    is_final=True,
+                                )
                             except Exception:
                                 continue
-                            await self.on_kline_closed(out)
+                            await self.on_bar(bar)
                     hb_task.cancel()
             except asyncio.CancelledError:
                 return
