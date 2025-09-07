@@ -1,35 +1,36 @@
-"""CLI wrapper around :mod:`service_eval`."""
+"""CLI wrapper around :mod:`service_eval` using YAML config."""
 
 from __future__ import annotations
 
 import argparse
 
-from service_eval import EvalConfig, ServiceEval
+from core_config import load_config
+from service_eval import EvalConfig, from_config
 
 
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Evaluate strategy performance via ServiceEval",
     )
-    p.add_argument("--trades", required=True, help="Path to trades (CSV/Parquet or glob)")
-    p.add_argument("--reports", required=True, help="Path to reports (CSV/Parquet or glob)")
-    p.add_argument("--out-json", default="logs/metrics.json", help="Where to save metrics JSON")
-    p.add_argument("--out-md", default="logs/metrics.md", help="Where to save Markdown report")
-    p.add_argument("--equity-png", default="logs/equity.png", help="PNG with equity curve")
-    p.add_argument("--capital-base", type=float, default=10_000.0, help="Base capital for returns")
-    p.add_argument("--rf-annual", type=float, default=0.0, help="Annual risk-free rate")
+    p.add_argument(
+        "--config",
+        default="configs/config_eval.yaml",
+        help="Путь к YAML-конфигу запуска",
+    )
     args = p.parse_args()
 
-    cfg = EvalConfig(
-        trades_path=args.trades,
-        reports_path=args.reports,
-        out_json=args.out_json,
-        out_md=args.out_md,
-        equity_png=args.equity_png,
-        capital_base=float(args.capital_base),
-        rf_annual=float(args.rf_annual),
+    cfg = load_config(args.config)
+
+    eval_cfg = EvalConfig(
+        trades_path=cfg.input.trades_path,
+        reports_path=getattr(cfg.input, "equity_path", ""),
+        out_json=f"{cfg.logs_dir}/metrics.json",
+        out_md=f"{cfg.logs_dir}/metrics.md",
+        equity_png=f"{cfg.logs_dir}/equity.png",
+        capital_base=10_000.0,
+        rf_annual=0.0,
     )
-    ServiceEval(cfg).run()
+    from_config(cfg, eval_cfg)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
