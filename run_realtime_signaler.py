@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 
 from core_config import load_config
-from service_signal_runner import from_config
+from service_signal_runner import RunnerConfig, from_config
 
 
 def main() -> None:
@@ -25,7 +25,9 @@ def main() -> None:
 
     cfg = load_config(args.config)
 
-    for report in from_config(cfg):
+    svc_cfg = RunnerConfig(snapshot_config_path=args.config, artifacts_dir=cfg.artifacts_dir)
+
+    for report in from_config(cfg, svc_cfg=svc_cfg):
         print(report)
 
 
