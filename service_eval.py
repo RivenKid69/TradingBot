@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 from services.utils_config import snapshot_config
@@ -39,12 +39,6 @@ class EvalConfig:
     equity_png: str = "logs/equity.png"
     capital_base: float = 10_000.0
     rf_annual: float = 0.0
-
-
-
-
-@dataclass
-class EvalServiceConfig:
     snapshot_config_path: Optional[str] = None
     artifacts_dir: Optional[str] = None
 
@@ -52,13 +46,13 @@ class EvalServiceConfig:
 class ServiceEval:
     """High-level service that reads logs, computes metrics and stores artefacts."""
 
-    def __init__(self, cfg: EvalConfig, svc_cfg: EvalServiceConfig | None = None):
+    def __init__(self, cfg: EvalConfig, container: Optional[Dict[str, Any]] = None):
         self.cfg = cfg
-        self.svc_cfg = svc_cfg or EvalServiceConfig()
+        self.container = container or {}
 
     def run(self) -> Dict[str, Dict[str, float]]:
-        if self.svc_cfg.snapshot_config_path and self.svc_cfg.artifacts_dir:
-            snapshot_config(self.svc_cfg.snapshot_config_path, self.svc_cfg.artifacts_dir)
+        if self.cfg.snapshot_config_path and self.cfg.artifacts_dir:
+            snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
         trades = read_any(self.cfg.trades_path)
         reports = read_any(self.cfg.reports_path)
 
@@ -108,12 +102,12 @@ class ServiceEval:
         return metrics
 
 
-def from_config(cfg: CommonRunConfig, eval_cfg: EvalConfig, svc_cfg: EvalServiceConfig | None = None) -> Dict[str, Dict[str, float]]:
+def from_config(cfg: CommonRunConfig, eval_cfg: EvalConfig) -> Dict[str, Dict[str, float]]:
     """Run :class:`ServiceEval` using dependencies described in ``cfg``."""
-    di_registry.build_graph(cfg.components, cfg)
-    service = ServiceEval(eval_cfg, svc_cfg)
+    container = di_registry.build_graph(cfg.components, cfg)
+    service = ServiceEval(eval_cfg, container)
     return service.run()
 
 
-__all__ = ["EvalConfig", "EvalServiceConfig", "ServiceEval", "from_config"]
+__all__ = ["EvalConfig", "ServiceEval", "from_config"]
 
