@@ -18,9 +18,10 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 import pandas as pd
+from services.utils_config import snapshot_config
 
 from services.metrics import calculate_metrics, read_any, plot_equity_curve
 from core_config import CommonRunConfig
@@ -40,13 +41,24 @@ class EvalConfig:
     rf_annual: float = 0.0
 
 
+
+
+@dataclass
+class EvalServiceConfig:
+    snapshot_config_path: Optional[str] = None
+    artifacts_dir: Optional[str] = None
+
+
 class ServiceEval:
     """High-level service that reads logs, computes metrics and stores artefacts."""
 
-    def __init__(self, cfg: EvalConfig):
+    def __init__(self, cfg: EvalConfig, svc_cfg: EvalServiceConfig | None = None):
         self.cfg = cfg
+        self.svc_cfg = svc_cfg or EvalServiceConfig()
 
     def run(self) -> Dict[str, Dict[str, float]]:
+        if self.svc_cfg.snapshot_config_path and self.svc_cfg.artifacts_dir:
+            snapshot_config(self.svc_cfg.snapshot_config_path, self.svc_cfg.artifacts_dir)
         trades = read_any(self.cfg.trades_path)
         reports = read_any(self.cfg.reports_path)
 
@@ -96,12 +108,12 @@ class ServiceEval:
         return metrics
 
 
-def from_config(cfg: CommonRunConfig, eval_cfg: EvalConfig) -> Dict[str, Dict[str, float]]:
+def from_config(cfg: CommonRunConfig, eval_cfg: EvalConfig, svc_cfg: EvalServiceConfig | None = None) -> Dict[str, Dict[str, float]]:
     """Run :class:`ServiceEval` using dependencies described in ``cfg``."""
     di_registry.build_graph(cfg.components, cfg)
-    service = ServiceEval(eval_cfg)
+    service = ServiceEval(eval_cfg, svc_cfg)
     return service.run()
 
 
-__all__ = ["EvalConfig", "ServiceEval", "from_config"]
+__all__ = ["EvalConfig", "EvalServiceConfig", "ServiceEval", "from_config"]
 

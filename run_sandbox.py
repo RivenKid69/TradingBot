@@ -34,7 +34,7 @@ def main() -> None:
 
     params = cfg.components.backtest_engine.params or {}
     bt_kwargs = {k: v for k, v in params.items() if k in BacktestConfig.__annotations__}
-    svc_cfg = BacktestConfig(**bt_kwargs)
+    svc_cfg = BacktestConfig(**bt_kwargs, snapshot_config_path=args.config, artifacts_dir=cfg.artifacts_dir)
 
     ts_col = params.get("ts_col", "ts_ms")
     sym_col = params.get("symbol_col", "symbol")
