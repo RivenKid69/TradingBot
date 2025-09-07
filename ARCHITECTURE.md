@@ -46,6 +46,17 @@ from core_config import load_config
 cfg = load_config("configs/run_sim.yaml")
 ```
 
+### CLI-скрипты
+
+Несколько вспомогательных скриптов принимают путь к YAML через
+флаг `--config` и запускают соответствующие сервисы через `from_config`:
+
+```
+python run_realtime_signaler.py --config configs/config_live.yaml
+python run_sandbox.py          --config configs/config_sim.yaml
+python evaluate_performance.py --config configs/config_eval.yaml
+```
+
 ## ServiceTrain
 
 `ServiceTrain` подготавливает датасет и запускает обучение модели.  Он
