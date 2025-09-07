@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 impl_binance_public.py
-Источник рыночных данных Binance Public WS. Выдаёт MarketEvent(BAR) по kline.
+Источник рыночных данных Binance Public WS. Источник выдаёт объекты `Bar` через `stream_bars`.
 Работает синхронно через внутренний поток, который обслуживает asyncio + websockets.
 """
 
