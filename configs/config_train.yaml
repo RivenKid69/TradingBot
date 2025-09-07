@@ -1,3 +1,13 @@
+mode: train
+run_id: train-run
+logs_dir: logs
+artifacts_dir: artifacts
+data:
+  symbols: ["BTCUSDT"]
+  timeframe: "1m"
+model:
+  algo: "ppo"
+  params: {}
 components:
   market_data:
     target: impl_offline_data:OfflineCSVBarSource

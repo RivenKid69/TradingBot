@@ -1,3 +1,9 @@
+mode: eval
+run_id: eval-run
+logs_dir: logs
+artifacts_dir: artifacts
+input:
+  trades_path: "data/trades.csv"
 components:
   market_data:
     target: impl_offline_data:OfflineCSVBarSource
