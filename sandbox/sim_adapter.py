@@ -63,18 +63,20 @@ class SimAdapter:
 
         # Пишем унифицированный лог построчно (без изменения возврата)
         try:
-            # логирование по единому контракту ExecReport
-            exec_reports = sim_report_dict_to_core_exec_reports(d, symbol=self.symbol, client_order_id=None)
-            for _er in exec_reports:
+            exec_reports = sim_report_dict_to_core_exec_reports(
+                d, symbol=self.symbol, client_order_id=None
+            )
+        except Exception:
+            exec_reports = []
+
+        for _er in exec_reports:
+            try:
                 _bus_log_trade_exec(_er)
-        except Exception:
-            pass
+            except Exception:
+                pass
+
         # формируем core_exec_reports (унифицированные отчёты исполнения) без изменения существующего интерфейса
-        try:
-            exec_reports = sim_report_dict_to_core_exec_reports(d, symbol=self.symbol, client_order_id=None)
-            d["core_exec_reports"] = [as_dict(er) for er in exec_reports]
-        except Exception:
-            d["core_exec_reports"] = []
+        d["core_exec_reports"] = [as_dict(er) for er in exec_reports]
         return d
 
     def run_events(self, provider: "DecisionsProvider") -> Iterator[Dict[str, Any]]:
