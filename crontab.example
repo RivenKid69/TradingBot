@@ -1,0 +1,4 @@
+SHELL=/bin/bash
+TZ=UTC
+# Every hour at :02, single-run guarded by flock in the wrapper
+2 * * * * /bin/bash -lc '/path/to/project/deploy/run_update.sh'

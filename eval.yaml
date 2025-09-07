@@ -1,0 +1,13 @@
+# configs/eval.yaml
+inputs:
+  trades: "logs/log_trades_*.csv"           # единая схема ExecReport → TradeLogRow
+  reports: "logs/reports.csv"               # или "logs/reports.parquet.part-*.parquet""
+
+outputs:
+  json: "logs/metrics.json"
+  markdown: "logs/metrics.md"
+  equity_png: "logs/equity.png"
+
+params:
+  capital_base: 10000.0
+  rf_annual: 0.00

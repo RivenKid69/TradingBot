@@ -1,0 +1,220 @@
+# Имя файла: custom_policy_patch.py
+# ИЗМЕНЕНИЯ (АРХИТЕКТУРНЫЙ РЕФАКТОРИНГ):
+# 1. Устранен конфликт двух механизмов памяти (Трансформер vs GRU).
+# 2. Выбран путь "чистой рекуррентности": GRU становится основным и единственным
+#    механизмом памяти.
+# 3. CustomMlpExtractor радикально упрощен. Теперь это не сложный анализатор
+#    окон, а простой MLP-кодировщик признаков ОДНОГО временного шага.
+# 4. Все неиспользуемые более классы (Attention, Conv блоки и т.д.) удалены.
+# 
+# --- ИСПРАВЛЕНИЕ IndexError ---
+# Применены точечные исправления к CustomActorCriticPolicy, чтобы она
+# корректно работала с новой GRU-архитектурой, не затрагивая остальной код.
+
+import torch
+import torch.nn as nn
+import numpy as np
+from gymnasium import spaces
+from typing import Tuple, Type
+
+from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
+
+
+
+class CustomMlpExtractor(nn.Module):
+    """
+    Простой MLP-экстрактор для кодирования признаков одного временного шага.
+    Он заменяет сложную трансформер-подобную архитектуру, передавая
+    задачу обработки последовательности рекуррентной сети (GRU).
+    """
+    def __init__(self, feature_dim: int, hidden_dim: int, activation: Type[nn.Module]):
+        super().__init__()
+        # Определяем размерность для actor и critic
+        self.latent_dim_pi = hidden_dim
+        self.latent_dim_vf = hidden_dim
+
+        # Простая полносвязная сеть для проекции признаков
+        self.input_projection = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            activation()
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        # Просто прогоняем признаки через MLP
+        return self.input_projection(features)
+
+    def forward_actor(self, features: torch.Tensor) -> torch.Tensor:
+        return features
+
+    def forward_critic(self, features: torch.Tensor) -> torch.Tensor:
+        return features
+
+
+class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        lr_schedule,
+        *args,
+        arch_params=None,
+        **kwargs,
+    ):
+        arch_params = arch_params or {}
+        hidden_dim = arch_params.get('hidden_dim', 64)
+        self.hidden_dim = hidden_dim
+
+        act_str = arch_params.get('activation', 'relu').lower()
+        if act_str == 'relu': self.activation = nn.ReLU
+        elif act_str == 'tanh': self.activation = nn.Tanh
+        elif act_str == 'leakyrelu': self.activation = nn.LeakyReLU
+        else: self.activation = nn.ReLU
+
+        # Параметры n_res_blocks, n_attn_blocks, attn_heads больше не нужны
+        
+        self.use_memory = True # Теперь память обеспечивается только GRU
+                
+        self.num_atoms = arch_params.get("num_atoms", 51)
+        self.v_min = -1.0  # Начальное значение-заглушка
+        self.v_max = 1.0
+
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            *args,
+            **kwargs,
+        )
+        
+        self.dist_head = nn.Linear(self.mlp_extractor.latent_dim_vf, self.num_atoms)
+
+        # буфер с опорой атомов остаётся
+        atoms = torch.linspace(self.v_min, self.v_max, self.num_atoms)
+        self.register_buffer("atoms", atoms)
+
+        # совместимость: где-то в старом коде могли обращаться к self.value_net
+        self.value_net = self.dist_head
+
+        
+
+        if isinstance(self.action_space, spaces.Box):
+            action_dim = self.action_space.shape[0]
+            self.unconstrained_log_std = nn.Parameter(torch.zeros(action_dim))
+
+        self.recurrent_initial_state = (
+            torch.zeros(1, 1, self.hidden_dim, device=self.device),
+            torch.zeros(1, 1, self.hidden_dim, device=self.device),
+        )
+
+    @torch.no_grad()
+    def update_atoms(self, v_min: float, v_max: float) -> None:
+        """
+        Динамически обновляет диапазон и сами атомы для value-распределения.
+        """
+        # Проверяем, изменился ли диапазон, чтобы не делать лишнюю работу
+        if self.v_min == v_min and self.v_max == v_max:
+            return
+
+        self.v_min = v_min
+        self.v_max = v_max
+        
+        # Создаем временный тензор с новыми значениями
+        new_atoms = torch.linspace(v_min, v_max, self.num_atoms, device=self.atoms.device)
+        
+        # Копируем данные "in-place" в существующий буфер.
+        # Это сохраняет регистрацию и гарантирует правильное сохранение/загрузку.
+        self.atoms.copy_(new_atoms)
+
+    def _build_mlp_extractor(self) -> None:
+        # Теперь создается простой MLP экстрактор
+        self.mlp_extractor = CustomMlpExtractor(
+            feature_dim=self.features_dim, 
+            hidden_dim=self.hidden_dim,
+            activation=self.activation
+        )
+    def _build(self, lr_schedule) -> None:
+        """
+        Создает архитектуру сети, включая кастомные раздельные GRU
+        для actor и critic.
+        """
+        # 1. Сначала вызываем _build_mlp_extractor, который создаст self.mlp_extractor
+        self._build_mlp_extractor()
+
+        # 2. Определяем размерности для GRU
+        # Входная размерность для GRU - это выходная размерность MLP-экстрактора
+        gru_input_dim = self.mlp_extractor.latent_dim_pi
+
+        # 3. Создаем наши кастомные рекуррентные слои
+        self.pi_lstm = nn.GRU(gru_input_dim, self.hidden_dim, num_layers=1)
+        self.vf_lstm = nn.GRU(gru_input_dim, self.hidden_dim, num_layers=1)
+
+        # 4. Создаем головы для actor и critic
+        self.action_net = nn.Linear(self.hidden_dim, self.action_dim)
+        # Голова для value-распределения уже создается в __init__ (self.dist_head)
+
+        # 5. Создаем оптимизатор
+        # Собираем все параметры модели для оптимизатора
+        all_params = list(self.mlp_extractor.parameters()) + \
+                     list(self.pi_lstm.parameters()) + \
+                     list(self.vf_lstm.parameters()) + \
+                     list(self.action_net.parameters()) + \
+                     list(self.dist_head.parameters())
+        
+        # Если для action_space типа Box есть unconstrained_log_std, добавляем его
+        if hasattr(self, 'unconstrained_log_std'):
+            all_params.append(self.unconstrained_log_std)
+
+        self.optimizer = self.optimizer_class(all_params, lr=lr_schedule(1), **self.optimizer_kwargs)
+    # --- ИСПРАВЛЕНИЕ: Метод переименован с forward_rnn на _forward_recurrent ---
+    def _forward_recurrent(
+        self,
+        features: torch.Tensor,
+        lstm_states: Tuple[torch.Tensor, ...],
+        episode_starts: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """
+        Обрабатывает последовательность признаков, используя раздельные GRU для актера и критика.
+        Возвращает скрытые состояния, которые будут использованы как latent_pi и latent_vf.
+        """
+        pi_hidden_state, vf_hidden_state = lstm_states
+
+        mask = (1.0 - episode_starts).reshape(1, -1, 1)
+        pi_hidden_state = pi_hidden_state * mask
+        vf_hidden_state = vf_hidden_state * mask
+
+        features_rnn = features.unsqueeze(0)
+
+        # ИЗМЕНЕНО: latent_pi и latent_vf теперь являются прямыми выходами из GRU
+        latent_pi, new_pi_hidden_state = self.pi_lstm(features_rnn, pi_hidden_state)
+        latent_vf, new_vf_hidden_state = self.vf_lstm(features_rnn, vf_hidden_state)
+
+        latent_pi = latent_pi.squeeze(0)
+        latent_vf = latent_vf.squeeze(0)
+
+        new_lstm_states = (new_pi_hidden_state, new_vf_hidden_state)
+
+        return latent_pi, latent_vf, new_lstm_states
+
+    def _get_action_dist_from_latent(self, latent_pi: torch.Tensor):
+        if isinstance(self.action_space, spaces.Box):
+            mean_actions = self.action_net(latent_pi)
+            # Гладкое отображение неурезанного параметра в диапазон [-5, 0]
+            # torch.tanh дает [-1, 1], мы масштабируем и сдвигаем его.
+            log_std = -2.5 + 2.5 * torch.tanh(self.unconstrained_log_std)
+            return self.action_dist.proba_distribution(mean_actions, log_std)
+        elif isinstance(self.action_space, spaces.Discrete):
+            action_logits = self.action_net(latent_pi)
+            return self.action_dist.proba_distribution(action_logits)
+        else:
+            raise NotImplementedError(f"Action space {type(self.action_space)} not supported")
+
+    def _get_value_from_latent(self, latent_vf: torch.Tensor) -> torch.Tensor:
+        """
+        Переопределяем базовый метод SB3.
+        Вместо отдельной линейной головы берём logits → probs → ожидание.
+        """
+        dist_logits = self.dist_head(latent_vf)        # [B, n_atoms]
+        probs = torch.softmax(dist_logits, dim=-1)     # [B, n_atoms]
+        value = (probs * self.atoms).sum(dim=-1, keepdim=True)  # [B, 1]
+        return value

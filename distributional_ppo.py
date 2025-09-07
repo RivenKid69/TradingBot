@@ -1,0 +1,338 @@
+# Имя файла: distributional_ppo.py
+# ИЗМЕНЕНИЯ (ФАЗА 5 - Векторизация CVaR):
+# 1. Функция `calculate_cvar` полностью переписана с использованием
+#    векторизованных операций PyTorch.
+# 2. Удален неэффективный цикл `for` по элементам батча, что значительно
+#    ускоряет вычисления и снижает нагрузку на CPU.
+# 3. Логика вычислений и результат функции остались прежними, изменился
+#    только способ их получения (без циклов).
+# ОПТИМИЗАЦИЯ (Смешанная точность):
+# 1. Добавлена поддержка Automatic Mixed Precision (AMP) с помощью
+#    torch.cuda.amp.GradScaler и autocast для ускорения обучения на GPU.
+
+import torch
+import numpy as np
+from sb3_contrib import RecurrentPPO
+from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
+from stable_baselines3.common.utils import explained_variance
+from stable_baselines3.common.vec_env import VecEnv
+import torch.nn.functional as F
+from typing import Any, Dict, Optional, Type, Union
+
+# --- ИЗМЕНЕНИЕ: Импортируем инструменты для смешанной точности ---
+from torch.cuda.amp import autocast, GradScaler
+
+torch.set_float32_matmul_precision("high")
+
+
+import time
+from stable_baselines3.common.callbacks import BaseCallback
+import gymnasium as gym
+from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn
+
+def safe_explained_variance(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    y_true = y_true.astype(np.float64)
+    y_pred = y_pred.astype(np.float64)
+    var_y = np.var(y_true)
+    return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+# --- Векторизованная версия функции CVaR (без изменений) ---
+def calculate_cvar(probs: torch.Tensor, atoms: torch.Tensor, alpha: float) -> torch.Tensor:
+    """
+    Вычисляет Conditional Value at Risk (CVaR) для заданного распределения.
+    Эта версия векторизована для эффективной работы с батчами.
+    """
+    batch_size, num_atoms = probs.shape
+    device = probs.device
+
+    sorted_atoms, sort_indices = torch.sort(atoms)
+    sorted_probs = probs.gather(1, sort_indices.unsqueeze(0).expand_as(probs))
+    cumulative_probs = torch.cumsum(sorted_probs, dim=1)
+
+    alpha_tensor = torch.full((batch_size, 1), fill_value=alpha, dtype=torch.float32, device=device)
+    var_indices = torch.searchsorted(cumulative_probs.detach(), alpha_tensor).clamp(max=num_atoms - 1)
+
+    atom_indices_j = torch.arange(num_atoms, device=device).view(1, -1)
+    tail_mask = atom_indices_j < var_indices
+
+    per_atom_expectation = sorted_probs * sorted_atoms.view(1, -1).detach()
+    tail_expectation = torch.sum(per_atom_expectation * tail_mask, dim=1)
+
+    tail_mass_indices = (var_indices - 1).clamp(min=0)
+    tail_mass = cumulative_probs.gather(1, tail_mass_indices).squeeze(1)
+    tail_mass[var_indices.squeeze(1) == 0] = 0.0
+
+    weight_on_var = alpha - tail_mass
+    var_atom_values = sorted_atoms[var_indices.squeeze(1)].detach()
+    expectation_on_var = weight_on_var * var_atom_values
+
+    cvar = (tail_expectation + expectation_on_var) / (alpha + 1e-8)
+
+    return cvar
+
+
+class DistributionalPPO(RecurrentPPO):
+    """
+    Дистрибутивный вариант RecurrentPPO с поддержкой смешанной точности.
+    """
+    def __init__(
+        self,
+        policy: Union[str, Type[RecurrentActorCriticPolicy]],
+        env: Union[VecEnv, str],
+        cql_alpha: float = 1.0,
+        cql_beta: float = 5.0,
+        cvar_alpha: float = 0.05,
+        cvar_weight: float = 0.5,
+        v_range_ema_alpha: float = 0.01,
+        use_torch_compile: bool = False,
+        **kwargs: Any,
+    ):
+        self._last_lstm_states = None
+        super().__init__(policy=policy, env=env, **kwargs)
+
+        self.cql_alpha = cql_alpha
+        self.cql_beta = cql_beta
+        self.cvar_alpha = cvar_alpha
+        self.cvar_weight = cvar_weight
+        self.v_range_ema_alpha = v_range_ema_alpha
+        self.running_v_min = 0.0
+        self.running_v_max = 0.0
+        self.v_range_initialized = False
+
+        # --- ИЗМЕНЕНИЕ: Инициализация GradScaler для смешанной точности ---
+        self.lr_scheduler = None
+        self.scaler = None
+        # Создаем скейлер, только если используется GPU
+        if self.device.type == "cuda":
+            self.scaler = GradScaler()
+            print("--> DistributionalPPO initialized with Mixed Precision Training (AMP) enabled.")
+        else:
+            print("--> DistributionalPPO initialized on CPU. Mixed Precision Training is disabled.")
+        
+        if use_torch_compile and self.device.type == "cuda":
+            print("--> Compiling the policy with torch.compile...")
+            # Оптимизатор уже создан и ссылается на параметры,
+            # torch.compile будет работать с ними.
+            self.policy = torch.compile(self.policy, mode="reduce-overhead")
+            print("--> Policy compilation complete.")
+        print(f"--> CVaR-in-loss settings: (alpha={self.cvar_alpha:.2f}, weight={self.cvar_weight:.2f}).")
+    
+    def parameters(self, recurse: bool = True):
+        """Позволяет обращаться к параметрам агента как к nn.Module."""
+        return self.policy.parameters(recurse)
+
+    def collect_rollouts(
+        self,
+        env: VecEnv,
+        callback: BaseCallback,
+        rollout_buffer: RolloutBuffer,
+        n_rollout_steps: int,
+    ) -> bool:
+        """
+        Собирает траектории. Эта версия адаптирована для дистрибутивного RL.
+        """
+        assert self._last_obs is not None, "No previous observation was provided"
+        if self._last_lstm_states is None:
+            # self.policy.recurrent_initial_state создается в RecurrentActorCriticPolicy
+            # и является кортежем из двух тензоров (для pi и vf)
+            initial_state = self.policy.recurrent_initial_state
+            # Перемещаем начальное состояние на правильное устройство
+            self._last_lstm_states = (initial_state[0].to(self.device), initial_state[1].to(self.device))
+
+
+        self.policy.set_training_mode(False)
+
+        n_steps = 0
+        rollout_buffer.reset()
+        callback.on_rollout_start()
+
+        while n_steps < n_rollout_steps:
+            # Включаем autocast для инференса, если используется AMP
+            with torch.no_grad(), autocast(enabled=self.scaler is not None):
+                obs_tensor = self.policy.obs_to_tensor(self._last_obs)[0]
+                episode_starts = torch.as_tensor(self._last_episode_starts, dtype=torch.float32).to(self.device)
+
+                actions, values, log_probs, self._last_lstm_states = self.policy.forward(
+                    obs_tensor, self._last_lstm_states, episode_starts
+                )
+            
+            probs = F.softmax(values, dim=1)
+            scalar_values = (probs * self.policy.atoms).sum(dim=1)
+            actions = actions.cpu().numpy()
+
+            clipped_actions = actions
+            if isinstance(self.action_space, gym.spaces.Box):
+                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+
+            new_obs, rewards, dones, infos = env.step(clipped_actions)
+            self.num_timesteps += env.num_envs
+
+            callback.update_locals(locals())
+            if callback.on_step() is False:
+                return False
+
+            self._update_info_buffer(infos)
+            n_steps += 1
+
+            if isinstance(self.action_space, gym.spaces.Discrete):
+                actions = actions.reshape(-1, 1)
+
+            
+
+            rollout_buffer.add(
+                self._last_obs, actions, rewards, self._last_episode_starts, scalar_values, log_probs, lstm_states=self._last_lstm_states
+            )
+
+            self._last_obs = new_obs
+            self._last_episode_starts = dones
+
+        with torch.no_grad(), autocast(enabled=self.scaler is not None):
+            obs_tensor = self.policy.obs_to_tensor(new_obs)[0]
+            episode_starts = torch.as_tensor(dones, dtype=torch.float32).to(self.device)
+            _, last_values_dist, _, _ = self.policy.forward(obs_tensor, self._last_lstm_states, episode_starts)
+
+            last_probs = F.softmax(last_values_dist, dim=1)
+            last_scalar_values = (last_probs * self.policy.atoms).sum(dim=1)
+
+        rollout_buffer.compute_returns_and_advantage(last_values=last_scalar_values, dones=dones)
+        callback.on_rollout_end()
+        return True
+
+
+    def train(self) -> None:
+        """
+        Обновляет политику с использованием смешанной точности (AMP).
+        """
+        self.policy.set_training_mode(True)
+        self._update_learning_rate(self.policy.optimizer)
+        clip_range = self.clip_range(self._current_progress_remaining)
+ 
+        with torch.no_grad():
+            # Вычисляем мин/макс по ВСЕМУ буферу роллаута
+            v_min = self.rollout_buffer.returns.min().item()
+            v_max = self.rollout_buffer.returns.max().item()
+            # Сразу обновляем атомы в политике
+            self.policy.update_atoms(v_min, v_max)
+
+        # Логируем эти границы
+        self.logger.record("train/v_min", v_min)
+        self.logger.record("train/v_max", v_max)
+
+        for epoch in range(self.n_epochs):
+            approx_kl_divs = []
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
+                
+                
+
+                
+                # --- ИЗМЕНЕНИЕ: Включаем autocast для forward pass и loss ---
+                with autocast(enabled=self.scaler is not None):
+                    value_logits, log_prob, entropy = self.policy.evaluate_actions(
+                        rollout_data.observations,
+                        rollout_data.actions,
+                        rollout_data.lstm_states,
+                        rollout_data.episode_starts,
+                    )
+
+                    # --- РАСЧЕТ КРИТИЧЕСКОЙ ПОТЕРИ (CRITIC LOSS) ---
+                    with torch.no_grad():
+                        target_returns = rollout_data.returns
+                        delta_z = (self.policy.v_max - self.policy.v_min) / (self.policy.num_atoms - 1)
+                        clamped_targets = target_returns.clamp(self.policy.v_min, self.policy.v_max)
+                        b = (clamped_targets - self.policy.v_min) / (delta_z + 1e-8)
+                        lower_bound = b.floor().long()
+                        upper_bound = b.ceil().long()
+                        lower_bound[(upper_bound > 0) & (lower_bound == upper_bound)] -= 1
+                        upper_bound[(lower_bound < (self.policy.num_atoms - 1)) & (lower_bound == upper_bound)] += 1
+                        target_distribution = torch.zeros_like(value_logits)
+                        upper_prob = (b - lower_bound.float())
+                        lower_prob = (upper_bound.float() - b)
+                        upper_prob = upper_prob.to(target_distribution.dtype)
+                        lower_prob = lower_prob.to(target_distribution.dtype)
+                        target_distribution.scatter_add_(1, lower_bound.unsqueeze(1), lower_prob.unsqueeze(1))
+                        target_distribution.scatter_add_(1, upper_bound.unsqueeze(1), upper_prob.unsqueeze(1))
+
+                    log_predictions = F.log_softmax(value_logits, dim=1)
+                    critic_loss = -(target_distribution * log_predictions).sum(dim=1).mean()
+
+                    # --- РАСЧЕТ ПОЛИТИЧЕСКОЙ ПОТЕРИ (POLICY LOSS) ---
+                    advantages = rollout_data.advantages
+                    if self.normalize_advantage:
+                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                    ratio = torch.exp(log_prob - rollout_data.old_log_prob)
+                    policy_loss_1 = advantages * ratio
+                    policy_loss_2 = advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                    policy_loss_ppo = -torch.min(policy_loss_1, policy_loss_2).mean()
+
+                    with torch.no_grad():
+                        weights = torch.exp(advantages / self.cql_beta)
+                        weights = torch.clamp(weights, max=100.0).detach()
+                    policy_loss_bc = (-log_prob * weights).mean()
+
+                    policy_loss = policy_loss_ppo + self.cql_alpha * policy_loss_bc
+
+                    # --- РАСЧЕТ ПОТЕРИ ЭНТРОПИИ ---
+                    if entropy is None: entropy_loss = -torch.mean(-log_prob)
+                    else: entropy_loss = -torch.mean(entropy)
+
+                    # --- РАСЧЕТ ПОТЕРИ CVaR ---
+                    pred_probs_for_cvar = F.softmax(value_logits, dim=1)
+                    predicted_cvar = calculate_cvar(pred_probs_for_cvar, self.policy.atoms, self.cvar_alpha)
+                    cvar_loss = -predicted_cvar.mean()
+
+                    # --- ИТОГОВАЯ ФУНКЦИЯ ПОТЕРЬ ---
+                    loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * critic_loss + self.cvar_weight * cvar_loss
+
+                # --- ИЗМЕНЕНИЕ: Рабочий процесс обратного прохода с GradScaler ---
+                self.policy.optimizer.zero_grad(set_to_none=True)
+
+                if self.scaler is not None:
+                    # Масштабируем loss и делаем backward pass
+                    self.scaler.scale(loss).backward()
+                    # Делаем unscale градиентов перед клиппингом
+                    self.scaler.unscale_(self.policy.optimizer)
+                    # Клиппинг градиентов
+                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    # Делаем шаг оптимизатора через scaler
+                    self.scaler.step(self.policy.optimizer)
+                    # Обновляем масштаб для следующей итерации
+                    self.scaler.update()
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
+                else: # Стандартный путь для CPU
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    self.policy.optimizer.step()
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
+
+
+                with torch.no_grad():
+                    log_ratio = log_prob - rollout_data.old_log_prob
+                    approx_kl_divs.append(torch.mean((torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy())
+
+        self._n_updates += self.n_epochs
+
+        with torch.no_grad():
+            pred_probs = F.softmax(value_logits, dim=1)
+            mean_pred_values = (pred_probs * self.policy.atoms).sum(dim=1)
+
+        y_true_np = rollout_data.returns.flatten().cpu().numpy()
+        y_pred_np = mean_pred_values.flatten().cpu().numpy()
+        explained_var = np.nan_to_num(safe_explained_variance(y_true_np, y_pred_np))
+
+        self.logger.record("train/entropy_loss", entropy_loss.item())
+        self.logger.record("train/policy_loss", policy_loss.item())
+        self.logger.record("train/critic_loss", critic_loss.item())
+        self.logger.record("train/cvar_loss", cvar_loss.item())
+        self.logger.record("train/policy_loss_ppo", policy_loss_ppo.item())
+        self.logger.record("train/policy_loss_bc", policy_loss_bc.item())
+        if len(approx_kl_divs) > 0:
+            self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/loss", loss.item())
+        self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/clip_range", clip_range)
+        if self.scaler is not None:
+            self.logger.record("train/grad_scaler_scale", self.scaler.get_scale())

@@ -1,0 +1,24 @@
+# configs/ingest.yaml
+symbols: ["BTCUSDT", "ETHUSDT"]
+market: "futures"       # "spot" или "futures"
+intervals:
+  - "1m"
+aggregate_to:
+  - "5m"
+  - "15m"
+  - "1h"
+period:
+  start: "2024-01-01"
+  end: "2024-12-31"
+
+paths:
+  klines_dir: "data/klines"
+  futures_dir: "data/futures"
+  prices_out: "data/prices.parquet"
+
+futures:
+  mark_interval: "1m"
+
+slowness:
+  api_limit: 1500
+  sleep_ms: 350
