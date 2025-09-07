@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from metrics import compute_equity_metrics, compute_trade_metrics
+from services.metrics import compute_equity_metrics, compute_trade_metrics
 
 
 def _read_any(path: str) -> pd.DataFrame:

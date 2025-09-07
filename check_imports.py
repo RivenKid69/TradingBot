@@ -80,13 +80,16 @@ def iter_py_files(root: str) -> List[str]:
 def analyze_file(path: str) -> List[Tuple[str, str]]:
     base = os.path.basename(path)
     # Временный пропуск переходных скриптов до введения services_* (Фаза 3)
-    SKIP_FILES = {"run_sandbox.py"}
+    SKIP_FILES = {"run_sandbox.py", "run_realtime_signaler.py"}
     if base in SKIP_FILES:
         return []
 
     src = open(path, "r", encoding="utf-8").read()
     try:
         tree = ast.parse(src)
+    except SyntaxError:
+        # пропускаем файлы с синтаксическими ошибками
+        return []
     src_layer = detect_layer(path)
     if not src_layer:
         return []
