@@ -54,6 +54,8 @@ class _Provider(DecisionsProvider):
         self._guards = guards
 
     def on_bar(self, bar: Bar):
+        # FeaturePipe now uses ``update`` for streaming features
+        # (``on_bar`` is kept only as a backward-compatible alias).
         feats = self._fp.update(bar)
         self._strat.on_features({**feats, "ref_price": float(bar.close)})
         dec = list(self._strat.decide({"ts_ms": int(bar.ts), "symbol": bar.symbol, "ref_price": float(bar.close), "features": feats}) or [])
