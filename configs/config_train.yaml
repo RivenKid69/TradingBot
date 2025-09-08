@@ -22,7 +22,7 @@ components:
     target: offline_feature_pipe:OfflineFeaturePipe
     params: {}
   strategy:
-    target: momentum:MomentumStrategy
+    target: strategies.momentum:MomentumStrategy
     params: {}
   risk_guards:
     target: impl_risk_basic:RiskBasicImpl

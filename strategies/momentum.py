@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any, Dict, List
 
-from strategies.base import BaseStrategy, Decision
+from .base import BaseStrategy, Decision
 
 
 class MomentumStrategy(BaseStrategy):
