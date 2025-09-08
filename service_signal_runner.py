@@ -111,22 +111,17 @@ class ServiceSignalRunner:
                 pass
 
 
-def from_config(cfg: CommonRunConfig, svc_cfg: SignalRunnerConfig | None = None) -> Iterator[Dict[str, Any]]:
-    """Build dependencies from ``cfg`` and run :class:`ServiceSignalRunner`.
+def from_config(
+    cfg: CommonRunConfig,
+    *,
+    snapshot_config_path: str | None = None,
+) -> Iterator[Dict[str, Any]]:
+    """Build dependencies from ``cfg`` and run :class:`ServiceSignalRunner`."""
 
-    Parameters
-    ----------
-    cfg:
-        Runtime configuration describing component graph.
-    svc_cfg:
-        Optional additional service configuration.
-
-    Returns
-    -------
-    Iterator[Dict[str, Any]]
-        Stream of execution reports produced by the service.
-    """
-    svc_cfg = svc_cfg or SignalRunnerConfig()
+    svc_cfg = SignalRunnerConfig(
+        snapshot_config_path=snapshot_config_path,
+        artifacts_dir=cfg.artifacts_dir,
+    )
     if svc_cfg.logs_dir is None:
         svc_cfg.logs_dir = cfg.logs_dir
     if svc_cfg.run_id is None:
