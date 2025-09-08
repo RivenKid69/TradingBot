@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 import pandas as pd
 
-from strategies.base import BaseStrategy
+from core_strategy import Strategy
 
 
 def read_df(path: str) -> pd.DataFrame:
@@ -17,10 +17,10 @@ def read_df(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def build_strategy(mod: str, cls: str, params: Dict[str, Any]) -> BaseStrategy:
+def build_strategy(mod: str, cls: str, params: Dict[str, Any]) -> Strategy:
     """Создаёт стратегию и вызывает setup."""
     m = importlib.import_module(mod)
     Cls = getattr(m, cls)
-    s: BaseStrategy = Cls()
+    s: Strategy = Cls()
     s.setup(params or {})
     return s

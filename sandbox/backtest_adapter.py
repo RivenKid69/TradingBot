@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from strategies.base import BaseStrategy
+from core_strategy import Strategy
 from sandbox.sim_adapter import SimAdapter
 from exchange.specs import load_specs, round_price_to_tick, round_qty_to_step, notional_ok
 
@@ -87,7 +87,7 @@ class BacktestAdapter:
     """
     def __init__(
         self,
-        strategy: BaseStrategy,
+        strategy: Strategy,
         sim_bridge: SimAdapter,
         dynamic_spread_config: Optional[Dict[str, Any]] = None,
         exchange_specs_path: Optional[str] = None,
