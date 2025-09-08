@@ -1,13 +1,63 @@
 mode: train
-run_id: train-run
+run_id: default-run
 logs_dir: logs
 artifacts_dir: artifacts
+
+market: spot
+spot_symbols: ["BTCUSDT"]
+futures_symbols: ["BTCUSDT"]
+
 data:
   symbols: ["BTCUSDT"]
   timeframe: "1m"
+
 model:
   algo: "ppo"
   params: {}
+
+quantizer:
+  path: "binance_filters.json"
+  strict: true
+  enforce_percent_price_by_side: true
+
+fees:
+  maker_bps: 1.0
+  taker_bps: 5.0
+  use_bnb_discount: false
+  maker_discount_mult: 1.0
+  taker_discount_mult: 1.0
+
+slippage:
+  k: 0.8
+  min_half_spread_bps: 0.0
+  default_spread_bps: 2.0
+  eps: 1e-12
+
+latency:
+  base_ms: 250
+  jitter_ms: 50
+  spike_p: 0.01
+  spike_mult: 5.0
+  timeout_ms: 2500
+  retries: 1
+  seed: 0
+
+risk:
+  enabled: true
+  max_abs_position_qty: 0.0
+  max_abs_position_notional: 0.0
+  max_order_notional: 0.0
+  max_orders_per_min: 60
+  max_orders_window_s: 60
+  daily_loss_limit: 0.0
+  pause_seconds_on_violation: 300
+  daily_reset_utc_hour: 0
+
+no_trade:
+  funding_buffer_min: 0
+  daily_utc: []
+  custom_ms: []
+
 components:
   market_data:
     target: impl_offline_data:OfflineCSVBarSource
@@ -26,4 +76,7 @@ components:
     params: {}
   risk_guards:
     target: impl_risk_basic:RiskBasicImpl
+    params: {}
+  backtest_engine:
+    target: service_backtest:ServiceBacktest
     params: {}
