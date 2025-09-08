@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, Iterable, Iterator, Optional, Sequence, Mapping, Any, Dict, List, runtime_checkable
 
+import pandas as pd
+
 from core_models import Instrument, Bar, Tick, Order, ExecReport, Position, PortfolioLimits
 
 
@@ -51,7 +53,16 @@ class TradeExecutor(Protocol):
 class FeaturePipe(Protocol):
     """
     Преобразование входящих баров/тиков в вектор признаков.
-    Возвращает словарь feature_name->value или None, если окно/прогрев ещё не готов.
+
+    Стриминговое использование:
+        последовательно вызывайте :meth:`update` для каждого нового бара и
+        получайте словарь ``feature_name -> value``.
+
+    Офлайн-использование:
+        реализации могут поддерживать методы :meth:`fit`,
+        :meth:`transform_df` и :meth:`make_targets` для работы с
+        :class:`pandas.DataFrame`.
+        Эти методы опциональны и могут отсутствовать у конкретной реализации.
     """
 
     def reset(self) -> None:
@@ -60,7 +71,19 @@ class FeaturePipe(Protocol):
     def warmup(self) -> None:
         ...
 
-    def on_bar(self, bar: Bar) -> Optional[Mapping[str, Any]]:
+    def update(self, bar: Bar) -> Mapping[str, Any]:
+        ...
+
+    # ------------------------------------------------------------------
+    # Optional offline helpers
+    # ------------------------------------------------------------------
+    def fit(self, df: pd.DataFrame) -> None:
+        ...
+
+    def transform_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        ...
+
+    def make_targets(self, df: pd.DataFrame) -> Optional[pd.Series]:
         ...
 
 
