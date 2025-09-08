@@ -62,7 +62,7 @@ class SimExecutor(TradeExecutor):
 
         # последовательное подключение компонентов к симулятору
         if quantizer is not None:
-            quantizer.attach_to(self._sim)
+            quantizer.attach_to(self._sim, strict=True, enforce_percent_price_by_side=True)
         if risk is not None:
             risk.attach_to(self._sim)
         if latency is not None:

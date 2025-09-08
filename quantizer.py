@@ -165,15 +165,17 @@ class Quantizer:
             data = json.load(f)
         return cls(data, strict=strict)
 
+    @staticmethod
+    def load_filters(path: str) -> Dict[str, Dict[str, Any]]:
+        """Загружает словарь фильтров из JSON. Возвращает {} если файл отсутствует."""
+        if not path:
+            return {}
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
+
+# для обратной совместимости
 def load_filters(path: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Загружает словарь фильтров из JSON.
-    Возвращает {} если файл отсутствует.
-    """
-    if not path:
-        return {}
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return Quantizer.load_filters(path)
