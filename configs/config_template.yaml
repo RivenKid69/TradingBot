@@ -1,14 +1,15 @@
-mode: sim
+# Base configuration template for training and simulation
+mode: train
 run_id: default-run
 logs_dir: logs
 artifacts_dir: artifacts
 
-market: spot
-spot_symbols: ["BTCUSDT"]
-futures_symbols: ["BTCUSDT"]
+market: spot  # or futures
+spot_symbols: &spot_symbols ["BTCUSDT"]
+futures_symbols: &futures_symbols ["BTCUSDT"]
 
 data:
-  symbols: ["BTCUSDT"]
+  symbols: *spot_symbols
   timeframe: "1m"
 
 model:
@@ -62,7 +63,7 @@ components:
   market_data:
     target: impl_offline_data:OfflineCSVBarSource
     params:
-      paths: ["data/sample.csv"]
+      paths: []
       timeframe: "1m"
   executor:
     target: impl_sim_executor:SimExecutor
