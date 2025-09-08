@@ -147,7 +147,7 @@ from_config(cfg_run, trainer=trainer, train_cfg=cfg)
 1700000000000,sim,BTCUSDT,BUY,LIMIT,30000,0.01,0.0005,USDT,FILLED,TAKER,c1,o1,t1,15.0,30010,1005.0,{}
 ```
 
-### `logs/sim_reports.csv`
+### `logs/report_equity_<runid>.csv`
 
 - Строки соответствуют [`EquityPoint`](core_models.py).
 - Обязательные колонки: `ts`, `run_id`, `symbol`, `fee_total`,

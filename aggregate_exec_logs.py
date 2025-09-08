@@ -253,7 +253,11 @@ def aggregate(
 def main() -> None:
     p = argparse.ArgumentParser(description="Aggregate execution logs into per-bar and per-day summaries.")
     p.add_argument("--trades", required=True, help="Path or glob to unified Exec logs (log_trades_*.csv). Legacy trades.csv is supported but deprecated.")
-    p.add_argument("--reports", default="", help="Optional path or glob to equity reports (csv/parquet)")
+    p.add_argument(
+        "--reports",
+        default="",
+        help="Optional path or glob to equity reports (report_equity_*.csv)",
+    )
     p.add_argument("--out-bars", default="logs/agg_bars.csv", help="Output CSV path for per-bar aggregation")
     p.add_argument("--out-days", default="logs/agg_days.csv", help="Output CSV path for per-day aggregation")
     p.add_argument("--bar-seconds", type=int, default=60, help="Bar length in seconds (default: 60)")
