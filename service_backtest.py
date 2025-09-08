@@ -24,7 +24,7 @@ import pandas as pd
 from execution_sim import ExecutionSimulator  # type: ignore
 from sandbox.backtest_adapter import BacktestAdapter
 from sandbox.sim_adapter import SimAdapter
-from strategies.base import BaseStrategy  # существующий контракт стратегии
+from core_strategy import Strategy
 from services.utils_config import snapshot_config  # сохранение снапшота конфига
 from core_config import CommonRunConfig
 import di_registry
@@ -57,7 +57,7 @@ class ServiceBacktest:
         def stream_ticks(self, symbols):  # pragma: no cover - простая заглушка
             return iter(())
 
-    def __init__(self, strategy: BaseStrategy, sim: ExecutionSimulator, cfg: Optional[BacktestConfig] = None) -> None:
+    def __init__(self, strategy: Strategy, sim: ExecutionSimulator, cfg: Optional[BacktestConfig] = None) -> None:
         self.strategy = strategy
         self.sim = sim
         self.cfg = cfg or BacktestConfig()
@@ -108,7 +108,7 @@ def from_config(
         Additional service configuration.
     """
     container = di_registry.build_graph(cfg.components, cfg)
-    strat: BaseStrategy = container["strategy"]
+    strat: Strategy = container["strategy"]
     sim: ExecutionSimulator = container["executor"]  # type: ignore[assignment]
     service = ServiceBacktest(strat, sim, svc_cfg)
     return service.run(df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col)
