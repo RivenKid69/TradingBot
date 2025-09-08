@@ -3,14 +3,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Protocol, Mapping
 
-from execution_sim import ExecutionSimulator, SimStepReport as ExecReport  # type: ignore
+from execution_sim import ExecutionSimulator  # type: ignore
 from action_proto import ActionProto, ActionType
-from core_strategy import Decision
-from core_models import Bar, as_dict
+from core_models import Bar, Order, Side, as_dict
 from compat_shims import sim_report_dict_to_core_exec_reports
 from event_bus import log_trade_exec as _bus_log_trade_exec
 from core_contracts import MarketDataSource
-from order_shims import OrderContext, decisions_to_orders
 
 _TF_MS = {
     "1s": 1_000,
@@ -44,7 +42,7 @@ def _timeframe_to_ms(tf: str) -> int:
     tf = _ensure_timeframe(tf)
     return _TF_MS[tf]
 
-class DecisionsProvider(Protocol):
+class OrdersProvider(Protocol):
     def on_bar(self, bar: Bar) -> Sequence[Any]: ...
 
 class SimAdapter:
@@ -74,10 +72,13 @@ class SimAdapter:
                     actions.append((ActionType.MARKET, proto))
                 continue
 
-            # high-level Decision
-            if isinstance(d, Decision):
-                proto = d.to_action_proto()
-                actions.append((proto.action_type, proto))
+            # high-level Order
+            if isinstance(d, Order):
+                vol = float(d.quantity)
+                if d.side == Side.SELL:
+                    vol = -abs(vol)
+                proto = ActionProto(action_type=ActionType.MARKET, volume_frac=vol)
+                actions.append((ActionType.MARKET, proto))
                 continue
 
             # already ActionProto
@@ -125,7 +126,7 @@ class SimAdapter:
         d["core_exec_reports"] = [as_dict(er) for er in exec_reports]
         return d
 
-    def run_events(self, provider: "DecisionsProvider") -> Iterator[Dict[str, Any]]:
+    def run_events(self, provider: "OrdersProvider") -> Iterator[Dict[str, Any]]:
         """
         Итерация по источнику баров.
         Для каждого BAR:
@@ -140,7 +141,7 @@ class SimAdapter:
             decisions: Sequence[Any] = list(provider.on_bar(bar) or [])
 
             vol_factor = float(bar.volume_base) if bar.volume_base is not None else None
-            liquidity = "NORMAL"
+            liquidity = None
 
             rep = self.step(
                 ts_ms=int(bar.ts),
@@ -152,19 +153,7 @@ class SimAdapter:
                 decisions=decisions,
             )
 
-            ctx = OrderContext(
-                ts_ms=int(bar.ts),
-                symbol=bar.symbol,
-                ref_price=float(bar.close),
-                max_position_abs_base=1.0,
-                tick_size=None,
-                price_offset_ticks=0,
-                tif="GTC",
-                client_tag=None,
-                round_qty_fn=None,
-            )
-            orders = decisions_to_orders(decisions, ctx)
             rep["symbol"] = bar.symbol
             rep["ts_ms"] = int(bar.ts)
-            rep["core_orders"] = ([as_dict(o) for o in orders] if orders else [])
+            rep["core_orders"] = ([as_dict(o) for o in decisions if isinstance(o, Order)] or [])
             yield rep
