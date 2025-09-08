@@ -4,7 +4,7 @@ symbol: "BTCUSDT"
 latency_steps: 0
 sim_config_path: "configs/config_sim.yaml"
 
-# Биржевые спецификации (tickSize/stepSize/minNotional), получаем скриптом fetch_exchange_specs.py
+# Биржевые спецификации (tickSize/stepSize/minNotional), получаем скриптом script_fetch_exchange_specs.py
 exchange_specs_path: "data/exchange_specs.json"
 
 # Гварды симуляции: блокировка сигналов
