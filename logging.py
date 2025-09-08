@@ -69,8 +69,19 @@ class LogWriter:
         for t in rep_dict.get("trades", []):
             er = trade_dict_to_core_exec_report(t, parent=rep_dict, symbol=str(symbol), run_id=self._run_id)
             row = TradeLogRow.from_exec(er).to_dict()
-            row["mark_price"] = float(getattr(report, "mark_price", 0.0))
-            row["equity"] = float(getattr(report, "equity", 0.0))
+            row["mark_price"] = float(getattr(report, "mark_price", row.get("mark_price", 0.0)))
+            row["equity"] = float(getattr(report, "equity", row.get("equity", 0.0)))
+            row["drawdown"] = (
+                float(getattr(report, "drawdown"))
+                if getattr(report, "drawdown", None) is not None
+                else (float(row["drawdown"]) if row.get("drawdown") is not None else None)
+            )
+            try:
+                row["notional"] = float(row.get("notional", 0.0))
+            except Exception:
+                row["notional"] = float(
+                    Decimal(str(row.get("price", 0.0))) * Decimal(str(row.get("quantity", 0.0)))
+                )
             self._trades_buf.append(row)
         eq = EquityPoint(
             ts=int(ts_ms),
@@ -82,10 +93,13 @@ class LogWriter:
             unrealized_pnl=Decimal(str(getattr(report, "unrealized_pnl", 0.0))),
             equity=Decimal(str(getattr(report, "equity", 0.0))),
             mark_price=Decimal(str(getattr(report, "mark_price", 0.0))),
+            notional=Decimal(str(getattr(report, "position_qty", 0.0))) * Decimal(str(getattr(report, "mark_price", 0.0))),
             drawdown=Decimal(str(getattr(report, "drawdown", 0.0))) if getattr(report, "drawdown", None) is not None else None,
             risk_paused_until_ms=int(getattr(report, "risk_paused_until_ms", 0)),
             risk_events_count=int(len(getattr(report, "risk_events", []) or [])),
             funding_events_count=int(len(getattr(report, "funding_events", []) or [])),
+            funding_cashflow=Decimal(str(getattr(report, "funding_cashflow", 0.0))) if getattr(report, "funding_cashflow", None) is not None else None,
+            cash=Decimal(str(getattr(report, "cash", 0.0))) if getattr(report, "cash", None) is not None else None,
         )
         self._reports_buf.append(eq.to_dict())
 

@@ -377,6 +377,10 @@ class TradeLogRow:
     order_id: Optional[str] = None
     trade_id: Optional[str] = None
     pnl: Optional[Decimal] = None
+    mark_price: Optional[Decimal] = None       # mark price в момент трейда
+    equity: Optional[Decimal] = None           # equity после трейда
+    notional: Optional[Decimal] = None         # absolute price*quantity
+    drawdown: Optional[Decimal] = None         # drawdown после трейда
     meta: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
@@ -397,6 +401,10 @@ class TradeLogRow:
             order_id=er.order_id,
             trade_id=er.trade_id,
             pnl=er.pnl,
+            notional=er.price * er.quantity,
+            mark_price=to_decimal_opt(er.meta.get("mark_price")),
+            equity=to_decimal_opt(er.meta.get("equity")),
+            drawdown=to_decimal_opt(er.meta.get("drawdown")),
             meta=dict(er.meta),
         )
 
@@ -418,10 +426,12 @@ class EquityPoint:
     unrealized_pnl: Decimal
     equity: Decimal
     mark_price: Decimal
+    notional: Optional[Decimal] = None               # текущий ноционал позиции (qty*mark_price)
     drawdown: Optional[Decimal] = None
     risk_paused_until_ms: int = 0
     risk_events_count: int = 0
     funding_events_count: int = 0
+    funding_cashflow: Optional[Decimal] = None
     cash: Optional[Decimal] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 
