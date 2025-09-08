@@ -98,24 +98,25 @@ def build_all_pipeline(
         st.error(f"build_training_table завершился с кодом {rc}")
         return
 
-    rc = run_cmd([py, "scripts/run_sandbox.py", "--config", cfg_sandbox],
-                 log_path=os.path.join(logs_dir, "sandbox.log"))
-    if rc != 0:
-        st.error(f"run_sandbox завершился с кодом {rc}")
+    try:
+        run_backtest_from_yaml(cfg_sandbox, reports_path, logs_dir)
+    except Exception as e:
+        st.error(f"Backtest failed: {e}")
         return
 
-    rc = run_cmd([
-        py, "scripts/evaluate_performance.py",
-        "--trades", trades_path,
-        "--reports", reports_path,
-        "--out-json", metrics_json,
-        "--out-md", out_md,
-        "--equity-png", equity_png,
-        "--capital-base", "10000",
-        "--rf-annual", "0.00",
-    ], log_path=os.path.join(logs_dir, "evaluate.log"))
-    if rc != 0:
-        st.error(f"evaluate_performance завершился с кодом {rc}")
+    eval_cfg = EvalConfig(
+        trades_path=trades_path,
+        reports_path=reports_path,
+        out_json=metrics_json,
+        out_md=out_md,
+        equity_png=equity_png,
+        capital_base=10000.0,
+        rf_annual=0.0,
+    )
+    try:
+        ServiceEval(eval_cfg).run()
+    except Exception as e:
+        st.error(f"Evaluation failed: {e}")
         return
 
     st.success("Полный прогон: метрики готовы")
@@ -126,7 +127,7 @@ def build_all_pipeline(
         else:
             try:
                 pid = start_background(
-                    [py, "scripts/run_realtime_signaler.py", "--config", cfg_realtime],
+                    [py, "script_live.py", "--config", cfg_realtime],
                     pid_file=realtime_pid,
                     log_file=realtime_log,
                 )
@@ -137,7 +138,7 @@ def build_all_pipeline(
 
 # --------------------------- Service wrappers ---------------------------
 
-def run_backtest_from_yaml(cfg_path: str, default_out: str) -> str:
+def run_backtest_from_yaml(cfg_path: str, default_out: str, logs_dir: str) -> str:
     cfg: SandboxConfig = load_sandbox_config(cfg_path)
     sim_cfg = load_config(cfg.sim_config_path)
 
@@ -147,6 +148,7 @@ def run_backtest_from_yaml(cfg_path: str, default_out: str) -> str:
         guards_config=cfg.sim_guards,
         signal_cooldown_s=int(cfg.min_signal_gap_s),
         no_trade_config=cfg.no_trade,
+        logs_dir=logs_dir,
     )
 
     data_cfg = cfg.data
@@ -338,7 +340,7 @@ with tabs[4]:
     default_rep = os.path.join(logs_dir, "sandbox_reports.csv")
     if st.button("Запустить бэктест", type="primary"):
         try:
-            out = run_backtest_from_yaml(cfg_sandbox, default_rep)
+            out = run_backtest_from_yaml(cfg_sandbox, default_rep, logs_dir)
             st.success(f"Бэктест завершён, отчёт: {out}")
         except Exception as e:
             st.error(str(e))
@@ -357,15 +359,16 @@ with tabs[5]:
     artifacts_dir_eval = st.text_input("Каталог артефактов", value=os.path.join(logs_dir, "eval"))
     if st.button("Посчитать метрики", type="primary"):
         cfg_eval = EvalConfig(
-            trades_csv=trades_path,
-            equity_csv=reports_path,
+            trades_path=trades_path,
+            reports_path=reports_path,
             artifacts_dir=artifacts_dir_eval,
+            out_json=metrics_json,
+            out_md=os.path.join(artifacts_dir_eval, "metrics.md"),
+            equity_png=os.path.join(artifacts_dir_eval, "equity.png"),
         )
         try:
-            svc = ServiceEval(cfg_eval)
-            res = svc.run()
-            pd.Series(res["metrics"]).to_json(metrics_json, force_ascii=False)
-            st.success(f"Метрики готовы, отчёт: {res['report_path']}")
+            ServiceEval(cfg_eval).run()
+            st.success("Метрики готовы")
         except Exception as e:
             st.error(str(e))
 
@@ -413,7 +416,7 @@ with tabs[6]:
         if st.button("Старт", disabled=running, type="primary"):
             try:
                 pid = start_background(
-                    [sys.executable, "scripts/run_realtime_signaler.py", "--config", cfg_realtime],
+                    [sys.executable, "script_live.py", "--config", cfg_realtime],
                     pid_file=realtime_pid,
                     log_file=realtime_log,
                 )
@@ -990,7 +993,7 @@ with tabs[12]:
     st.subheader("Sim Settings — тонкая настройка симулятора (configs/sim.yaml)")
 
     st.caption("Редактируйте параметры симулятора через форму. Неизвестные ключи в sim.yaml будут сохранены без изменений. "
-               "Это влияет на бэктест песочницы (run_sandbox.py).")
+               "Это влияет на бэктест (script_backtest.py).")
 
     # читаем текущий sim.yaml
     current = {}
