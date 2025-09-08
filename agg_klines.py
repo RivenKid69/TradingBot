@@ -50,6 +50,22 @@ def _agg(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     for c in ["open", "high", "low", "close", "volume", "taker_buy_base", "taker_buy_quote"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
     out["number_of_trades"] = pd.to_numeric(out["number_of_trades"], errors="coerce").astype("Int64")
+
+    # валидации: ts_ms кратно step и нет пропусков/дубликатов
+    if ((out["ts_ms"] % step) != 0).any():
+        bad = out.loc[(out["ts_ms"] % step) != 0, ["symbol", "ts_ms"]]
+        raise ValueError(f"ts_ms not aligned to {step}: {bad.to_dict(orient='records')[:5]}")
+
+    problems: List[str] = []
+    for sym, g in out.groupby("symbol"):
+        ts = g["ts_ms"].tolist()
+        for prev, curr in zip(ts, ts[1:]):
+            delta = int(curr) - int(prev)
+            if delta != step:
+                kind = "dup" if delta == 0 else "gap"
+                problems.append(f"{sym}: {prev}->{curr} (Δ={delta}, {kind})")
+    if problems:
+        raise ValueError("ts_ms gaps/duplicates detected: " + "; ".join(problems))
     return out
 
 
