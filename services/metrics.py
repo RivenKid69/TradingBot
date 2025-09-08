@@ -95,10 +95,20 @@ def turnover_from_trades(trades: pd.DataFrame, capital_base: float) -> float:
     """Estimate portfolio turnover from trades."""
     if trades is None or trades.empty or capital_base <= 0:
         return float("nan")
-    notional = trades["notional"].astype(float) if "notional" in trades.columns else None
-    if notional is None:
-        return float("nan")
-    gross = float(notional.abs().sum())
+    if "notional" in trades.columns:
+        notional = trades["notional"].astype(float)
+    else:
+        price_col = "price" if "price" in trades.columns else None
+        qty_col = None
+        if "quantity" in trades.columns:
+            qty_col = "quantity"
+        elif "qty" in trades.columns:
+            qty_col = "qty"
+        if price_col and qty_col:
+            notional = trades[price_col].astype(float) * trades[qty_col].astype(float)
+        else:
+            return float("nan")
+    gross = float(pd.Series(notional).abs().sum())
     return float(gross / float(capital_base))
 
 
@@ -314,7 +324,14 @@ def compute_equity_metrics(
     sharpe = _sharpe(returns, rf_per_step=rf_per_step, ann_factor=ann_factor)
     sortino = _sortino(returns, rf_per_step=rf_per_step, ann_factor=ann_factor)
     cvar = _cvar(returns)
-    dd_series, max_dd, dd_start, dd_end = _drawdown(eq)
+    if "drawdown" in r.columns:
+        dd_series = r["drawdown"].astype(float)
+        max_dd = float(dd_series.min()) if len(dd_series) else 0.0
+        dd_end = int(dd_series.idxmin()) if len(dd_series) else 0
+        sub = eq.loc[:dd_end]
+        dd_start = int(sub.idxmax()) if not sub.empty else 0
+    else:
+        dd_series, max_dd, dd_start, dd_end = _drawdown(eq)
 
     # Calmar по годовому PnL на capital_base делённому на |maxDD|
     if capital_base > 0 and math.isfinite(max_dd) and max_dd < 0:
