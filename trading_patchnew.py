@@ -20,6 +20,18 @@ import event_bus
 from infra.event_bus import publish, Topics
 from infra.time_provider import TimeProvider, RealTimeProvider
 
+try:  # existing dynamic-spread config (pydantic model)
+    from trainingtcost import DynSpreadCfg
+except Exception:  # pragma: no cover - fallback to simple dataclass
+    @dataclass
+    class DynSpreadCfg:
+        base_bps: float = 3.0
+        alpha_vol: float = 0.5
+        beta_illiquidity: float = 1.0
+        liq_ref: float = 1000.0
+        min_bps: float = 1.0
+        max_bps: float = 25.0
+
 # --- auto‑import compiled C++ simulator ---
 try:
     from fast_market import MarketSimulatorWrapper, CyMicrostructureGenerator
@@ -68,6 +80,34 @@ except Exception:
     # PATCH‑ID:P15_TENV_enum
 from action_proto import ActionProto, ActionType
 from mediator import Mediator
+
+
+def _dynamic_spread_bps(vol_factor: float, liquidity: float, cfg: DynSpreadCfg) -> float:
+    """Compute dynamic spread in basis points.
+
+    Parameters
+    ----------
+    vol_factor : float
+        Volatility factor, dimensionless (e.g. ATR percentage).
+    liquidity : float
+        Rolling liquidity measure.
+    cfg : DynSpreadCfg
+        Configuration for dynamic spread parameters.
+
+    Returns
+    -------
+    float
+        Clamped spread in basis points.
+    """
+    ratio = 0.0
+    if getattr(cfg, "liq_ref", 0) > 0 and liquidity == liquidity:  # NaN check
+        ratio = max(0.0, (float(cfg.liq_ref) - float(liquidity)) / float(cfg.liq_ref))
+    spread_bps = (
+        float(cfg.base_bps)
+        + float(cfg.alpha_vol) * float(vol_factor) * 10000.0
+        + float(cfg.beta_illiquidity) * ratio * float(cfg.base_bps)
+    )
+    return float(max(float(cfg.min_bps), min(float(cfg.max_bps), spread_bps)))
 
 
 class _AgentOrders(set):
@@ -175,13 +215,8 @@ def __init__(
         self.df["atr_pct"] = 0.0
 
     # dynamic spread config and rolling liquidity
-    dyn_cfg = dict(kwargs.get("dynamic_spread", {}) or {})
-    self._dyn_base_bps = float(dyn_cfg.get("base_bps", 3.0))
-    self._dyn_alpha_vol = float(dyn_cfg.get("alpha_vol", 0.5))
-    self._dyn_beta_illq = float(dyn_cfg.get("beta_illiquidity", 1.0))
-    self._dyn_liq_ref = float(dyn_cfg.get("liq_ref", 1000.0))
-    self._dyn_min_bps = float(dyn_cfg.get("min_bps", 1.0))
-    self._dyn_max_bps = float(dyn_cfg.get("max_bps", 25.0))
+    dyn_cfg_dict = dict(kwargs.get("dynamic_spread", {}) or {})
+    self._dyn_cfg = DynSpreadCfg(**dyn_cfg_dict)
 
     self._liq_col = next(
         (c for c in ["quote_asset_volume", "quote_volume", "volume"] if c in self.df.columns),
@@ -330,15 +365,6 @@ def _to_proto(self, action) -> ActionProto:
     raise TypeError("Unsupported action type")
 
     
-def _dyn_spread_bps(self, vol_factor: float, liquidity: float) -> float:
-    base = self._dyn_base_bps
-    vol_term = self._dyn_alpha_vol * float(vol_factor) * 10000.0
-    illq = 0.0
-    if self._dyn_liq_ref > 0 and liquidity == liquidity:
-        ratio = max(0.0, (self._dyn_liq_ref - float(liquidity)) / self._dyn_liq_ref)
-        illq = self._dyn_beta_illq * ratio * base
-    spread = base + vol_term + illq
-    return float(max(self._dyn_min_bps, min(self._dyn_max_bps, spread)))
 
 # ------------------------------------------------ Gym API
 def reset(self, *args, **kwargs):
@@ -386,7 +412,7 @@ def step(self, action):
     if bid_col and ask_col:
         spread_bps = (ask - bid) / mid * 10000 if mid else 0.0
     else:
-        spread_bps = self._dyn_spread_bps(vol_factor=vol_factor, liquidity=liquidity)
+        spread_bps = _dynamic_spread_bps(vol_factor=vol_factor, liquidity=liquidity, cfg=self._dyn_cfg)
         half = mid * spread_bps / 20000.0
         bid = mid - half
         ask = mid + half
