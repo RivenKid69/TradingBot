@@ -158,6 +158,9 @@ class SimStepReport:
     mark_price: float = 0.0
     risk_events: List[RiskEvent] = field(default_factory=list)  # type: ignore
     risk_paused_until_ms: int = 0
+    spread_bps: Optional[float] = None
+    vol_factor: Optional[float] = None
+    liquidity: Optional[float] = None
 
     def to_dict(self) -> dict:
         return {
@@ -175,7 +178,14 @@ class SimStepReport:
             "mark_price": float(self.mark_price),
             "risk_events": [re.__dict__ for re in self.risk_events],
             "risk_paused_until_ms": int(self.risk_paused_until_ms),
+            "spread_bps": float(self.spread_bps) if self.spread_bps is not None else None,
+            "vol_factor": float(self.vol_factor) if self.vol_factor is not None else None,
+            "liquidity": float(self.liquidity) if self.liquidity is not None else None,
         }
+
+
+# Alias for compatibility with older interfaces
+ExecReport = SimStepReport
 
 
 @dataclass
@@ -700,20 +710,20 @@ class ExecutionSimulator:
             else:
                 self.position_qty -= float(qty)
 
-                    trades.append(ExecTrade(
-                        ts=ts,
-                        side=side,
-                        price=filled_price,
-                        qty=qty,
-                        notional=filled_price * qty,
-                        liquidity="taker",
-                        proto_type=atype,
-                        client_order_id=p.client_order_id,
-                        fee=float(fee),
-                        slippage_bps=float(slip_bps),
-                        spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
-                    ))
-                continue
+            trades.append(ExecTrade(
+                ts=ts,
+                side=side,
+                price=filled_price,
+                qty=qty,
+                notional=filled_price * qty,
+                liquidity="taker",
+                proto_type=atype,
+                client_order_id=p.client_order_id,
+                fee=float(fee),
+                slippage_bps=float(slip_bps),
+                spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
+            ))
+            continue
 
             # LIMIT
             if atype == ActionType.LIMIT:
@@ -796,19 +806,22 @@ class ExecutionSimulator:
             equity=float(eq),
             mark_price=float(mark_p if mark_p is not None else 0.0),
             risk_events=risk_events_all,  # type: ignore
-            risk_paused_until_ms=int(risk_pause_until_ms),
+            risk_paused_until_ms=int(risk_paused_until),
+            spread_bps=self._last_spread_bps,
+            vol_factor=self._last_vol_factor,
+            liquidity=self._last_liquidity,
         )
 
 # логирование
-try:
-    if self._logger is not None:
-        self._logger.append(report, symbol=self.symbol, ts_ms=ts)
-        self._step_counter += 1
-except Exception:
-    # не ломаем симуляцию из-за проблем с логом
-    pass
+        try:
+            if self._logger is not None:
+                self._logger.append(report, symbol=self.symbol, ts_ms=ts)
+                self._step_counter += 1
+        except Exception:
+            # не ломаем симуляцию из-за проблем с логом
+            pass
 
-return report
+        return report
 
     # Совместимость с интерфейсами некоторых обёрток
     def run_step(self, *,
@@ -1022,4 +1035,7 @@ return report
             mark_price=float(mark_p if mark_p is not None else 0.0),
             risk_events=risk_events_all,  # type: ignore
             risk_paused_until_ms=int(risk_paused_until),
+            spread_bps=self._last_spread_bps,
+            vol_factor=self._last_vol_factor,
+            liquidity=self._last_liquidity,
         )

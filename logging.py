@@ -101,7 +101,11 @@ class LogWriter:
             funding_cashflow=Decimal(str(getattr(report, "funding_cashflow", 0.0))) if getattr(report, "funding_cashflow", None) is not None else None,
             cash=Decimal(str(getattr(report, "cash", 0.0))) if getattr(report, "cash", None) is not None else None,
         )
-        self._reports_buf.append(eq.to_dict())
+        eq_dict = eq.to_dict()
+        eq_dict["spread_bps"] = getattr(report, "spread_bps", None)
+        eq_dict["vol_factor"] = getattr(report, "vol_factor", None)
+        eq_dict["liquidity"] = getattr(report, "liquidity", None)
+        self._reports_buf.append(eq_dict)
 
         # авто-сброс
         if (len(self._trades_buf) + len(self._reports_buf)) >= max(1, int(self.cfg.flush_every)):
