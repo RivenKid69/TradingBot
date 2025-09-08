@@ -112,6 +112,42 @@ trainer = ...
 cfg = TrainConfig(input_path="data/train.parquet")
 from_config(cfg_run, trainer=trainer, train_cfg=cfg)
 ```
+## Логи и отчёты
+
+Сервисы автоматически пишут журналы сделок и отчёты по эквити через
+класс `LogWriter` из модуля [`logging.py`](logging.py). По умолчанию
+создаются два файла.
+
+### `logs/log_trades_<runid>.csv`
+
+- Каждая строка соответствует датаклассу
+  [`TradeLogRow`](core_models.py).
+- Обязательные колонки: `ts`, `run_id`, `symbol`, `side`, `order_type`,
+  `price`, `quantity`, `fee`, `fee_asset`, `exec_status`, `liquidity`,
+  `client_order_id`, `order_id`, `trade_id`, `pnl`, а также добавленные
+  `mark_price` и `equity`.
+- Пример строки:
+
+```csv
+1700000000000,sim,BTCUSDT,BUY,LIMIT,30000,0.01,0.0005,USDT,FILLED,TAKER,c1,o1,t1,15.0,30010,1005.0,{}
+```
+
+### `logs/sim_reports.csv`
+
+- Строки соответствуют [`EquityPoint`](core_models.py).
+- Обязательные колонки: `ts`, `run_id`, `symbol`, `fee_total`,
+  `position_qty`, `realized_pnl`, `unrealized_pnl`, `equity`,
+  `mark_price`, `drawdown`, `risk_paused_until_ms`, `risk_events_count`,
+  `funding_events_count`, `cash`, `meta`.
+- Пример строки:
+
+```csv
+1700000000000,sim,BTCUSDT,1.2,0.05,100.0,5.0,105.0,30050,-0.02,0,0,0,,{}
+```
+
+Логи формируются и обновляются автоматически во всех сервисах
+(`service_*`, `execution_sim`) и могут сохраняться как в CSV, так и в
+формате Parquet.
 =======
 ## Проверка паритета фич
 
