@@ -1,26 +1,32 @@
-# scripts/aggregate_exec_logs.py
+"""Aggregate execution logs into per-bar and per-day summaries.
+
+Example
+-------
+```
+python aggregate_exec_logs.py \
+    --trades 'logs/log_trades_*.csv' \
+    --reports 'logs/report_equity_*.csv' \
+    --out-bars logs/agg_bars.csv \
+    --out-days logs/agg_days.csv \
+    --equity-png logs/equity.png \
+    --metrics-md logs/metrics.md
+```
+"""
+
 from __future__ import annotations
 
 import argparse
-import glob
 import math
 import os
-from typing import List, Tuple
+from typing import Tuple
 
 import pandas as pd
 
-
-def _read_any(path: str) -> pd.DataFrame:
-    """Reads CSV/Parquet or glob into a single DataFrame."""
-    if "*" in path or "?" in path or ("[" in path and "]" in path):
-        parts: List[str] = glob.glob(path)
-        dfs = [ _read_any(p) for p in parts ]
-        if not dfs:
-            return pd.DataFrame()
-        return pd.concat(dfs, ignore_index=True)
-    if path.lower().endswith(".parquet"):
-        return pd.read_parquet(path)
-    return pd.read_csv(path)
+from services.metrics import (
+    calculate_metrics,
+    plot_equity_curve,
+    read_any,
+)
 
 
 def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
@@ -87,13 +93,53 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
     return df[["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"]]
 
 
+def _normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize equity reports to at least ts_ms and equity columns."""
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=["ts_ms", "symbol", "equity", "fee_total", "funding_cashflow"]
+        )
+
+    r = df.copy()
+    cols = set(r.columns)
+
+    if "ts_ms" not in cols:
+        for candidate in ["ts", "timestamp", "time"]:
+            if candidate in r.columns:
+                r = r.rename(columns={candidate: "ts_ms"})
+                break
+
+    if "symbol" not in r.columns:
+        r["symbol"] = "UNKNOWN"
+
+    for c in ["equity", "fee_total", "funding_cashflow"]:
+        if c not in r.columns:
+            r[c] = pd.NA
+
+    r["ts_ms"] = pd.to_numeric(r["ts_ms"], errors="coerce").astype("Int64")
+    r["equity"] = pd.to_numeric(r["equity"], errors="coerce")
+    r["fee_total"] = pd.to_numeric(r["fee_total"], errors="coerce")
+    r["funding_cashflow"] = pd.to_numeric(r["funding_cashflow"], errors="coerce")
+
+    return r[["ts_ms", "symbol", "equity", "fee_total", "funding_cashflow"]]
+
+
 def _bucket_ts_ms(ts_ms: pd.Series, *, bar_seconds: int) -> pd.Series:
     """Floors ms timestamp to bar_seconds buckets."""
     step = int(bar_seconds) * 1000
     return (pd.to_numeric(ts_ms, errors="coerce").astype("Int64") // step) * step
 
 
-def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str, bar_seconds: int = 60) -> Tuple[str, str]:
+def aggregate(
+    trades_path: str,
+    reports_path: str,
+    out_bars: str,
+    out_days: str,
+    *,
+    bar_seconds: int = 60,
+    equity_png: str = "",
+    metrics_md: str = "",
+) -> Tuple[str, str]:
     """
     Aggregates trade logs into per-bar and per-day summaries.
     - trades_path: path or glob to log_trades_*.csv (unified) or legacy trades.csv
@@ -101,7 +147,7 @@ def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str,
     - out_bars, out_days: output CSV paths
     Returns (out_bars, out_days).
     """
-    trades_raw = _read_any(trades_path)
+    trades_raw = read_any(trades_path)
     trades = _normalize_trades(trades_raw)
 
     if trades.empty:
@@ -114,7 +160,7 @@ def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str,
     trades["price"] = pd.to_numeric(trades["price"], errors="coerce")
     trades["quantity"] = pd.to_numeric(trades["quantity"], errors="coerce")
     trades["ts"] = pd.to_numeric(trades["ts"], errors="coerce").astype("Int64")
-    trades["side_sign"] = trades["side"].astype(str).map(lambda s: 1 if s.upper()=="BUY" else -1)
+    trades["side_sign"] = trades["side"].astype(str).map(lambda s: 1 if s.upper() == "BUY" else -1)
 
     # Per-bar aggregation
     trades["ts_bucket"] = _bucket_ts_ms(trades["ts"], bar_seconds=bar_seconds)
@@ -138,7 +184,7 @@ def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str,
         })
 
     bars = g.apply(_agg)
-    bars = bars.rename(columns={"ts_bucket":"ts"})
+    bars = bars.rename(columns={"ts_bucket": "ts"})
     bars["ts"] = bars["ts"].astype("Int64")
 
     # Per-day aggregation (UTC days by ms timestamp)
@@ -156,6 +202,47 @@ def aggregate(trades_path: str, reports_path: str, out_bars: str, out_days: str,
     days = days.rename(columns={"day":"ts"})
     days["ts"] = days["ts"].astype("Int64")
 
+    reports = _normalize_reports(read_any(reports_path)) if reports_path else _normalize_reports(pd.DataFrame())
+    if not reports.empty:
+        rep_sorted = reports.sort_values(["symbol", "ts_ms"])
+        bars = pd.merge_asof(
+            bars.sort_values(["symbol", "ts"]),
+            rep_sorted,
+            left_on="ts",
+            right_on="ts_ms",
+            by="symbol",
+            direction="backward",
+        ).drop(columns=["ts_ms"])
+        days = pd.merge_asof(
+            days.sort_values(["symbol", "ts"]),
+            rep_sorted,
+            left_on="ts",
+            right_on="ts_ms",
+            by="symbol",
+            direction="backward",
+        ).drop(columns=["ts_ms"])
+        if equity_png:
+            try:
+                plot_equity_curve(reports, equity_png)
+            except Exception:
+                pass
+    else:
+        if equity_png:
+            os.makedirs(os.path.dirname(equity_png) or ".", exist_ok=True)
+
+    if metrics_md:
+        trades_for_metrics = trades.rename(columns={"quantity": "qty"})
+        metrics = calculate_metrics(trades_for_metrics, reports)
+        os.makedirs(os.path.dirname(metrics_md) or ".", exist_ok=True)
+        with open(metrics_md, "w", encoding="utf-8") as f:
+            f.write("# Performance Metrics\n\n")
+            f.write("## Equity\n")
+            for k, v in metrics["equity"].items():
+                f.write(f"- **{k}**: {v}\n")
+            f.write("\n## Trades\n")
+            for k, v in metrics["trades"].items():
+                f.write(f"- **{k}**: {v}\n")
+
     os.makedirs(os.path.dirname(out_bars) or ".", exist_ok=True)
     bars.to_csv(out_bars, index=False)
     os.makedirs(os.path.dirname(out_days) or ".", exist_ok=True)
@@ -170,9 +257,19 @@ def main() -> None:
     p.add_argument("--out-bars", default="logs/agg_bars.csv", help="Output CSV path for per-bar aggregation")
     p.add_argument("--out-days", default="logs/agg_days.csv", help="Output CSV path for per-day aggregation")
     p.add_argument("--bar-seconds", type=int, default=60, help="Bar length in seconds (default: 60)")
+    p.add_argument("--equity-png", default="", help="Optional path to save equity curve PNG")
+    p.add_argument("--metrics-md", default="", help="Optional path to save metrics summary in Markdown")
     args = p.parse_args()
 
-    aggregate(args.trades, args.reports, args.out_bars, args.out_days, bar_seconds=int(args.bar_seconds))
+    aggregate(
+        args.trades,
+        args.reports,
+        args.out_bars,
+        args.out_days,
+        bar_seconds=int(args.bar_seconds),
+        equity_png=args.equity_png,
+        metrics_md=args.metrics_md,
+    )
 
 
 if __name__ == "__main__":
