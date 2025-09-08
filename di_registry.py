@@ -99,13 +99,12 @@ def build_graph(components: Components, run_config: Optional[CommonRunConfig] = 
     build_component("feature_pipe", components.feature_pipe, container)
     build_component("policy", components.policy, container)
     build_component("risk_guards", components.risk_guards, container)
+    # пробрасываем конфиг до сборки executor, чтобы он мог получить run_config
+    if run_config is not None:
+        container["run_config"] = run_config
     build_component("executor", components.executor, container)
     if components.backtest_engine:
         build_component("backtest_engine", components.backtest_engine, container)
-
-    # пробрасываем конфиг как зависимость, если кому-то понадобится
-    if run_config is not None:
-        container["run_config"] = run_config
     global _GLOBAL_CONTAINER
     _GLOBAL_CONTAINER = container
     return container

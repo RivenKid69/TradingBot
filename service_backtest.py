@@ -34,8 +34,8 @@ import di_registry
 
 @dataclass
 class BacktestConfig:
-    symbol: str = "BTCUSDT"
-    timeframe: str = "1m"
+    symbol: str
+    timeframe: str
     exchange_specs_path: Optional[str] = None
     dynamic_spread_config: Optional[Dict[str, Any]] = None
     guards_config: Optional[Dict[str, Any]] = None
@@ -61,10 +61,10 @@ class ServiceBacktest:
         def stream_ticks(self, symbols):  # pragma: no cover - простая заглушка
             return iter(())
 
-    def __init__(self, policy: SignalPolicy, sim: ExecutionSimulator, cfg: Optional[BacktestConfig] = None) -> None:
+    def __init__(self, policy: SignalPolicy, sim: ExecutionSimulator, cfg: BacktestConfig) -> None:
         self.policy = policy
         self.sim = sim
-        self.cfg = cfg or BacktestConfig()
+        self.cfg = cfg
 
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
@@ -117,15 +117,25 @@ def from_config(
 
     params = cfg.components.backtest_engine.params or {}
     bt_kwargs = {k: v for k, v in params.items() if k in BacktestConfig.__annotations__}
+
+    symbol = bt_kwargs.get("symbol") or (cfg.symbols[0] if getattr(cfg, "symbols", []) else None)
+    timeframe = bt_kwargs.get("timeframe") or getattr(getattr(cfg, "data", None), "timeframe", None)
+    if not symbol or not timeframe:
+        raise ValueError("Config must provide symbols and data.timeframe")
+
     svc_cfg = BacktestConfig(
-        **bt_kwargs,
+        symbol=symbol,
+        timeframe=timeframe,
+        exchange_specs_path=bt_kwargs.get("exchange_specs_path"),
+        dynamic_spread_config=bt_kwargs.get("dynamic_spread_config"),
+        guards_config=bt_kwargs.get("guards_config"),
+        signal_cooldown_s=bt_kwargs.get("signal_cooldown_s", 0),
+        no_trade_config=bt_kwargs.get("no_trade_config") or getattr(cfg, "no_trade", None),
         snapshot_config_path=snapshot_config_path,
         artifacts_dir=cfg.artifacts_dir,
+        logs_dir=bt_kwargs.get("logs_dir") or cfg.logs_dir,
+        run_id=bt_kwargs.get("run_id") or cfg.run_id,
     )
-    if svc_cfg.logs_dir is None:
-        svc_cfg.logs_dir = cfg.logs_dir
-    if svc_cfg.run_id is None:
-        svc_cfg.run_id = cfg.run_id
 
     data_path = getattr(cfg.data, "prices_path", None)
     if data_path is None:

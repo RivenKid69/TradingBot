@@ -143,6 +143,8 @@ def run_backtest_from_yaml(cfg_path: str, default_out: str, logs_dir: str) -> st
     sim_cfg = load_config(cfg.sim_config_path)
 
     sb_cfg = BacktestConfig(
+        symbol=sim_cfg.symbols[0] if getattr(sim_cfg, "symbols", []) else "BTCUSDT",
+        timeframe=getattr(sim_cfg.data, "timeframe", "1m"),
         dynamic_spread_config=cfg.dynamic_spread,
         exchange_specs_path=cfg.exchange_specs_path,
         guards_config=cfg.sim_guards,
