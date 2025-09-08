@@ -1,6 +1,7 @@
 # sandbox/sim_adapter.py
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Sequence, Tuple, Iterator, Protocol
 
 from execution_sim import ExecutionSimulator  # type: ignore
@@ -115,18 +116,36 @@ class SimAdapter:
           - выполняем шаг симуляции через self.step(...)
           - возвращаем отчёт симулятора, расширенный служебными полями
         """
+        prev_close: Optional[float] = None
         for bar in self.source.stream_bars([self.symbol], self.interval_ms):
             if bar.symbol != self.symbol:
                 continue
 
             orders: Sequence[Order] = list(provider.on_bar(bar) or [])
 
-            vol_factor = float(bar.volume_base) if bar.volume_base is not None else None
-            liquidity = None
+            high = float(bar.high)
+            low = float(bar.low)
+            close = float(bar.close)
+
+            vol_factor: Optional[float] = None
+            if prev_close is not None and prev_close > 0.0:
+                tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+                atr_pct = tr / prev_close if prev_close != 0.0 else None
+                log_ret = abs(math.log(close / prev_close)) if close > 0.0 else None
+                if atr_pct is not None and log_ret is not None:
+                    vol_factor = max(atr_pct, log_ret)
+                else:
+                    vol_factor = atr_pct if atr_pct is not None else log_ret
+
+            liquidity: Optional[float] = None
+            if bar.volume_base is not None:
+                liquidity = float(bar.volume_base)
+            elif bar.trades is not None:
+                liquidity = float(bar.trades)
 
             rep = self.step(
                 ts_ms=int(bar.ts),
-                ref_price=float(bar.close),
+                ref_price=close,
                 bid=None,
                 ask=None,
                 vol_factor=vol_factor,
@@ -137,4 +156,6 @@ class SimAdapter:
             rep["symbol"] = bar.symbol
             rep["ts_ms"] = int(bar.ts)
             rep["core_orders"] = ([as_dict(o) for o in orders] or [])
+
+            prev_close = close
             yield rep
