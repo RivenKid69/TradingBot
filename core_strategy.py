@@ -1,6 +1,7 @@
 """Core strategy contract and protocol."""
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol, Sequence, runtime_checkable
 
@@ -9,7 +10,11 @@ from action_proto import ActionProto, ActionType
 
 @runtime_checkable
 class Strategy(Protocol):
-    """Trading strategy interface."""
+    """Trading strategy interface.
+
+    Deprecated:
+        Use :class:`SignalPolicy` instead.
+    """
 
     def setup(self, config: Dict[str, Any]) -> None:
         """Initialize strategy with configuration."""
@@ -27,6 +32,9 @@ class Strategy(Protocol):
 @dataclass(frozen=True)
 class Decision:
     """High level strategy decision.
+
+    Deprecated:
+        Use :class:`OrderIntent` instead.
 
     Parameters
     ----------
@@ -68,3 +76,9 @@ class Decision:
         )
 
 __all__ = ["Strategy", "Decision"]
+
+warnings.warn(
+    "core_strategy.Strategy and .Decision are deprecated; use SignalPolicy and OrderIntent instead",
+    DeprecationWarning,
+    stacklevel=2,
+)

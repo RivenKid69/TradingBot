@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 from core_contracts import PolicyCtx, SignalPolicy
 from core_models import Order, OrderType, Side, TimeInForce, to_decimal
-from core_strategy import Decision, Strategy
+from core_strategy import Strategy
 
 
 class BaseStrategy(Strategy):
@@ -118,4 +118,4 @@ class BaseSignalPolicy(SignalPolicy):
         )
 
 
-__all__ = ["BaseStrategy", "Decision", "BaseSignalPolicy"]
+__all__ = ["BaseStrategy", "BaseSignalPolicy"]
