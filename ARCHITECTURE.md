@@ -109,6 +109,19 @@ python script_compare_runs.py run1/ run2/metrics.json --csv summary.csv
 `Hit-rate`, `CVaR` и других найденных показателей. При указании флага
 `--csv` таблица сохраняется в указанный файл.
 
+## CLI‑точки входа
+
+Все консольные скрипты используют DI‑контейнер и не содержат бизнес‑логики. Они
+описывают аргументы командной строки и делегируют работу соответствующим
+сервисам:
+
+- `script_train.py` — запускает обучение через `ServiceTrain`.
+- `script_backtest.py` — проводит бэктест через `ServiceBacktest`.
+- `script_eval.py` — рассчитывает метрики через `ServiceEval`.
+- `script_live.py` — исполняет стратегию на живых данных через `ServiceSignalRunner`.
+- `script_calibrate_tcost.py` — калибрует параметры T‑cost через `ServiceCalibrateTCost`.
+- `script_calibrate_slippage.py` — калибрует проскальзывание через `ServiceCalibrateSlippage`.
+
 ## ServiceTrain
 
 `ServiceTrain` подготавливает датасет и запускает обучение модели.  Он
