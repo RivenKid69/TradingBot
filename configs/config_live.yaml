@@ -18,7 +18,7 @@ components:
     params:
       symbol: "BTCUSDT"
   feature_pipe:
-    target: offline_feature_pipe:OfflineFeaturePipe
+    target: feature_pipe:FeaturePipe
     params: {}
   strategy:
     target: strategies.momentum:MomentumStrategy
