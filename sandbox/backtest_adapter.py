@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Mapping, Union
+from dataclasses import dataclass, replace
+from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 
-from core_strategy import Strategy, Decision
+from core_contracts import SignalPolicy, PolicyCtx
+from core_models import Order, Side
 from sandbox.sim_adapter import SimAdapter
 from exchange.specs import load_specs, round_price_to_tick
 
@@ -87,7 +88,7 @@ class BacktestAdapter:
     """
     def __init__(
         self,
-        strategy: Strategy,
+        policy: SignalPolicy,
         sim_bridge: SimAdapter,
         dynamic_spread_config: Optional[Dict[str, Any]] = None,
         exchange_specs_path: Optional[str] = None,
@@ -95,7 +96,7 @@ class BacktestAdapter:
         signal_cooldown_s: int = 0,
         no_trade_config: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self.strategy = strategy
+        self.policy = policy
         self.sim = sim_bridge
         self._dyn = DynSpreadConfig.from_dict(dynamic_spread_config or {})
         self._guards = GuardsConfig.from_dict(guards_config or {})
@@ -172,47 +173,33 @@ class BacktestAdapter:
 
     # --------------------- helpers: exchange constraints ---------------------
 
-    def _apply_exchange_rules_to_decisions(
+    def _apply_exchange_rules_to_orders(
         self,
         symbol: str,
         ref_price: float,
-        decisions: Sequence[Union[Decision, Mapping[str, Any]]],
-    ) -> List[Union[Decision, Mapping[str, Any]]]:
-        """Применяет биржевые ограничения к решениям.
+        orders: Sequence[Order],
+    ) -> List[Order]:
+        """Применяет биржевые ограничения к ордерам.
 
-        Поддерживает высокоуровневые ``Decision`` и совместимые ``Mapping``.
-        Фильтрует решения с нулевой долей и нормализует поля ``side``,
-        ``volume_frac`` и ``price_offset_ticks``.
+        Фильтрует ордера с нулевым количеством и нормализует ``side``, ``quantity``
+        и ``price_offset_ticks`` (в ``meta``).
         """
 
-        out: List[Union[Decision, Mapping[str, Any]]] = []
-        for d in decisions:
-            if isinstance(d, Mapping):
-                side = str(d.get("side", "BUY")).upper()
-                vol = float(d.get("volume_frac", 0.0))
-                if vol == 0:
+        out: List[Order] = []
+        for o in orders:
+            try:
+                qty = abs(o.quantity)
+                if qty == 0:
                     continue
-                po = int(d.get("price_offset_ticks", 0))
-                nd = dict(d)
-                nd["side"] = side
-                nd["volume_frac"] = vol
-                nd["price_offset_ticks"] = po
-                out.append(nd)
-            else:
-                vol = float(d.volume_frac)
-                if vol == 0:
-                    continue
-                side = "BUY" if str(d.side).upper() == "BUY" else "SELL"
-                po = int(getattr(d, "price_offset_ticks", 0))
-                out.append(
-                    Decision(
-                        side=side,
-                        volume_frac=vol,
-                        price_offset_ticks=po,
-                        tif=d.tif,
-                        client_tag=d.client_tag,
-                    )
-                )
+                side = Side.BUY if str(o.side).upper() == "BUY" else Side.SELL
+                po = 0
+                if isinstance(o.meta, dict) and "price_offset_ticks" in o.meta:
+                    po = int(o.meta.get("price_offset_ticks", 0))
+                meta = dict(o.meta)
+                meta["price_offset_ticks"] = po
+                out.append(replace(o, side=side, quantity=qty, meta=meta))
+            except Exception:
+                continue
         return out
 
     # --------------------- helpers: guards & cooldown ---------------------
@@ -239,15 +226,15 @@ class BacktestAdapter:
         return True
 
     def _apply_signal_cooldown(
-        self, sym: str, ts: int, decisions: Sequence[Union[Decision, Mapping[str, Any]]]
-    ) -> List[Union[Decision, Mapping[str, Any]]]:
-        if self._signal_cooldown_ms <= 0 or not decisions:
-            return list(decisions)
+        self, sym: str, ts: int, orders: Sequence[Order]
+    ) -> List[Order]:
+        if self._signal_cooldown_ms <= 0 or not orders:
+            return list(orders)
         last_sig = self._last_signal_ts.get(sym)
         if last_sig is not None and (int(ts) - int(last_sig) < self._signal_cooldown_ms):
             return []
         self._last_signal_ts[sym] = int(ts)
-        return list(decisions)
+        return list(orders)
 
     # --------------------- helpers: no-trade windows ---------------------
 
@@ -334,13 +321,12 @@ class BacktestAdapter:
             if allow and self._no_trade_block(ts):
                 allow = False
 
-            self.strategy.on_features({**feats, "ref_price": ref})
+            features = {**feats, "ref_price": ref}
+            ctx = PolicyCtx(ts=ts, symbol=sym)
             if allow:
-                decisions = list(
-                    self.strategy.decide({"ts_ms": ts, "symbol": sym, "ref_price": ref, "features": feats})
-                )
+                orders = list(self.policy.decide(features, ctx))
             else:
-                decisions = []
+                orders = []
 
             if self._dyn.enabled:
                 vol_factor = float(self._compute_vol_factor(row, ref=ref, has_hl=has_hl))
@@ -352,11 +338,11 @@ class BacktestAdapter:
                 bid = None
                 ask = None
 
-            decisions = self._apply_signal_cooldown(sym, ts, decisions)
-            decisions = self._apply_exchange_rules_to_decisions(sym, ref, decisions)
+            orders = self._apply_signal_cooldown(sym, ts, orders)
+            orders = self._apply_exchange_rules_to_orders(sym, ref, orders)
 
             # стандартизированный выход стратегии: OrderIntent[]
-            from order_shims import OrderContext, decisions_to_order_intents  # локальный импорт во избежание циклов
+            from order_shims import OrderContext, orders_to_order_intents  # локальный импорт во избежание циклов
             _ctx = OrderContext(
                 ts_ms=int(ts),
                 symbol=str(sym),
@@ -368,7 +354,7 @@ class BacktestAdapter:
                 client_tag=None,
                 round_qty_fn=None,
             )
-            core_order_intents = [it.to_dict() for it in decisions_to_order_intents(decisions, _ctx)]
+            core_order_intents = [it.to_dict() for it in orders_to_order_intents(orders, _ctx)]
 
             rep = self.sim.step(
                 ts_ms=ts,
@@ -377,7 +363,7 @@ class BacktestAdapter:
                 ask=ask,
                 vol_factor=vol_factor,
                 liquidity=liquidity,
-                decisions=decisions,
+                orders=orders,
             )
             out_reports.append({**rep, "symbol": sym, "ts_ms": ts, "core_order_intents": core_order_intents})
 

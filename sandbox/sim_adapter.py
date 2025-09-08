@@ -1,7 +1,7 @@
 # sandbox/sim_adapter.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Protocol, Mapping
+from typing import Dict, List, Optional, Sequence, Tuple, Iterator, Protocol
 
 from execution_sim import ExecutionSimulator  # type: ignore
 from action_proto import ActionProto, ActionType
@@ -43,7 +43,7 @@ def _timeframe_to_ms(tf: str) -> int:
     return _TF_MS[tf]
 
 class OrdersProvider(Protocol):
-    def on_bar(self, bar: Bar) -> Sequence[Any]: ...
+    def on_bar(self, bar: Bar) -> Sequence[Order]: ...
 
 class SimAdapter:
     """
@@ -58,33 +58,14 @@ class SimAdapter:
         self.source = source
 
 
-    def _to_actions(self, decisions: Sequence[Any]) -> List[Tuple[ActionType, ActionProto]]:
+    def _to_actions(self, orders: Sequence[Order]) -> List[Tuple[ActionType, ActionProto]]:
         actions: List[Tuple[ActionType, ActionProto]] = []
-        for d in decisions:
-            # legacy mapping: {"kind": "MARKET", "side": "BUY", "volume_frac": 0.1}
-            if isinstance(d, Mapping):
-                kind = str(d.get("kind", "MARKET")).upper()
-                if kind == "MARKET":
-                    side = str(d.get("side", "BUY")).upper()
-                    vol = float(d.get("volume_frac", 0.0))
-                    proto = ActionProto(action_type=ActionType.MARKET,
-                                        volume_frac=(vol if side == "BUY" else -abs(vol)))
-                    actions.append((ActionType.MARKET, proto))
-                continue
-
-            # high-level Order
-            if isinstance(d, Order):
-                vol = float(d.quantity)
-                if d.side == Side.SELL:
-                    vol = -abs(vol)
-                proto = ActionProto(action_type=ActionType.MARKET, volume_frac=vol)
-                actions.append((ActionType.MARKET, proto))
-                continue
-
-            # already ActionProto
-            if isinstance(d, ActionProto):
-                actions.append((d.action_type, d))
-
+        for o in orders:
+            vol = float(o.quantity)
+            if o.side == Side.SELL:
+                vol = -abs(vol)
+            proto = ActionProto(action_type=ActionType.MARKET, volume_frac=vol)
+            actions.append((ActionType.MARKET, proto))
         return actions
 
     def step(self,
@@ -95,8 +76,8 @@ class SimAdapter:
              ask: Optional[float],
              vol_factor: Optional[float],
              liquidity: Optional[float],
-             decisions: Sequence[Any]) -> Dict[str, Any]:
-        actions = self._to_actions(decisions)
+             orders: Sequence[Order]) -> Dict[str, Any]:
+        actions = self._to_actions(orders)
         report = self.sim.run_step(
             ts=ts_ms,
             ref_price=ref_price,
@@ -138,7 +119,7 @@ class SimAdapter:
             if bar.symbol != self.symbol:
                 continue
 
-            decisions: Sequence[Any] = list(provider.on_bar(bar) or [])
+            orders: Sequence[Order] = list(provider.on_bar(bar) or [])
 
             vol_factor = float(bar.volume_base) if bar.volume_base is not None else None
             liquidity = None
@@ -150,10 +131,10 @@ class SimAdapter:
                 ask=None,
                 vol_factor=vol_factor,
                 liquidity=liquidity,
-                decisions=decisions,
+                orders=orders,
             )
 
             rep["symbol"] = bar.symbol
             rep["ts_ms"] = int(bar.ts)
-            rep["core_orders"] = ([as_dict(o) for o in decisions if isinstance(o, Order)] or [])
+            rep["core_orders"] = ([as_dict(o) for o in orders] or [])
             yield rep
