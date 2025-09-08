@@ -47,15 +47,14 @@ EXTERNAL_WHITELIST_PREFIXES = (
     "re", "importlib", "inspect", "argparse", "typing_extensions",
 )
 
-
 def detect_layer(filename: str) -> Optional[str]:
-    base = os.path.basename(filename)
+    rel = filename.lstrip("./")
+    if rel.startswith("strategies/"):
+        return "strategy"
+    base = os.path.basename(rel)
     for pref, layer in LAYER_BY_PREFIX.items():
         if base.startswith(pref):
             return layer
-    # strategy файлы проекта могут иметь имена вроде momentum.py — разрешим маппинг
-    if base in ("momentum.py", "base.py", "no_trade.py"):
-        return "strategy"
     if base in ("prepare_and_run.py", "run_realtime_signaler.py", "run_sandbox.py", "app.py"):
         return "scripts"
     # impl: известные имена существующих реализаций
@@ -70,10 +69,11 @@ def detect_layer(filename: str) -> Optional[str]:
 
 def iter_py_files(root: str) -> List[str]:
     result = []
-    for f in os.listdir(root):
-        if f.endswith(".py"):
-            result.append(os.path.join(root, f))
-    # минимально: корень проекта; при необходимости добавить обход поддиректорий
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for f in filenames:
+            if f.endswith(".py"):
+                result.append(os.path.join(dirpath, f))
     return result
 
 
