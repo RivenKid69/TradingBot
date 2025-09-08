@@ -94,6 +94,21 @@ python run_sandbox.py          --config configs/config_sim.yaml
 python evaluate_performance.py --config configs/config_eval.yaml
 ```
 
+### Сравнение запусков
+
+Для агрегирования результатов нескольких прогонов используйте скрипт
+`script_compare_runs.py`. Он принимает список путей к файлам
+`metrics.json` или каталогам запусков и формирует таблицу ключевых
+метрик:
+
+```bash
+python script_compare_runs.py run1/ run2/metrics.json --csv summary.csv
+```
+
+В консоль выводятся значения `run_id`, `Sharpe`, `Sortino`, `MDD`, `PnL`,
+`Hit-rate`, `CVaR` и других найденных показателей. При указании флага
+`--csv` таблица сохраняется в указанный файл.
+
 ## ServiceTrain
 
 `ServiceTrain` подготавливает датасет и запускает обучение модели.  Он
