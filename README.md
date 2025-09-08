@@ -19,3 +19,17 @@ python script_compare_runs.py run1 metrics.json --stdout  # вывод в stdout
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
 ```
 
+
+## Проверка кривой проскальзывания
+
+Скрипт `compare_slippage_curve.py` строит кривые `slippage_bps` по квантилям
+размера ордера для исторических и симуляционных сделок и сравнивает их.
+Если отклонение по каждой точке превышает допустимый порог, выполнение
+заканчивается кодом ошибки.
+
+```bash
+python compare_slippage_curve.py hist.csv sim.csv --tolerance 5
+```
+
+Критерий акцептанса: абсолютное различие между средним `slippage_bps`
+в соответствующих квантилях не должно превышать указанного порога в bps.
