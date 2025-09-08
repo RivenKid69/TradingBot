@@ -29,7 +29,7 @@ class Components(BaseModel):
     market_data: ComponentSpec
     executor: ComponentSpec
     feature_pipe: ComponentSpec
-    strategy: ComponentSpec
+    policy: ComponentSpec
     risk_guards: ComponentSpec
     backtest_engine: Optional[ComponentSpec] = None
 

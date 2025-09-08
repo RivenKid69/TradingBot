@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence, Iterator, Protocol
 import os
+import logging
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
@@ -28,8 +29,6 @@ from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig
 import di_registry
-# исторически сохранилось имя "strategy" в DI и конфигурациях
-Strategy = SignalPolicy
 
 
 class RiskGuards(Protocol):
@@ -49,9 +48,18 @@ RunnerConfig = SignalRunnerConfig
 
 
 class _Provider:
-    def __init__(self, fp: FeaturePipe, policy: SignalPolicy, guards: Optional[RiskGuards] = None):
+    def __init__(
+        self,
+        fp: FeaturePipe,
+        policy: SignalPolicy,
+        logger: logging.Logger,
+        executor: Any,
+        guards: Optional[RiskGuards] = None,
+    ) -> None:
         self._fp = fp
         self._policy = policy
+        self._logger = logger
+        self._executor = executor
         self._guards = guards
 
     def on_bar(self, bar: Bar):
@@ -60,6 +68,17 @@ class _Provider:
         orders = list(self._policy.decide({**feats}, ctx) or [])
         if self._guards:
             orders = list(self._guards.apply(int(bar.ts), bar.symbol, orders) or [])
+        for o in orders:
+            try:
+                self._logger.info("order %s", o)
+            except Exception:
+                pass
+            submit = getattr(self._executor, "submit", None)
+            if callable(submit):
+                try:
+                    submit(o)
+                except Exception:
+                    pass
         return orders
 
 
@@ -68,15 +87,16 @@ class ServiceSignalRunner:
         self,
         adapter: SimAdapter,
         feature_pipe: FeaturePipe,
-        strategy: SignalPolicy,
+        policy: SignalPolicy,
         risk_guards: Optional[RiskGuards] = None,
         cfg: Optional[SignalRunnerConfig] = None,
     ) -> None:
         self.adapter = adapter
         self.feature_pipe = feature_pipe
-        self.policy = strategy
+        self.policy = policy
         self.risk_guards = risk_guards
         self.cfg = cfg or SignalRunnerConfig()
+        self.logger = logging.getLogger(__name__)
 
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
@@ -99,7 +119,7 @@ class ServiceSignalRunner:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
 
         self.feature_pipe.warmup()
-        provider = _Provider(self.feature_pipe, self.policy, self.risk_guards)
+        provider = _Provider(self.feature_pipe, self.policy, self.logger, self.adapter, self.risk_guards)
         try:
             for rep in self.adapter.run_events(provider):
                 yield rep
@@ -132,7 +152,7 @@ def from_config(
     container = di_registry.build_graph(cfg.components, cfg)
     adapter: SimAdapter = container["executor"]
     fp: FeaturePipe = container["feature_pipe"]
-    policy: SignalPolicy = container["strategy"]
+    policy: SignalPolicy = container["policy"]
     guards: RiskGuards | None = container.get("risk_guards")
     service = ServiceSignalRunner(adapter, fp, policy, guards, svc_cfg)
     return service.run()

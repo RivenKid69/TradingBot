@@ -23,7 +23,7 @@ guards:
   gap_cooldown_bars: 10
   gap_threshold_ms: 90000
 
-strategy:
+policy:
   module: "strategies.momentum"
   class: "MomentumStrategy"
   params:

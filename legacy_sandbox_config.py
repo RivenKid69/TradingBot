@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 import yaml
 
 
-class StrategyConfig(BaseModel):
+class PolicyConfig(BaseModel):
     module: str = "strategies.momentum"
     class_name: str = Field("MomentumStrategy", alias="class")
     params: Dict[str, Any] = Field(default_factory=dict)
@@ -27,7 +27,7 @@ class SandboxConfig(BaseModel):
     sim_guards: Dict[str, Any] = Field(default_factory=dict)
     min_signal_gap_s: int = 0
     no_trade: Dict[str, Any] = Field(default_factory=dict)
-    strategy: StrategyConfig = StrategyConfig()
+    policy: PolicyConfig = PolicyConfig()
     data: DataConfig
     dynamic_spread: Dict[str, Any] = Field(default_factory=dict)
     out_reports: Optional[str] = None
