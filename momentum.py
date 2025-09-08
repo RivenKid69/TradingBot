@@ -30,6 +30,7 @@ class MomentumStrategy(BaseStrategy):
         self._window = deque(maxlen=self.lookback)
 
     def on_features(self, row: Dict[str, Any]) -> None:
+        super().on_features(row)
         # ожидаем, что ref_price присутствует в features (или придёт в ctx)
         price = row.get("ref_price")
         if price is not None:

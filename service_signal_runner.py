@@ -27,11 +27,7 @@ from core_contracts import FeaturePipe
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig
 import di_registry
-
-
-class Strategy(Protocol):
-    def on_features(self, feats: Dict[str, Any]) -> None: ...
-    def decide(self, ctx: Dict[str, Any]) -> Sequence[Any]: ...
+from core_strategy import Strategy
 
 
 class RiskGuards(Protocol):
