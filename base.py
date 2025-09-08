@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from core_strategy import Strategy
+
 from action_proto import ActionProto, ActionType
 
 
@@ -45,7 +47,7 @@ class Decision:
         )
 
 
-class BaseStrategy:
+class BaseStrategy(Strategy):
     """
     Базовый класс стратегии.
 
@@ -63,6 +65,16 @@ class BaseStrategy:
 
     def __init__(self, **params: Any) -> None:
         self.params: Dict[str, Any] = dict(params or {})
+
+    # --- Strategy interface -------------------------------------------------
+
+    def setup(self, config: Dict[str, Any]) -> None:  # pragma: no cover - trivial
+        """Configure strategy with ``config`` parameters."""
+        self.params.update(dict(config or {}))
+
+    def on_features(self, row: Dict[str, Any]) -> None:  # pragma: no cover - trivial
+        """Receive feature row from pipeline. Base implementation does nothing."""
+        return None
 
     def decide(self, ctx: Dict[str, Any]) -> List[Decision]:
         """
