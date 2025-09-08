@@ -1,11 +1,11 @@
 # sandbox/sim_adapter.py
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Protocol
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Protocol, Mapping
 
 from execution_sim import ExecutionSimulator, SimStepReport as ExecReport  # type: ignore
-from action_proto import ActionType
+from action_proto import ActionProto, ActionType
+from strategies.base import Decision
 from core_models import Bar, as_dict
 from compat_shims import sim_report_dict_to_core_exec_reports
 from event_bus import log_trade_exec as _bus_log_trade_exec
@@ -60,15 +60,30 @@ class SimAdapter:
         self.source = source
 
 
-    def _to_actions(self, decisions: List[Dict[str, Any]]) -> List[Tuple[Any, Any]]:
-        actions: List[Tuple[Any, Any]] = []
+    def _to_actions(self, decisions: Sequence[Any]) -> List[Tuple[ActionType, ActionProto]]:
+        actions: List[Tuple[ActionType, ActionProto]] = []
         for d in decisions:
-            kind = str(d.get("kind", "MARKET")).upper()
-            if kind == "MARKET":
-                side = str(d.get("side", "BUY")).upper()
-                vol = float(d.get("volume_frac", 0.0))
-                proto = SimpleNamespace(volume_frac=(vol if side == "BUY" else -abs(vol)))
-                actions.append((ActionType.MARKET, proto))
+            # legacy mapping: {"kind": "MARKET", "side": "BUY", "volume_frac": 0.1}
+            if isinstance(d, Mapping):
+                kind = str(d.get("kind", "MARKET")).upper()
+                if kind == "MARKET":
+                    side = str(d.get("side", "BUY")).upper()
+                    vol = float(d.get("volume_frac", 0.0))
+                    proto = ActionProto(action_type=ActionType.MARKET,
+                                        volume_frac=(vol if side == "BUY" else -abs(vol)))
+                    actions.append((ActionType.MARKET, proto))
+                continue
+
+            # high-level Decision
+            if isinstance(d, Decision):
+                proto = d.to_action_proto()
+                actions.append((proto.action_type, proto))
+                continue
+
+            # already ActionProto
+            if isinstance(d, ActionProto):
+                actions.append((d.action_type, d))
+
         return actions
 
     def step(self,
@@ -79,7 +94,7 @@ class SimAdapter:
              ask: Optional[float],
              vol_factor: Optional[float],
              liquidity: Optional[float],
-             decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
+             decisions: Sequence[Any]) -> Dict[str, Any]:
         actions = self._to_actions(decisions)
         report = self.sim.run_step(
             ts=ts_ms,
@@ -122,7 +137,7 @@ class SimAdapter:
             if bar.symbol != self.symbol:
                 continue
 
-            decisions = list(provider.on_bar(bar) or [])
+            decisions: Sequence[Any] = list(provider.on_bar(bar) or [])
 
             vol_factor = float(bar.volume_base) if bar.volume_base is not None else None
             liquidity = "NORMAL"
