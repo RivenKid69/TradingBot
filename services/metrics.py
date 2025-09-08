@@ -22,6 +22,7 @@ class EquityMetrics:
     pnl_std_step: float
     sharpe: float
     sortino: float
+    cvar: float
     calmar: float
     max_drawdown: float
     max_dd_start_ts: int
@@ -188,6 +189,17 @@ def _sortino(returns: np.ndarray, rf_per_step: float = 0.0, ann_factor: float = 
     return float(mu / ds * math.sqrt(ann_factor))
 
 
+def _cvar(returns: np.ndarray, alpha: float = 0.05) -> float:
+    """Conditional Value at Risk (expected shortfall) for returns array."""
+    if returns.size == 0:
+        return float("nan")
+    q = float(np.nanquantile(returns, alpha))
+    tail = returns[returns <= q]
+    if tail.size == 0:
+        return float("nan")
+    return float(np.nanmean(tail))
+
+
 def _vwap(px: pd.Series, qty: pd.Series) -> float:
     w = qty.abs().astype(float)
     if w.sum() <= 0:
@@ -264,7 +276,7 @@ def compute_equity_metrics(
     if reports is None or reports.empty:
         return EquityMetrics(
             start_ts=0, end_ts=0, num_points=0, pnl_total=0.0, pnl_mean_step=float("nan"),
-            pnl_std_step=float("nan"), sharpe=float("nan"), sortino=float("nan"),
+            pnl_std_step=float("nan"), sharpe=float("nan"), sortino=float("nan"), cvar=float("nan"),
             calmar=float("nan"), max_drawdown=0.0, max_dd_start_ts=0, max_dd_end_ts=0,
             avg_step_seconds=float("nan"), turnover=float("nan"), fees_sum=0.0, funding_cashflow_sum=0.0
         )
@@ -301,6 +313,7 @@ def compute_equity_metrics(
 
     sharpe = _sharpe(returns, rf_per_step=rf_per_step, ann_factor=ann_factor)
     sortino = _sortino(returns, rf_per_step=rf_per_step, ann_factor=ann_factor)
+    cvar = _cvar(returns)
     dd_series, max_dd, dd_start, dd_end = _drawdown(eq)
 
     # Calmar по годовому PnL на capital_base делённому на |maxDD|
@@ -330,6 +343,7 @@ def compute_equity_metrics(
         pnl_std_step=float(np.nanstd(d_eq.values.astype(float), ddof=1)) if len(d_eq) > 1 else float("nan"),
         sharpe=float(sharpe),
         sortino=float(sortino),
+        cvar=float(cvar),
         calmar=float(calmar),
         max_drawdown=float(max_dd),
         max_dd_start_ts=int(dd_start),
@@ -351,7 +365,7 @@ def calculate_metrics(
     capital_base: float = 10_000.0,
     rf_annual: float = 0.0,
 ) -> Dict[str, Any]:
-    """Convenience wrapper returning both trade and equity metrics."""
+    """Convenience wrapper returning both trade and equity metrics (with CVaR)."""
     if ts_col != "ts_ms" or equity_col != "equity":
         equity = equity.rename(columns={ts_col: "ts_ms", equity_col: "equity"})
     eqm = compute_equity_metrics(equity, capital_base=capital_base, rf_annual=rf_annual)
