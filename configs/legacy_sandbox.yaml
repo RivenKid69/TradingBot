@@ -34,7 +34,7 @@ strategy:
   params:
     lookback: 5
     threshold: 0.0
-    order_qty: 0.001
+    order_qty: 0.1  # доля позиции
 
 data:
   path: "data/train.parquet"   # или любой CSV/Parquet с колонками: ts_ms, symbol, ref_price(+фичи)

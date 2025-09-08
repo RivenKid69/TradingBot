@@ -20,7 +20,10 @@ class MomentumStrategy(BaseStrategy):
         super().__init__()
         self.lookback = 5
         self.threshold = 0.0
-        self.order_qty = 0.001
+        self.order_qty = 0.001  # доля позиции
+        self.price_offset_ticks = 0
+        self.tif = "GTC"
+        self.client_tag: str | None = None
         self._window: deque[float] = deque(maxlen=5)
 
     def setup(self, config: Dict[str, Any]) -> None:
@@ -28,6 +31,11 @@ class MomentumStrategy(BaseStrategy):
         self.lookback = int(config.get("lookback", self.lookback))
         self.threshold = float(config.get("threshold", self.threshold))
         self.order_qty = float(config.get("order_qty", self.order_qty))
+        self.price_offset_ticks = int(
+            config.get("price_offset_ticks", self.price_offset_ticks)
+        )
+        self.tif = str(config.get("tif", self.tif))
+        self.client_tag = config.get("client_tag", self.client_tag)
         self._window = deque(maxlen=self.lookback)
 
     def on_features(self, row: Dict[str, Any]) -> None:
@@ -47,7 +55,23 @@ class MomentumStrategy(BaseStrategy):
         avg = sum(self._window) / float(len(self._window))
         out: List[Decision] = []
         if float(ref) > avg + self.threshold:
-            out.append(Decision(side="BUY", volume_frac=self.order_qty))
+            out.append(
+                Decision(
+                    side="BUY",
+                    volume_frac=self.order_qty,
+                    price_offset_ticks=self.price_offset_ticks,
+                    tif=self.tif,
+                    client_tag=self.client_tag,
+                )
+            )
         elif float(ref) < avg - self.threshold:
-            out.append(Decision(side="SELL", volume_frac=self.order_qty))
+            out.append(
+                Decision(
+                    side="SELL",
+                    volume_frac=self.order_qty,
+                    price_offset_ticks=self.price_offset_ticks,
+                    tif=self.tif,
+                    client_tag=self.client_tag,
+                )
+            )
         return out

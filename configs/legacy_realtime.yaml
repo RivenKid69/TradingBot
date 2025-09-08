@@ -29,7 +29,7 @@ strategy:
   params:
     lookback: 5
     threshold: 0.0
-    order_qty: 0.001
+    order_qty: 0.1  # доля позиции
 
 features:
   lookbacks_prices: [5, 15, 60]
