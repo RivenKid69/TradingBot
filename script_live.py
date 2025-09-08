@@ -1,15 +1,11 @@
-"""Run realtime signaler using :mod:`service_signal_runner`.
-
-The script now relies on ``load_config``/``from_config`` pair and does not
-manually construct any of the runtime components.
-"""
+"""Run realtime signaler using :mod:`service_signal_runner`."""
 
 from __future__ import annotations
 
 import argparse
 
 from core_config import load_config
-from service_signal_runner import RunnerConfig, from_config
+from service_signal_runner import from_config
 
 
 def main() -> None:
@@ -25,9 +21,7 @@ def main() -> None:
 
     cfg = load_config(args.config)
 
-    svc_cfg = RunnerConfig(snapshot_config_path=args.config, artifacts_dir=cfg.artifacts_dir)
-
-    for report in from_config(cfg, svc_cfg=svc_cfg):
+    for report in from_config(cfg, snapshot_config_path=args.config):
         print(report)
 
 

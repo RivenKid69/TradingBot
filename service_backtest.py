@@ -27,6 +27,7 @@ from sandbox.backtest_adapter import BacktestAdapter
 from sandbox.sim_adapter import SimAdapter
 from core_strategy import Strategy
 from services.utils_config import snapshot_config  # сохранение снапшота конфига
+from services.utils_sandbox import read_df
 from core_config import CommonRunConfig
 import di_registry
 
@@ -109,37 +110,52 @@ class ServiceBacktest:
 
 def from_config(
     cfg: CommonRunConfig,
-    df: pd.DataFrame,
     *,
-    ts_col: str = "ts_ms",
-    symbol_col: str = "symbol",
-    price_col: str = "ref_price",
-    svc_cfg: BacktestConfig | None = None,
+    snapshot_config_path: str | None = None,
 ) -> List[Dict[str, Any]]:
-    """Run :class:`ServiceBacktest` using dependencies from ``cfg``.
+    """Run :class:`ServiceBacktest` using dependencies from ``cfg``."""
 
-    Parameters
-    ----------
-    cfg: CommonRunConfig
-        Configuration describing components to build.
-    df: pandas.DataFrame
-        Input price data for backtesting.
-    ts_col, symbol_col, price_col:
-        Column names of timestamp, symbol and price respectively.
-    svc_cfg: BacktestConfig, optional
-        Additional service configuration.
-    """
-    svc_cfg = svc_cfg or BacktestConfig()
+    params = cfg.components.backtest_engine.params or {}
+    bt_kwargs = {k: v for k, v in params.items() if k in BacktestConfig.__annotations__}
+    svc_cfg = BacktestConfig(
+        **bt_kwargs,
+        snapshot_config_path=snapshot_config_path,
+        artifacts_dir=cfg.artifacts_dir,
+    )
     if svc_cfg.logs_dir is None:
         svc_cfg.logs_dir = cfg.logs_dir
     if svc_cfg.run_id is None:
         svc_cfg.run_id = cfg.run_id
 
+    data_path = getattr(cfg.data, "prices_path", None)
+    if data_path is None:
+        md_params = cfg.components.market_data.params or {}
+        paths = md_params.get("paths") or []
+        data_path = paths[0] if paths else None
+    if not data_path:
+        raise ValueError("Data path must be specified in config")
+
+    df = read_df(data_path)
+
+    ts_col = params.get("ts_col", "ts_ms")
+    sym_col = params.get("symbol_col", "symbol")
+    price_col = params.get("price_col", "ref_price")
+
     container = di_registry.build_graph(cfg.components, cfg)
     strat: Strategy = container["strategy"]
     sim: ExecutionSimulator = container["executor"]  # type: ignore[assignment]
     service = ServiceBacktest(strat, sim, svc_cfg)
-    return service.run(df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col)
+    reports = service.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
+
+    out_path = params.get("out_reports", "logs/sandbox_reports.csv")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    if out_path.lower().endswith(".parquet"):
+        pd.DataFrame(reports).to_parquet(out_path, index=False)
+    else:
+        pd.DataFrame(reports).to_csv(out_path, index=False)
+    print(f"Wrote {len(reports)} rows to {out_path}")
+
+    return reports
 
 
 __all__ = ["BacktestConfig", "ServiceBacktest", "from_config"]

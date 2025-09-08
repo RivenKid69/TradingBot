@@ -104,8 +104,25 @@ class ServiceEval:
         return metrics
 
 
-def from_config(cfg: CommonRunConfig, eval_cfg: EvalConfig) -> Dict[str, Dict[str, float]]:
+def from_config(
+    cfg: CommonRunConfig,
+    *,
+    snapshot_config_path: str | None = None,
+) -> Dict[str, Dict[str, float]]:
     """Run :class:`ServiceEval` using dependencies described in ``cfg``."""
+
+    eval_cfg = EvalConfig(
+        trades_path=cfg.input.trades_path,
+        reports_path=getattr(cfg.input, "equity_path", ""),
+        out_json=f"{cfg.logs_dir}/metrics.json",
+        out_md=f"{cfg.logs_dir}/metrics.md",
+        equity_png=f"{cfg.logs_dir}/equity.png",
+        capital_base=10_000.0,
+        rf_annual=0.0,
+        snapshot_config_path=snapshot_config_path,
+        artifacts_dir=cfg.artifacts_dir,
+    )
+
     container = di_registry.build_graph(cfg.components, cfg)
     service = ServiceEval(eval_cfg, container)
     return service.run()
