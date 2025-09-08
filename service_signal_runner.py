@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence, Iterator, Protocol
+import os
 
 from sandbox.sim_adapter import SimAdapter, DecisionsProvider  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
@@ -35,9 +36,15 @@ class RiskGuards(Protocol):
 
 
 @dataclass
-class RunnerConfig:
+class SignalRunnerConfig:
     snapshot_config_path: Optional[str] = None
     artifacts_dir: Optional[str] = None
+    logs_dir: Optional[str] = None
+    run_id: Optional[str] = None
+
+
+# обратная совместимость
+RunnerConfig = SignalRunnerConfig
 
 
 class _Provider(DecisionsProvider):
@@ -56,12 +63,34 @@ class _Provider(DecisionsProvider):
 
 
 class ServiceSignalRunner:
-    def __init__(self, adapter: SimAdapter, feature_pipe: FeaturePipe, strategy: Strategy, risk_guards: Optional[RiskGuards] = None, cfg: Optional[RunnerConfig] = None) -> None:
+    def __init__(
+        self,
+        adapter: SimAdapter,
+        feature_pipe: FeaturePipe,
+        strategy: Strategy,
+        risk_guards: Optional[RiskGuards] = None,
+        cfg: Optional[SignalRunnerConfig] = None,
+    ) -> None:
         self.adapter = adapter
         self.feature_pipe = feature_pipe
         self.strategy = strategy
         self.risk_guards = risk_guards
-        self.cfg = cfg or RunnerConfig()
+        self.cfg = cfg or SignalRunnerConfig()
+
+        run_id = self.cfg.run_id or "sim"
+        logs_dir = self.cfg.logs_dir or "logs"
+        sim = getattr(self.adapter, "sim", None) or getattr(self.adapter, "_sim", None)
+        if sim is not None:
+            logging_config = {
+                "trades_path": os.path.join(logs_dir, f"log_trades_{run_id}.csv"),
+                "reports_path": os.path.join(logs_dir, f"sim_reports_{run_id}.csv"),
+            }
+            try:
+                from logging import LogWriter, LogConfig  # type: ignore
+
+                sim._logger = LogWriter(LogConfig.from_dict(logging_config), run_id=run_id)
+            except Exception:
+                pass
 
     def run(self) -> Iterator[Dict[str, Any]]:
         # снапшот конфига, если задан
@@ -70,11 +99,19 @@ class ServiceSignalRunner:
 
         self.feature_pipe.warmup()
         provider = _Provider(self.feature_pipe, self.strategy, self.risk_guards)
-        for rep in self.adapter.run_events(provider):
-            yield rep
+        try:
+            for rep in self.adapter.run_events(provider):
+                yield rep
+        finally:
+            sim = getattr(self.adapter, "sim", None) or getattr(self.adapter, "_sim", None)
+            try:
+                if getattr(sim, "_logger", None):
+                    sim._logger.flush()
+            except Exception:
+                pass
 
 
-def from_config(cfg: CommonRunConfig, svc_cfg: RunnerConfig | None = None) -> Iterator[Dict[str, Any]]:
+def from_config(cfg: CommonRunConfig, svc_cfg: SignalRunnerConfig | None = None) -> Iterator[Dict[str, Any]]:
     """Build dependencies from ``cfg`` and run :class:`ServiceSignalRunner`.
 
     Parameters
@@ -89,6 +126,12 @@ def from_config(cfg: CommonRunConfig, svc_cfg: RunnerConfig | None = None) -> It
     Iterator[Dict[str, Any]]
         Stream of execution reports produced by the service.
     """
+    svc_cfg = svc_cfg or SignalRunnerConfig()
+    if svc_cfg.logs_dir is None:
+        svc_cfg.logs_dir = cfg.logs_dir
+    if svc_cfg.run_id is None:
+        svc_cfg.run_id = cfg.run_id
+
     container = di_registry.build_graph(cfg.components, cfg)
     adapter: SimAdapter = container["executor"]
     fp: FeaturePipe = container["feature_pipe"]
@@ -98,4 +141,4 @@ def from_config(cfg: CommonRunConfig, svc_cfg: RunnerConfig | None = None) -> It
     return service.run()
 
 
-__all__ = ["RunnerConfig", "ServiceSignalRunner", "from_config"]
+__all__ = ["SignalRunnerConfig", "RunnerConfig", "ServiceSignalRunner", "from_config"]

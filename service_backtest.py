@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+import os
 import pandas as pd
 
 from execution_sim import ExecutionSimulator  # type: ignore
@@ -41,6 +42,8 @@ class BacktestConfig:
     no_trade_config: Optional[Dict[str, Any]] = None
     snapshot_config_path: Optional[str] = None
     artifacts_dir: Optional[str] = None
+    logs_dir: Optional[str] = None
+    run_id: Optional[str] = None
 
 
 class ServiceBacktest:
@@ -62,6 +65,19 @@ class ServiceBacktest:
         self.sim = sim
         self.cfg = cfg or BacktestConfig()
 
+        run_id = self.cfg.run_id or "sim"
+        logs_dir = self.cfg.logs_dir or "logs"
+        logging_config = {
+            "trades_path": os.path.join(logs_dir, f"log_trades_{run_id}.csv"),
+            "reports_path": os.path.join(logs_dir, f"sim_reports_{run_id}.csv"),
+        }
+        try:  # переподключаем логгер симулятора с нужными путями
+            from logging import LogWriter, LogConfig  # type: ignore
+
+            self.sim._logger = LogWriter(LogConfig.from_dict(logging_config), run_id=run_id)
+        except Exception:
+            pass
+
         self.sim_bridge = SimAdapter(
             sim,
             symbol=self.cfg.symbol,
@@ -82,7 +98,13 @@ class ServiceBacktest:
     def run(self, df: pd.DataFrame, *, ts_col: str = "ts_ms", symbol_col: str = "symbol", price_col: str = "ref_price") -> List[Dict[str, Any]]:
         if self.cfg.snapshot_config_path and self.cfg.artifacts_dir:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
-        return self._bt.run(df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col)
+        reports = self._bt.run(df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col)
+        try:
+            if getattr(self.sim, "_logger", None):
+                self.sim._logger.flush()
+        except Exception:
+            pass
+        return reports
 
 
 def from_config(
@@ -107,6 +129,12 @@ def from_config(
     svc_cfg: BacktestConfig, optional
         Additional service configuration.
     """
+    svc_cfg = svc_cfg or BacktestConfig()
+    if svc_cfg.logs_dir is None:
+        svc_cfg.logs_dir = cfg.logs_dir
+    if svc_cfg.run_id is None:
+        svc_cfg.run_id = cfg.run_id
+
     container = di_registry.build_graph(cfg.components, cfg)
     strat: Strategy = container["strategy"]
     sim: ExecutionSimulator = container["executor"]  # type: ignore[assignment]
