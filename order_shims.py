@@ -286,3 +286,47 @@ def decisions_to_orders(decisions: Sequence[Any], ctx: OrderContext) -> List[Ord
         except Exception:
             continue
     return out
+
+
+def orders_to_order_intents(orders: Sequence[Order], ctx: OrderContext) -> List[OrderIntent]:
+    """Преобразование Order -> OrderIntent.
+
+    Использует ``ctx.max_position_abs_base`` для вычисления ``volume_frac`` и
+    ``ctx.ref_price``/``ctx.tick_size`` для восстановления ``price_offset_ticks``.
+    """
+    out: List[OrderIntent] = []
+    max_abs = _to_dec(ctx.max_position_abs_base)
+    ref = _to_dec(ctx.ref_price) if ctx.ref_price is not None else None
+    tick = _to_dec(ctx.tick_size) if ctx.tick_size is not None else None
+
+    for o in orders:
+        try:
+            vf = (o.quantity / max_abs) if max_abs != 0 else Decimal("0")
+            if o.side == Side.SELL:
+                vf = -abs(vf)
+            else:
+                vf = abs(vf)
+
+            if o.meta and "price_offset_ticks" in o.meta:
+                po = int(o.meta.get("price_offset_ticks", 0))
+            elif ref is not None and tick is not None and o.price is not None and tick != 0:
+                po = int((o.price - ref) / tick)
+            else:
+                po = 0
+
+            out.append(
+                OrderIntent(
+                    ts=o.ts,
+                    symbol=o.symbol,
+                    side=o.side,
+                    order_type=o.order_type,
+                    volume_frac=vf,
+                    price_offset_ticks=po,
+                    time_in_force=o.time_in_force,
+                    client_tag=o.client_order_id,
+                    meta=o.meta,
+                )
+            )
+        except Exception:
+            continue
+    return out

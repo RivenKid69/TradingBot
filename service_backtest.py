@@ -25,7 +25,7 @@ import pandas as pd
 from execution_sim import ExecutionSimulator  # type: ignore
 from sandbox.backtest_adapter import BacktestAdapter
 from sandbox.sim_adapter import SimAdapter
-from core_strategy import Strategy
+from core_contracts import SignalPolicy
 from services.utils_config import snapshot_config  # сохранение снапшота конфига
 from services.utils_sandbox import read_df
 from core_config import CommonRunConfig
@@ -61,8 +61,8 @@ class ServiceBacktest:
         def stream_ticks(self, symbols):  # pragma: no cover - простая заглушка
             return iter(())
 
-    def __init__(self, strategy: Strategy, sim: ExecutionSimulator, cfg: Optional[BacktestConfig] = None) -> None:
-        self.strategy = strategy
+    def __init__(self, policy: SignalPolicy, sim: ExecutionSimulator, cfg: Optional[BacktestConfig] = None) -> None:
+        self.policy = policy
         self.sim = sim
         self.cfg = cfg or BacktestConfig()
 
@@ -87,7 +87,7 @@ class ServiceBacktest:
         )
 
         self._bt = BacktestAdapter(
-            strategy=self.strategy,
+            policy=self.policy,
             sim_bridge=self.sim_bridge,
             dynamic_spread_config=self.cfg.dynamic_spread_config,
             exchange_specs_path=self.cfg.exchange_specs_path,
@@ -142,9 +142,9 @@ def from_config(
     price_col = params.get("price_col", "ref_price")
 
     container = di_registry.build_graph(cfg.components, cfg)
-    strat: Strategy = container["strategy"]
+    policy: SignalPolicy = container["policy"]
     sim: ExecutionSimulator = container["executor"]  # type: ignore[assignment]
-    service = ServiceBacktest(strat, sim, svc_cfg)
+    service = ServiceBacktest(policy, sim, svc_cfg)
     reports = service.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
 
     out_path = params.get("out_reports", "logs/sandbox_reports.csv")
