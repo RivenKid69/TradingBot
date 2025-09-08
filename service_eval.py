@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Service for evaluating strategy performance.
 
+Includes equity metrics such as Sharpe, Sortino and Conditional Value at Risk (CVaR).
+
 Example
 -------
 ```python
