@@ -254,40 +254,6 @@ def intent_to_order(intent: OrderIntent, ctx: OrderContext) -> Order:
     )
 
 
-def decisions_to_order_intents(
-    decisions: Sequence[Mapping[str, Any] | ActionProto | Decision],
-    ctx: OrderContext,
-) -> List[OrderIntent]:
-    """Преобразование решений в OrderIntent.
-
-    Принимает последовательность элементов формата legacy ``Mapping``, ``ActionProto``
-    или высокоуровневых ``Decision`` и возвращает список ``OrderIntent``.
-    """
-
-    out: List[OrderIntent] = []
-    for d in decisions:
-        if isinstance(d, Mapping):
-            intent = legacy_decision_to_order_intent(d, ctx)
-        elif isinstance(d, Decision):
-            intent = actionproto_to_order_intent(d.to_action_proto(), ctx)
-        else:
-            intent = actionproto_to_order_intent(d, ctx)
-        if intent is not None:
-            out.append(intent)
-    return out
-
-
-def decisions_to_orders(decisions: Sequence[Any], ctx: OrderContext) -> List[Order]:
-    intents = decisions_to_order_intents(decisions, ctx)
-    out: List[Order] = []
-    for it in intents:
-        try:
-            out.append(intent_to_order(it, ctx))
-        except Exception:
-            continue
-    return out
-
-
 def orders_to_order_intents(orders: Sequence[Order], ctx: OrderContext) -> List[OrderIntent]:
     """Преобразование Order -> OrderIntent.
 
