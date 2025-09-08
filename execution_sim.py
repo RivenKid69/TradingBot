@@ -848,8 +848,12 @@ class ExecutionSimulator:
         self._last_liquidity = float(liquidity) if liquidity is not None else None
         self._last_spread_bps = None
         try:
-            if compute_spread_bps_from_quotes is not None:
-                self._last_spread_bps = compute_spread_bps_from_quotes(self._last_bid, self._last_ask)
+            if compute_spread_bps_from_quotes is not None and self.slippage_cfg is not None:
+                self._last_spread_bps = compute_spread_bps_from_quotes(
+                    bid=self._last_bid,
+                    ask=self._last_ask,
+                    cfg=self.slippage_cfg,
+                )
         except Exception:
             self._last_spread_bps = None
         self._last_ref_price = float(ref_price) if ref_price is not None else None
