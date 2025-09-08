@@ -4,9 +4,13 @@ from __future__ import annotations
 import argparse
 from typing import Any, Dict, List
 
+from decimal import Decimal
+
 import pandas as pd
 
-from transformers import FeatureSpec, OnlineFeatureTransformer, apply_offline_features
+from transformers import FeatureSpec
+from feature_pipe import FeaturePipe
+from core_models import Bar
 
 
 def _read_any(path: str) -> pd.DataFrame:
@@ -35,20 +39,27 @@ def main() -> None:
     lookbacks = [int(s.strip()) for s in str(args.lookbacks).split(",") if s.strip()]
     spec = FeatureSpec(lookbacks_prices=lookbacks, rsi_period=int(args.rsi_period))
 
-    offline = apply_offline_features(
-        df, spec=spec, ts_col="ts_ms", symbol_col="symbol", price_col=args.price_col
-    )
+    pipe = FeaturePipe(spec, price_col=args.price_col)
+    offline = pipe.transform_df(df)
 
     d = df[["ts_ms", "symbol", args.price_col]].dropna().copy()
     d["ts_ms"] = d["ts_ms"].astype("int64")
     d["symbol"] = d["symbol"].astype(str)
     d = d.sort_values(["symbol", "ts_ms"]).reset_index(drop=True)
 
-    tr = OnlineFeatureTransformer(spec)
+    pipe.reset()
     rows: List[Dict[str, Any]] = []
     for row in d.itertuples(index=False):
         price = getattr(row, args.price_col)
-        rows.append(tr.update(symbol=row.symbol, ts_ms=row.ts_ms, close=price))
+        bar = Bar(
+            ts=int(row.ts_ms),
+            symbol=str(row.symbol),
+            open=Decimal(price),
+            high=Decimal(price),
+            low=Decimal(price),
+            close=Decimal(price),
+        )
+        rows.append(pipe.update(bar))
     online = pd.DataFrame(rows)
 
     merged = offline.merge(online, on=["ts_ms", "symbol"], suffixes=("_off", "_on"))
