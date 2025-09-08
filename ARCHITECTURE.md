@@ -63,7 +63,7 @@ class MomentumStrategy(Strategy):
 используйте функцию `load_config`:
 
 ```yaml
-# configs/run_sim.yaml
+# configs/config_sim.yaml
 mode: sim
 components:
   market_data:
@@ -80,7 +80,7 @@ data:
 ```python
 from core_config import load_config
 
-cfg = load_config("configs/run_sim.yaml")
+cfg = load_config("configs/config_sim.yaml")
 ```
 
 ### CLI-скрипты
@@ -89,9 +89,9 @@ cfg = load_config("configs/run_sim.yaml")
 флаг `--config` и запускают соответствующие сервисы через `from_config`:
 
 ```
-python run_realtime_signaler.py --config configs/config_live.yaml
-python run_sandbox.py          --config configs/config_sim.yaml
-python evaluate_performance.py --config configs/config_eval.yaml
+python script_live.py    --config configs/config_live.yaml
+python script_backtest.py --config configs/config_sim.yaml
+python script_eval.py    --config configs/config_eval.yaml
 ```
 
 ### Сравнение запусков
@@ -121,6 +121,7 @@ python script_compare_runs.py run1/ run2/metrics.json --csv summary.csv
 - `script_live.py` — исполняет стратегию на живых данных через `ServiceSignalRunner`.
 - `script_calibrate_tcost.py` — калибрует параметры T‑cost через `ServiceCalibrateTCost`.
 - `script_calibrate_slippage.py` — калибрует проскальзывание через `ServiceCalibrateSlippage`.
+- `script_compare_runs.py` — агрегирует метрики нескольких запусков.
 
 ## ServiceTrain
 
