@@ -54,7 +54,7 @@ class _Provider(DecisionsProvider):
         self._guards = guards
 
     def on_bar(self, bar: Bar):
-        feats = self._fp.on_bar(bar)
+        feats = self._fp.update(bar)
         self._strat.on_features({**feats, "ref_price": float(bar.close)})
         dec = list(self._strat.decide({"ts_ms": int(bar.ts), "symbol": bar.symbol, "ref_price": float(bar.close), "features": feats}) or [])
         if self._guards:

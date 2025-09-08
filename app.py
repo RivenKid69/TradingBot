@@ -461,7 +461,7 @@ with tabs[6]:
             def warmup(self):
                 pass
 
-            def on_bar(self, bar):
+            def update(self, bar):
                 return {"ref_price": float(bar.close)}
 
         class DummyStrat:
