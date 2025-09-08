@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import pandas as pd
 import yaml
@@ -51,11 +51,11 @@ class SlippageCalibrateConfig:
     trades: str
     out: str
     fmt: Optional[str] = None
-    min_half_spread_bps: float = 0.0
-    default_spread_bps: float = 2.0
+    default_spread_mode: str = "median"
+    min_half_spread_quantile: float = 0.0
 
 
-def run(cfg: SlippageCalibrateConfig) -> float:
+def run(cfg: SlippageCalibrateConfig) -> Dict[str, float]:
     """Load trades, fit coefficient and dump JSON report."""
 
     fmt = cfg.fmt
@@ -67,26 +67,57 @@ def run(cfg: SlippageCalibrateConfig) -> float:
     else:
         df = pd.read_parquet(path)
 
+    df = df.copy()
+
+    # ------------------------------------------------------------------
+    # Derive default spread and minimal half spread from the data
+    # ------------------------------------------------------------------
+    spread_series = df["spread_bps"].dropna() if "spread_bps" in df.columns else pd.Series(dtype=float)
+    if not spread_series.empty:
+        mode = str(cfg.default_spread_mode).lower()
+        if mode == "mean":
+            default_spread_bps = float(spread_series.mean())
+        else:
+            default_spread_bps = float(spread_series.median())
+    else:
+        default_spread_bps = 2.0
+
+    if "half_spread_bps" in df.columns:
+        half = df["half_spread_bps"].astype(float).fillna(default_spread_bps * 0.5)
+    else:
+        half = df["spread_bps"].fillna(default_spread_bps) * 0.5
+
+    q = float(cfg.min_half_spread_quantile)
+    if 0.0 < q < 1.0 and not half.dropna().empty:
+        min_half_spread_bps = float(half.quantile(q))
+    else:
+        min_half_spread_bps = 0.0
+
+    half = half.clip(lower=min_half_spread_bps)
+    df["half_spread_bps"] = half
+
     cfg_slip = SlippageConfig(
         k=0.8,
-        min_half_spread_bps=float(cfg.min_half_spread_bps),
-        default_spread_bps=float(cfg.default_spread_bps),
+        min_half_spread_bps=float(min_half_spread_bps),
+        default_spread_bps=float(default_spread_bps),
     )
-    df = df.copy()
-    if "half_spread_bps" not in df.columns:
-        df["half_spread_bps"] = df["spread_bps"].fillna(cfg_slip.default_spread_bps) * 0.5
-        df["half_spread_bps"] = df["half_spread_bps"].clip(lower=cfg_slip.min_half_spread_bps)
 
     k = fit_k_closed_form(df)
 
+    report = {
+        "k": float(k),
+        "default_spread_bps": float(default_spread_bps),
+        "min_half_spread_bps": float(min_half_spread_bps),
+    }
+
     os.makedirs(os.path.dirname(cfg.out) or ".", exist_ok=True)
     with open(cfg.out, "w", encoding="utf-8") as f:
-        json.dump({"k": float(k)}, f, ensure_ascii=False, indent=2, sort_keys=True)
+        json.dump(report, f, ensure_ascii=False, indent=2, sort_keys=True)
 
-    return float(k)
+    return report
 
 
-def from_config(path: str, *, out: str) -> float:
+def from_config(path: str, *, out: str) -> Dict[str, float]:
     """Load YAML configuration and execute calibration."""
 
     with open(path, "r", encoding="utf-8") as f:
@@ -96,8 +127,8 @@ def from_config(path: str, *, out: str) -> float:
         trades=d["trades"],
         out=out,
         fmt=d.get("format"),
-        min_half_spread_bps=float(d.get("min_half_spread_bps", 0.0)),
-        default_spread_bps=float(d.get("default_spread_bps", 2.0)),
+        default_spread_mode=d.get("default_spread_mode", "median"),
+        min_half_spread_quantile=float(d.get("min_half_spread_quantile", 0.0)),
     )
     return run(cfg)
 

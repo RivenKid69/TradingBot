@@ -1,0 +1,7 @@
+# Example configuration for slippage calibration service
+trades: "trades.parquet"
+format: "parquet"  # or csv
+# Strategy for default spread calculation: "median" or "mean"
+default_spread_mode: "median"
+# Lower quantile for minimal half-spread clipping
+min_half_spread_quantile: 0.05
