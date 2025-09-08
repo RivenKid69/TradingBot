@@ -4,8 +4,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
+from decimal import Decimal
 
 import pandas as pd
+
+from compat_shims import trade_dict_to_core_exec_report
+from core_models import TradeLogRow, EquityPoint
 
 
 @dataclass
@@ -43,8 +47,11 @@ class LogWriter:
       - append(report, symbol, ts_ms): кладёт трейды и снэпшот отчёта в буфер
       - flush(): сбрасывает буферы на диск
     """
-    def __init__(self, cfg: Optional[LogConfig] = None):
+    def __init__(self, cfg: Optional[LogConfig] = None, *, run_id: str = "sim"):
         self.cfg = cfg or LogConfig()
+        self._run_id = str(run_id)
+        self.cfg.trades_path = self.cfg.trades_path.replace("<runid>", self._run_id)
+        self.cfg.reports_path = self.cfg.reports_path.replace("<runid>", self._run_id)
         self._trades_buf: List[Dict[str, Any]] = []
         self._reports_buf: List[Dict[str, Any]] = []
         self._part_counter_trades: int = 0
@@ -58,31 +65,29 @@ class LogWriter:
     def append(self, report: Any, *, symbol: str, ts_ms: int) -> None:
         if not self.cfg.enabled:
             return
-        # трейды
-        for t in report.trades:
-            row = dict(t.__dict__)
-            row["symbol"] = str(symbol)
-            # ts трейда уже в t.ts
-            # добавим пару полей из отчёта для удобства
-            row["mark_price"] = float(report.mark_price)
-            row["equity"] = float(report.equity)
+        rep_dict = report.to_dict() if hasattr(report, "to_dict") else {}
+        for t in rep_dict.get("trades", []):
+            er = trade_dict_to_core_exec_report(t, parent=rep_dict, symbol=str(symbol), run_id=self._run_id)
+            row = TradeLogRow.from_exec(er).to_dict()
+            row["mark_price"] = float(getattr(report, "mark_price", 0.0))
+            row["equity"] = float(getattr(report, "equity", 0.0))
             self._trades_buf.append(row)
-        # отчёт (одна строка на шаг)
-        rep = {
-            "ts_ms": int(ts_ms),
-            "symbol": str(symbol),
-            "fee_total": float(report.fee_total),
-            "position_qty": float(report.position_qty),
-            "realized_pnl": float(report.realized_pnl),
-            "unrealized_pnl": float(report.unrealized_pnl),
-            "equity": float(report.equity),
-            "mark_price": float(report.mark_price),
-            "risk_paused_until_ms": int(getattr(report, "risk_paused_until_ms", 0)),
-        }
-        # события риска/фандинга храним как количества (для быстроты сводок)
-        rep["risk_events_count"] = int(len(getattr(report, "risk_events", []) or []))
-        rep["funding_events_count"] = int(len(getattr(report, "funding_events", []) or []))
-        self._reports_buf.append(rep)
+        eq = EquityPoint(
+            ts=int(ts_ms),
+            run_id=self._run_id,
+            symbol=str(symbol),
+            fee_total=Decimal(str(getattr(report, "fee_total", 0.0))),
+            position_qty=Decimal(str(getattr(report, "position_qty", 0.0))),
+            realized_pnl=Decimal(str(getattr(report, "realized_pnl", 0.0))),
+            unrealized_pnl=Decimal(str(getattr(report, "unrealized_pnl", 0.0))),
+            equity=Decimal(str(getattr(report, "equity", 0.0))),
+            mark_price=Decimal(str(getattr(report, "mark_price", 0.0))),
+            drawdown=Decimal(str(getattr(report, "drawdown", 0.0))) if getattr(report, "drawdown", None) is not None else None,
+            risk_paused_until_ms=int(getattr(report, "risk_paused_until_ms", 0)),
+            risk_events_count=int(len(getattr(report, "risk_events", []) or [])),
+            funding_events_count=int(len(getattr(report, "funding_events", []) or [])),
+        )
+        self._reports_buf.append(eq.to_dict())
 
         # авто-сброс
         if (len(self._trades_buf) + len(self._reports_buf)) >= max(1, int(self.cfg.flush_every)):
