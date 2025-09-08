@@ -928,7 +928,7 @@ strategy:
   params:
     lookback: 5
     threshold: 0.0
-    order_qty: 0.001
+    order_qty: 0.1  # доля позиции
 data:
   path: "data/train.parquet"
   ts_col: "ts_ms"
@@ -975,7 +975,7 @@ strategy:
   params:
     lookback: 5
     threshold: 0.0
-    order_qty: 0.001
+    order_qty: 0.1  # доля позиции
     model_path: "artifacts/model.pkl"
 features:
   lookbacks_prices: [5, 15, 60]
