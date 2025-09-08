@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Mapping, Union
 
 import pandas as pd
 
-from core_strategy import Strategy
+from core_strategy import Strategy, Decision
 from sandbox.sim_adapter import SimAdapter
-from exchange.specs import load_specs, round_price_to_tick, round_qty_to_step, notional_ok
+from exchange.specs import load_specs, round_price_to_tick
 
 
 @dataclass
@@ -172,22 +172,47 @@ class BacktestAdapter:
 
     # --------------------- helpers: exchange constraints ---------------------
 
-    def _apply_exchange_rules_to_decisions(self, symbol: str, ref_price: float, decisions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
+    def _apply_exchange_rules_to_decisions(
+        self,
+        symbol: str,
+        ref_price: float,
+        decisions: Sequence[Union[Decision, Mapping[str, Any]]],
+    ) -> List[Union[Decision, Mapping[str, Any]]]:
+        """Применяет биржевые ограничения к решениям.
+
+        Поддерживает высокоуровневые ``Decision`` и совместимые ``Mapping``.
+        Фильтрует решения с нулевой долей и нормализует поля ``side``,
+        ``volume_frac`` и ``price_offset_ticks``.
+        """
+
+        out: List[Union[Decision, Mapping[str, Any]]] = []
         for d in decisions:
-            dd = dict(d)
-            if "order_qty" in dd:
-                try:
-                    q = float(dd.get("order_qty", 0.0))
-                    q = round_qty_to_step(symbol, q, self._specs, mode="down")
-                    if q == 0.0:
-                        continue
-                    if not notional_ok(symbol, ref_price, q, self._specs):
-                        continue
-                    dd["order_qty"] = q
-                except Exception:
-                    pass
-            out.append(dd)
+            if isinstance(d, Mapping):
+                side = str(d.get("side", "BUY")).upper()
+                vol = float(d.get("volume_frac", 0.0))
+                if vol == 0:
+                    continue
+                po = int(d.get("price_offset_ticks", 0))
+                nd = dict(d)
+                nd["side"] = side
+                nd["volume_frac"] = vol
+                nd["price_offset_ticks"] = po
+                out.append(nd)
+            else:
+                vol = float(d.volume_frac)
+                if vol == 0:
+                    continue
+                side = "BUY" if str(d.side).upper() == "BUY" else "SELL"
+                po = int(getattr(d, "price_offset_ticks", 0))
+                out.append(
+                    Decision(
+                        side=side,
+                        volume_frac=vol,
+                        price_offset_ticks=po,
+                        tif=d.tif,
+                        client_tag=d.client_tag,
+                    )
+                )
         return out
 
     # --------------------- helpers: guards & cooldown ---------------------
@@ -213,14 +238,16 @@ class BacktestAdapter:
             return False
         return True
 
-    def _apply_signal_cooldown(self, sym: str, ts: int, decisions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _apply_signal_cooldown(
+        self, sym: str, ts: int, decisions: Sequence[Union[Decision, Mapping[str, Any]]]
+    ) -> List[Union[Decision, Mapping[str, Any]]]:
         if self._signal_cooldown_ms <= 0 or not decisions:
-            return decisions
+            return list(decisions)
         last_sig = self._last_signal_ts.get(sym)
         if last_sig is not None and (int(ts) - int(last_sig) < self._signal_cooldown_ms):
             return []
         self._last_signal_ts[sym] = int(ts)
-        return decisions
+        return list(decisions)
 
     # --------------------- helpers: no-trade windows ---------------------
 
@@ -309,8 +336,9 @@ class BacktestAdapter:
 
             self.strategy.on_features({**feats, "ref_price": ref})
             if allow:
-                decisions_raw = self.strategy.decide({"ts_ms": ts, "symbol": sym, "ref_price": ref, "features": feats})
-                decisions = [d.__dict__ for d in decisions_raw]
+                decisions = list(
+                    self.strategy.decide({"ts_ms": ts, "symbol": sym, "ref_price": ref, "features": feats})
+                )
             else:
                 decisions = []
 
