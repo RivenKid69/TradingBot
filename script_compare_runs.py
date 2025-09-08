@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Aggregate metrics from multiple runs.
 
-This script loads ``metrics.json`` files and prints a table with key
-performance indicators.  Each path supplied on the command line may
-point directly to a ``metrics.json`` file or to a directory containing
-one.  The resulting table is printed to stdout and may optionally be
-saved to a CSV file.
+This script loads ``metrics.json`` files and aggregates key
+performance indicators into a table. Each path supplied on the command
+line may point directly to a ``metrics.json`` file or to a directory
+containing one. By default the table is written to ``compare_runs.csv``
+in the current working directory, but the ``--stdout`` flag allows
+printing the table to standard output instead.
 """
 import argparse
 import csv
@@ -83,7 +84,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--csv",
-        help="Optional path to save CSV output.",
+        default="compare_runs.csv",
+        help="Path to save CSV output (default: compare_runs.csv).",
+    )
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print table to stdout instead of saving CSV.",
     )
     args = parser.parse_args()
 
@@ -108,9 +115,9 @@ def main() -> None:
         for row in rows:
             writer.writerow([row.get(h, "") for h in headers])
 
-    write_rows(csv.writer(sys.stdout))
-
-    if args.csv:
+    if args.stdout:
+        write_rows(csv.writer(sys.stdout))
+    else:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
             write_rows(csv.writer(f))
 
