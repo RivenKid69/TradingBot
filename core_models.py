@@ -411,7 +411,17 @@ class EquityPoint:
     """
     ts: int
     run_id: str
+    symbol: str
+    fee_total: Decimal
+    position_qty: Decimal
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal
     equity: Decimal
+    mark_price: Decimal
+    drawdown: Optional[Decimal] = None
+    risk_paused_until_ms: int = 0
+    risk_events_count: int = 0
+    funding_events_count: int = 0
     cash: Optional[Decimal] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 

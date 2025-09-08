@@ -231,65 +231,81 @@ class ExecutionSimulator:
                  latency_config: Optional[dict] = None,
                  pnl_config: Optional[dict] = None,
                  risk_config: Optional[dict] = None,
-                 logging_config: Optional[dict] = None):
-    self.symbol = str(symbol).upper()
-    self.latency_steps = int(max(0, latency_steps))
-    self.seed = int(seed)
-    self._rng = np.random.RandomState(seed) if hasattr(np, "random") else None  # type: ignore
-    self._q = _LatencyQueue(self.latency_steps)
-    self._next_cli_id = 1
-    self.lob = lob
-    self._last_ref_price: Optional[float] = None
+                 logging_config: Optional[dict] = None,
+                 run_config: Any = None):
+        self.symbol = str(symbol).upper()
+        self.latency_steps = int(max(0, latency_steps))
+        self.seed = int(seed)
+        self._rng = np.random.RandomState(seed) if hasattr(np, "random") else None  # type: ignore
+        self._q = _LatencyQueue(self.latency_steps)
+        self._next_cli_id = 1
+        self.lob = lob
+        self._last_ref_price: Optional[float] = None
+        self.run_id: str = str(getattr(run_config, "run_id", "sim") or "sim")
 
-    # квантайзер — опционально
-    self.quantizer: Optional[Quantizer] = None
-    self.enforce_ppbs = bool(enforce_ppbs)
-    self.strict_filters = bool(strict_filters)
-    try:
-        if Quantizer is not None and filters_path:
-            filters = load_filters(filters_path)
-            if filters:
-                self.quantizer = Quantizer(filters, strict=strict_filters)
-    except Exception:
-        # не ломаемся, если файл отсутствует; квантизация просто не активна
-        self.quantizer = None
+        # квантайзер — опционально
+        self.quantizer: Optional[Quantizer] = None
+        self.enforce_ppbs = bool(enforce_ppbs)
+        self.strict_filters = bool(strict_filters)
+        try:
+            if Quantizer is not None and filters_path:
+                filters = load_filters(filters_path)
+                if filters:
+                    self.quantizer = Quantizer(filters, strict=strict_filters)
+        except Exception:
+            # не ломаемся, если файл отсутствует; квантизация просто не активна
+            self.quantizer = None
 
-    # комиссии и funding
-    self.fees = FeesModel.from_dict(fees_config or {}) if FeesModel is not None else None
-    self.funding = FundingCalculator(**(funding_config or {"enabled": False})) if FundingCalculator is not None else None
+        # комиссии и funding
+        self.fees = FeesModel.from_dict(fees_config or {}) if FeesModel is not None else None
+        self.funding = (
+            FundingCalculator(**(funding_config or {"enabled": False}))
+            if FundingCalculator is not None
+            else None
+        )
 
-    # слиппедж
-    self.slippage_cfg = SlippageConfig.from_dict(slippage_config or {}) if SlippageConfig is not None else None
+        # слиппедж
+        self.slippage_cfg = (
+            SlippageConfig.from_dict(slippage_config or {}) if SlippageConfig is not None else None
+        )
 
-    # исполнители
-    self._execution_cfg = dict(execution_config or {})
-    self._executor: Optional[BaseExecutor] = None
-    self._build_executor()
+        # исполнители
+        self._execution_cfg = dict(execution_config or {})
+        self._executor: Optional[BaseExecutor] = None
+        self._build_executor()
 
-    # латентность
-    self.latency = LatencyModel(**(latency_config or {})) if LatencyModel is not None else None
+        # латентность
+        self.latency = (
+            LatencyModel(**(latency_config or {})) if LatencyModel is not None else None
+        )
 
-    # риск-менеджер
-    self.risk = RiskManager.from_dict(risk_config or {}) if RiskManager is not None else None
+        # риск-менеджер
+        self.risk = (
+            RiskManager.from_dict(risk_config or {}) if RiskManager is not None else None
+        )
 
-    # состояние позиции и PnL
-    self.position_qty: float = 0.0
-    self._avg_entry_price: Optional[float] = None
-    self.realized_pnl_cum: float = 0.0
-    self.fees_cum: float = 0.0
-    self.funding_cum: float = 0.0
-    self._pnl_mark_to: str = str((pnl_config or {}).get("mark_to", "side")).lower()
+        # состояние позиции и PnL
+        self.position_qty: float = 0.0
+        self._avg_entry_price: Optional[float] = None
+        self.realized_pnl_cum: float = 0.0
+        self.fees_cum: float = 0.0
+        self.funding_cum: float = 0.0
+        self._pnl_mark_to: str = str((pnl_config or {}).get("mark_to", "side")).lower()
 
-    # последний снапшот рынка для оценки spread/vol/liquidity
-    self._last_bid: Optional[float] = None
-    self._last_ask: Optional[float] = None
-    self._last_spread_bps: Optional[float] = None
-    self._last_vol_factor: Optional[float] = None
-    self._last_liquidity: Optional[float] = None
+        # последний снапшот рынка для оценки spread/vol/liquidity
+        self._last_bid: Optional[float] = None
+        self._last_ask: Optional[float] = None
+        self._last_spread_bps: Optional[float] = None
+        self._last_vol_factor: Optional[float] = None
+        self._last_liquidity: Optional[float] = None
 
-    # логирование
-    self._logger = LogWriter(LogConfig.from_dict(logging_config or {})) if LogWriter is not None else None
-    self._step_counter: int = 0
+        # логирование
+        self._logger = (
+            LogWriter(LogConfig.from_dict(logging_config or {}), run_id=self.run_id)
+            if LogWriter is not None
+            else None
+        )
+        self._step_counter: int = 0
 
     def set_quantizer(self, q: Quantizer) -> None:
         self.quantizer = q
@@ -649,34 +665,40 @@ class ExecutionSimulator:
                         latency_spike=bool(lat_spike),
                     ))
                 continue
-                    filled_price = float(ref)
+            filled_price = float(ref)
 
-                    # слиппедж
-                    slip_bps = 0.0
-                    sbps = self._last_spread_bps
-                    vf = self._last_vol_factor
-                    liq = self._last_liquidity
-                    if self.slippage_cfg is not None and estimate_slippage_bps is not None and apply_slippage_price is not None:
-                        slip_bps = estimate_slippage_bps(
-                            spread_bps=sbps,
-                            size=qty,
-                            liquidity=liq,
-                            vol_factor=vf,
-                            cfg=self.slippage_cfg,
-                        )
-                        filled_price = apply_slippage_price(side=side, quote_price=filled_price, slippage_bps=slip_bps)
+            # слиппедж
+            slip_bps = 0.0
+            sbps = self._last_spread_bps
+            vf = self._last_vol_factor
+            liq = self._last_liquidity
+            if (
+                self.slippage_cfg is not None
+                and estimate_slippage_bps is not None
+                and apply_slippage_price is not None
+            ):
+                slip_bps = estimate_slippage_bps(
+                    spread_bps=sbps,
+                    size=qty,
+                    liquidity=liq,
+                    vol_factor=vf,
+                    cfg=self.slippage_cfg,
+                )
+                filled_price = apply_slippage_price(
+                    side=side, quote_price=filled_price, slippage_bps=slip_bps
+                )
 
-                    # комиссия
-                    fee = 0.0
-                    if self.fees is not None:
-                        fee = self.fees.compute(side=side, price=filled_price, qty=qty, liquidity="taker")
-                    fee_total += float(fee)
+            # комиссия
+            fee = 0.0
+            if self.fees is not None:
+                fee = self.fees.compute(side=side, price=filled_price, qty=qty, liquidity="taker")
+            fee_total += float(fee)
 
-                    # обновить позицию
-                    if side == "BUY":
-                        self.position_qty += float(qty)
-                    else:
-                        self.position_qty -= float(qty)
+            # обновить позицию
+            if side == "BUY":
+                self.position_qty += float(qty)
+            else:
+                self.position_qty -= float(qty)
 
                     trades.append(ExecTrade(
                         ts=ts,

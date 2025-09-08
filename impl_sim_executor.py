@@ -16,7 +16,7 @@ impl_sim_executor.py
 from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, Optional, Sequence, Mapping, List
+from typing import Dict, Optional, Sequence, Mapping, List, Any
 
 from core_models import Order, ExecReport, Position, as_dict
 from core_contracts import TradeExecutor
@@ -54,8 +54,10 @@ class SimExecutor(TradeExecutor):
         latency: LatencyImpl | None = None,
         slippage: SlippageImpl | None = None,
         fees: FeesImpl | None = None,
+        run_config: Any = None,
     ) -> None:
         self._sim = sim
+        self._run_id = str(getattr(run_config, "run_id", "sim") or "sim")
         self._ctx = _SimCtx(symbol=str(symbol), max_position_abs_base=float(max_position_abs_base))
 
         # последовательное подключение компонентов к симулятору
@@ -81,6 +83,7 @@ class SimExecutor(TradeExecutor):
         latency_cfg: dict | None = None,
         slippage_cfg: dict | None = None,
         fees_cfg: dict | None = None,
+        run_config: Any = None,
     ) -> "SimExecutor":
         q_impl = QuantizerImpl.from_dict(filters_cfg or {}) if filters_cfg is not None else None
         r_impl = RiskBasicImpl.from_dict(risk_cfg or {}) if risk_cfg is not None else None
@@ -96,6 +99,7 @@ class SimExecutor(TradeExecutor):
             latency=l_impl,
             slippage=s_impl,
             fees=f_impl,
+            run_config=run_config,
         )
 
     # ---- вспомогательное: Order -> (ActionType, ActionProto) ----
@@ -162,6 +166,7 @@ class SimExecutor(TradeExecutor):
         core_reports: List[ExecReport] = sim_report_dict_to_core_exec_reports(
             d,
             symbol=self._ctx.symbol,
+            run_id=self._run_id,
             client_order_id=str(getattr(order, "client_order_id", "") or ""),
         )
         # Возвращаем первый отчёт; при необходимости вызывающая сторона может получить остальные из d
