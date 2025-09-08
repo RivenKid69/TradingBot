@@ -1,0 +1,172 @@
+Симуляция рынка и исполнение
+
+[P0] Подключить реальный квантайзер и фильтры Binance
+— impl_quantizer.py, quantizer.py, binance_public.py, binance_filters.json
+— Скрипт выгрузки фильтров для целевых символов (PRICE_FILTER, LOT_SIZE, MIN_NOTIONAL, PERCENT_PRICE_BY_SIDE) в binance_filters.json; загрузка через Quantizer.load_filters.
+— В impl_sim_executor.QuantizerImpl.attach_to() включить strict=True, enforce_percent_price_by_side=True.
+— Acceptance: любые некорректные цены/количества отклоняются/округляются как на Binance; нет ордеров ниже MIN_NOTIONAL.
+
+[P0] Передача рыночного снапшота в ExecutionSimulator на каждом шаге
+— trading_patchnew.py → внутри step()/перед Mediator → вызвать exec.set_market_snapshot(bid, ask, spread_bps, vol_factor, liquidity) из текущего бара.
+— bid/ask: если есть — подать фактические; если нет — синтетика: mid=close, spread_bps из модели (см. ниже), bid/ask = mid±spread/2.
+— vol_factor: ATR% текущего окна; liquidity: роллинг-объём (base/quote) за N часов.
+— Acceptance: в логах симулятора появляются динамические spread_bps, vol_factor, liquidity без пропусков.
+
+[P0] Динамический спред и слиппедж, завязанные на волатильность/ликвидность
+— slippage.py, impl_slippage.py, execution_sim.py
+— Использовать формулу из SlippageConfig; передавать vol_factor (ATR%) и liquidity из env (см. пункт выше).
+— Калибровка k, default_spread_bps, min_half_spread_bps на историке (использовать service_calibrate_slippage.py).
+— Acceptance: кривая «проскальзывание (б.п.) vs квантиль размера ордера» совпадает с историкой в пределах допусков.
+
+[P0] Латентность и таймауты в контур исполнения
+— latency.py, impl_latency.py, execution_sim.py, mediator.py
+— Подключить LatencyModel к ExecutionSimulator (через impl_latency.LatencyImpl.attach_to).
+— Ордер исполняется после задержки; учитывать таймауты и ретраи.
+— Acceptance: метрики p50/p95 задержки, доля таймаутов логируются; влияние задержки видно на цене фила.
+
+[P0] Комиссии и (опционально) funding для фьючерсов
+— fees.py, impl_fees.py, execution_sim.py
+— Включить maker/taker, скидки BNB (мультипликаторы), FundingCalculator с интервалом 8h; загрузка реальной кривой (опционально) из binance_public.get_funding() для валидации.
+— Acceptance: отчёт симулятора содержит разложение PnL на realized/unrealized/fees/funding.
+
+[P0] Жёсткое соблюдение правил биржи при размещении/изменении/TTL лимиток
+— execution_sim.py, mediator.py (+ при использовании C++ LOB: OrderBook.cpp)
+— Квантизация цены/qty → проверка PPBS → применение TTL из ActionProto.ttl_steps; отмена по истечении TTL.
+— Acceptance: нет фила лимиток с нарушением квантования; истечение TTL корректно снимает заявки.
+
+[P1] IOC/FOK для лимитных ордеров (если используете LOB)
+— OrderBook.cpp (в TODO отмечен IOC)
+— Реализовать матчинг «снять остаток» (IOC) и «либо полностью, либо отмена» (FOK).
+— Acceptance: юнит-примеры сценариев IOC/FOK в логах симуляции (частичные/нулевые филы корректны).
+(Если используете только ExecutionSimulator — можно опционально.)
+
+Реализм данных и отсутствие утечек
+
+[P0] Синхронизация тайминга решения на H1
+— trading_patchnew.py
+— Режимы: «решение по close бара (действие на open следующего)» и «решение внутри часа с latency».
+— Запрет на использование close текущего бара при формировании признаков/сигнала.
+— Acceptance: assert-чек «no-leak» на каждом шаге; отсутствие look-ahead в признаках.
+
+[P0] No-trade окна (funding buffer и кастомные периоды)
+— no_trade.py, apply_no_trade_mask.py, trading_patchnew.py
+— Применить маску: не торговать за N минут до/после funding и в заданные UTC-интервалы; в обучении — либо дроп строк, либо train_weight=0.
+— Acceptance: доля заблокированных шагов совпадает с конфигом; ордера в эти окна не генерируются.
+
+[P1] Калибровка регимов/шоков и сезонности ликвидности
+— MarketSimulator.cpp (для стресс-тестов), train_model_multi_patch.py (adversarial regime tests)
+— Параметры NORMAL/FLAT/TREND/ILLIQUID и flash-шоки — подкрутить к историке; ввести сезонность ликвидности по часу-недели (UTC) при расчёте liquidity.
+— Acceptance: распределения волатильности/объёма/спреда по режимам близки к историческим.
+
+Интеграция с train_model_multi_patch.py
+
+[P0] Единая точка входа на обучение через train_model_multi_patch.py
+— Обновить CLI/скрипты: удалить/депрекейтить старые train-entrypoints; все конфиги — через configs/config_train.yaml.
+— Прокинуть в конструктор env параметры симуляции (quantizer/slippage/fees/latency/risk/no_trade) через argparse/конфиг.
+— Acceptance: один сценарий запуска обучает и валидирует модель; другие train-скрипты не используются.
+
+[P0] Совместимость с параллельными средами и “multi-patch”
+— shared_memory_vec_env.py, trading_patchnew.py
+— Нет глобального состояния в env; корректные seed/reset/close; независимые буферы/нормализации по инстансам.
+— Строгое разбиение train/val/test пачек без утечек нормстат (см. уже внедрённую фиксацию в train_model_multi_patch.py).
+— Acceptance: детерминируемый повтор запуска при одинаковом seed; валидация не потребляет train-статистики.
+
+[P1] Инструменты логирования симуляции прямо в ходе обучения
+— mediator.py, execution_sim.py, train_model_multi_patch.py
+— Логи: timestamp сигнала, задержка, заявка, фактический фил (цена/объём), комиссии/funding, риск-события.
+— Интеграция KPI симуляции (ниже) в коллбеки тренировки.
+— Acceptance: артефакты в logs/ и artifacts/ на каждый запуск, пригодные для последующего анализа.
+
+KPI реалистичности и приёмка
+
+[P0] KPI симуляции и сравнение с историкой
+— Скрипт отчёта (новый scripts/sim_reality_check.py):
+
+распределение spread_bps, slippage_bps vs размер ордера, p50/p95 latency, доля частичных/незаполненных, доля отмен по TTL/IOC/FOK;
+
+сравнение с историческими эталонами (пороговые допуски).
+— Acceptance: все KPI в пределах допусков; при отклонениях — флаг «нереалистично».
+
+[P1] Стресс-бенчмарк устойчивости модели
+— Использовать уже встроенные adversarial regime tests в train_model_multi_patch.py; расширить набор параметров (шоки, всплески latency, сужение ликвидности).
+— Acceptance: Sortino/дроудаун не выходят за заданные лимиты под стрессами.
+
+Мелкие, но важные доработки
+
+[P0] Единая конфигурация симуляции
+— configs/config_train.yaml, configs/config_sim.yaml
+— Блоки quantizer/fees/slippage/latency/risk/no_trade с параметрами; быстрый переключатель spot/futures и списков символов.
+— Acceptance: запуск обучения/бэктеста меняет поведение симуляции только через конфиг.
+
+[P1] Режим “signal-only”
+— mediator.py, trading_patchnew.py
+— Опция: не открывать реальные позиции, а лишь фиксировать сигналы и считать «гипотетический» PnL по правилам исполнения; полезно для чисто сигнального сценария.
+— Acceptance: переключатель в конфиге, корректные отчёты сигналов и гипотетических сделок.
+
+Дополнения (новые пункты)
+
+[P0] Интрабар-микро-сим на H1 (иерархический бар)
+— trading_patchnew.py, execution_sim.py, slippage.py, impl_offline_data.py
+— При обучении на H1 использовать 1m (или 5m) «внутри часа» для расчёта цены фила/проскальзывания (VWAP/POV или по траектории min→max).
+— Acceptance: расхождение между H1-«настенным» fill и микро-симом ≤ заданного порога на эталонных периодах.
+
+[P0] PnL по bid/ask (а не по mid)
+— execution_sim.py, mediator.py
+— Оценка входа/выхода: BUY на ask, SELL на bid; mark-to-market позиции по лучшим котировкам.
+— Acceptance: отчёт симуляции содержит отдельные поля bid, ask, mtm_price, и PnL воспроизводится из логов фила + этих цен.
+
+[P0] Жёсткая UTC-синхронизация и ресемплинг
+— agg_klines.py, impl_offline_data.py
+— Все бары выровнены по UTC-границам часа; запрет на локальные таймзоны и «плавающие» окна.
+— Acceptance: инварианты: ts_ms % 3600000 == 0 для H1; отсутствие «дублирующих» и «дыр» после агрегации.
+
+[P0] Профили исполнения сигналов (policy profiles)
+— execution_algos.py, execution_sim.py
+— Три профиля оценки сигналов:
+
+MKT@open(next H1) + слиппедж;
+
+VWAP@текущем H1;
+
+LIMIT@mid±X bps с TTL/IOC/FOK.
+— Acceptance: в конфиге переключатель профиля; метрики считаются по каждому профилю.
+
+[P1] Сезонность ликвидности/латентности по часу-недели
+— execution_sim.py, impl_latency.py
+— Мультипликаторы liquidity/latency по «часу недели» (0..167) на основе истории.
+— Acceptance: распределения spread/liquidity/latency по часам недели близки к историке.
+
+[P1] Симуляция деградаций данных/API
+— impl_offline_data.py, binance_ws.py (для лайва), execution_sim.py
+— Случайные «стэйл» котировки/пропуски баров, кратковременные разрывы стрима → задержка/дропаут сигналов.
+— Acceptance: логируется доля пропусков и задержек; поведение контролируется параметрами в конфиге.
+
+[P1] Рейт-лимиты/бэк-офф для публикации сигналов
+— mediator.py, binance_public.py / binance_ws.py (только для оценки real-time)
+— Смоделировать ограничение на частоту отправки/обновления сигналов и бэк-офф при превышении.
+— Acceptance: доля «отложенных/отбракованных» сигналов фиксируется в логах.
+
+[P1] Слайсинг крупных ордеров (POV/TWAP) по триггерам размера
+— execution_algos.py, execution_sim.py
+— Включать POV/TWAP при notional > threshold; параметризуемое участие в объёме.
+— Acceptance: детерминируемые траектории частичных филов; кривые impact vs participation согласованы с историкой.
+
+[P1] Сенситивити-раны по издержкам/спреду
+— scripts/sim_reality_check.py
+— Набор сценариев: (Low/Med/High) fees & spread; отчёт устойчивости метрик модели.
+— Acceptance: ранжирование деградации по сценарию; флаг при «чрезмерной» чувствительности.
+
+[P2] Futures-специфика (опционально)
+— ingest_funding_mark.py, execution_sim.py
+— Отдельный режим: PnL/маржа по mark-price, учёт funding по расписанию; (без ликвидации, если бот сигнальный).
+— Acceptance: сверка выписок funding/mark на контрольных участках.
+
+[P2] Мульти-символьная выборка с весами ликвидности
+— trading_patchnew.py, configs/config_train.yaml
+— Семплирование пар по весам ликвидности; пер-символьные фильтры/спред/fees.
+— Acceptance: доли эпизодов по символам соответствуют весам; отдельные KPI по каждому символу.
+
+[P2] Гарды качества данных
+— impl_offline_data.py
+— Винзоризация «хвостов» цены/объёма, детектор разметочных ошибок (аномальные хай/лоу, нулевой объём).
+— Acceptance: отчёт по корректировкам (сколько/каких) + возможность запретить обучение на таких барах.
