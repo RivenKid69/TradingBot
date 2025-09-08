@@ -33,7 +33,7 @@ from services.utils_app import (
 )
 from service_backtest import BacktestConfig, from_config as backtest_from_config
 from service_train import ServiceTrain, TrainConfig
-from offline_feature_pipe import OfflineFeaturePipe
+from feature_pipe import FeaturePipe
 from transformers import FeatureSpec
 from service_signal_runner import ServiceSignalRunner, RunnerConfig
 from service_eval import ServiceEval, EvalConfig
@@ -724,7 +724,7 @@ with tabs[10]:
                         return path
 
                 spec = FeatureSpec(lookbacks_prices=[5, 15, 60], rsi_period=14)
-                fp = OfflineFeaturePipe(spec, price_col=price_col, label_col=(label_col or None))
+                fp = FeaturePipe(spec, price_col=price_col, label_col=(label_col or None))
                 trainer = DummyTrainer(model_type)
                 fmt = "parquet" if train_data.endswith(".parquet") else "csv"
                 cfg_train = TrainConfig(

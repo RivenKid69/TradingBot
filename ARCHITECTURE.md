@@ -127,8 +127,8 @@ python script_compare_runs.py run1/ run2/metrics.json --csv summary.csv
 
 `ServiceTrain` подготавливает датасет и запускает обучение модели.  Он
 ожидает реализацию протокола `FeaturePipe`.  Для оффлайн‑расчёта фич
-можно использовать класс `OfflineFeaturePipe`, который оборачивает
-функцию `apply_offline_features`.
+используется тот же класс `FeaturePipe`, оборачивающий функцию
+`apply_offline_features`.
 
 Пример запуска обучения:
 
