@@ -1,1 +1,40 @@
-{}
+{
+  "BTCUSDT": {
+    "PRICE_FILTER": {
+      "minPrice": "0.01",
+      "maxPrice": "1000000",
+      "tickSize": "0.01"
+    },
+    "LOT_SIZE": {
+      "minQty": "0.00001",
+      "maxQty": "1000",
+      "stepSize": "0.00001"
+    },
+    "MIN_NOTIONAL": {
+      "minNotional": "10"
+    },
+    "PERCENT_PRICE_BY_SIDE": {
+      "multiplierUp": "1.2",
+      "multiplierDown": "0.8"
+    }
+  },
+  "ETHUSDT": {
+    "PRICE_FILTER": {
+      "minPrice": "0.01",
+      "maxPrice": "1000000",
+      "tickSize": "0.01"
+    },
+    "LOT_SIZE": {
+      "minQty": "0.0001",
+      "maxQty": "100000",
+      "stepSize": "0.0001"
+    },
+    "MIN_NOTIONAL": {
+      "minNotional": "10"
+    },
+    "PERCENT_PRICE_BY_SIDE": {
+      "multiplierUp": "1.2",
+      "multiplierDown": "0.8"
+    }
+  }
+}

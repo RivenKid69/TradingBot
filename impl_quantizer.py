@@ -10,10 +10,9 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 try:
-    from quantizer import Quantizer, load_filters
+    from quantizer import Quantizer
 except Exception as e:  # pragma: no cover
     Quantizer = None  # type: ignore
-    load_filters = None  # type: ignore
 
 
 @dataclass
@@ -27,8 +26,8 @@ class QuantizerImpl:
     def __init__(self, cfg: QuantizerConfig) -> None:
         self.cfg = cfg
         self._quantizer = None
-        if Quantizer is not None and load_filters is not None and cfg.path:
-            filters = load_filters(cfg.path)
+        if Quantizer is not None and cfg.path:
+            filters = Quantizer.load_filters(cfg.path)
             if filters:
                 self._quantizer = Quantizer(filters, strict=bool(cfg.strict))
 
@@ -36,13 +35,12 @@ class QuantizerImpl:
     def quantizer(self):
         return self._quantizer
 
-    def attach_to(self, sim) -> None:
-        """
-        Подключает к симулятору:
-          - sim.quantizer = Quantizer(...)
-          - sim.enforce_ppbs = cfg.enforce_percent_price_by_side
-          - sim.strict_filters = cfg.strict
-        """
+    def attach_to(self, sim, *, strict: Optional[bool] = None, enforce_percent_price_by_side: Optional[bool] = None) -> None:
+        """Подключает квантайзер к симулятору."""
+        if strict is not None:
+            self.cfg.strict = bool(strict)
+        if enforce_percent_price_by_side is not None:
+            self.cfg.enforce_percent_price_by_side = bool(enforce_percent_price_by_side)
         if self._quantizer is not None:
             setattr(sim, "quantizer", self._quantizer)
         setattr(sim, "enforce_ppbs", bool(self.cfg.enforce_percent_price_by_side))

@@ -121,3 +121,34 @@ class BinancePublicClient:
         if isinstance(data, list):
             return data  # type: ignore
         raise RuntimeError(f"Unexpected funding response: {data}")
+
+    # -------- EXCHANGE FILTERS --------
+
+    def get_exchange_filters(self, *, market: str = "spot", symbols: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Возвращает фильтры торговли для указанных символов Binance.
+        Поддерживаются типы фильтров: PRICE_FILTER, LOT_SIZE, MIN_NOTIONAL,
+        PERCENT_PRICE_BY_SIDE / PERCENT_PRICE.
+        """
+        if market not in ("spot", "futures"):
+            raise ValueError("market must be 'spot' or 'futures'")
+        base = self.e.spot_base if market == "spot" else self.e.futures_base
+        path = "/api/v3/exchangeInfo" if market == "spot" else "/fapi/v1/exchangeInfo"
+        url = f"{base}{path}"
+        params: Dict[str, Any] = {}
+        if symbols:
+            params["symbols"] = json.dumps([s.upper() for s in symbols])
+        data = _retrying_get(url, params, timeout=self.timeout)
+        out: Dict[str, Dict[str, Any]] = {}
+        if isinstance(data, dict):
+            for s in data.get("symbols", []):
+                sym = s.get("symbol")
+                filts = s.get("filters", [])
+                d: Dict[str, Any] = {}
+                for f in filts:
+                    ftype = f.get("filterType")
+                    if ftype in {"PRICE_FILTER", "LOT_SIZE", "MIN_NOTIONAL", "PERCENT_PRICE_BY_SIDE", "PERCENT_PRICE"}:
+                        d[ftype] = {k: v for k, v in f.items() if k != "filterType"}
+                if sym and d:
+                    out[sym] = d
+        return out
