@@ -7,7 +7,7 @@ Pydantic-модели конфигураций: sim/live/train/eval + декла
 
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, List, Mapping, Union
+from typing import Dict, Any, Optional, List, Mapping, Union, Literal
 
 import yaml
 from pydantic import BaseModel, Field, validator
@@ -53,11 +53,22 @@ class SimulationDataConfig(BaseModel):
 
 class SimulationConfig(CommonRunConfig):
     mode: str = Field(default="sim")
-    data: SimulationDataConfig
+    market: Literal["spot", "futures"] = Field(default="spot")
+    symbols: List[str] = Field(default_factory=list)
+    quantizer: Dict[str, Any] = Field(default_factory=dict)
     fees: Dict[str, Any] = Field(default_factory=dict)
-    latency: Dict[str, Any] = Field(default_factory=dict)
     slippage: Dict[str, Any] = Field(default_factory=dict)
+    latency: Dict[str, Any] = Field(default_factory=dict)
+    risk: Dict[str, Any] = Field(default_factory=dict)
+    no_trade: Dict[str, Any] = Field(default_factory=dict)
+    data: SimulationDataConfig
     limits: Dict[str, Any] = Field(default_factory=dict)
+
+    @validator("symbols", always=True)
+    def validate_symbols(cls, v, values):
+        if values.get("market") and not v:
+            raise ValueError("symbols must be provided for the selected market")
+        return v
 
 
 class LiveAPIConfig(BaseModel):
@@ -100,8 +111,22 @@ class ModelConfig(BaseModel):
 
 class TrainConfig(CommonRunConfig):
     mode: str = Field(default="train")
+    market: Literal["spot", "futures"] = Field(default="spot")
+    symbols: List[str] = Field(default_factory=list)
+    quantizer: Dict[str, Any] = Field(default_factory=dict)
+    fees: Dict[str, Any] = Field(default_factory=dict)
+    slippage: Dict[str, Any] = Field(default_factory=dict)
+    latency: Dict[str, Any] = Field(default_factory=dict)
+    risk: Dict[str, Any] = Field(default_factory=dict)
+    no_trade: Dict[str, Any] = Field(default_factory=dict)
     data: TrainDataConfig
     model: ModelConfig
+
+    @validator("symbols", always=True)
+    def validate_symbols(cls, v, values):
+        if values.get("market") and not v:
+            raise ValueError("symbols must be provided for the selected market")
+        return v
 
 
 class EvalInputConfig(BaseModel):
@@ -130,7 +155,8 @@ def load_config(path: str) -> CommonRunConfig:
     cfg_cls = mapping.get(mode)
     if cfg_cls is None:
         raise ValueError(f"Unknown mode: {mode}")
-    return cfg_cls(**data)
+    # parse_obj ensures all newly added optional fields are preserved
+    return cfg_cls.parse_obj(data)
 
 
 def load_config_from_str(content: str) -> CommonRunConfig:
@@ -146,7 +172,8 @@ def load_config_from_str(content: str) -> CommonRunConfig:
     cfg_cls = mapping.get(mode)
     if cfg_cls is None:
         raise ValueError(f"Unknown mode: {mode}")
-    return cfg_cls(**data)
+    # parse_obj ensures all newly added optional fields are preserved
+    return cfg_cls.parse_obj(data)
 
 
 __all__ = [
