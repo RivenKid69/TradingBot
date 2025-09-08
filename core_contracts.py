@@ -101,14 +101,29 @@ class RiskGuards(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class PolicyCtx:
+    """
+    Контекст принятия решения, который может предоставлять BacktestEngine/сервис.
+    Обязательные поля: ``ts`` (мс) и ``symbol``.
+    Дополнительно могут передаваться текущая позиция и лимиты портфеля.
+    """
+
+    ts: int
+    symbol: str
+    position: Optional[Position] = None
+    limits: Optional[PortfolioLimits] = None
+    extra: Optional[Dict[str, Any]] = None
+
+
 @runtime_checkable
 class SignalPolicy(Protocol):
     """
-    Политика принятия решений. На вход подаются признаки и контекст.
-    Возвращает список заявок (Order) для исполнения.
+    Политика принятия решений. На вход подаются признаки и контекст,
+    возвращает список заявок (:class:`Order`) для исполнения.
     """
 
-    def decide(self, features: Mapping[str, Any], ctx: Mapping[str, Any]) -> List[Order]:
+    def decide(self, features: Mapping[str, Any], ctx: PolicyCtx) -> List[Order]:
         ...
 
 
@@ -123,17 +138,3 @@ class BacktestEngine(Protocol):
         Возвращает словарь с итоговыми артефактами: trades: List[ExecReport], equity: List[Dict], metrics: Dict
         """
         ...
-
-
-@dataclass(frozen=True)
-class DecisionContext:
-    """
-    Контекст принятия решения, который может предоставлять BacktestEngine/сервис.
-    Обязательные ключи: ts (int ms), symbol (str).
-    Дополнительно: position (Position), limits (PortfolioLimits), extra (Dict[str, Any]).
-    """
-    ts: int
-    symbol: str
-    position: Optional[Position] = None
-    limits: Optional[PortfolioLimits] = None
-    extra: Optional[Dict[str, Any]] = None
