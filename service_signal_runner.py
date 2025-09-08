@@ -22,13 +22,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence, Iterator, Protocol
 import os
 
-from sandbox.sim_adapter import SimAdapter, DecisionsProvider  # исп. как TradeExecutor-подобный мост
+from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
-from core_contracts import FeaturePipe
+from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig
 import di_registry
-from core_strategy import Strategy
+# исторически сохранилось имя "strategy" в DI и конфигурациях
+Strategy = SignalPolicy
 
 
 class RiskGuards(Protocol):
@@ -47,21 +48,19 @@ class SignalRunnerConfig:
 RunnerConfig = SignalRunnerConfig
 
 
-class _Provider(DecisionsProvider):
-    def __init__(self, fp: FeaturePipe, strat: Strategy, guards: Optional[RiskGuards] = None):
+class _Provider:
+    def __init__(self, fp: FeaturePipe, policy: SignalPolicy, guards: Optional[RiskGuards] = None):
         self._fp = fp
-        self._strat = strat
+        self._policy = policy
         self._guards = guards
 
     def on_bar(self, bar: Bar):
-        # FeaturePipe now uses ``update`` for streaming features
-        # (``on_bar`` is kept only as a backward-compatible alias).
         feats = self._fp.update(bar)
-        self._strat.on_features({**feats, "ref_price": float(bar.close)})
-        dec = list(self._strat.decide({"ts_ms": int(bar.ts), "symbol": bar.symbol, "ref_price": float(bar.close), "features": feats}) or [])
+        ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
+        orders = list(self._policy.decide({**feats}, ctx) or [])
         if self._guards:
-            dec = list(self._guards.apply(int(bar.ts), bar.symbol, dec) or [])
-        return dec
+            orders = list(self._guards.apply(int(bar.ts), bar.symbol, orders) or [])
+        return orders
 
 
 class ServiceSignalRunner:
@@ -69,13 +68,13 @@ class ServiceSignalRunner:
         self,
         adapter: SimAdapter,
         feature_pipe: FeaturePipe,
-        strategy: Strategy,
+        strategy: SignalPolicy,
         risk_guards: Optional[RiskGuards] = None,
         cfg: Optional[SignalRunnerConfig] = None,
     ) -> None:
         self.adapter = adapter
         self.feature_pipe = feature_pipe
-        self.strategy = strategy
+        self.policy = strategy
         self.risk_guards = risk_guards
         self.cfg = cfg or SignalRunnerConfig()
 
@@ -100,15 +99,16 @@ class ServiceSignalRunner:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
 
         self.feature_pipe.warmup()
-        provider = _Provider(self.feature_pipe, self.strategy, self.risk_guards)
+        provider = _Provider(self.feature_pipe, self.policy, self.risk_guards)
         try:
             for rep in self.adapter.run_events(provider):
                 yield rep
         finally:
             sim = getattr(self.adapter, "sim", None) or getattr(self.adapter, "_sim", None)
+            logger = getattr(sim, "_logger", None) if sim is not None else None
             try:
-                if getattr(sim, "_logger", None):
-                    sim._logger.flush()
+                if logger:
+                    logger.flush()
             except Exception:
                 pass
 
@@ -132,9 +132,9 @@ def from_config(
     container = di_registry.build_graph(cfg.components, cfg)
     adapter: SimAdapter = container["executor"]
     fp: FeaturePipe = container["feature_pipe"]
-    strat: Strategy = container["strategy"]
+    policy: SignalPolicy = container["strategy"]
     guards: RiskGuards | None = container.get("risk_guards")
-    service = ServiceSignalRunner(adapter, fp, strat, guards, svc_cfg)
+    service = ServiceSignalRunner(adapter, fp, policy, guards, svc_cfg)
     return service.run()
 
 
