@@ -44,12 +44,14 @@ class OfflineCSVBarSource(MarketDataSource):
         ensure_timeframe(self.cfg.timeframe)
 
     def stream_bars(self, symbols: Sequence[str], interval_ms: int) -> Iterator[Bar]:
-        if interval_ms != timeframe_to_ms(self.cfg.timeframe):
+        interval_ms_cfg = timeframe_to_ms(self.cfg.timeframe)
+        if interval_ms != interval_ms_cfg:
             raise ValueError(
                 f"Timeframe mismatch. Source={self.cfg.timeframe}, requested={interval_ms}ms"
             )
 
         symbols_u = list(dict.fromkeys([s.upper() for s in symbols]))
+        last_ts: Dict[str, int] = {}
 
         files: List[str] = []
         for p in self.cfg.paths:
@@ -78,8 +80,21 @@ class OfflineCSVBarSource(MarketDataSource):
                 sym = str(r[self.cfg.symbol_col]).upper()
                 if symbols_u and sym not in symbols_u:
                     continue
+                ts = to_ms(r[self.cfg.ts_col])
+                if ts % interval_ms_cfg != 0:
+                    raise ValueError(
+                        f"Timestamp {ts} not aligned with interval {interval_ms_cfg}ms"
+                    )
+                prev = last_ts.get(sym)
+                if prev is not None:
+                    if ts == prev:
+                        continue
+                    if ts - prev > interval_ms_cfg:
+                        missing = list(range(prev + interval_ms_cfg, ts, interval_ms_cfg))
+                        print(f"Missing bars for {sym}: {missing}")
+                last_ts[sym] = ts
                 yield Bar(
-                    ts=to_ms(r[self.cfg.ts_col]),
+                    ts=ts,
                     symbol=sym,
                     open=Decimal(str(r[self.cfg.o_col])),
                     high=Decimal(str(r[self.cfg.h_col])),
