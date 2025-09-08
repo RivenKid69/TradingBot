@@ -54,11 +54,38 @@ class SimExecutor(TradeExecutor):
         latency: LatencyImpl | None = None,
         slippage: SlippageImpl | None = None,
         fees: FeesImpl | None = None,
-        run_config: Any = None,
+        run_config: Any | None = None,
     ) -> None:
+        """Создать исполнителя поверх :class:`ExecutionSimulator`.
+
+        Параметры ``quantizer``, ``risk``, ``latency``, ``slippage`` и ``fees`` могут
+        быть переданы явно как соответствующие реализации. Если они отсутствуют,
+        попытка построения происходит из блоков ``run_config``: ``quantizer``,
+        ``fees``, ``slippage``, ``latency``, ``risk`` и ``no_trade``. При отсутствии
+        этих блоков используются значения по умолчанию.
+        """
+
         self._sim = sim
         self._run_id = str(getattr(run_config, "run_id", "sim") or "sim")
         self._ctx = _SimCtx(symbol=str(symbol), max_position_abs_base=float(max_position_abs_base))
+
+        rc_quantizer = getattr(run_config, "quantizer", {}) if run_config else {}
+        rc_risk = getattr(run_config, "risk", {}) if run_config else {}
+        rc_latency = getattr(run_config, "latency", {}) if run_config else {}
+        rc_slippage = getattr(run_config, "slippage", {}) if run_config else {}
+        rc_fees = getattr(run_config, "fees", {}) if run_config else {}
+        self._no_trade_cfg = getattr(run_config, "no_trade", {}) if run_config else {}
+
+        if quantizer is None:
+            quantizer = QuantizerImpl.from_dict(rc_quantizer)
+        if risk is None:
+            risk = RiskBasicImpl.from_dict(rc_risk)
+        if latency is None:
+            latency = LatencyImpl.from_dict(rc_latency)
+        if slippage is None:
+            slippage = SlippageImpl.from_dict(rc_slippage)
+        if fees is None:
+            fees = FeesImpl.from_dict(rc_fees)
 
         # последовательное подключение компонентов к симулятору
         if quantizer is not None:
@@ -78,18 +105,32 @@ class SimExecutor(TradeExecutor):
         symbol: str,
         max_position_abs_base: float = 1.0,
         sim: ExecutionSimulator,
-        filters_cfg: dict | None = None,
-        risk_cfg: dict | None = None,
-        latency_cfg: dict | None = None,
-        slippage_cfg: dict | None = None,
-        fees_cfg: dict | None = None,
-        run_config: Any = None,
+        run_config: Any | None = None,
     ) -> "SimExecutor":
-        q_impl = QuantizerImpl.from_dict(filters_cfg or {}) if filters_cfg is not None else None
-        r_impl = RiskBasicImpl.from_dict(risk_cfg or {}) if risk_cfg is not None else None
-        l_impl = LatencyImpl.from_dict(latency_cfg or {}) if latency_cfg is not None else None
-        s_impl = SlippageImpl.from_dict(slippage_cfg or {}) if slippage_cfg is not None else None
-        f_impl = FeesImpl.from_dict(fees_cfg or {}) if fees_cfg is not None else None
+        """Сконструировать :class:`SimExecutor` из ``run_config``.
+
+        Извлекает блоки ``quantizer``, ``fees``, ``slippage``, ``latency``, ``risk`` и
+        ``no_trade`` из ``run_config`` и создаёт соответствующие реализации.
+        Значения по умолчанию используются, если блок отсутствует.
+        """
+
+        q_impl = QuantizerImpl.from_dict(getattr(run_config, "quantizer", {}) or {})
+        f_impl = FeesImpl.from_dict(getattr(run_config, "fees", {}) or {})
+        s_impl = SlippageImpl.from_dict(getattr(run_config, "slippage", {}) or {})
+        l_impl = LatencyImpl.from_dict(getattr(run_config, "latency", {}) or {})
+        r_impl = RiskBasicImpl.from_dict(getattr(run_config, "risk", {}) or {})
+
+        if q_impl is not None:
+            q_impl.attach_to(sim, strict=True, enforce_percent_price_by_side=True)
+        if r_impl is not None:
+            r_impl.attach_to(sim)
+        if l_impl is not None:
+            l_impl.attach_to(sim)
+        if s_impl is not None:
+            s_impl.attach_to(sim)
+        if f_impl is not None:
+            f_impl.attach_to(sim)
+
         return SimExecutor(
             sim,
             symbol=symbol,
