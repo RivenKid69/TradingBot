@@ -134,7 +134,7 @@ def __init__(
     rng: np.random.Generator | None = None,
     validate_data: bool = False,
     time_provider: TimeProvider | None = None,
-    **_: Any,
+    **kwargs: Any,
 ) -> None:
     super().__init__()
 
@@ -152,6 +152,37 @@ def __init__(
     self.time = time_provider or RealTimeProvider()
     # price data
     self.df = df.reset_index(drop=True).copy()
+
+    # dynamic spread config and rolling liquidity
+    dyn_cfg = dict(kwargs.get("dynamic_spread", {}) or {})
+    self._dyn_base_bps = float(dyn_cfg.get("base_bps", 3.0))
+    self._dyn_alpha_vol = float(dyn_cfg.get("alpha_vol", 0.5))
+    self._dyn_beta_illq = float(dyn_cfg.get("beta_illiquidity", 1.0))
+    self._dyn_liq_ref = float(dyn_cfg.get("liq_ref", 1000.0))
+    self._dyn_min_bps = float(dyn_cfg.get("min_bps", 1.0))
+    self._dyn_max_bps = float(dyn_cfg.get("max_bps", 25.0))
+
+    self._liq_col = next(
+        (c for c in ["quote_asset_volume", "quote_volume", "volume"] if c in self.df.columns),
+        None,
+    )
+    self._liq_window_h = float(kwargs.get("liquidity_window_hours", 1.0))
+    if self._liq_col is not None:
+        if "ts_ms" in self.df.columns and len(self.df) > 1:
+            step_ms = float(self.df["ts_ms"].iloc[1] - self.df["ts_ms"].iloc[0])
+            bars_per_hour = int(3600000 / step_ms) if step_ms > 0 else 1
+        else:
+            bars_per_hour = 60
+        win = max(1, int(self._liq_window_h * bars_per_hour))
+        self._rolling_liquidity = (
+            self.df[self._liq_col].rolling(win, min_periods=1).sum().to_numpy()
+        )
+    else:
+        self._rolling_liquidity = np.full(len(self.df), np.nan)
+
+    self.last_bid: float | None = None
+    self.last_ask: float | None = None
+    self.last_mid: float | None = None
 
     # optional strict data validation
     if validate_data or os.getenv("DATA_VALIDATE") == "1":
@@ -271,6 +302,17 @@ def _to_proto(self, action) -> ActionProto:
         raise TypeError("NumPy array actions are no longer supported")
     raise TypeError("Unsupported action type")
 
+    
+def _dyn_spread_bps(self, vol_factor: float, liquidity: float) -> float:
+    base = self._dyn_base_bps
+    vol_term = self._dyn_alpha_vol * float(vol_factor) * 10000.0
+    illq = 0.0
+    if self._dyn_liq_ref > 0 and liquidity == liquidity:
+        ratio = max(0.0, (self._dyn_liq_ref - float(liquidity)) / self._dyn_liq_ref)
+        illq = self._dyn_beta_illq * ratio * base
+    spread = base + vol_term + illq
+    return float(max(self._dyn_min_bps, min(self._dyn_max_bps, spread)))
+
 # ------------------------------------------------ Gym API
 def reset(self, *args, **kwargs):
     # инициализируем собственный ГПСЧ для этой среды
@@ -299,7 +341,53 @@ def reset(self, *args, **kwargs):
     return obs, info
 
 def step(self, action):
-    # полностью через Mediator: никаких прямых вызовов market_sim здесь
+    row = self.df.iloc[self.state.step_idx]
+
+    bid_col = next((c for c in ("bid", "best_bid", "bid_price") if c in row.index), None)
+    ask_col = next((c for c in ("ask", "best_ask", "ask_price") if c in row.index), None)
+    bid = ask = None
+    if bid_col and ask_col:
+        bid = float(row[bid_col])
+        ask = float(row[ask_col])
+        mid = (bid + ask) / 2.0
+    else:
+        mid = float(row.get("close", row.get("price", 0.0)))
+
+    atr_val = None
+    for col in ("atr", "atr14", "atr_14", "bar_atr"):
+        if col in row.index:
+            atr_val = row[col]
+            break
+    vol_factor = 0.0
+    if atr_val is not None and mid and mid == mid:
+        vol_factor = float(atr_val) / float(mid) if mid != 0 else 0.0
+
+    liquidity = 0.0
+    if getattr(self, "_rolling_liquidity", None) is not None:
+        liquidity = float(self._rolling_liquidity[self.state.step_idx])
+
+    if bid_col and ask_col:
+        spread_bps = (ask - bid) / mid * 10000 if mid else 0.0
+    else:
+        spread_bps = self._dyn_spread_bps(vol_factor=vol_factor, liquidity=liquidity)
+        half = mid * spread_bps / 20000.0
+        bid = mid - half
+        ask = mid + half
+
+    exec_sim = getattr(self._mediator, "exec", None)
+    if exec_sim is not None and hasattr(exec_sim, "set_market_snapshot"):
+        exec_sim.set_market_snapshot(
+            bid=bid,
+            ask=ask,
+            spread_bps=spread_bps,
+            vol_factor=vol_factor,
+            liquidity=liquidity,
+        )
+
+    self.last_bid = bid
+    self.last_ask = ask
+    self.last_mid = mid
+
     proto = self._to_proto(action)
     return self._mediator.step(proto)
 
