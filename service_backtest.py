@@ -69,7 +69,7 @@ class ServiceBacktest:
         logs_dir = self.cfg.logs_dir or "logs"
         logging_config = {
             "trades_path": os.path.join(logs_dir, f"log_trades_{run_id}.csv"),
-            "reports_path": os.path.join(logs_dir, f"sim_reports_{run_id}.csv"),
+            "reports_path": os.path.join(logs_dir, f"report_equity_{run_id}.csv"),
         }
         try:  # переподключаем логгер симулятора с нужными путями
             from logging import LogWriter, LogConfig  # type: ignore
