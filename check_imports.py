@@ -55,7 +55,7 @@ def detect_layer(filename: str) -> Optional[str]:
     for pref, layer in LAYER_BY_PREFIX.items():
         if base.startswith(pref):
             return layer
-    if base in ("prepare_and_run.py", "run_realtime_signaler.py", "run_sandbox.py", "app.py"):
+    if base in ("prepare_and_run.py", "app.py"):
         return "scripts"
     # impl: известные имена существующих реализаций
     if base in ("execution_sim.py", "binance_ws.py", "binance_public.py", "sim_adapter.py",
@@ -78,12 +78,6 @@ def iter_py_files(root: str) -> List[str]:
 
 
 def analyze_file(path: str) -> List[Tuple[str, str]]:
-    base = os.path.basename(path)
-    # Временный пропуск переходных скриптов до введения services_* (Фаза 3)
-    SKIP_FILES = {"run_sandbox.py", "run_realtime_signaler.py"}
-    if base in SKIP_FILES:
-        return []
-
     src = open(path, "r", encoding="utf-8").read()
     try:
         tree = ast.parse(src)
