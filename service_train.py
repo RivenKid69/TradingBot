@@ -20,22 +20,15 @@ from_config(cfg_run, trainer=trainer, train_cfg=train_cfg)
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Protocol, Sequence, Iterable, Tuple
+from typing import Any, Dict, Optional, Sequence, Protocol
 import os
 import time
 import pandas as pd
 
 from services.utils_config import snapshot_config  # снапшот конфигурации
-from core_contracts import FeaturePipe as BaseFeaturePipe
+from core_contracts import FeaturePipe
 from core_config import CommonRunConfig
 import di_registry
-
-
-class FeaturePipe(BaseFeaturePipe, Protocol):
-    def fit(self, df: pd.DataFrame) -> None: ...
-    def transform_df(self, df: pd.DataFrame) -> pd.DataFrame: ...
-    # опционально: целевая переменная
-    def make_targets(self, df: pd.DataFrame) -> Optional[pd.Series]: ...
 
 
 class Trainer(Protocol):
@@ -89,11 +82,10 @@ class ServiceTrain:
         # построение фичей и таргета
         X = self.fp.transform_df(df_raw)
         y = None
-        if hasattr(self.fp, "make_targets"):
-            try:
-                y = self.fp.make_targets(df_raw)  # type: ignore[attr-defined]
-            except Exception:
-                y = None
+        try:
+            y = self.fp.make_targets(df_raw)
+        except Exception:
+            y = None
 
         # опциональная фильтрация колонок
         if self.cfg.columns_keep:
