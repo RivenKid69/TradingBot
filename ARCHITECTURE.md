@@ -48,9 +48,9 @@ core_ → impl_ → service_ → strategies → scripts_
 
 ```python
 # strategies/momentum.py
-from strategies.base import BaseStrategy, Decision
+from core_strategy import Strategy, Decision
 
-class MomentumStrategy(BaseStrategy):
+class MomentumStrategy(Strategy):
     def decide(self, ctx: dict) -> list[Decision]:
         if ctx["ref_price"] > ctx["features"]["ma"]:
             return [Decision(side="BUY", volume_frac=0.1)]

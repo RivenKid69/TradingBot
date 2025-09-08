@@ -24,7 +24,7 @@ from decimal import Decimal
 from typing import Any, Dict, Mapping, Optional, Callable, Sequence, List
 
 from core_models import Order, OrderIntent, Side, OrderType, TimeInForce
-from strategies.base import Decision
+from core_strategy import Decision
 try:
     from action_proto import ActionProto, ActionType
 except Exception:
