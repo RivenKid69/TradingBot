@@ -21,9 +21,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Dict, Mapping, Optional, Callable
+from typing import Any, Dict, Mapping, Optional, Callable, Sequence, List
 
 from core_models import Order, OrderIntent, Side, OrderType, TimeInForce
+from strategies.base import Decision
 try:
     from action_proto import ActionProto, ActionType
 except Exception:
@@ -253,11 +254,22 @@ def intent_to_order(intent: OrderIntent, ctx: OrderContext) -> Order:
     )
 
 
-def decisions_to_order_intents(decisions: Sequence[Any], ctx: OrderContext) -> List[OrderIntent]:
+def decisions_to_order_intents(
+    decisions: Sequence[Mapping[str, Any] | ActionProto | Decision],
+    ctx: OrderContext,
+) -> List[OrderIntent]:
+    """Преобразование решений в OrderIntent.
+
+    Принимает последовательность элементов формата legacy ``Mapping``, ``ActionProto``
+    или высокоуровневых ``Decision`` и возвращает список ``OrderIntent``.
+    """
+
     out: List[OrderIntent] = []
     for d in decisions:
         if isinstance(d, Mapping):
             intent = legacy_decision_to_order_intent(d, ctx)
+        elif isinstance(d, Decision):
+            intent = actionproto_to_order_intent(d.to_action_proto(), ctx)
         else:
             intent = actionproto_to_order_intent(d, ctx)
         if intent is not None:
