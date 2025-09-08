@@ -20,7 +20,7 @@ components:
   feature_pipe:
     target: feature_pipe:FeaturePipe
     params: {}
-  strategy:
+  policy:
     target: strategies.momentum:MomentumStrategy
     params: {}
   risk_guards:

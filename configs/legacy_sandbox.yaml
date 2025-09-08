@@ -28,7 +28,7 @@ no_trade:
     - "16:00-16:05"
   custom_ms: []   # список явных окон [{start_ts_ms: ..., end_ts_ms: ...}]
 
-strategy:
+policy:
   module: "strategies.momentum"
   class: "MomentumStrategy"
   params:

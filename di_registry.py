@@ -64,13 +64,13 @@ def build_component(name: str, spec: ComponentSpec, container: Dict[str, Any]) -
 
 def build_graph(components: Components, run_config: Optional[CommonRunConfig] = None) -> Dict[str, Any]:
     """
-    Сборка графа в последовательности: market_data → feature_pipe → strategy → risk_guards → executor → backtest_engine
+    Сборка графа в последовательности: market_data → feature_pipe → policy → risk_guards → executor → backtest_engine
     (BacktestEngine опционален.)
     """
     container: Dict[str, Any] = {}
     build_component("market_data", components.market_data, container)
     build_component("feature_pipe", components.feature_pipe, container)
-    build_component("strategy", components.strategy, container)
+    build_component("policy", components.policy, container)
     build_component("risk_guards", components.risk_guards, container)
     build_component("executor", components.executor, container)
     if components.backtest_engine:
