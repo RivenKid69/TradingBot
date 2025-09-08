@@ -153,6 +153,27 @@ def __init__(
     # price data
     self.df = df.reset_index(drop=True).copy()
 
+    # --- precompute ATR-based volatility and rolling liquidity ---
+    close_col = "close" if "close" in self.df.columns else "price"
+    high = self.df.get("high")
+    low = self.df.get("low")
+    if high is not None and low is not None and close_col in self.df.columns:
+        prev_close = self.df[close_col].shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        self.df["tr"] = tr
+        atr_window = int(kwargs.get("atr_window", 14))
+        self.df["atr"] = tr.ewm(alpha=1 / atr_window, adjust=False).mean()
+        denom = self.df[close_col].replace(0, np.nan)
+        self.df["atr_pct"] = (self.df["atr"] / denom).ffill().fillna(0.0)
+    else:
+        self.df["tr"] = 0.0
+        self.df["atr"] = 0.0
+        self.df["atr_pct"] = 0.0
+
     # dynamic spread config and rolling liquidity
     dyn_cfg = dict(kwargs.get("dynamic_spread", {}) or {})
     self._dyn_base_bps = float(dyn_cfg.get("base_bps", 3.0))
@@ -174,11 +195,17 @@ def __init__(
         else:
             bars_per_hour = 60
         win = max(1, int(self._liq_window_h * bars_per_hour))
-        self._rolling_liquidity = (
-            self.df[self._liq_col].rolling(win, min_periods=1).sum().to_numpy()
+        self.df["liq_roll"] = (
+            self.df[self._liq_col]
+            .rolling(win, min_periods=1)
+            .sum()
+            .ffill()
+            .fillna(0.0)
         )
+        self._rolling_liquidity = self.df["liq_roll"].to_numpy()
     else:
-        self._rolling_liquidity = np.full(len(self.df), np.nan)
+        self.df["liq_roll"] = 0.0
+        self._rolling_liquidity = np.zeros(len(self.df))
 
     self.last_bid: float | None = None
     self.last_ask: float | None = None
@@ -353,18 +380,8 @@ def step(self, action):
     else:
         mid = float(row.get("close", row.get("price", 0.0)))
 
-    atr_val = None
-    for col in ("atr", "atr14", "atr_14", "bar_atr"):
-        if col in row.index:
-            atr_val = row[col]
-            break
-    vol_factor = 0.0
-    if atr_val is not None and mid and mid == mid:
-        vol_factor = float(atr_val) / float(mid) if mid != 0 else 0.0
-
-    liquidity = 0.0
-    if getattr(self, "_rolling_liquidity", None) is not None:
-        liquidity = float(self._rolling_liquidity[self.state.step_idx])
+    vol_factor = float(row.get("atr_pct", 0.0))
+    liquidity = float(row.get("liq_roll", 0.0))
 
     if bid_col and ask_col:
         spread_bps = (ask - bid) / mid * 10000 if mid else 0.0
