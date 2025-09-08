@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Protoco
 
 from execution_sim import ExecutionSimulator, SimStepReport as ExecReport  # type: ignore
 from action_proto import ActionProto, ActionType
-from strategies.base import Decision
+from core_strategy import Decision
 from core_models import Bar, as_dict
 from compat_shims import sim_report_dict_to_core_exec_reports
 from event_bus import log_trade_exec as _bus_log_trade_exec

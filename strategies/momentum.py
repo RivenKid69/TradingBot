@@ -4,7 +4,8 @@ from __future__ import annotations
 from collections import deque
 from typing import Any, Dict, List
 
-from .base import BaseStrategy, Decision
+from core_strategy import Decision
+from .base import BaseStrategy
 
 
 class MomentumStrategy(BaseStrategy):
@@ -46,7 +47,7 @@ class MomentumStrategy(BaseStrategy):
         avg = sum(self._window) / float(len(self._window))
         out: List[Decision] = []
         if float(ref) > avg + self.threshold:
-            out.append(Decision(kind="MARKET", side="BUY", volume_frac=self.order_qty))
+            out.append(Decision(side="BUY", volume_frac=self.order_qty))
         elif float(ref) < avg - self.threshold:
-            out.append(Decision(kind="MARKET", side="SELL", volume_frac=self.order_qty))
+            out.append(Decision(side="SELL", volume_frac=self.order_qty))
         return out
