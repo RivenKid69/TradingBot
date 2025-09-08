@@ -17,6 +17,7 @@ import pandas as pd  # предполагается в зависимостях
 
 from core_models import Bar, Tick
 from core_contracts import MarketDataSource
+from utils_time import parse_time_to_ms
 
 
 @dataclass
@@ -139,10 +140,7 @@ def to_ms(dt: Any) -> int:
     if isinstance(dt, float):
         return int(dt)
     if isinstance(dt, str):
-        try:
-            return int(datetime.fromisoformat(dt.replace("Z", "+00:00")).timestamp() * 1000)
-        except Exception as e:
-            raise ValueError(f"Cannot parse datetime string: {dt}") from e
+        return parse_time_to_ms(dt)
     if isinstance(dt, datetime):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)

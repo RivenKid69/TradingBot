@@ -1,6 +1,7 @@
 import datetime
 
 from utils_time import parse_time_to_ms
+from impl_offline_data import to_ms
 
 
 def test_numeric_seconds_to_ms():
@@ -21,3 +22,8 @@ def test_datetime_string_to_ms():
 def test_iso_string_to_ms():
     dt = datetime.datetime(2023, 1, 1, tzinfo=datetime.timezone.utc)
     assert parse_time_to_ms(dt.isoformat()) == 1672531200000
+
+
+def test_to_ms_naive_iso_treated_as_utc():
+    dt_str = "2023-01-01T00:00:00"
+    assert to_ms(dt_str) == 1672531200000
