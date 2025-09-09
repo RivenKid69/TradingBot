@@ -97,6 +97,7 @@ try:
         TakerExecutor,
         TWAPExecutor,
         POVExecutor,
+        MarketOpenH1Executor,
     )
 except Exception:
     BaseExecutor = None  # type: ignore
@@ -104,6 +105,7 @@ except Exception:
     TakerExecutor = None  # type: ignore
     TWAPExecutor = None  # type: ignore
     POVExecutor = None  # type: ignore
+    MarketOpenH1Executor = None  # type: ignore
 
 # --- Импорт модели латентности ---
 try:
@@ -272,6 +274,7 @@ class ExecutionSimulator:
         self._next_cli_id = 1
         self.lob = lob
         self._last_ref_price: Optional[float] = None
+        self._next_h1_open_price: Optional[float] = None
         self.run_id: str = str(getattr(run_config, "run_id", "sim") or "sim")
         self.step_ms: int = int(getattr(run_config, "step_ms", 1000)) if run_config is not None else 1000
         if self.step_ms <= 0:
@@ -349,6 +352,7 @@ class ExecutionSimulator:
         """Установить профиль исполнения и параметры."""
         self.execution_profile = str(profile)
         self.execution_params = dict(params or {})
+        self._build_executor()
 
     def set_quantizer(self, q: Quantizer) -> None:
         self.quantizer = q
@@ -358,6 +362,9 @@ class ExecutionSimulator:
 
     def set_ref_price(self, price: float) -> None:
         self._last_ref_price = float(price)
+
+    def set_next_open_price(self, price: float) -> None:
+        self._next_h1_open_price = float(price)
 
     def set_market_snapshot(
         self,
@@ -394,6 +401,10 @@ class ExecutionSimulator:
         """
         if TakerExecutor is None:
             self._executor = None
+            return
+        profile = str(getattr(self, "execution_profile", "")).upper()
+        if profile == "MKT_OPEN_NEXT_H1" and MarketOpenH1Executor is not None:
+            self._executor = MarketOpenH1Executor()
             return
         cfg = dict(self._execution_cfg or {})
         algo = str(cfg.get("algo", "TAKER")).upper()
@@ -696,12 +707,18 @@ class ExecutionSimulator:
                         q_child = self.quantizer.clamp_notional(self.symbol, ref, q_child)
                         if q_child <= 0.0:
                             continue
-
-                    # базовая котировка: используем ask для BUY и bid для SELL
-                    base_price = self._last_ask if side == "BUY" else self._last_bid
-                    if base_price is None:
-                        base_price = ref
-                    filled_price = float(base_price) if base_price is not None else float(ref)
+                    # базовая котировка
+                    if (
+                        str(getattr(self, "execution_profile", "")).upper()
+                        == "MKT_OPEN_NEXT_H1"
+                        and self._next_h1_open_price is not None
+                    ):
+                        filled_price = float(self._next_h1_open_price)
+                    else:
+                        base_price = self._last_ask if side == "BUY" else self._last_bid
+                        if base_price is None:
+                            base_price = ref
+                        filled_price = float(base_price) if base_price is not None else float(ref)
 
                     # слиппедж на ребёнка
                     slip_bps = 0.0
@@ -1109,12 +1126,18 @@ class ExecutionSimulator:
                             cancelled_ids.append(int(cli_id))
                             continue
                     ts_fill = int(ts_fill + lat_ms)
-
-                    # цена исполнения: ask для BUY, bid для SELL
-                    base_price = self._last_ask if side == "BUY" else self._last_bid
-                    if base_price is None:
-                        base_price = ref
-                    filled_price = float(base_price) if base_price is not None else float(ref)
+                    # цена исполнения
+                    if (
+                        str(getattr(self, "execution_profile", "")).upper()
+                        == "MKT_OPEN_NEXT_H1"
+                        and self._next_h1_open_price is not None
+                    ):
+                        filled_price = float(self._next_h1_open_price)
+                    else:
+                        base_price = self._last_ask if side == "BUY" else self._last_bid
+                        if base_price is None:
+                            base_price = ref
+                        filled_price = float(base_price) if base_price is not None else float(ref)
                     slip_bps = 0.0
                     sbps = self._last_spread_bps
                     vf = self._last_vol_factor
