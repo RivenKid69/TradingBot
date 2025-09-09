@@ -164,6 +164,9 @@ class SimStepReport:
     spread_bps: Optional[float] = None
     vol_factor: Optional[float] = None
     liquidity: Optional[float] = None
+    latency_p50_ms: float = 0.0
+    latency_p95_ms: float = 0.0
+    latency_timeout_ratio: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -187,6 +190,9 @@ class SimStepReport:
             "spread_bps": float(self.spread_bps) if self.spread_bps is not None else None,
             "vol_factor": float(self.vol_factor) if self.vol_factor is not None else None,
             "liquidity": float(self.liquidity) if self.liquidity is not None else None,
+            "latency_p50_ms": float(self.latency_p50_ms),
+            "latency_p95_ms": float(self.latency_p95_ms),
+            "latency_timeout_ratio": float(self.latency_timeout_ratio),
         }
 
 
@@ -835,6 +841,14 @@ class ExecutionSimulator:
                 # не рушим исполнение
                 pass
 
+        lat_stats = {"p50_ms": 0.0, "p95_ms": 0.0, "timeout_rate": 0.0}
+        if self.latency is not None:
+            try:
+                lat_stats = self.latency.stats()
+                self.latency.reset_stats()
+            except Exception:
+                lat_stats = {"p50_ms": 0.0, "p95_ms": 0.0, "timeout_rate": 0.0}
+
         report = SimStepReport(
             trades=trades,
             cancelled_ids=cancelled_ids,
@@ -856,6 +870,9 @@ class ExecutionSimulator:
             spread_bps=self._last_spread_bps,
             vol_factor=self._last_vol_factor,
             liquidity=self._last_liquidity,
+            latency_p50_ms=float(lat_stats.get("p50_ms", 0.0)),
+            latency_p95_ms=float(lat_stats.get("p95_ms", 0.0)),
+            latency_timeout_ratio=float(lat_stats.get("timeout_rate", 0.0)),
         )
 
 # логирование
