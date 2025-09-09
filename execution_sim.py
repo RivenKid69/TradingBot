@@ -257,6 +257,8 @@ class ExecutionSimulator:
                  funding_config: Optional[dict] = None,
                  slippage_config: Optional[dict] = None,
                  execution_config: Optional[dict] = None,
+                 execution_profile: Optional[str] = None,
+                 execution_params: Optional[dict] = None,
                  latency_config: Optional[dict] = None,
                  pnl_config: Optional[dict] = None,
                  risk_config: Optional[dict] = None,
@@ -305,6 +307,8 @@ class ExecutionSimulator:
 
         # исполнители
         self._execution_cfg = dict(execution_config or {})
+        self.execution_profile = str(execution_profile) if execution_profile is not None else ""
+        self.execution_params: dict = dict(execution_params or {})
         self._executor: Optional[BaseExecutor] = None
         self._build_executor()
 
@@ -340,6 +344,11 @@ class ExecutionSimulator:
             else None
         )
         self._step_counter: int = 0
+
+    def set_execution_profile(self, profile: str, params: dict | None = None) -> None:
+        """Установить профиль исполнения и параметры."""
+        self.execution_profile = str(profile)
+        self.execution_params = dict(params or {})
 
     def set_quantizer(self, q: Quantizer) -> None:
         self.quantizer = q
@@ -700,7 +709,12 @@ class ExecutionSimulator:
                     vf = self._last_vol_factor
                     liq_override = child.liquidity_hint
                     liq = float(liq_override) if (liq_override is not None) else self._last_liquidity
-                    if self.slippage_cfg is not None and estimate_slippage_bps is not None and apply_slippage_price is not None:
+                    cfg_slip = self.execution_params.get("slippage_bps") if isinstance(self.execution_params, dict) else None
+                    if cfg_slip is not None:
+                        slip_bps = float(cfg_slip)
+                        if apply_slippage_price is not None:
+                            filled_price = apply_slippage_price(side=side, quote_price=filled_price, slippage_bps=slip_bps)
+                    elif self.slippage_cfg is not None and estimate_slippage_bps is not None and apply_slippage_price is not None:
                         slip_bps = estimate_slippage_bps(
                             spread_bps=sbps,
                             size=q_child,

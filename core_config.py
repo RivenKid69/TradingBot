@@ -8,6 +8,7 @@ Pydantic-модели конфигураций: sim/live/train/eval + декла
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, List, Mapping, Union, Literal
+from enum import Enum
 
 import yaml
 from pydantic import BaseModel, Field, validator
@@ -43,6 +44,21 @@ class CommonRunConfig(BaseModel):
     components: Components
 
 
+class ExecutionProfile(str, Enum):
+    """Подход к исполнению заявок."""
+
+    MKT_OPEN_NEXT_H1 = "MKT_OPEN_NEXT_H1"
+    VWAP_CURRENT_H1 = "VWAP_CURRENT_H1"
+    LIMIT_MID_BPS = "LIMIT_MID_BPS"
+
+
+class ExecutionParams(BaseModel):
+    slippage_bps: float = 0.0
+    limit_offset_bps: float = 0.0
+    ttl_steps: int = 0
+    tif: str = "GTC"
+
+
 class SimulationDataConfig(BaseModel):
     symbols: List[str]
     timeframe: str = Field(..., description="Например: '1m', '5m'")
@@ -63,6 +79,8 @@ class SimulationConfig(CommonRunConfig):
     no_trade: Dict[str, Any] = Field(default_factory=dict)
     data: SimulationDataConfig
     limits: Dict[str, Any] = Field(default_factory=dict)
+    execution_profile: ExecutionProfile = Field(default=ExecutionProfile.MKT_OPEN_NEXT_H1)
+    execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
 
     @validator("symbols", always=True)
     def validate_symbols(cls, v, values):
@@ -121,6 +139,8 @@ class TrainConfig(CommonRunConfig):
     no_trade: Dict[str, Any] = Field(default_factory=dict)
     data: TrainDataConfig
     model: ModelConfig
+    execution_profile: ExecutionProfile = Field(default=ExecutionProfile.MKT_OPEN_NEXT_H1)
+    execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
 
     @validator("symbols", always=True)
     def validate_symbols(cls, v, values):
@@ -138,6 +158,8 @@ class EvalConfig(CommonRunConfig):
     mode: str = Field(default="eval")
     input: EvalInputConfig
     metrics: List[str] = Field(default_factory=lambda: ["sharpe", "sortino", "mdd", "pnl"])
+    execution_profile: ExecutionProfile = Field(default=ExecutionProfile.MKT_OPEN_NEXT_H1)
+    execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
 
 
 def load_config(path: str) -> CommonRunConfig:
@@ -190,6 +212,8 @@ __all__ = [
     "TrainConfig",
     "EvalInputConfig",
     "EvalConfig",
+    "ExecutionProfile",
+    "ExecutionParams",
     "load_config",
     "load_config_from_str",
 ]

@@ -2,6 +2,12 @@ mode: sim
 run_id: default-run
 logs_dir: logs
 artifacts_dir: artifacts
+execution_profile: MKT_OPEN_NEXT_H1
+execution_params:
+  slippage_bps: 0.0
+  limit_offset_bps: 0.0
+  ttl_steps: 0
+  tif: GTC
 
 market: spot
 spot_symbols: ["BTCUSDT"]
