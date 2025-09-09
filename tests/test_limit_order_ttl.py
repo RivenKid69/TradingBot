@@ -21,3 +21,17 @@ def test_limit_order_ttl_expires():
     report2 = sim.pop_ready(ref_price=100.0)
     assert report2.cancelled_ids == [oid]
     assert report2.trades == []
+
+
+def test_limit_order_ttl_survives():
+    sim = ExecutionSimulator()
+    proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=1.0, abs_price=100.0, ttl_steps=3)
+    oid = sim.submit(proto)
+    report1 = sim.pop_ready(ref_price=100.0)
+    assert report1.new_order_ids == [oid]
+    report2 = sim.pop_ready(ref_price=100.0)
+    assert report2.cancelled_ids == []
+    report3 = sim.pop_ready(ref_price=100.0)
+    assert report3.cancelled_ids == []
+    report4 = sim.pop_ready(ref_price=100.0)
+    assert report4.cancelled_ids == [oid]
