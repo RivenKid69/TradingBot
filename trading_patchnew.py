@@ -18,8 +18,7 @@ import gymnasium as gym
 import numpy as np
 import pandas as pd
 from gymnasium import spaces as spaces
-import event_bus
-from infra.event_bus import publish, Topics
+from infra.event_bus import Topics
 from infra.time_provider import TimeProvider, RealTimeProvider
 from leakguard import LeakGuard, LeakConfig
 from no_trade import (
@@ -191,6 +190,9 @@ class TradingEnv(gym.Env):
         flash_prob: float = 0.01,
         rng: np.random.Generator | None = None,
         validate_data: bool = False,
+        event_bus: Any | None = None,
+        leak_guard: LeakGuard | None = None,
+        no_trade_cfg: NoTradeConfig | None = None,
         time_provider: TimeProvider | None = None,
         decision_mode: DecisionTiming = DecisionTiming.CLOSE_TO_OPEN,
         decision_delay_ms: int = 0,
@@ -209,12 +211,13 @@ class TradingEnv(gym.Env):
         rank_offset = getattr(self, "rank", 0)
         base_seed = seed or 0
         self._rng: np.random.Generator = rng or np.random.default_rng(base_seed + rank_offset)
+        self._publish = getattr(event_bus, "publish", lambda *a, **k: None)
         self.time = time_provider or RealTimeProvider()
         self.decision_mode = decision_mode
         # action scheduled for next bar when using delayed decisions
         self._pending_action: ActionProto | None = None
         self._action_queue: deque[ActionProto] = deque()
-        self._leak_guard = LeakGuard(LeakConfig(decision_delay_ms=int(decision_delay_ms)))
+        self._leak_guard = leak_guard or LeakGuard(LeakConfig(decision_delay_ms=int(decision_delay_ms)))
         # price data
         self.df = df.reset_index(drop=True).copy()
         if "ts_ms" in self.df.columns and "decision_ts" not in self.df.columns:
@@ -278,7 +281,9 @@ class TradingEnv(gym.Env):
 
         # --- precompute no-trade mask ---
         override = kwargs.get("no_trade")
-        if override:
+        if no_trade_cfg is not None:
+            cfg_nt = no_trade_cfg
+        elif override:
             cfg_nt = NoTradeConfig(**override)
         else:
             cfg_nt = get_no_trade_config(kwargs.get("sandbox_config", "configs/legacy_sandbox.yaml"))
@@ -310,7 +315,7 @@ class TradingEnv(gym.Env):
                 from data_validation import DataValidator
                 DataValidator().validate(self.df)
                 import time as _time
-                publish(Topics.RISK, {
+                self._publish(Topics.RISK, {
                     "step": 0,
                     "ts": int(_time.time()),
                     "reason": "data_validation_ok",
@@ -319,7 +324,7 @@ class TradingEnv(gym.Env):
             except Exception as e:
                 # лог + немедленный fail: некондиционные данные нам не нужны
                 import time as _time
-                publish(Topics.RISK, {
+                self._publish(Topics.RISK, {
                     "step": 0,
                     "ts": int(_time.time()),
                     "reason": "data_validation_fail",
