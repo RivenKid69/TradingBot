@@ -26,6 +26,13 @@ from core_events import EventType, OrderEvent, FillEvent
 from compat_shims import sim_report_dict_to_core_exec_reports
 import event_bus as eb
 from impl_latency import LatencyImpl
+from core_constants import PRICE_SCALE
+try:
+    from quantizer import Quantizer, load_filters
+except Exception:  # pragma: no cover - soft dependency
+    Quantizer = None  # type: ignore
+    def load_filters(path: str):  # type: ignore
+        return {}
 
 try:
     import event_bus
@@ -150,6 +157,29 @@ class Mediator:
             self.exec = None
             self._latency_impl = None
 
+        # Quantizer (shared with ExecutionSimulator)
+        self.quantizer = None
+        self.enforce_ppbs = True
+        rc = getattr(env_ref, "run_config", None)
+        qcfg = getattr(rc, "quantizer", {}) if rc is not None else {}
+        filters_path = qcfg.get("path", "")
+        strict = bool(qcfg.get("strict", True))
+        self.enforce_ppbs = bool(qcfg.get("enforce_percent_price_by_side", True))
+        if Quantizer is not None and filters_path:
+            try:
+                filters = load_filters(filters_path)
+                if filters:
+                    self.quantizer = Quantizer(filters, strict=strict)
+            except Exception:
+                self.quantizer = None
+        if self._use_exec and self.exec is not None and self.quantizer is not None:
+            try:
+                self.exec.set_quantizer(self.quantizer)  # type: ignore[attr-defined]
+                setattr(self.exec, "enforce_ppbs", self.enforce_ppbs)
+                setattr(self.exec, "strict_filters", strict)
+            except Exception:
+                pass
+
         # TTL-очередь: [(order_id, expire_ts)]
         self._ttl_queue: List[Tuple[int, int]] = []
 
@@ -246,8 +276,29 @@ class Mediator:
         evt = self.risk.on_action_proposed(self.env.state, proto)  # type: ignore[attr-defined]
         if evt.name != "NONE":
             return 0, 0
+        price_ticks_q = int(price_ticks)
+        volume_q = float(volume)
+        symbol = str(getattr(self.env, "symbol", getattr(self.env, "base_symbol", ""))).upper()
+        ref_price = getattr(self.env, "last_mid", None)
+        if self.quantizer is not None:
+            try:
+                price_abs = float(price_ticks_q) / PRICE_SCALE
+                p_abs = self.quantizer.quantize_price(symbol, price_abs)
+                q = self.quantizer.quantize_qty(symbol, volume_q)
+                q_clamped = self.quantizer.clamp_notional(symbol, p_abs if p_abs > 0 else (ref_price or 0.0), q)
+                p_ticks = int(round(p_abs * PRICE_SCALE))
+                if p_ticks != price_ticks_q or abs(q - volume_q) > 1e-12 or abs(q_clamped - q) > 1e-12:
+                    return 0, 0
+                if self.enforce_ppbs and ref_price is not None:
+                    side = "BUY" if is_buy_side else "SELL"
+                    if not self.quantizer.check_percent_price_by_side(symbol, side, p_abs, ref_price):
+                        return 0, 0
+                price_ticks_q = p_ticks
+                volume_q = q_clamped
+            except Exception:
+                return 0, 0
 
-        order_id, qpos = self.lob.add_limit_order(bool(is_buy_side), int(price_ticks), float(volume), int(timestamp),
+        order_id, qpos = self.lob.add_limit_order(bool(is_buy_side), int(price_ticks_q), float(volume_q), int(timestamp),
                                                   bool(taker_is_agent))
         if int(ttl_steps) > 0:
             ttl_set = False
@@ -260,9 +311,9 @@ class Mediator:
                 self._ttl_queue.append((int(order_id), int(timestamp) + int(ttl_steps)))
         # учёт «ожидаемого» объёма
         if is_buy_side:
-            self._pending_buy_volume += float(volume)
+            self._pending_buy_volume += float(volume_q)
         else:
-            self._pending_sell_volume += float(volume)
+            self._pending_sell_volume += float(volume_q)
         return int(order_id), int(qpos)
 
     def remove_order(self, *, is_buy_side: bool, price_ticks: int, order_id: int) -> bool:
@@ -463,16 +514,16 @@ class Mediator:
                             event_bus.log_trade(_er)
                         except Exception:
                             pass
-            except Exception:
-                d["core_exec_reports"] = []
+                except Exception:
+                    d["core_exec_reports"] = []
 
-            # возвращаем также события
-            d["events"] = events
-            d["info"] = info
-            return d
-        except Exception:
-            # запасной путь — выполнить напрямую по типу действия
-            pass
+                # возвращаем также события
+                d["events"] = events
+                d["info"] = info
+                return d
+            except Exception:
+                # запасной путь — выполнить напрямую по типу действия
+                pass
 
         # иначе — прямое исполнение через LOB
         trades: List[Tuple[float, float, bool, bool]] = []
@@ -488,9 +539,17 @@ class Mediator:
                                              volume=abs(proto.volume_frac) * max(1.0, self._state_view().max_position),
                                              timestamp=int(timestamp), taker_is_agent=True)
         elif proto.action_type == ActionType.LIMIT:
-            price_ticks = int(getattr(proto, "price_offset_ticks", 0))
             ttl_steps = int(getattr(proto, "ttl_steps", 0))
             vol = abs(proto.volume_frac) * max(1.0, self._state_view().max_position)
+            price_ticks = int(getattr(proto, "price_offset_ticks", 0))
+            abs_price = getattr(proto, "abs_price", None)
+            if abs_price is not None:
+                symbol = str(getattr(self.env, "symbol", getattr(self.env, "base_symbol", ""))).upper()
+                if self.quantizer is not None:
+                    p_abs = self.quantizer.quantize_price(symbol, float(abs_price))
+                else:
+                    p_abs = float(abs_price)
+                price_ticks = int(round(p_abs * PRICE_SCALE))
             oid, qpos = self.add_limit_order(is_buy_side=(proto.volume_frac > 0.0),
                                              price_ticks=price_ticks, volume=vol,
                                              timestamp=int(timestamp), ttl_steps=ttl_steps, taker_is_agent=True)
