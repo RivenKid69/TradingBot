@@ -48,6 +48,9 @@ public:
     // Зафиксировать принудительный режим на [start, start+duration).
     void force_market_regime(MarketRegime regime, std::size_t start, std::size_t duration);
 
+    // Установить сезонные коэффициенты ликвидности (168 часов недели).
+    void set_liquidity_seasonality(const std::array<double, 168>& multipliers);
+
     // Была ли на шаге i триггернута вспышка-шок? (-1: sell, +1: buy, 0: нет)
     int shock_triggered(std::size_t i) const;
 
@@ -134,6 +137,9 @@ private:
     std::mt19937_64 m_rng;
     std::normal_distribution<double> m_stdnorm;
     std::uniform_real_distribution<double> m_unif;
+
+    // Сезонные коэффициенты ликвидности по часам недели
+    std::array<double, 168> m_liq_mult;
 
     // --- внутренние методы ---
     void initialize_defaults();
