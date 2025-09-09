@@ -25,6 +25,7 @@ from core_models import ExecReport, TradeLogRow, Side, OrderType, Liquidity, Exe
 from core_events import EventType, OrderEvent, FillEvent
 from compat_shims import sim_report_dict_to_core_exec_reports
 import event_bus as eb
+from impl_latency import LatencyImpl
 
 try:
     import event_bus
@@ -94,12 +95,14 @@ class _EnvStateView:
 class Mediator:
     def __init__(self, env_ref: Any, *, event_level: int = 0,
                  use_exec_sim: Optional[bool] = None,
-                 latency_steps: int = 0, slip_k: float = 0.0, seed: int = 0):
+                 latency_steps: int = 0, slip_k: float = 0.0, seed: int = 0,
+                 latency_cfg: dict | None = None):
         """
         env_ref — ссылка на «среду» (должна держать .state и, опционально, .lob)
         event_level — уровень логов EventBus (0/1/2)
         use_exec_sim — если None, выбираем автоматически по наличию execution_sim
         latency_steps/slip_k/seed — параметры ExecutionSimulator (если используется)
+        latency_cfg — параметры модели латентности для ExecutionSimulator
         """
         self.env = env_ref
 
@@ -128,10 +131,24 @@ class Mediator:
         if use_exec_sim is None:
             use_exec_sim = _HAVE_EXEC_SIM
         self._use_exec = bool(use_exec_sim and _HAVE_EXEC_SIM)
+
+        if latency_cfg is None:
+            rc = getattr(env_ref, "run_config", None)
+            if rc is not None:
+                latency_cfg = getattr(rc, "latency", None)
+
+        self._latency_impl: LatencyImpl | None = None
         if self._use_exec:
             self.exec = ExecutionSimulator(latency_steps=latency_steps, slip_k=slip_k, seed=seed)  # type: ignore
+            try:
+                l_impl = LatencyImpl.from_dict(latency_cfg or {})
+                l_impl.attach_to(self.exec)
+                self._latency_impl = l_impl
+            except Exception:
+                self._latency_impl = None
         else:
             self.exec = None
+            self._latency_impl = None
 
         # TTL-очередь: [(order_id, expire_ts)]
         self._ttl_queue: List[Tuple[int, int]] = []
@@ -144,9 +161,29 @@ class Mediator:
 
     def reset(self) -> None:
         """Очистить внутреннее состояние посредника (портфельное состояние живёт в env.state)."""
+        # логируем накопленную статистику латентности за предыдущий эпизод
+        self.on_episode_end()
         self._ttl_queue.clear()
         self._pending_buy_volume = 0.0
         self._pending_sell_volume = 0.0
+
+    def on_episode_end(self) -> None:
+        """Запросить и вывести статистику латентности."""
+        if self._latency_impl is None:
+            return
+        try:
+            stats = self._latency_impl.get_stats()
+        except Exception:
+            stats = None
+        if stats:
+            try:
+                event_bus.log_risk({"etype": "LATENCY_STATS", **stats})
+            except Exception:
+                pass
+            try:
+                self._latency_impl.reset_stats()
+            except Exception:
+                pass
 
     def _state_view(self) -> _EnvStateView:
         st = getattr(self.env, "state", None)
