@@ -1,5 +1,9 @@
 #include "MarketSimulator.h"
 #include <cstring> // std::memset
+#include <fstream>
+#include <regex>
+#include <sstream>
+#include <cstdlib>
 
 #ifndef NAN
 #define NAN std::numeric_limits<double>::quiet_NaN()
@@ -54,15 +58,78 @@ MarketSimulator::MarketSimulator(
 }
 
 void MarketSimulator::initialize_defaults() {
-    // Параметры режимов (часовой шаг, лог-доходности)
-    // mu ~ средний дрейф (в час), sigma ~ вола
-    m_params[(int)MarketRegime::NORMAL]       = { 0.0000, 0.0100, 0.00 };
-    m_params[(int)MarketRegime::CHOPPY_FLAT]  = { 0.0000, 0.0040, 0.50 }; // OU reversion
-    m_params[(int)MarketRegime::STRONG_TREND] = { 0.0008, 0.0120, 0.00 };
-    m_params[(int)MarketRegime::ILLIQUID]     = { 0.0000, 0.0200, 0.00 };
-
-    // Равномерное распределение режимов по умолчанию
-    m_regime_probs = {0.25, 0.25, 0.25, 0.25};
+    // Попытка загрузить параметры режимов из JSON-конфигурации
+    std::string path = "configs/market_regimes.json";
+    if (const char* env_p = std::getenv("MARKET_REGIMES_JSON")) {
+        path = env_p;
+    }
+    bool loaded = false;
+    std::ifstream in(path);
+    if (in.good()) {
+        std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        auto parse_regime = [&](const std::string& name, RegimeParams& out) {
+            std::regex re("\"" + name + "\"\\s*:\\s*\{[^}]*\"mu\"\\s*:\\s*([-0-9.eE]+)[^}]*\"sigma\"\\s*:\\s*([-0-9.eE]+)[^}]*\"kappa\"\\s*:\\s*([-0-9.eE]+)[^}]*\"avg_volume\"\\s*:\\s*([-0-9.eE]+)[^}]*\"avg_spread\"\\s*:\\s*([-0-9.eE]+)");
+            std::smatch m;
+            if (std::regex_search(s, m, re)) {
+                out.mu = std::stod(m[1]);
+                out.sigma = std::stod(m[2]);
+                out.kappa = std::stod(m[3]);
+                out.avg_volume = std::stod(m[4]);
+                out.avg_spread = std::stod(m[5]);
+                return true;
+            }
+            return false;
+        };
+        loaded = parse_regime("NORMAL",       m_params[(int)MarketRegime::NORMAL]);
+        loaded = parse_regime("CHOPPY_FLAT",  m_params[(int)MarketRegime::CHOPPY_FLAT]) || loaded;
+        loaded = parse_regime("STRONG_TREND", m_params[(int)MarketRegime::STRONG_TREND]) || loaded;
+        loaded = parse_regime("ILLIQUID",     m_params[(int)MarketRegime::ILLIQUID]) || loaded;
+        // распределение режимов
+        std::regex re_probs("\"regime_probs\"\\s*:\\s*\[([^\]]+)\]");
+        std::smatch mp;
+        if (std::regex_search(s, mp, re_probs)) {
+            std::string arr = mp[1];
+            std::stringstream ss(arr);
+            for (int i = 0; i < 4; ++i) {
+                std::string token;
+                if (!std::getline(ss, token, ',')) break;
+                try { m_regime_probs[i] = std::max(0.0, std::stod(token)); }
+                catch (...) { m_regime_probs[i] = 0.0; }
+            }
+            double sum = 0.0; for (double p: m_regime_probs) sum += p; if (sum>0) for (double& p: m_regime_probs) p/=sum;
+        } else {
+            m_regime_probs = {0.25,0.25,0.25,0.25};
+        }
+        // flash shock
+        std::regex re_fp("\"flash_shock\"[^}]*\"probability\"\\s*:\\s*([-0-9.eE]+)");
+        if (std::regex_search(s, mp, re_fp)) {
+            m_shock_p = clampd(std::stod(mp[1]),0.0,1.0);
+            m_shocks_enabled = m_shock_p > 0.0;
+        }
+        std::regex re_mags("\"flash_shock\"[^}]*\"magnitudes\"\\s*:\\s*\[([^\]]+)\]");
+        if (std::regex_search(s, mp, re_mags)) {
+            std::string arr = mp[1];
+            std::stringstream ss(arr);
+            std::string token;
+            m_shock_mags.clear();
+            while (std::getline(ss, token, ',')) {
+                try { m_shock_mags.push_back(std::stod(token)); } catch (...) {}
+            }
+        }
+    }
+    if (!loaded) {
+        // Параметры режимов (часовой шаг, лог-доходности)
+        // mu ~ средний дрейф (в час), sigma ~ вола
+        m_params[(int)MarketRegime::NORMAL]       = { 0.0000, 0.0100, 0.00, 1000.0, 0.0005 };
+        m_params[(int)MarketRegime::CHOPPY_FLAT]  = { 0.0000, 0.0040, 0.50, 800.0, 0.0007 }; // OU reversion
+        m_params[(int)MarketRegime::STRONG_TREND] = { 0.0008, 0.0120, 0.00, 1200.0, 0.0004 };
+        m_params[(int)MarketRegime::ILLIQUID]     = { 0.0000, 0.0200, 0.00, 500.0, 0.0010 };
+        // Равномерное распределение режимов по умолчанию
+        m_regime_probs = {0.25, 0.25, 0.25, 0.25};
+        m_shock_p = 0.01;
+        m_shocks_enabled = true;
+        m_shock_mags = {0.005,0.01,0.015,0.02};
+    }
 
     // Индикаторы — нач. значения
     sum5 = 0.0; sum20 = 0.0; sum20_sq = 0.0;
@@ -138,8 +205,14 @@ void MarketSimulator::apply_flash_shock_if_any(std::size_t i, double& close_ref)
     if (!m_shocks_enabled) return;
     int mark = m_shock_marks[i];
     if (mark == 0) return;
-    // краткосрочный "рывок": +/-[0.5%..2.0%]
-    double mag = 0.005 + 0.015 * m_unif(m_rng);
+    double mag = 0.0;
+    if (!m_shock_mags.empty()) {
+        std::uniform_int_distribution<std::size_t> idx(0, m_shock_mags.size() - 1);
+        mag = m_shock_mags[idx(m_rng)];
+    } else {
+        // fallback uniform range
+        mag = 0.005 + 0.015 * m_unif(m_rng);
+    }
     if (mark < 0) mag = -mag;
     close_ref = close_ref * (1.0 + mag);
 }

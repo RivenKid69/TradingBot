@@ -627,7 +627,10 @@ def objective(trial: optuna.Trial,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config_train.yaml", help="Path to YAML config")
+    parser.add_argument("--market-regimes", default="configs/market_regimes.json", help="Path to market regime parameters")
     args, unknown = parser.parse_known_args()
+
+    os.environ["MARKET_REGIMES_JSON"] = args.market_regimes
 
     cfg = load_config(args.config)
 
