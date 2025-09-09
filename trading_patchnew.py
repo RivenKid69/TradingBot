@@ -8,7 +8,6 @@ TradingEnv – Phase 11
 Fully modern pipeline (Dict action‑space). Legacy box/array paths removed.
 """
 import os
-import random
 from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
@@ -200,18 +199,15 @@ class TradingEnv(gym.Env):
     ) -> None:
         super().__init__()
 
-        # deterministic seed
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
+        # store seed and initialize per-instance RNG
         self.seed_value = seed
-
-        # per‑instance RNG
-        # для каждой среды используем seed + rank (rank определяется в shared_memory_vec_env.worker)
         rank_offset = getattr(self, "rank", 0)
         base_seed = seed or 0
         self._rng: np.random.Generator = rng or np.random.default_rng(base_seed + rank_offset)
-        self._publish = getattr(event_bus, "publish", lambda *a, **k: None)
+
+        # event bus / publisher
+        self._bus = event_bus
+        self._publish = getattr(self._bus, "publish", lambda *a, **k: None)
         self.time = time_provider or RealTimeProvider()
         self.decision_mode = decision_mode
         # action scheduled for next bar when using delayed decisions
@@ -446,10 +442,6 @@ class TradingEnv(gym.Env):
 
     # ------------------------------------------------ Gym API
     def reset(self, *args, **kwargs):
-        # инициализируем собственный ГПСЧ для этой среды
-        rank_offset = getattr(self, "rank", 0)
-        base_seed = self.seed_value or 0
-        self._rng = np.random.default_rng(base_seed + rank_offset)
         obs, info = self._init_state()
 
         # prepare regime & shocks
@@ -563,11 +555,54 @@ class TradingEnv(gym.Env):
             "blocked_steps": int(self.no_trade_blocks),
         }
 
+    def close(self) -> None:
+        """Close all external resources."""
+        ms = getattr(self, "market_sim", None)
+        if ms is not None:
+            try:
+                close_fn = getattr(ms, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception:
+                pass
+        bus = getattr(self, "_bus", None)
+        if bus is not None:
+            try:
+                getattr(bus, "close", lambda: None)()
+            except Exception:
+                pass
+        lg = getattr(self, "_leak_guard", None)
+        if lg is not None:
+            try:
+                getattr(lg, "close", lambda: None)()
+            except Exception:
+                pass
+        try:
+            super().close()
+        except Exception:
+            pass
 
 
     # ------------------------------------------------ util
     def seed(self, seed: int) -> None:  # noqa: D401
-        self.__init__(df=self.df, seed=seed, initial_cash=self.initial_cash)
+        """Seed the environment's RNG and propagate to sub-components."""
+        self.seed_value = int(seed)
+        rank_offset = getattr(self, "rank", 0)
+        self._rng = np.random.default_rng(self.seed_value + rank_offset)
+
+        # propagate to market simulator if possible
+        ms = getattr(self, "market_sim", None)
+        if ms is not None:
+            if hasattr(ms, "set_seed"):
+                try:
+                    ms.set_seed(int(self.seed_value + rank_offset))
+                except Exception:
+                    pass
+            elif hasattr(ms, "_rng"):
+                try:
+                    ms._rng = self._rng
+                except Exception:
+                    pass
 # ----------------------- Simple market-sim stub (unchanged) -----------------------
 class _SimpleMarketSim:
     def __init__(self, rng: np.random.Generator | None = None) -> None:
