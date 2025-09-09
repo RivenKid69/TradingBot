@@ -35,3 +35,16 @@ def test_limit_order_ttl_survives():
     assert report3.cancelled_ids == []
     report4 = sim.pop_ready(ref_price=100.0)
     assert report4.cancelled_ids == [oid]
+
+
+from fast_lob import CythonLOB
+
+def test_cpp_lob_ttl_expires():
+    lob = CythonLOB()
+    oid, _ = lob.add_limit_order(True, 1000, 1.0, 0, True)
+    assert lob.set_order_ttl(oid, 2)
+    assert lob.contains_order(oid)
+    assert lob.decay_ttl_and_cancel() == []
+    assert lob.contains_order(oid)
+    assert lob.decay_ttl_and_cancel() == [oid]
+    assert not lob.contains_order(oid)

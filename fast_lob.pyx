@@ -17,6 +17,13 @@ cdef extern from "OrderBook.h":
         double taker_fee
         double slip_k
 
+    cdef struct Order:
+        uint64_t id
+        double volume
+        cpp_bool is_agent
+        int timestamp
+        int ttl_steps
+
     cppclass OrderBook:
         OrderBook() except +
         void add_limit_order(cpp_bool is_buy_side,
@@ -49,6 +56,14 @@ cdef extern from "OrderBook.h":
         void swap(OrderBook& other)
         void set_fee_model(const FeeModel& fm)
         void set_seed(unsigned long long seed)
+        cpp_bool set_order_ttl(uint64_t order_id, int ttl_steps)
+        int decay_ttl_and_cancel(void (*on_cancel)(const Order&))
+
+cdef vector[uint64_t]* _ttl_buf = NULL
+
+cdef void _collect_cancel(const Order& o) noexcept nogil:
+    if _ttl_buf is not NULL:
+        _ttl_buf.push_back(o.id)
 
 cdef class CythonLOB:
     """
@@ -91,8 +106,7 @@ cdef class CythonLOB:
         """
         cdef uint64_t oid = self._next_id
         self._next_id += 1
-        with nogil:
-            self.thisptr.add_limit_order(is_buy_side, price_ticks, volume, oid,
+        self.thisptr.add_limit_order(is_buy_side, price_ticks, volume, oid,
                                          taker_is_agent, timestamp)
         cdef uint32_t pos = self.thisptr.get_queue_position(oid)
         # 0xFFFFFFFF обычно используют как «нет позиции»
@@ -101,8 +115,18 @@ cdef class CythonLOB:
         return (oid, pos)
 
     cpdef remove_order(self, bint is_buy_side, long long price_ticks, unsigned long long order_id):
-        with nogil:
-            self.thisptr.remove_order(is_buy_side, price_ticks, <uint64_t>order_id)
+        self.thisptr.remove_order(is_buy_side, price_ticks, <uint64_t>order_id)
+    cpdef bint set_order_ttl(self, unsigned long long order_id, int ttl_steps):
+        return bool(self.thisptr.set_order_ttl(<uint64_t>order_id, ttl_steps))
+
+    cpdef list decay_ttl_and_cancel(self):
+        cdef vector[uint64_t] acc
+        global _ttl_buf
+        _ttl_buf = &acc
+        self.thisptr.decay_ttl_and_cancel(_collect_cancel)
+        _ttl_buf = NULL
+        return [acc[i] for i in range(acc.size())]
+
 
     cpdef tuple match_market_order(self,
                                    bint is_buy_side,
@@ -135,20 +159,18 @@ cdef class CythonLOB:
 
         cdef double fee_total = 0.0
         cdef int n_trades
-        with nogil:
-            n_trades = self.thisptr.match_market_order(
-                is_buy_side, volume, timestamp, taker_is_agent,
-                &out_prices[0], &out_volumes[0],
-                &out_is_buy[0], &out_is_self[0],
-                &out_ids[0], m, &fee_total)
+        n_trades = self.thisptr.match_market_order(
+            is_buy_side, volume, timestamp, taker_is_agent,
+            &out_prices[0], &out_volumes[0],
+            &out_is_buy[0], &out_is_self[0],
+            &out_ids[0], m, &fee_total)
 
         return (n_trades, fee_total)
 
     cpdef prune_stale_orders(self, int current_step, int max_age):
-        with nogil:
-            self.thisptr.prune_stale_orders(current_step, max_age)
+        self.thisptr.prune_stale_orders(current_step, max_age)
 
-    cpdef cancel_random_orders_batch(self, cnp.ndarray[cnp.bool_t, ndim=1] sides):
+    cpdef cancel_random_orders_batch(self, sides):
         cdef Py_ssize_t i, n = sides.shape[0]
         for i in range(n):
             self.thisptr.cancel_random_public_orders(<cpp_bool>bool(sides[i]), 1)
@@ -169,13 +191,6 @@ cdef class CythonLOB:
         """
         return <size_t>self.thisptr
 
-    cpdef size_t raw_ptr(self):
-        """
-        Сырой указатель на внутренний OrderBook* (для Cython/C++-интеграции).
-        Использовать только для friend-обёрток; руками не разыменовывать в Python.
-        """
-        return <size_t>self.thisptr
-
     cpdef CythonLOB clone(self):
         cdef CythonLOB other = CythonLOB.__new__(CythonLOB)
         other.thisptr = self.thisptr.clone()
@@ -183,5 +198,4 @@ cdef class CythonLOB:
         return other
 
     cpdef swap(self, CythonLOB other):
-        with nogil:
-            self.thisptr.swap(other.thisptr[0])
+        self.thisptr.swap(other.thisptr[0])

@@ -45,7 +45,7 @@ inline uint64_t make_order_id() {
 
 Basic order record
 
---------------------------------------------------------------------- */
+/* --------------------------------------------------------------------- */
 struct Order {
     uint64_t id;       // 64-битный идентификатор
     double   volume;
@@ -150,6 +150,11 @@ double get_volume_for_top_levels(bool is_buy_side, int levels) const;
 /* O(1) queue‑index lookup */
 uint32_t get_queue_position(uint64_t order_id) const;
 
+// Установить TTL конкретному ордеру (сканирует обе стороны книги), true если найден
+bool set_order_ttl(uint64_t order_id, int ttl_steps);
+// Декремент TTL у всех ордеров; нулевые — удалить. Возвращает число отмен.
+int decay_ttl_and_cancel(const std::function<void(const Order&)>& on_cancel = {});
+
 // Copy-on-Write helpers (глубокая копия если !ORDERBOOK_COW)
 OrderBook* clone() const;
 void swap(OrderBook& other) noexcept;
@@ -177,10 +182,6 @@ private:
         int    timestamp,
         bool   taker_is_agent,
         const std::function<void(long long,double,const Order&)>& trade_handler);
-        // Установить TTL конкретному ордеру (сканирует обе стороны книги), true если найден
-        bool set_order_ttl(uint64_t order_id, int ttl_steps);
-        // Декремент TTL у всех ордеров; нулевые — удалить. Возвращает число отмен.
-        int decay_ttl_and_cancel(const std::function<void(const Order&)>& on_cancel = {});
 };
 
 #endif /* ORDER_BOOK_H */
