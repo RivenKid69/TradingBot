@@ -32,9 +32,6 @@ from services.utils_app import (
     load_signals_full,
 )
 from service_backtest import BacktestConfig, from_config as backtest_from_config
-from service_train import ServiceTrain, TrainConfig
-from feature_pipe import FeaturePipe
-from transformers import FeatureSpec
 from service_signal_runner import ServiceSignalRunner, RunnerConfig
 from service_eval import ServiceEval, EvalConfig
 
@@ -616,186 +613,69 @@ with tabs[9]:
 with tabs[10]:
     st.subheader("Model Train — обучение модели и выбор артефакта")
 
-    st.caption("Выбери один из режимов: (A) запуск твоего train_model_multi_patch (произвольная команда), (B) baseline-тренер (опционально). После обучения можно записать путь к модели в configs/realtime.yaml.")
+    st.caption(
+        "Запуск обучения осуществляется через единый entrypoint `train_model_multi_patch.py`. После обучения можно записать путь к модели в configs/realtime.yaml."
+    )
 
-    mode = st.radio("Режим обучения", options=["A) Мой скрипт (train_model_multi_patch)", "B) Baseline тренер"], index=0, key="mt_mode")
+    st.markdown("### Запуск train_model_multi_patch")
+    st.caption(
+        "Введи точную команду запуска. Пример: "
+        "`python train_model_multi_patch.py --config configs/config_train.yaml` "
+        "или любая другая подходящая команда."
+    )
+    custom_cmd = st.text_input(
+        "Команда запуска обучения",
+        value="python train_model_multi_patch.py --config configs/config_train.yaml",
+        key="mt_custom_cmd",
+    )
+    custom_log = os.path.join(logs_dir, "train_custom.log")
+    st.caption(f"Лог обучения: `{custom_log}`")
 
-    # -------------------- Режим A: кастомный train_model_multi_patch --------------------
-    if mode.startswith("A"):
-        st.markdown("### Режим A — запуск твоего train_model_multi_patch")
-
-        st.caption(
-            "Введи точную команду запуска. Пример: "
-            "`python train_model_multi_patch.py --config configs/config_train.yaml` "
-            "или любая другая подходящая команда."
-        )
-        custom_cmd = st.text_input(
-            "Команда запуска обучения",
-            value="python train_model_multi_patch.py --config configs/config_train.yaml",
-            key="mt_custom_cmd",
-        )
-        custom_log = os.path.join(logs_dir, "train_custom.log")
-        st.caption(f"Лог обучения: `{custom_log}`")
-
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("Запустить мой тренер", type="primary", key="mt_run_custom"):
-                # Разобьём команду по пробелам простым способом; при необходимости пользователь может обрамлять пути кавычками
-                try:
-                    import shlex
-                    cmd_list = shlex.split(custom_cmd)
-                    rc = run_cmd(cmd_list, log_path=custom_log)
-                    if rc == 0:
-                        st.success("Обучение завершено (кастомная команда)")
-                    else:
-                        st.error(f"Команда завершилась с кодом {rc}")
-                except Exception as e:
-                    st.error(str(e))
-        with colB:
-            if st.button("Показать лог кастомного обучения", key="mt_show_custom_log"):
-                st.code(tail_file(custom_log, n=500) or "(пусто)")
-
-        st.divider()
-        st.markdown("### Указать артефакт модели и записать в configs/realtime.yaml")
-        model_art = st.text_input("Путь к готовому файлу модели (.pkl или др.)", value="artifacts/model.pkl", key="mt_art_path_a")
-
-        set_cols = st.columns(2)
-        with set_cols[0]:
-            if st.button("Записать model_path в configs/realtime.yaml", type="primary", key="mt_set_model_a"):
-                try:
-                    import copy
-                    rt_cfg = load_config(cfg_realtime).model_dump()
-                    new_cfg = copy.deepcopy(rt_cfg)
-                    new_cfg.setdefault("strategy", {}).setdefault("params", {})
-                    new_cfg["strategy"]["params"]["model_path"] = str(model_art)
-                    _ensure_dir(cfg_realtime)
-                    with open(cfg_realtime, "w", encoding="utf-8") as wf:
-                        yaml.safe_dump(new_cfg, wf, sort_keys=False, allow_unicode=True)
-                    st.success("Путь к модели записан в configs/realtime.yaml")
-                except Exception as e:
-                    st.error(f"Ошибка записи в configs/realtime.yaml: {e}")
-
-        with set_cols[1]:
-            if st.button("Показать текущий configs/realtime.yaml", key="mt_show_rt_yaml_a"):
-                try:
-                    with open(cfg_realtime, "r", encoding="utf-8") as f:
-                        st.code(f.read(), language="yaml")
-                except Exception as e:
-                    st.error(str(e))
-
-    # -------------------- Режим B: baseline тренер (опционально) --------------------
-    else:
-        st.markdown("### Режим B — baseline-тренер (опционально)")
-        st.caption("Это универсальный тренер на sklearn. Используй его только если тебе нужен простой эталон или быстрый старт. "
-                   "Если тебе достаточно твоего train_model_multi_patch — этот раздел можно не использовать.")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("**Параметры обучения**")
-            train_data = st.text_input("Путь к train.parquet/csv (--data)", value="data/train.parquet", key="mt_data_b")
-            price_col = st.text_input("Колонка цены (--price-col)", value="ref_price", key="mt_price_b")
-            label_col = st.text_input("Колонка таргета (--label-col)", value="", key="mt_label_b")
-            task = st.selectbox("Тип задачи (--task)", options=["classification", "regression"], index=0, key="mt_task_b")
-            threshold = st.text_input("Порог для классификации (--threshold)", value="0.0", key="mt_thr_b")
-            positive_rule = st.selectbox("Правило положительного класса (--positive-rule)", options=["gt", "ge"], index=0, key="mt_posrule_b")
-            drop_cols = st.text_input("Исключить колонки (--drop-cols, через запятую)", value="", key="mt_dropcols_b")
-            prefixes = st.text_input("Оставлять префиксы фич (--features-prefixes)", value="sma_,ret_,rsi", key="mt_prefixes_b")
-            test_size = st.number_input("Доля валидации (--test-size)", min_value=0.05, max_value=0.9, value=0.2, step=0.05, key="mt_testsize_b")
-            random_state = st.number_input("random_state (--random-state)", min_value=0, max_value=1_000_000, value=42, step=1, key="mt_rs_b")
-
-        with col2:
-            st.markdown("**Модель и выходы**")
-            model_type = st.selectbox("Тип модели (--model)", options=["logreg", "rf_cls", "ridge", "rf_reg"], index=0, key="mt_model_b")
-            out_dir = st.text_input("Каталог для артефактов (--out-dir)", value="artifacts", key="mt_outdir_b")
-            model_name = st.text_input("Имя файла модели (--model-name)", value="model.pkl", key="mt_modelname_b")
-            metrics_json = st.text_input("Куда сохранить метрики (--metrics-json)", value=os.path.join(logs_dir, "train_metrics.json"), key="mt_metricsjson_b")
-            train_log = os.path.join(logs_dir, "train.log")
-            st.caption(f"Лог обучения (baseline): `{train_log}`")
-
-        run_cols = st.columns(2)
-        with run_cols[0]:
-            if st.button("Запустить baseline-тренер", type="primary", key="mt_run_b"):
-                class DummyTrainer:
-                    def __init__(self, mtype: str):
-                        self.mtype = mtype
-                        self.info: Dict[str, Any] = {}
-
-                    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None):
-                        self.info = {"model": self.mtype, "n": len(X)}
-
-                    def save(self, path: str) -> str:
-                        _ensure_dir(path)
-                        with open(path, "w", encoding="utf-8") as f:
-                            json.dump(self.info, f)
-                        return path
-
-                spec = FeatureSpec(lookbacks_prices=[5, 15, 60], rsi_period=14)
-                fp = FeaturePipe(spec, price_col=price_col, label_col=(label_col or None))
-                trainer = DummyTrainer(model_type)
-                fmt = "parquet" if train_data.endswith(".parquet") else "csv"
-                cfg_train = TrainConfig(
-                    input_path=train_data,
-                    input_format=fmt,
-                    artifacts_dir=out_dir,
-                    dataset_name="train_dataset",
-                    model_name=model_name,
-                )
-                try:
-                    svc = ServiceTrain(fp, trainer, cfg_train)
-                    res = svc.run()
-                    pd.Series({"n_samples": res["n_samples"], "n_features": res["n_features"]}).to_json(metrics_json)
-                    st.success(f"Обучение завершено, модель: {res['model_path']}")
-                except Exception as e:
-                    st.error(str(e))
-
-        with run_cols[1]:
-            if st.button("Показать train_metrics.json (baseline)", key="mt_showmetrics_b"):
-                mj = read_json(metrics_json)
-                if mj:
-                    st.json(mj)
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Запустить тренер", type="primary", key="mt_run_custom"):
+            # Разобьём команду по пробелам простым способом; при необходимости пользователь может обрамлять пути кавычками
+            try:
+                import shlex
+                cmd_list = shlex.split(custom_cmd)
+                rc = run_cmd(cmd_list, log_path=custom_log)
+                if rc == 0:
+                    st.success("Обучение завершено (кастомная команда)")
                 else:
-                    st.info("Файл метрик пока не найден.")
+                    st.error(f"Команда завершилась с кодом {rc}")
+            except Exception as e:
+                st.error(str(e))
+    with colB:
+        if st.button("Показать лог обучения", key="mt_show_custom_log"):
+            st.code(tail_file(custom_log, n=500) or "(пусто)")
 
-        st.divider()
-        st.subheader("Выбор baseline-модели и запись в configs/realtime.yaml")
-        try:
-            pkls = []
-            if os.path.exists(out_dir) and os.path.isdir(out_dir):
-                for name in os.listdir(out_dir):
-                    if name.lower().endswith(".pkl"):
-                        pkls.append(os.path.join(out_dir, name))
-            pkls = sorted(pkls)
-        except Exception:
-            pkls = []
+    st.divider()
+    st.markdown("### Указать артефакт модели и записать в configs/realtime.yaml")
+    model_art = st.text_input("Путь к готовому файлу модели (.pkl или др.)", value="artifacts/model.pkl", key="mt_art_path_a")
 
-        chosen = st.selectbox("Выберите модельный .pkl", options=pkls if pkls else ["(нет файлов .pkl в каталоге артефактов)"], index=0, key="mt_choose_b")
-        if pkls:
-            st.caption(f"Выбрано: `{chosen}`")
+    set_cols = st.columns(2)
+    with set_cols[0]:
+        if st.button("Записать model_path в configs/realtime.yaml", type="primary", key="mt_set_model_a"):
+            try:
+                import copy
+                rt_cfg = load_config(cfg_realtime).model_dump()
+                new_cfg = copy.deepcopy(rt_cfg)
+                new_cfg.setdefault("strategy", {}).setdefault("params", {})
+                new_cfg["strategy"]["params"]["model_path"] = str(model_art)
+                _ensure_dir(cfg_realtime)
+                with open(cfg_realtime, "w", encoding="utf-8") as wf:
+                    yaml.safe_dump(new_cfg, wf, sort_keys=False, allow_unicode=True)
+                st.success("Путь к модели записан в configs/realtime.yaml")
+            except Exception as e:
+                st.error(f"Ошибка записи в configs/realtime.yaml: {e}")
 
-        set_cols_b = st.columns(2)
-        with set_cols_b[0]:
-            if st.button("Записать model_path в configs/realtime.yaml (baseline)", type="primary", key="mt_set_model_b"):
-                try:
-                    import copy
-                    rt_cfg = load_config(cfg_realtime).model_dump()
-                    new_cfg = copy.deepcopy(rt_cfg)
-                    new_cfg.setdefault("strategy", {}).setdefault("params", {})
-                    new_cfg["strategy"]["params"]["model_path"] = str(chosen) if pkls else ""
-                    _ensure_dir(cfg_realtime)
-                    with open(cfg_realtime, "w", encoding="utf-8") as wf:
-                        yaml.safe_dump(new_cfg, wf, sort_keys=False, allow_unicode=True)
-                    st.success("Путь к модели записан в configs/realtime.yaml")
-                except Exception as e:
-                    st.error(f"Ошибка записи в configs/realtime.yaml: {e}")
-
-        with set_cols_b[1]:
-            if st.button("Показать текущий configs/realtime.yaml (baseline)", key="mt_show_rt_yaml_b"):
-                try:
-                    with open(cfg_realtime, "r", encoding="utf-8") as f:
-                        st.code(f.read(), language="yaml")
-                except Exception as e:
-                    st.error(str(e))
+    with set_cols[1]:
+        if st.button("Показать текущий configs/realtime.yaml", key="mt_show_rt_yaml_a"):
+            try:
+                with open(cfg_realtime, "r", encoding="utf-8") as f:
+                    st.code(f.read(), language="yaml")
+            except Exception as e:
+                st.error(str(e))
 
 with tabs[11]:
     st.subheader("YAML-редактор конфигов проекта")
