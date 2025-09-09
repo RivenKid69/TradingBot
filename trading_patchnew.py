@@ -198,6 +198,8 @@ def __init__(
     self._rng: np.random.Generator = rng or np.random.default_rng(base_seed + rank_offset)
     self.time = time_provider or RealTimeProvider()
     self.decision_mode = decision_mode
+    # action scheduled for next bar when using delayed decisions
+    self._pending_action: ActionProto | None = None
     # price data
     self.df = df.reset_index(drop=True).copy()
 
@@ -395,10 +397,14 @@ def reset(self, *args, **kwargs):
 
     # mediator internal clear
     self._mediator.reset()
-    return obs, info
 
-    # mediator internal clear
-    self._mediator.reset()
+    # queue default action for delayed execution
+    if self.decision_mode == DecisionTiming.CLOSE_TO_OPEN:
+        # first action is deferred to the next bar, so execute HOLD on bar 0
+        self._pending_action = ActionProto(ActionType.HOLD, 0.0)
+    else:
+        self._pending_action = None
+
     return obs, info
 
 def step(self, action):
@@ -407,12 +413,15 @@ def step(self, action):
     bid_col = next((c for c in ("bid", "best_bid", "bid_price") if c in row.index), None)
     ask_col = next((c for c in ("ask", "best_ask", "ask_price") if c in row.index), None)
     bid = ask = None
+
+    price_key = "open" if self.decision_mode == DecisionTiming.CLOSE_TO_OPEN else "close"
+
     if bid_col and ask_col:
         bid = float(row[bid_col])
         ask = float(row[ask_col])
         mid = (bid + ask) / 2.0
     else:
-        mid = float(row.get("close", row.get("price", 0.0)))
+        mid = float(row.get(price_key, row.get("price", 0.0)))
 
     vol_factor = float(row.get("atr_pct", 0.0))
     liquidity = float(row.get("liq_roll", 0.0))
@@ -439,7 +448,12 @@ def step(self, action):
     self.last_ask = ask
     self.last_mid = mid
 
-    proto = self._to_proto(action)
+    if self.decision_mode == DecisionTiming.CLOSE_TO_OPEN:
+        proto = self._pending_action or ActionProto(ActionType.HOLD, 0.0)
+        self._pending_action = self._to_proto(action)
+    else:
+        proto = self._to_proto(action)
+
     return self._mediator.step(proto)
 
 
