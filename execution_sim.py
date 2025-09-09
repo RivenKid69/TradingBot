@@ -630,8 +630,11 @@ class ExecutionSimulator:
                             continue
                     ts_fill = int(ts_fill + lat_ms)
 
-                    # базовая котировка
-                    filled_price = float(ref)
+                    # базовая котировка: используем ask для BUY и bid для SELL
+                    base_price = self._last_ask if side == "BUY" else self._last_bid
+                    if base_price is None:
+                        base_price = ref
+                    filled_price = float(base_price) if base_price is not None else float(ref)
 
                     # слиппедж на ребёнка
                     slip_bps = 0.0
@@ -675,7 +678,14 @@ class ExecutionSimulator:
                         latency_spike=bool(lat_spike),
                     ))
                 continue
-            filled_price = float(ref)
+            # Определение направления и базовой цены для прочих типов
+            is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
+            side = "BUY" if is_buy else "SELL"
+            qty = abs(float(getattr(proto, "volume_frac", 0.0)))
+            base_price = self._last_ask if side == "BUY" else self._last_bid
+            if base_price is None:
+                base_price = ref
+            filled_price = float(base_price) if base_price is not None else float(ref)
 
             # слиппедж
             slip_bps = 0.0
@@ -951,8 +961,11 @@ class ExecutionSimulator:
                             continue
                     ts_fill = int(ts_fill + lat_ms)
 
-                    # цена исполнения + слиппедж
-                    filled_price = float(ref)
+                    # цена исполнения: ask для BUY, bid для SELL
+                    base_price = self._last_ask if side == "BUY" else self._last_bid
+                    if base_price is None:
+                        base_price = ref
+                    filled_price = float(base_price) if base_price is not None else float(ref)
                     slip_bps = 0.0
                     sbps = self._last_spread_bps
                     vf = self._last_vol_factor
