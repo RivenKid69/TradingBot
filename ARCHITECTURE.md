@@ -156,7 +156,7 @@ python script_compare_runs.py run1/ run2/metrics.json --csv summary.csv
 описывают аргументы командной строки и делегируют работу соответствующим
 сервисам:
 
-- `script_train.py` — запускает обучение через `ServiceTrain`.
+- `train_model_multi_patch.py` — запускает обучение через `ServiceTrain`.
 - `script_backtest.py` — проводит бэктест через `ServiceBacktest`.
 - `script_eval.py` — рассчитывает метрики через `ServiceEval` (поддерживает `--profile` и `--all-profiles`).
 - `script_live.py` — исполняет стратегию на живых данных через `ServiceSignalRunner`.
