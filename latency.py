@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
-from typing import Dict
+from dataclasses import dataclass, field
+from typing import Dict, List
 
 
 @dataclass
@@ -32,6 +32,9 @@ class LatencyModel:
     timeout_ms: int = 2500
     retries: int = 1
     seed: int = 0
+    # Accumulators for latency statistics
+    lat_samples: List[int] = field(default_factory=list)
+    timeouts: int = 0
 
     def __post_init__(self) -> None:
         self._rng = random.Random(int(self.seed))
@@ -67,9 +70,41 @@ class LatencyModel:
             if attempts > int(self.retries) + 1:
                 break
 
-        return {
+        result = {
             "total_ms": int(agg_ms),
             "spike": bool(spike_on_success),
             "timeout": bool(last_timeout),
             "attempts": int(attempts),
         }
+        # Update statistics accumulators
+        self.lat_samples.append(int(agg_ms))
+        if last_timeout:
+            self.timeouts += 1
+        return result
+
+    def stats(self) -> Dict[str, float]:
+        """Return latency statistics."""
+        n = len(self.lat_samples)
+        if n == 0:
+            return {"p50_ms": 0.0, "p95_ms": 0.0, "timeout_rate": 0.0}
+        sorted_samples = sorted(self.lat_samples)
+        # Helper to compute percentile with linear interpolation
+        def percentile(p: float) -> float:
+            if n == 1:
+                return float(sorted_samples[0])
+            k = (n - 1) * p
+            f = int(k)
+            c = min(f + 1, n - 1)
+            if f == c:
+                return float(sorted_samples[f])
+            return float(sorted_samples[f] + (sorted_samples[c] - sorted_samples[f]) * (k - f))
+
+        p50 = percentile(0.5)
+        p95 = percentile(0.95)
+        timeout_rate = float(self.timeouts) / n
+        return {"p50_ms": p50, "p95_ms": p95, "timeout_rate": timeout_rate}
+
+    def reset_stats(self) -> None:
+        """Reset collected latency statistics."""
+        self.lat_samples.clear()
+        self.timeouts = 0
