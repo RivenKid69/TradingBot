@@ -8,17 +8,22 @@ sys.path.append(REPO)
 from apply_no_trade_mask import main
 
 
-def run(mode: str) -> None:
+def run(mode: str | None) -> None:
+    out = f"/tmp/no_trade_sample_{mode or 'mask'}.csv"
     sys.argv = [
         "no-trade-mask",
         "--data", os.path.join(REPO, "tests/data/no_trade_sample.csv"),
-        "--out", f"/tmp/no_trade_sample_{mode}.csv",
+        "--out", out,
         "--sandbox_config", os.path.join(REPO, "configs/legacy_sandbox.yaml"),
-        "--mode", mode,
     ]
+    if mode:
+        sys.argv += ["--mode", mode]
+    else:
+        sys.argv += ["--mask-only"]
     main()
 
 
 if __name__ == "__main__":
     run("drop")
     run("weight")
+    run(None)
