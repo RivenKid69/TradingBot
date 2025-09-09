@@ -30,13 +30,26 @@ def test_in_funding_buffer_with_midnight_and_day_marks():
 
 
 def test_in_custom_window_respects_ranges():
-    ts_minutes = np.array([0, 4, 5, 10, 11], dtype=np.int64)
+    ts_minutes = np.array([0, 4, 5, 10, 12], dtype=np.int64)
     ts_ms = ts_minutes * 60_000
     windows = [
         {"start_ts_ms": 0, "end_ts_ms": 5 * 60_000},
-        {"start_ts_ms": 10 * 60_000, "end_ts_ms": 10 * 60_000},
-        {"start_ts_ms": "bad", "end_ts_ms": 20},
+        {"start_ts_ms": 10 * 60_000, "end_ts_ms": 11 * 60_000},
     ]
     mask = _in_custom_window(ts_ms, windows)
     expected = np.array([True, True, True, True, False])
     np.testing.assert_array_equal(mask, expected)
+
+
+@pytest.mark.parametrize(
+    "windows,match",
+    [
+        ([{"start_ts_ms": "bad", "end_ts_ms": 20}], "integer"),
+        ([{"start_ts_ms": 10, "end_ts_ms": 5}], "must be <"),
+        ([{"start_ts_ms": 10, "end_ts_ms": 10}], "must be <"),
+    ],
+)
+def test_in_custom_window_invalid_windows_raise(windows, match):
+    ts_ms = np.array([0], dtype=np.int64)
+    with pytest.raises(ValueError, match=match):
+        _in_custom_window(ts_ms, windows)
