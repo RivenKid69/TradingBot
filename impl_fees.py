@@ -20,8 +20,20 @@ class FeesConfig:
     maker_bps: float = 1.0
     taker_bps: float = 5.0
     use_bnb_discount: bool = False
-    maker_discount_mult: float = 1.0
-    taker_discount_mult: float = 1.0
+    maker_discount_mult: Optional[float] = None
+    taker_discount_mult: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.use_bnb_discount:
+            if self.maker_discount_mult is None:
+                self.maker_discount_mult = 0.75
+            if self.taker_discount_mult is None:
+                self.taker_discount_mult = 0.75
+        else:
+            if self.maker_discount_mult is None:
+                self.maker_discount_mult = 1.0
+            if self.taker_discount_mult is None:
+                self.taker_discount_mult = 1.0
 
 
 class FeesImpl:
@@ -45,10 +57,13 @@ class FeesImpl:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "FeesImpl":
+        use_bnb = bool(d.get("use_bnb_discount", False))
+        maker_mult = d.get("maker_discount_mult")
+        taker_mult = d.get("taker_discount_mult")
         return FeesImpl(FeesConfig(
             maker_bps=float(d.get("maker_bps", 1.0)),
             taker_bps=float(d.get("taker_bps", 5.0)),
-            use_bnb_discount=bool(d.get("use_bnb_discount", False)),
-            maker_discount_mult=float(d.get("maker_discount_mult", 1.0)),
-            taker_discount_mult=float(d.get("taker_discount_mult", 1.0)),
+            use_bnb_discount=use_bnb,
+            maker_discount_mult=float(maker_mult) if maker_mult is not None else None,
+            taker_discount_mult=float(taker_mult) if taker_mult is not None else None,
         ))
