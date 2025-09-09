@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import argparse
 import os
-import logging
+import sys
 
 import pandas as pd
 
-from training.no_trade import (
+from no_trade import (
     compute_no_trade_mask,
     load_no_trade_config,
     estimate_block_ratio,
@@ -53,8 +53,9 @@ def main():
     est_ratio = estimate_block_ratio(df, cfg, ts_col=args.ts_col)
     actual_ratio = float(mask_block.mean())
     if abs(actual_ratio - est_ratio) > 0.01:
-        logging.warning(
-            "Blocked ratio %.4f differs from expected %.4f", actual_ratio, est_ratio
+        print(
+            f"Blocked ratio {actual_ratio:.4f} differs from expected {est_ratio:.4f}",
+            file=sys.stderr,
         )
     if args.mode == "drop":
         out_df = df.loc[~mask_block].reset_index(drop=True)
