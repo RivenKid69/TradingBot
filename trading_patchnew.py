@@ -9,6 +9,7 @@ Fully modern pipeline (Dict action‑space). Legacy box/array paths removed.
 """
 import os
 import random
+from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Sequence, Tuple
@@ -200,6 +201,7 @@ def __init__(
     self.decision_mode = decision_mode
     # action scheduled for next bar when using delayed decisions
     self._pending_action: ActionProto | None = None
+    self._action_queue: deque[ActionProto] = deque()
     # price data
     self.df = df.reset_index(drop=True).copy()
 
@@ -283,7 +285,9 @@ def __init__(
     self._max_steps = len(self.df)
 
     # store config for Mediator
-    self.latency_steps = latency_steps or 0
+    self.latency_steps = int(latency_steps or 0)
+    if self.latency_steps < 0 or self.latency_steps > self._max_steps:
+        raise ValueError("latency_steps out of range")
     self.slip_k = slip_k or 0.0
     self.max_abs_position = max_abs_position or 1e12
     self.max_drawdown_pct = max_drawdown_pct or 1.0
@@ -402,13 +406,23 @@ def reset(self, *args, **kwargs):
     if self.decision_mode == DecisionTiming.CLOSE_TO_OPEN:
         # first action is deferred to the next bar, so execute HOLD on bar 0
         self._pending_action = ActionProto(ActionType.HOLD, 0.0)
+        self._action_queue.clear()
+    elif self.decision_mode == DecisionTiming.INTRA_HOUR_WITH_LATENCY:
+        self._pending_action = None
+        self._action_queue = deque(
+            ActionProto(ActionType.HOLD, 0.0) for _ in range(self.latency_steps)
+        )
     else:
         self._pending_action = None
+        self._action_queue.clear()
 
     return obs, info
 
 def step(self, action):
-    row = self.df.iloc[self.state.step_idx]
+    row_idx = self.state.step_idx
+    if self.decision_mode == DecisionTiming.INTRA_HOUR_WITH_LATENCY:
+        row_idx = max(0, row_idx - self.latency_steps)
+    row = self.df.iloc[row_idx]
 
     bid_col = next((c for c in ("bid", "best_bid", "bid_price") if c in row.index), None)
     ask_col = next((c for c in ("ask", "best_ask", "ask_price") if c in row.index), None)
@@ -451,6 +465,13 @@ def step(self, action):
     if self.decision_mode == DecisionTiming.CLOSE_TO_OPEN:
         proto = self._pending_action or ActionProto(ActionType.HOLD, 0.0)
         self._pending_action = self._to_proto(action)
+    elif self.decision_mode == DecisionTiming.INTRA_HOUR_WITH_LATENCY:
+        proto = (
+            self._action_queue.popleft()
+            if self._action_queue
+            else ActionProto(ActionType.HOLD, 0.0)
+        )
+        self._action_queue.append(self._to_proto(action))
     else:
         proto = self._to_proto(action)
 
