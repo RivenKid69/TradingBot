@@ -353,6 +353,20 @@ class Mediator:
         # если есть ExecutionSimulator — используем его
         if self._use_exec and self.exec is not None:
             try:
+                bid = getattr(self.env, "last_bid", None)
+                ask = getattr(self.env, "last_ask", None)
+                if bid is not None and ask is not None:
+                    try:
+                        self.exec.set_market_snapshot(bid=bid, ask=ask)  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                    mid = getattr(self.env, "last_mid", None)
+                    if mid is None:
+                        mid = (float(bid) + float(ask)) / 2.0
+                    try:
+                        self.exec.set_ref_price(float(mid))  # type: ignore[union-attr]
+                    except Exception:
+                        pass
                 cli_id = self.exec.submit(proto)  # type: ignore[union-attr]
                 # в простом варианте считаем, что latency=0 и сразу «поп» (если latency>0 — поп произойдёт на тик)
                 report: ExecReport = self.exec.pop_ready()  # type: ignore  # ExecReport — это alias на SimStepReport
