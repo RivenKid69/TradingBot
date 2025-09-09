@@ -7,11 +7,8 @@ import sys
 
 import pandas as pd
 
-from no_trade import (
-    compute_no_trade_mask,
-    load_no_trade_config,
-    estimate_block_ratio,
-)
+from no_trade import compute_no_trade_mask, estimate_block_ratio
+from no_trade_config import get_no_trade_config
 
 
 def _read_table(path: str) -> pd.DataFrame:
@@ -46,7 +43,7 @@ def main():
 
     df = _read_table(args.data)
 
-    cfg = load_no_trade_config(args.sandbox_config)
+    cfg = get_no_trade_config(args.sandbox_config)
     mask_block = compute_no_trade_mask(
         df, sandbox_yaml_path=args.sandbox_config, ts_col=args.ts_col
     )

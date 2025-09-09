@@ -29,6 +29,7 @@ from no_trade import (
     _in_funding_buffer,
     _in_custom_window,
 )
+from no_trade_config import get_no_trade_config
 
 try:  # existing dynamic-spread config (pydantic model)
     from trainingtcost import DynSpreadCfg
@@ -276,10 +277,18 @@ class TradingEnv(gym.Env):
             self._rolling_liquidity = np.zeros(len(self.df))
 
         # --- precompute no-trade mask ---
-        cfg_nt = NoTradeConfig(**(kwargs.get("no_trade", {}) or {}))
+        override = kwargs.get("no_trade")
+        if override:
+            cfg_nt = NoTradeConfig(**override)
+        else:
+            cfg_nt = get_no_trade_config(kwargs.get("sandbox_config", "configs/legacy_sandbox.yaml"))
         self._no_trade_cfg = cfg_nt
         if "ts_ms" in self.df.columns:
-            ts = pd.to_numeric(self.df["ts_ms"], errors="coerce").astype("Int64").to_numpy(dtype="int64")
+            ts = (
+                pd.to_numeric(self.df["ts_ms"], errors="coerce")
+                .astype("Int64")
+                .to_numpy(dtype="int64")
+            )
             daily_min = _parse_daily_windows_min(cfg_nt.daily_utc or [])
             m_daily = _in_daily_window(ts, daily_min)
             m_funding = _in_funding_buffer(ts, int(cfg_nt.funding_buffer_min or 0))

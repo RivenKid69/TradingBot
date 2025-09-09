@@ -38,6 +38,11 @@ no-trade-mask --data data.csv --sandbox_config configs/legacy_sandbox.yaml --mod
 no-trade-mask --data data.csv --sandbox_config configs/legacy_sandbox.yaml --mode weight
 ```
 
+Загрузка настроек `no_trade` централизована: функция
+`no_trade_config.get_no_trade_config()` считывает секцию `no_trade` из YAML‑файла
+и возвращает модель `NoTradeConfig`. Все модули используют её как единый
+источник правды, исключая расхождения в трактовке конфигурации.
+
 ## Профили исполнения
 
 В конфигурации можно описать несколько профилей исполнения. Каждый профиль
