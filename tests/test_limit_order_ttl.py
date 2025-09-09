@@ -48,3 +48,25 @@ def test_cpp_lob_ttl_expires():
     assert lob.contains_order(oid)
     assert lob.decay_ttl_and_cancel() == [oid]
     assert not lob.contains_order(oid)
+
+
+def test_limit_order_ioc_partial_cancel():
+    sim = ExecutionSimulator()
+    sim.set_market_snapshot(bid=99.0, ask=101.0, liquidity=5.0)
+    proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=10.0, abs_price=101.0, tif="IOC")
+    oid = sim.submit(proto)
+    report = sim.pop_ready(ref_price=100.0)
+    assert [t.qty for t in report.trades] == [5.0]
+    assert report.cancelled_ids == [oid]
+    assert report.new_order_ids == []
+
+
+def test_limit_order_fok_partial_cancel():
+    sim = ExecutionSimulator()
+    sim.set_market_snapshot(bid=99.0, ask=101.0, liquidity=5.0)
+    proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=10.0, abs_price=101.0, tif="FOK")
+    oid = sim.submit(proto)
+    report = sim.pop_ready(ref_price=100.0)
+    assert report.trades == []
+    assert report.cancelled_ids == [oid]
+    assert report.new_order_ids == []

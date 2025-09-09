@@ -53,6 +53,7 @@ except Exception:
         price_offset_ticks: int = 0
         ttl_steps: int = 0
         abs_price: Optional[float] = None  # опционально, если доступна абсолютная цена лимитки
+        tif: str = "GTC"
         client_tag: Optional[str] = None
 
     class ActionType(IntEnum):
@@ -893,6 +894,7 @@ class ExecutionSimulator:
                 side = "BUY" if is_buy else "SELL"
                 qty_raw = abs(float(getattr(proto, "volume_frac", 0.0)))
                 ttl_steps = int(getattr(proto, "ttl_steps", 0))
+                tif = str(getattr(proto, "tif", "GTC")).upper()
 
                 # Определяем лимитную цену
                 abs_price = getattr(proto, "abs_price", None)
@@ -914,6 +916,7 @@ class ExecutionSimulator:
                 filled = False
                 liquidity_role = "taker"
                 filled_price = float(price_q)
+                exec_qty = qty_q
                 if self._last_bid is not None or self._last_ask is not None:
                     best_ask = self._last_ask
                     best_bid = self._last_bid
@@ -921,7 +924,9 @@ class ExecutionSimulator:
                         if best_ask is not None and price_q >= best_ask:
                             filled_price = float(best_ask)
                             liquidity_role = "taker"
-                            filled = True
+                            if self._last_liquidity is not None:
+                                exec_qty = min(qty_q, float(self._last_liquidity))
+                            filled = exec_qty > 0.0
                         elif best_ask is not None and price_q < best_ask:
                             filled_price = float(price_q)
                             liquidity_role = "maker"
@@ -930,13 +935,53 @@ class ExecutionSimulator:
                         if best_bid is not None and price_q <= best_bid:
                             filled_price = float(best_bid)
                             liquidity_role = "taker"
-                            filled = True
+                            if self._last_liquidity is not None:
+                                exec_qty = min(qty_q, float(self._last_liquidity))
+                            filled = exec_qty > 0.0
                         elif best_bid is not None and price_q > best_bid:
                             filled_price = float(price_q)
                             liquidity_role = "maker"
                             filled = True
 
-                if filled:
+                if filled and liquidity_role == "taker":
+                    if tif == "FOK" and exec_qty + 1e-12 < qty_q:
+                        cancelled_ids.append(int(p.client_order_id))
+                        continue
+                    fee = 0.0
+                    if self.fees is not None:
+                        fee = self.fees.compute(side=side, price=filled_price, qty=exec_qty, liquidity=liquidity_role)
+                    fee_total += float(fee)
+                    _ = self._apply_trade_inventory(side=side, price=filled_price, qty=exec_qty)
+                    sbps = self._last_spread_bps
+                    trades.append(ExecTrade(
+                        ts=ts,
+                        side=side,
+                        price=filled_price,
+                        qty=exec_qty,
+                        notional=filled_price * exec_qty,
+                        liquidity=liquidity_role,
+                        proto_type=atype,
+                        client_order_id=p.client_order_id,
+                        fee=float(fee),
+                        slippage_bps=0.0,
+                        spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
+                        latency_ms=int(p.lat_ms),
+                        latency_spike=bool(p.spike),
+                    ))
+                    if exec_qty + 1e-12 < qty_q:
+                        if tif == "IOC":
+                            cancelled_ids.append(int(p.client_order_id))
+                            continue
+                        qty_q = qty_q - exec_qty
+                        filled = False
+                        liquidity_role = "maker"
+                    else:
+                        continue
+
+                if filled and liquidity_role == "maker":
+                    if tif in ("IOC", "FOK"):
+                        cancelled_ids.append(int(p.client_order_id))
+                        continue
                     fee = 0.0
                     if self.fees is not None:
                         fee = self.fees.compute(side=side, price=filled_price, qty=qty_q, liquidity=liquidity_role)
@@ -960,9 +1005,12 @@ class ExecutionSimulator:
                     ))
                     continue
 
+                if tif in ("IOC", "FOK"):
+                    cancelled_ids.append(int(p.client_order_id))
+                    continue
+
                 if self.lob and hasattr(self.lob, "add_limit_order"):
                     try:
-                        # предполагаем API add_limit_order(is_buy, price_abs, volume, timestamp, taker_is_agent)
                         oid, qpos = self.lob.add_limit_order(is_buy, float(price_q), float(qty_q), ts, True)
                         if oid:
                             new_order_ids.append(int(oid))
@@ -979,7 +1027,6 @@ class ExecutionSimulator:
                     except Exception:
                         cancelled_ids.append(int(p.client_order_id))
                 else:
-                    # без LOB — считаем, что заявка размещена
                     new_order_ids.append(int(p.client_order_id))
                     new_order_pos.append(0)
                     if ttl_steps > 0:

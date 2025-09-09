@@ -14,6 +14,7 @@ from .execution_algos import (
     TakerExecutor,
     TWAPExecutor,
     POVExecutor,
+    MidOffsetLimitExecutor,
 )
 from .latency import LatencyModel
 from .risk import RiskManager, RiskConfig, RiskEvent
@@ -40,6 +41,7 @@ __all__ = [
     "TakerExecutor",
     "TWAPExecutor",
     "POVExecutor",
+    "MidOffsetLimitExecutor",
     "LatencyModel",
     "RiskManager",
     "RiskConfig",

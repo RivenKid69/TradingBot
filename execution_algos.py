@@ -118,3 +118,66 @@ class VWAPExecutor(BaseExecutor):
         end = ((now_ts_ms // hour_ms) + 1) * hour_ms
         offset = int(max(0, end - now_ts_ms))
         return [MarketChild(ts_offset_ms=offset, qty=q, liquidity_hint=None)]
+
+
+class MidOffsetLimitExecutor(BaseExecutor):
+    """Generate a single limit order around the mid price.
+
+    The executor does **not** plan market child orders like the other
+    executors above.  Instead it builds an ``ActionProto`` (or a compatible
+    dictionary) describing a LIMIT order placed at ``mid*(1±offset)`` where the
+    sign of the offset depends on the order side.
+
+    Parameters
+    ----------
+    offset_bps: float
+        Offset from mid in basis points.  Positive values move buys above the
+        mid and sells below the mid.
+    ttl_steps: int
+        Optional TTL in simulation steps.
+    tif: str
+        Time-in-force policy: ``"GTC"``, ``"IOC"`` or ``"FOK"``.
+    """
+
+    def __init__(self, *, offset_bps: float = 0.0, ttl_steps: int = 0, tif: str = "GTC"):
+        self.offset_bps = float(offset_bps)
+        self.ttl_steps = int(ttl_steps)
+        self.tif = str(tif)
+
+    def build_action(self, *, side: str, qty: float, snapshot: Dict[str, Any]):
+        """Return a limit ``ActionProto`` based on the snapshot mid price.
+
+        If the ``action_proto`` module is unavailable, a dictionary with
+        equivalent fields is returned.
+        """
+        mid = snapshot.get("mid")
+        q = float(abs(qty))
+        if mid is None or q <= 0.0:
+            return None
+
+        offset = self.offset_bps / 10_000.0
+        if str(side).upper() == "BUY":
+            price = float(mid) * (1.0 + offset)
+            vol = q
+        else:
+            price = float(mid) * (1.0 - offset)
+            vol = -q
+
+        try:  # попытаться вернуть настоящий ActionProto
+            from action_proto import ActionProto, ActionType  # type: ignore
+
+            return ActionProto(
+                action_type=ActionType.LIMIT,
+                volume_frac=vol,
+                ttl_steps=self.ttl_steps,
+                abs_price=float(price),
+                tif=str(self.tif),
+            )
+        except Exception:  # pragma: no cover - fallback для минимальных окружений
+            return {
+                "action_type": 2,  # LIMIT
+                "volume_frac": vol,
+                "ttl_steps": self.ttl_steps,
+                "abs_price": float(price),
+                "tif": str(self.tif),
+            }
