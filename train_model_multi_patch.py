@@ -36,7 +36,7 @@ from pathlib import Path
 from core_config import load_config
 
 from distributional_ppo import DistributionalPPO
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, DummyVecEnv, VecEnv
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.vec_env import VecNormalize
 import torch
@@ -52,7 +52,16 @@ class AdversarialCallback(BaseCallback):
     Проводит стресс-тесты в специальных рыночных режимах и СОХРАНЯЕТ
     результаты (Sortino Ratio) для каждого режима.
     """
-    def __init__(self, eval_env: VecEnv, eval_freq: int, regimes: list, regime_duration: int):
+
+    def __init__(
+        self,
+        eval_env: VecEnv,
+        eval_freq: int,
+        regimes: list,
+        regime_duration: int,
+        regime_config_path: str | None = None,
+        liquidity_seasonality_path: str | None = None,
+    ):
         super().__init__()
         self.eval_env = eval_env
         self.eval_freq = eval_freq
@@ -60,6 +69,10 @@ class AdversarialCallback(BaseCallback):
         self.regime_duration = regime_duration
         # Словарь для хранения метрик: {'regime_name': sortino_score}
         self.regime_metrics = {}
+
+        if regime_config_path:
+            os.environ["MARKET_REGIMES_JSON"] = regime_config_path
+        self._liq_seasonality_path = liquidity_seasonality_path
 
     def _on_step(self) -> bool:
         if self.n_calls % self.eval_freq == 0:
@@ -644,10 +657,19 @@ def objective(trial: optuna.Trial,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/config_train.yaml", help="Path to YAML config")
-    parser.add_argument("--market-regimes", default="configs/market_regimes.json", help="Path to market regime parameters")
+    parser.add_argument(
+        "--regime-config",
+        default="configs/market_regimes.json",
+        help="Path to market regime parameters",
+    )
+    parser.add_argument(
+        "--liquidity-seasonality",
+        default="configs/liquidity_seasonality.json",
+        help="Path to liquidity seasonality coefficients",
+    )
     args, unknown = parser.parse_known_args()
 
-    os.environ["MARKET_REGIMES_JSON"] = args.market_regimes
+    os.environ["MARKET_REGIMES_JSON"] = args.regime_config
 
     cfg = load_config(args.config)
 
@@ -671,6 +693,7 @@ def main():
     cfg = cfg.__class__.parse_obj(cfg_dict)
 
     sim_config = {k: getattr(cfg, k) for k in ("quantizer", "slippage", "fees", "latency", "risk", "no_trade")}
+    sim_config["liquidity_seasonality_path"] = args.liquidity_seasonality
 
     processed_data_dir = getattr(cfg.data, "processed_dir", "data/processed")
     run_id = getattr(cfg, "run_id", "default-run")

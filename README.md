@@ -14,7 +14,9 @@
 
 ```bash
 python script_backtest.py --config configs/config_sim.yaml
-python train_model_multi_patch.py --config configs/config_train.yaml
+python train_model_multi_patch.py --config configs/config_train.yaml \
+  --regime-config configs/market_regimes.json \
+  --liquidity-seasonality configs/liquidity_seasonality.json
 python script_compare_runs.py run1 run2 run3            # сохранит compare_runs.csv
 python script_compare_runs.py run1 metrics.json --stdout  # вывод в stdout
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
@@ -25,6 +27,11 @@ python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT
 ```bash
 python train_model_multi_patch.py --config configs/config_train.yaml --slippage.bps 5 --latency.mean_ms 50
 ```
+
+Дополнительно доступны опции `--regime-config` и `--liquidity-seasonality`,
+позволяющие указать пути к откалиброванным JSON‑файлам с параметрами
+рыночных режимов и сезонностью ликвидности соответственно. По умолчанию
+используются файлы из каталога `configs/`.
 
 Те же значения можно задать в YAML‑конфиге:
 
