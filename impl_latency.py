@@ -38,6 +38,7 @@ class LatencyImpl:
             retries=int(cfg.retries),
             seed=int(cfg.seed),
         ) if LatencyModel is not None else None
+        self.attached_sim = None
 
     @property
     def model(self):
@@ -46,6 +47,16 @@ class LatencyImpl:
     def attach_to(self, sim) -> None:
         if self._model is not None:
             setattr(sim, "latency", self._model)
+        self.attached_sim = sim
+
+    def get_stats(self):
+        if self._model is None:
+            return None
+        return self._model.stats()
+
+    def reset_stats(self) -> None:
+        if self._model is not None:
+            self._model.reset_stats()
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "LatencyImpl":
