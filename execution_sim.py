@@ -797,6 +797,55 @@ class ExecutionSimulator:
                     cancelled_ids.append(int(p.client_order_id))
                     continue
 
+                filled = False
+                liquidity_role = "taker"
+                filled_price = float(price_q)
+                if self._last_bid is not None or self._last_ask is not None:
+                    best_ask = self._last_ask
+                    best_bid = self._last_bid
+                    if side == "BUY":
+                        if best_ask is not None and price_q >= best_ask:
+                            filled_price = float(best_ask)
+                            liquidity_role = "taker"
+                            filled = True
+                        elif best_ask is not None and price_q < best_ask:
+                            filled_price = float(price_q)
+                            liquidity_role = "maker"
+                            filled = True
+                    else:  # SELL
+                        if best_bid is not None and price_q <= best_bid:
+                            filled_price = float(best_bid)
+                            liquidity_role = "taker"
+                            filled = True
+                        elif best_bid is not None and price_q > best_bid:
+                            filled_price = float(price_q)
+                            liquidity_role = "maker"
+                            filled = True
+
+                if filled:
+                    fee = 0.0
+                    if self.fees is not None:
+                        fee = self.fees.compute(side=side, price=filled_price, qty=qty_q, liquidity=liquidity_role)
+                    fee_total += float(fee)
+                    _ = self._apply_trade_inventory(side=side, price=filled_price, qty=qty_q)
+                    sbps = self._last_spread_bps
+                    trades.append(ExecTrade(
+                        ts=ts,
+                        side=side,
+                        price=filled_price,
+                        qty=qty_q,
+                        notional=filled_price * qty_q,
+                        liquidity=liquidity_role,
+                        proto_type=atype,
+                        client_order_id=p.client_order_id,
+                        fee=float(fee),
+                        slippage_bps=0.0,
+                        spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
+                        latency_ms=int(p.lat_ms),
+                        latency_spike=bool(p.spike),
+                    ))
+                    continue
+
                 if self.lob and hasattr(self.lob, "add_limit_order"):
                     try:
                         # предполагаем API add_limit_order(is_buy, price_abs, volume, timestamp, taker_is_agent)
