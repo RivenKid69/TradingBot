@@ -58,6 +58,15 @@ class FeaturePipeline:
         # stats: {col: {"mean": float, "std": float}}
         self.stats: Dict[str, Dict[str, float]] = stats or {}
 
+    def reset(self) -> None:
+        """Drop previously computed statistics.
+
+        Creating a fresh instance for each ``TradingEnv`` or clearing the
+        state on episode reset avoids cross‑environment leakage of
+        normalization parameters.
+        """
+        self.stats.clear()
+
     def fit(self, dfs: Dict[str, pd.DataFrame]) -> "FeaturePipeline":
         # Fit over concatenation of all symbols (row-wise)
         frames = []
