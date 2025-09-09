@@ -21,6 +21,7 @@ from gymnasium import spaces as spaces
 import event_bus
 from infra.event_bus import publish, Topics
 from infra.time_provider import TimeProvider, RealTimeProvider
+from leakguard import LeakGuard, LeakConfig
 
 try:  # existing dynamic-spread config (pydantic model)
     from trainingtcost import DynSpreadCfg
@@ -184,6 +185,7 @@ class TradingEnv(gym.Env):
         validate_data: bool = False,
         time_provider: TimeProvider | None = None,
         decision_mode: DecisionTiming = DecisionTiming.CLOSE_TO_OPEN,
+        decision_delay_ms: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -204,8 +206,11 @@ class TradingEnv(gym.Env):
         # action scheduled for next bar when using delayed decisions
         self._pending_action: ActionProto | None = None
         self._action_queue: deque[ActionProto] = deque()
+        self._leak_guard = LeakGuard(LeakConfig(decision_delay_ms=int(decision_delay_ms)))
         # price data
         self.df = df.reset_index(drop=True).copy()
+        if "ts_ms" in self.df.columns and "decision_ts" not in self.df.columns:
+            self.df = self._leak_guard.attach_decision_time(self.df, ts_col="ts_ms")
         if "close_orig" in self.df.columns:
             self._close_actual = self.df["close_orig"].copy()
         elif "close" in self.df.columns:
@@ -387,6 +392,17 @@ class TradingEnv(gym.Env):
             raise TypeError("NumPy array actions are no longer supported")
         raise TypeError("Unsupported action type")
 
+    def _assert_feature_timestamps(self, row: pd.Series) -> None:
+        decision_ts = row.get("decision_ts")
+        if pd.isna(decision_ts):
+            return
+        dec_ts = int(decision_ts)
+        for col in row.index:
+            if col.endswith("_ts"):
+                val = row[col]
+                if pd.notna(val) and int(val) > dec_ts:
+                    raise AssertionError(f"{col}={int(val)} > decision_ts={dec_ts}")
+
 
 
     # ------------------------------------------------ Gym API
@@ -432,6 +448,7 @@ class TradingEnv(gym.Env):
         if self.decision_mode == DecisionTiming.INTRA_HOUR_WITH_LATENCY:
             row_idx = max(0, row_idx - self.latency_steps)
         row = self.df.iloc[row_idx]
+        self._assert_feature_timestamps(row)
 
         bid_col = next((c for c in ("bid", "best_bid", "bid_price") if c in row.index), None)
         ask_col = next((c for c in ("ask", "best_ask", "ask_price") if c in row.index), None)
@@ -486,7 +503,8 @@ class TradingEnv(gym.Env):
         else:
             proto = self._to_proto(action)
 
-        return self._mediator.step(proto)
+        result = self._mediator.step(proto)
+        return result
 
 
 
