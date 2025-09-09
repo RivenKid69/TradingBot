@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Optional, Any
+import copy
 
 import pandas as pd
 
@@ -42,6 +43,7 @@ class FeaturePipe:
     def __post_init__(self) -> None:
         # Initialize transformer for online mode.
         self._tr = OnlineFeatureTransformer(self.spec)
+        self._read_only = False
 
     # ------------------------------------------------------------------
     # Streaming API
@@ -49,6 +51,10 @@ class FeaturePipe:
     def reset(self) -> None:
         """Reset internal state of the transformer."""
         self._tr = OnlineFeatureTransformer(self.spec)
+
+    def set_read_only(self, flag: bool = True) -> None:
+        """Enable or disable read-only mode for normalization stats."""
+        self._read_only = bool(flag)
 
     def warmup(self, bars: Iterable[Bar] = ()) -> None:
         """Warm up transformer with a sequence of historical bars."""
@@ -58,11 +64,21 @@ class FeaturePipe:
 
     def update(self, bar: Bar) -> Mapping[str, Any]:
         """Process a single bar and return computed features."""
+        if not self._read_only:
+            feats = self._tr.update(
+                symbol=bar.symbol.upper(),
+                ts_ms=int(bar.ts),
+                close=float(bar.close),
+            )
+            return feats
+
+        state_backup = copy.deepcopy(self._tr._state)
         feats = self._tr.update(
             symbol=bar.symbol.upper(),
             ts_ms=int(bar.ts),
             close=float(bar.close),
         )
+        self._tr._state = state_backup
         return feats
 
     # ``core_contracts.FeaturePipe`` historically exposes ``on_bar``.  Keep
