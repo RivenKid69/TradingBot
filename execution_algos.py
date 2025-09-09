@@ -82,3 +82,21 @@ class POVExecutor(BaseExecutor):
             produced += q
             i += 1
         return plan
+
+
+class MarketOpenH1Executor(BaseExecutor):
+    def plan_market(
+        self,
+        *,
+        now_ts_ms: int,
+        side: str,
+        target_qty: float,
+        snapshot: Dict[str, Any],
+    ) -> List[MarketChild]:
+        q = float(abs(target_qty))
+        if q <= 0.0:
+            return []
+        hour_ms = 3_600_000
+        next_open = ((now_ts_ms // hour_ms) + 1) * hour_ms
+        offset = int(max(0, next_open - now_ts_ms))
+        return [MarketChild(ts_offset_ms=offset, qty=q, liquidity_hint=None)]
