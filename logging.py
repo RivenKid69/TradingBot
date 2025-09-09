@@ -9,7 +9,7 @@ from decimal import Decimal
 import pandas as pd
 
 from compat_shims import trade_dict_to_core_exec_report
-from core_models import TradeLogRow, EquityPoint
+from core_models import TradeLogRow, EquityPoint, ExecReport, Side, OrderType, Liquidity, ExecStatus
 
 
 @dataclass
@@ -83,6 +83,31 @@ class LogWriter:
                     Decimal(str(row.get("price", 0.0))) * Decimal(str(row.get("quantity", 0.0)))
                 )
             self._trades_buf.append(row)
+        for cid in rep_dict.get("cancelled_ids", []):
+            er_cancel = ExecReport(
+                ts=int(ts_ms),
+                run_id=self._run_id,
+                symbol=str(symbol),
+                side=Side.BUY,
+                order_type=OrderType.MARKET,
+                price=Decimal("0"),
+                quantity=Decimal("0"),
+                fee=Decimal("0"),
+                fee_asset=None,
+                exec_status=ExecStatus.CANCELED,
+                liquidity=Liquidity.UNKNOWN,
+                client_order_id=str(cid),
+                order_id=None,
+                trade_id=None,
+                pnl=None,
+                meta={
+                    "mark_price": float(getattr(report, "mark_price", 0.0)),
+                    "equity": float(getattr(report, "equity", 0.0)),
+                    "drawdown": float(getattr(report, "drawdown", 0.0)) if getattr(report, "drawdown", None) is not None else None,
+                },
+            )
+            row_cancel = TradeLogRow.from_exec(er_cancel).to_dict()
+            self._trades_buf.append(row_cancel)
         eq = EquityPoint(
             ts=int(ts_ms),
             run_id=self._run_id,
@@ -105,6 +130,9 @@ class LogWriter:
         eq_dict["spread_bps"] = getattr(report, "spread_bps", None)
         eq_dict["vol_factor"] = getattr(report, "vol_factor", None)
         eq_dict["liquidity"] = getattr(report, "liquidity", None)
+        eq_dict["latency_p50_ms"] = getattr(report, "latency_p50_ms", None)
+        eq_dict["latency_p95_ms"] = getattr(report, "latency_p95_ms", None)
+        eq_dict["latency_timeout_ratio"] = getattr(report, "latency_timeout_ratio", None)
         self._reports_buf.append(eq_dict)
 
         # авто-сброс
