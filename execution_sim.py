@@ -98,14 +98,27 @@ try:
         TWAPExecutor,
         POVExecutor,
         MarketOpenH1Executor,
+        VWAPExecutor,
     )
 except Exception:
-    BaseExecutor = None  # type: ignore
-    MarketChild = None  # type: ignore
-    TakerExecutor = None  # type: ignore
-    TWAPExecutor = None  # type: ignore
-    POVExecutor = None  # type: ignore
-    MarketOpenH1Executor = None  # type: ignore
+    try:
+        from execution_algos import (
+            BaseExecutor,
+            MarketChild,
+            TakerExecutor,
+            TWAPExecutor,
+            POVExecutor,
+            MarketOpenH1Executor,
+            VWAPExecutor,
+        )
+    except Exception:
+        BaseExecutor = None  # type: ignore
+        MarketChild = None  # type: ignore
+        TakerExecutor = None  # type: ignore
+        TWAPExecutor = None  # type: ignore
+        POVExecutor = None  # type: ignore
+        MarketOpenH1Executor = None  # type: ignore
+        VWAPExecutor = None  # type: ignore
 
 # --- Импорт модели латентности ---
 try:
@@ -269,7 +282,13 @@ class ExecutionSimulator:
         self.symbol = str(symbol).upper()
         self.latency_steps = int(max(0, latency_steps))
         self.seed = int(seed)
-        self._rng = np.random.RandomState(seed) if hasattr(np, "random") else None  # type: ignore
+        try:
+            self._rng = np.random.RandomState(seed)  # type: ignore
+        except Exception:
+            try:
+                self._rng = np.RandomState(seed)  # type: ignore
+            except Exception:
+                self._rng = None  # type: ignore
         self._q = _LatencyQueue(self.latency_steps)
         self._next_cli_id = 1
         self.lob = lob
@@ -348,6 +367,12 @@ class ExecutionSimulator:
         )
         self._step_counter: int = 0
 
+        # накопители для VWAP
+        self._vwap_pv: float = 0.0
+        self._vwap_vol: float = 0.0
+        self._vwap_hour: Optional[int] = None
+        self._last_hour_vwap: Optional[float] = None
+
     def set_execution_profile(self, profile: str, params: dict | None = None) -> None:
         """Установить профиль исполнения и параметры."""
         self.execution_profile = str(profile)
@@ -374,6 +399,9 @@ class ExecutionSimulator:
         spread_bps: Optional[float] = None,
         vol_factor: Optional[float] = None,
         liquidity: Optional[float] = None,
+        ts_ms: Optional[int] = None,
+        trade_price: Optional[float] = None,
+        trade_qty: Optional[float] = None,
     ) -> None:
         """
         Установить последний рыночный снапшот: bid/ask (для вычисления spread и mid),
@@ -395,6 +423,11 @@ class ExecutionSimulator:
                 mid = mid_from_quotes(bid=self._last_bid, ask=self._last_ask)
                 if mid is not None:
                     self._last_ref_price = float(mid)
+        if ts_ms is not None:
+            price_tick = trade_price if trade_price is not None else self._last_ref_price
+            qty_tick = trade_qty if trade_qty is not None else liquidity
+            if price_tick is not None and qty_tick is not None:
+                self._vwap_on_tick(int(ts_ms), float(price_tick), float(qty_tick))
     def _build_executor(self) -> None:
         """
         Построить исполнителя согласно self._execution_cfg.
@@ -413,6 +446,8 @@ class ExecutionSimulator:
             parts = int(tw.get("parts", 6))
             interval = int(tw.get("child_interval_s", 600))
             self._executor = TWAPExecutor(parts=parts, child_interval_s=interval)
+        elif algo == "VWAP":
+            self._executor = VWAPExecutor()
         elif algo == "POV":
             pv = dict(cfg.get("pov", {}))
             part = float(pv.get("participation", 0.10))
@@ -421,6 +456,23 @@ class ExecutionSimulator:
             self._executor = POVExecutor(participation=part, child_interval_s=interval, min_child_notional=min_not)
         else:
             self._executor = TakerExecutor()
+
+    def _vwap_on_tick(self, ts_ms: int, price: Optional[float], volume: Optional[float]) -> None:
+        hour_ms = 3_600_000
+        hour = int(ts_ms // hour_ms)
+        if self._vwap_hour is None:
+            self._vwap_hour = hour
+        elif hour != self._vwap_hour:
+            if self._vwap_vol > 0.0:
+                self._last_hour_vwap = self._vwap_pv / self._vwap_vol
+            else:
+                self._last_hour_vwap = None
+            self._vwap_pv = 0.0
+            self._vwap_vol = 0.0
+            self._vwap_hour = hour
+        if price is not None and volume is not None and volume > 0.0:
+            self._vwap_pv += float(price) * float(volume)
+            self._vwap_vol += float(volume)
 
     def _apply_trade_inventory(self, side: str, price: float, qty: float) -> float:
         """
@@ -630,6 +682,7 @@ class ExecutionSimulator:
 
         ts = int(now_ts or int(time.time()*1000))
         ref = self._ref(ref_price)
+        self._vwap_on_tick(ts, ref, self._last_liquidity)
 
         for p in ready:
             proto = p.proto
@@ -708,7 +761,15 @@ class ExecutionSimulator:
                         if q_child <= 0.0:
                             continue
                     # базовая котировка
-                    if (
+                    if isinstance(executor, VWAPExecutor):
+                        self._vwap_on_tick(ts_fill, None, None)
+                        base_price = (
+                            self._last_hour_vwap
+                            if self._last_hour_vwap is not None
+                            else ref
+                        )
+                        filled_price = float(base_price) if base_price is not None else float(ref)
+                    elif (
                         str(getattr(self, "execution_profile", "")).upper()
                         == "MKT_OPEN_NEXT_H1"
                         and self._next_h1_open_price is not None
@@ -1007,6 +1068,8 @@ class ExecutionSimulator:
                  ask: float | None = None,
                  vol_factor: float | None = None,
                  liquidity: float | None = None,
+                 trade_price: float | None = None,
+                 trade_qty: float | None = None,
                  actions: list[tuple[object, object]] | None = None) -> "ExecReport":
         """
         Универсальный публичный шаг симуляции.
@@ -1033,6 +1096,10 @@ class ExecutionSimulator:
         except Exception:
             self._last_spread_bps = None
         self._last_ref_price = float(ref_price) if ref_price is not None else None
+        price_tick = trade_price if trade_price is not None else self._last_ref_price
+        qty_tick = trade_qty if trade_qty is not None else liquidity
+        if price_tick is not None and qty_tick is not None:
+            self._vwap_on_tick(int(ts), float(price_tick), float(qty_tick))
 
         # --- инициализация аккамуляторов ---
         trades: list[ExecTrade] = []
@@ -1127,7 +1194,15 @@ class ExecutionSimulator:
                             continue
                     ts_fill = int(ts_fill + lat_ms)
                     # цена исполнения
-                    if (
+                    if isinstance(executor, VWAPExecutor):
+                        self._vwap_on_tick(ts_fill, None, None)
+                        base_price = (
+                            self._last_hour_vwap
+                            if self._last_hour_vwap is not None
+                            else ref
+                        )
+                        filled_price = float(base_price) if base_price is not None else float(ref)
+                    elif (
                         str(getattr(self, "execution_profile", "")).upper()
                         == "MKT_OPEN_NEXT_H1"
                         and self._next_h1_open_price is not None
