@@ -88,6 +88,22 @@ class AdversarialCallback(BaseCallback):
             # Сбрасываем среду в нормальный режим
             self.eval_env.env_method("set_market_regime", regime='normal', duration=0)
             print("--- Adversarial Tests Finished ---\n")
+
+            # Validate distributions against reference after stress tests
+            try:
+                dist_metrics, _ = compare_regime_distributions(
+                    env=self.eval_env,
+                    reference_path="configs/reference_regime_distributions.json",
+                    n_steps=self.regime_duration,
+                    tolerance=0.2,
+                    raise_on_fail=False,
+                )
+                for r_name, vals in dist_metrics.items():
+                    for m_name, val in vals.items():
+                        if self.logger is not None:
+                            self.logger.record(f"regime_dist/{r_name}/{m_name}", val)
+            except Exception as exc:
+                print(f"Distribution validation failed: {exc}")
         return True
 
     def get_regime_metrics(self) -> dict:
@@ -108,6 +124,7 @@ from custom_policy_patch import CustomActorCriticPolicy
 from fetch_all_data_patch import load_all_data
 # --- ИЗМЕНЕНИЕ: Импортируем быструю Cython-функцию оценки ---
 from evaluation_utils import evaluate_policy_custom_cython
+from scripts.validate_regime_distributions import compare_regime_distributions
 from data_validation import DataValidator
 from utils.model_io import save_sidecar_metadata, check_model_compat
 from watchdog_vec_env import WatchdogVecEnv
