@@ -156,6 +156,9 @@ class SimStepReport:
     unrealized_pnl: float = 0.0
     equity: float = 0.0
     mark_price: float = 0.0
+    bid: float = 0.0
+    ask: float = 0.0
+    mtm_price: float = 0.0
     risk_events: List[RiskEvent] = field(default_factory=list)  # type: ignore
     risk_paused_until_ms: int = 0
     spread_bps: Optional[float] = None
@@ -176,6 +179,9 @@ class SimStepReport:
             "unrealized_pnl": float(self.unrealized_pnl),
             "equity": float(self.equity),
             "mark_price": float(self.mark_price),
+            "bid": float(self.bid),
+            "ask": float(self.ask),
+            "mtm_price": float(self.mtm_price),
             "risk_events": [re.__dict__ for re in self.risk_events],
             "risk_paused_until_ms": int(self.risk_paused_until_ms),
             "spread_bps": float(self.spread_bps) if self.spread_bps is not None else None,
@@ -815,6 +821,9 @@ class ExecutionSimulator:
             unrealized_pnl=float(unrl),
             equity=float(eq),
             mark_price=float(mark_p if mark_p is not None else 0.0),
+            bid=float(self._last_bid) if self._last_bid is not None else 0.0,
+            ask=float(self._last_ask) if self._last_ask is not None else 0.0,
+            mtm_price=float(mark_p if mark_p is not None else 0.0),
             risk_events=risk_events_all,  # type: ignore
             risk_paused_until_ms=int(risk_paused_until),
             spread_bps=self._last_spread_bps,
@@ -1050,6 +1059,9 @@ class ExecutionSimulator:
             unrealized_pnl=float(unrl),
             equity=float(eq),
             mark_price=float(mark_p if mark_p is not None else 0.0),
+            bid=float(self._last_bid) if self._last_bid is not None else 0.0,
+            ask=float(self._last_ask) if self._last_ask is not None else 0.0,
+            mtm_price=float(mark_p if mark_p is not None else 0.0),
             risk_events=risk_events_all,  # type: ignore
             risk_paused_until_ms=int(risk_paused_until),
             spread_bps=self._last_spread_bps,
