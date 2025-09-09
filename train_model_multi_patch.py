@@ -808,6 +808,79 @@ def main():
         json.dump(ensemble_meta, f, indent=4)
     print(f"\n✅ Ensemble of {len(ensemble_meta)} models saved to '{ensemble_dir}'. HPO complete.")
 
+    # --- Validation of the best model for reproducibility ---
+    best_model_path = ensemble_dir / "model_1.zip"
+    best_stats_path = ensemble_dir / "vec_normalize_1.pkl"
+    if best_model_path.exists() and best_stats_path.exists():
+        print("\nRunning validation on the best ensemble model...")
+        best_trial = top_trials[0]
+
+        def _make_env_val():
+            params = best_trial.params
+            env_val_params = {
+                "df_dict": full_val_data,
+                "obs_dict": full_val_obs,
+                "norm_stats": norm_stats,
+                "window_size": params["window_size"],
+                "gamma": params["gamma"],
+                "atr_multiplier": params["atr_multiplier"],
+                "trailing_atr_mult": params["trailing_atr_mult"],
+                "tp_atr_mult": params["tp_atr_mult"],
+                "trade_frequency_penalty": params["trade_frequency_penalty"],
+                "mode": "val",
+                "reward_shaping": False,
+                "warmup_period": warmup_period,
+                "ma5_window": MA5_WINDOW,
+                "ma20_window": MA20_WINDOW,
+                "atr_window": ATR_WINDOW,
+                "rsi_window": RSI_WINDOW,
+                "macd_fast": MACD_FAST,
+                "macd_slow": MACD_SLOW,
+                "macd_signal": MACD_SIGNAL,
+                "momentum_window": MOMENTUM_WINDOW,
+                "cci_window": CCI_WINDOW,
+                "bb_window": BB_WINDOW,
+                "obv_ma_window": OBV_MA_WINDOW,
+            }
+            env_val_params.update(sim_config)
+            return TradingEnv(**env_val_params)
+
+        monitored_eval_env = VecMonitor(DummyVecEnv([_make_env_val]))
+        check_model_compat(str(best_stats_path))
+        eval_env = VecNormalize.load(str(best_stats_path), monitored_eval_env)
+        eval_env.training = False
+        eval_env.norm_reward = False
+
+        best_model = DistributionalPPO.load(str(best_model_path), env=eval_env)
+
+        rewards, equity_curves = evaluate_policy_custom_cython(
+            best_model, eval_env, num_episodes=5
+        )
+        all_returns = [
+            pd.Series(curve).pct_change().dropna().to_numpy()
+            for curve in equity_curves if len(curve) > 1
+        ]
+        flat_returns = np.concatenate(all_returns) if all_returns else np.array([0.0])
+        sortino = sortino_ratio(flat_returns)
+        sharpe = sharpe_ratio(flat_returns)
+
+        report = {
+            "mean_reward": float(np.mean(rewards)),
+            "std_reward": float(np.std(rewards)),
+            "sortino_ratio": float(sortino),
+            "sharpe_ratio": float(sharpe),
+        }
+        with open(ensemble_dir / "validation_report.json", "w") as f:
+            json.dump(report, f, indent=4)
+        print(
+            f"Validation metrics -> Sortino: {sortino:.4f}, Sharpe: {sharpe:.4f}. "
+            f"Report saved to '{ensemble_dir / 'validation_report.json'}'"
+        )
+    else:
+        print(
+            "⚠️ Could not find best model or normalization stats for validation evaluation."
+        )
+
 if __name__ == "__main__":
     try:
         mp.set_start_method("spawn", force=True)
