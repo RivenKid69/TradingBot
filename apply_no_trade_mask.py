@@ -22,7 +22,10 @@ def _read_table(path: str) -> pd.DataFrame:
     raise ValueError(f"Неизвестный формат файла данных: {ext}")
 
 
-def _write_table(df: pd.DataFrame, path: str) -> None:
+def _write_table(df: pd.DataFrame | Sequence[bool], path: str) -> None:
+    """Save dataframe or boolean mask to a file."""
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame({"no_trade_block": np.asarray(df, dtype=bool)})
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     ext = os.path.splitext(path)[1].lower()
     if ext in (".parquet", ".pq"):
@@ -58,6 +61,7 @@ def main():
     ap.add_argument("--sandbox_config", default="configs/legacy_sandbox.yaml", help="Путь к legacy_sandbox.yaml (раздел no_trade).")
     ap.add_argument("--ts_col", default="ts_ms", help="Колонка метки времени в мс UTC.")
     ap.add_argument("--mode", choices=["drop", "weight"], default="drop", help="drop — удалить строки; weight — оставить и добавить train_weight=0.")
+    ap.add_argument("--mask-only", action="store_true", help="Сохранить только колонку no_trade_block для всех строк.")
     ap.add_argument(
         "--histogram",
         nargs="?",
@@ -80,6 +84,34 @@ def main():
             f"Blocked ratio {actual_ratio:.4f} differs from expected {est_ratio:.4f}",
             file=sys.stderr,
         )
+    if args.mask_only:
+        base, ext = os.path.splitext(args.data)
+        out_path = args.out.strip() or f"{base}_mask{ext if ext.lower() in ('.csv', '.parquet', '.pq', '.txt') else '.parquet'}"
+        _write_table(mask_block, out_path)
+        total = int(len(df))
+        blocked = int(mask_block.sum())
+        print(
+            f"Готово. Всего строк: {total}. Запрещённых (no_trade): {blocked} ({actual_ratio:.2%}).",
+        )
+        print(f"Маска сохранена в {out_path}.")
+        print(f"NoTradeConfig: {cfg.dict()}")
+        if args.histogram is not None:
+            durations = _blocked_durations(df[args.ts_col], mask_block)
+            if durations.size:
+                hist, bin_edges = np.histogram(durations, bins="auto")
+                lines = ["Гистограмма длительностей блоков (минуты):"]
+                for count, start, end in zip(hist, bin_edges[:-1], bin_edges[1:]):
+                    lines.append(f"{start:.1f}-{end:.1f}: {int(count)}")
+            else:
+                lines = ["Гистограмма длительностей блоков (минуты):", "(пусто)"]
+            out = "\n".join(lines)
+            if args.histogram:
+                with open(args.histogram, "w", encoding="utf-8") as f:
+                    f.write(out + "\n")
+            else:
+                print(out)
+        return
+
     if args.mode == "drop":
         out_df = df.loc[~mask_block].reset_index(drop=True)
     else:
@@ -95,7 +127,7 @@ def main():
     blocked = int(mask_block.sum())
     kept = int(len(out_df))
     print(
-        f"Готово. Всего строк: {total}. Запрещённых (no_trade): {blocked} ({actual_ratio:.2%}). Вышло: {kept}."
+        f"Готово. Всего строк: {total}. Запрещённых (no_trade): {blocked} ({actual_ratio:.2%}). Вышло: {kept}.",
     )
     print(f"NoTradeConfig: {cfg.dict()}")
     if args.mode == "weight":

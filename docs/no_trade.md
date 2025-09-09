@@ -26,7 +26,7 @@ no_trade:
 
 ## Applying the mask to datasets
 
-`no_trade` windows can be applied to datasets either by **dropping** offending rows or by **weighting** them with `train_weight=0`.
+`no_trade` windows can be applied to datasets either by **dropping** offending rows, **weighting** them with `train_weight=0`, or exporting a **mask** with the `--mask-only` flag.
 Use the `no-trade-mask` CLI (installed with this project) or pass `--no-trade-mode` to training scripts.
 
 ```bash
@@ -35,6 +35,9 @@ no-trade-mask --data raw.csv --sandbox_config configs/legacy_sandbox.yaml --mode
 
 # keep rows but set train_weight=0
 no-trade-mask --data raw.csv --sandbox_config configs/legacy_sandbox.yaml --mode weight
+
+# output mask only
+no-trade-mask --data raw.csv --sandbox_config configs/legacy_sandbox.yaml --mask-only
 ```
 
 Effect on a sample dataset:
