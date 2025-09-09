@@ -78,6 +78,54 @@ def _in_custom_window(ts_ms: np.ndarray, windows: List[Dict[str, int]]) -> np.nd
     return mask
 
 
+def estimate_block_ratio(
+    df: pd.DataFrame,
+    cfg: NoTradeConfig,
+    ts_col: str = "ts_ms",
+) -> float:
+    """Оценивает ожидаемую долю блокированных меток времени.
+
+    Окна из ``daily_utc`` и ``funding_buffer_min`` трактуются как
+    периодически повторяющиеся по дням. ``custom_ms`` рассматриваются как
+    разовые интервалы поверх них. Возвращает значение в диапазоне [0, 1].
+    """
+
+    ts = (
+        pd.to_numeric(df[ts_col], errors="coerce")
+        .astype("Int64")
+        .dropna()
+        .astype("float")
+        .astype("int64")
+        .to_numpy()
+    )
+    if ts.size == 0:
+        return 0.0
+
+    # Строим дискретную маску минут суток
+    minutes = np.zeros(1440, dtype=bool)
+    for s, e in _parse_daily_windows_min(cfg.daily_utc or []):
+        minutes[s:e] = True
+
+    buf = int(cfg.funding_buffer_min or 0)
+    if buf > 0:
+        for m in (0, 8 * 60, 16 * 60):
+            s = max(0, m - buf)
+            e = min(1439, m + buf)
+            minutes[s : e + 1] = True  # включаем обе границы
+
+    ratio_daily = minutes.mean()
+
+    if cfg.custom_ms:
+        mins_idx = ((ts // 60000) % 1440).astype(int)
+        mask_df = minutes[mins_idx]
+        m_custom = _in_custom_window(ts, cfg.custom_ms)
+        ratio = ratio_daily + np.mean(~mask_df & m_custom)
+    else:
+        ratio = ratio_daily
+
+    return float(min(max(ratio, 0.0), 1.0))
+
+
 def compute_no_trade_mask(
     df: pd.DataFrame,
     *,

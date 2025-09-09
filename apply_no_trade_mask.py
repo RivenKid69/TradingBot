@@ -3,10 +3,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import logging
 
 import pandas as pd
 
-from training.no_trade import compute_no_trade_mask
+from training.no_trade import (
+    compute_no_trade_mask,
+    load_no_trade_config,
+    estimate_block_ratio,
+)
 
 
 def _read_table(path: str) -> pd.DataFrame:
@@ -41,7 +46,16 @@ def main():
 
     df = _read_table(args.data)
 
-    mask_block = compute_no_trade_mask(df, sandbox_yaml_path=args.sandbox_config, ts_col=args.ts_col)
+    cfg = load_no_trade_config(args.sandbox_config)
+    mask_block = compute_no_trade_mask(
+        df, sandbox_yaml_path=args.sandbox_config, ts_col=args.ts_col
+    )
+    est_ratio = estimate_block_ratio(df, cfg, ts_col=args.ts_col)
+    actual_ratio = float(mask_block.mean())
+    if abs(actual_ratio - est_ratio) > 0.01:
+        logging.warning(
+            "Blocked ratio %.4f differs from expected %.4f", actual_ratio, est_ratio
+        )
     if args.mode == "drop":
         out_df = df.loc[~mask_block].reset_index(drop=True)
     else:
