@@ -23,6 +23,21 @@ python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT
 `drop` удаляет такие строки из датасета, а `weight` оставляет их с
 добавленным столбцом `train_weight=0.0`.
 
+### no-trade-mask утилита
+
+Для предварительной фильтрации датасетов можно воспользоваться
+консольным скриптом `no-trade-mask` (устанавливается вместе с пакетами
+через `setup.py/pyproject.toml`). Он принимает путь к входным данным и
+конфигурации с описанием окон `no_trade` и поддерживает два режима:
+
+```bash
+# удалить запрещённые интервалы
+no-trade-mask --data data.csv --sandbox_config configs/legacy_sandbox.yaml --mode drop
+
+# пометить строки train_weight=0.0, оставив их в датасете
+no-trade-mask --data data.csv --sandbox_config configs/legacy_sandbox.yaml --mode weight
+```
+
 ## Профили исполнения
 
 В конфигурации можно описать несколько профилей исполнения. Каждый профиль

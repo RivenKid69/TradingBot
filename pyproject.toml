@@ -2,6 +2,14 @@
 requires = ["setuptools", "wheel", "cython", "numpy"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "tradingbot"
+version = "0.1.0"
+dependencies = ["pandas", "pydantic", "pyyaml"]
+
+[project.scripts]
+no-trade-mask = "apply_no_trade_mask:main"
+
 [tool.setuptools.extension-modules."core.core"]
 sources = ["core/core.pyx"]
 extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
@@ -29,11 +37,11 @@ extra-compile-args = ["-O3", "-std=c++17", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_W
 sources = ["risk/risk.pyx"]
 extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
 
-[tool.setuptools.extension-modules."obs.builder"]
-sources = ["obs/builder.pyx"]
-extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-Include NumPy headers for this module
-include-dirs = ["numpy.get_include()"]
+ [tool.setuptools.extension-modules."obs.builder"]
+ sources = ["obs/builder.pyx"]
+ extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
+ # Include NumPy headers for this module
+ include-dirs = ["numpy.get_include()"]
 
 [tool.setuptools.extension-modules."reward.reward"]
 sources = ["reward/reward.pyx"]
@@ -43,11 +51,11 @@ extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
 sources = ["metrics/metrics.pyx"]
 extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
 
-[tool.setuptools.extension-modules."api.environment"]
-sources = ["api/environment.pyx"]
-language = "c++"
-extra-compile-args = ["-O3", "-std=c++17", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-Include NumPy headers for this module
-include-dirs = ["numpy.get_include()"]
+ [tool.setuptools.extension-modules."api.environment"]
+ sources = ["api/environment.pyx"]
+ language = "c++"
+ extra-compile-args = ["-O3", "-std=c++17", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
+ # Include NumPy headers for this module
+ include-dirs = ["numpy.get_include()"]
 
 [DONE]

@@ -57,6 +57,11 @@ setup(
     name="tradingbot-extensions",
     version="0.1.0",
     description="Cython/C++ extensions: LOB and microstructure generator",
+    py_modules=["apply_no_trade_mask", "no_trade"],
+    entry_points={
+        "console_scripts": ["no-trade-mask=apply_no_trade_mask:main"],
+    },
+    install_requires=["pandas", "pydantic", "pyyaml"],
     ext_modules=cythonize(
         ext_modules,
         compiler_directives={
