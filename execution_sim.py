@@ -200,6 +200,9 @@ class Pending:
     client_order_id: int
     remaining_lat: int
     timestamp: int
+    lat_ms: int = 0
+    timeout: bool = False
+    spike: bool = False
 
 
 class _LatencyQueue:
@@ -210,17 +213,21 @@ class _LatencyQueue:
     def push(self, p: Pending) -> None:
         self._q.append(p)
 
-    def pop_ready(self) -> List[Pending]:
+    def pop_ready(self) -> Tuple[List[Pending], List[Pending]]:
         ready: List[Pending] = []
+        cancelled: List[Pending] = []
         rest: List[Pending] = []
         for p in self._q:
             if p.remaining_lat <= 0:
-                ready.append(p)
+                if p.timeout:
+                    cancelled.append(p)
+                else:
+                    ready.append(p)
             else:
                 p.remaining_lat -= 1
                 rest.append(p)
         self._q = rest
-        return ready
+        return ready, cancelled
 
     def clear(self) -> None:
         self._q.clear()
@@ -258,6 +265,10 @@ class ExecutionSimulator:
         self.lob = lob
         self._last_ref_price: Optional[float] = None
         self.run_id: str = str(getattr(run_config, "run_id", "sim") or "sim")
+        self.step_ms: int = int(getattr(run_config, "step_ms", 1000)) if run_config is not None else 1000
+        if self.step_ms <= 0:
+            self.step_ms = 1
+        self._cancelled_on_submit: List[int] = []
 
         # квантайзер — опционально
         self.quantizer: Optional[Quantizer] = None
@@ -494,11 +505,33 @@ class ExecutionSimulator:
     def submit(self, proto: ActionProto, now_ts: Optional[int] = None) -> int:
         cid = self._next_cli_id
         self._next_cli_id += 1
+        lat_ms = 0
+        timeout = False
+        spike = False
+        remaining = self.latency_steps
+        if self.latency is not None:
+            try:
+                d = self.latency.sample()
+                lat_ms = int(d.get("total_ms", 0))
+                timeout = bool(d.get("timeout", False))
+                spike = bool(d.get("spike", False))
+                remaining = int(lat_ms // int(self.step_ms))
+            except Exception:
+                lat_ms = 0
+                timeout = False
+                spike = False
+                remaining = self.latency_steps
+        if timeout:
+            self._cancelled_on_submit.append(cid)
+            return cid
         self._q.push(Pending(
             proto=proto,
             client_order_id=cid,
-            remaining_lat=self.latency_steps,
+            remaining_lat=remaining,
             timestamp=int(now_ts or int(time.time()*1000)),
+            lat_ms=int(lat_ms),
+            timeout=bool(timeout),
+            spike=bool(spike),
         ))
         return cid
 
@@ -539,9 +572,11 @@ class ExecutionSimulator:
 
     # ---- исполнение ----
     def pop_ready(self, now_ts: Optional[int] = None, ref_price: Optional[float] = None) -> ExecReport:
-        ready = self._q.pop_ready()
+        ready, timed_out = self._q.pop_ready()
         trades: List[ExecTrade] = []
-        cancelled_ids: List[int] = []
+        cancelled_ids: List[int] = list(self._cancelled_on_submit)
+        self._cancelled_on_submit = []
+        cancelled_ids.extend(int(p.client_order_id) for p in timed_out)
         new_order_ids: List[int] = []
         new_order_pos: List[int] = []
         fee_total: float = 0.0
@@ -600,8 +635,11 @@ class ExecutionSimulator:
                     cancelled_ids.append(int(p.client_order_id))
                     continue
 
+                lat_ms = int(p.lat_ms)
+                lat_spike = bool(p.spike)
+
                 for child in plan:
-                    ts_fill = int(ts + int(child.ts_offset_ms))
+                    ts_fill = int(ts + int(child.ts_offset_ms) + lat_ms)
                     q_child = float(child.qty)
                     if q_child <= 0.0:
                         continue
@@ -622,19 +660,6 @@ class ExecutionSimulator:
                         q_child = self.quantizer.clamp_notional(self.symbol, ref, q_child)
                         if q_child <= 0.0:
                             continue
-
-                    # латентность и ретраи
-                    lat_ms = 0
-                    lat_spike = False
-                    if self.latency is not None:
-                        d = self.latency.sample()
-                        lat_ms = int(d.get("total_ms", 0))
-                        lat_spike = bool(d.get("spike", False))
-                        if bool(d.get("timeout", False)):
-                            # не удалось после всех попыток — считаем, что ребёнок «сгорел»
-                            cancelled_ids.append(int(p.client_order_id))
-                            continue
-                    ts_fill = int(ts_fill + lat_ms)
 
                     # базовая котировка: используем ask для BUY и bid для SELL
                     base_price = self._last_ask if side == "BUY" else self._last_bid
@@ -680,8 +705,8 @@ class ExecutionSimulator:
                         fee=float(fee),
                         slippage_bps=float(slip_bps),
                         spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
-                        latency_ms=int(lat_ms),
-                        latency_spike=bool(lat_spike),
+                        latency_ms=int(p.lat_ms),
+                        latency_spike=bool(p.spike),
                     ))
                 continue
             # Определение направления и базовой цены для прочих типов
@@ -738,6 +763,8 @@ class ExecutionSimulator:
                 fee=float(fee),
                 slippage_bps=float(slip_bps),
                 spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
+                latency_ms=int(p.lat_ms),
+                latency_spike=bool(p.spike),
             ))
             continue
 
