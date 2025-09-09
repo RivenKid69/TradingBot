@@ -370,10 +370,16 @@ class Mediator:
                 cli_id = self.exec.submit(proto)  # type: ignore[union-attr]
                 # в простом варианте считаем, что latency=0 и сразу «поп» (если latency>0 — поп произойдёт на тик)
                 report: ExecReport = self.exec.pop_ready()  # type: ignore  # ExecReport — это alias на SimStepReport
+                try:
+                    setattr(self.env, "last_bid", float(getattr(report, "bid", getattr(self.env, "last_bid", 0.0))))
+                    setattr(self.env, "last_ask", float(getattr(report, "ask", getattr(self.env, "last_ask", 0.0))))
+                    setattr(self.env, "last_mid", float(getattr(report, "mtm_price", getattr(self.env, "last_mid", 0.0))))
+                except Exception:
+                    pass
                 # применить и пост-проверки
                 self._apply_trades_to_state(report.trades)
-                mid_for_risk = report.trades[-1][0] if report.trades else float(getattr(self.env, "last_mid", 0.0))
-                self.risk.on_post_trade(self.env.state, float(mid_for_risk))  # type: ignore[attr-defined]
+                mid_for_risk = float(getattr(report, "mtm_price", getattr(self.env, "last_mid", 0.0)))
+                self.risk.on_post_trade(self.env.state, mid_for_risk)  # type: ignore[attr-defined]
                 d = report.to_dict()
                 try:
                     exec_reports = sim_report_dict_to_core_exec_reports(
@@ -406,10 +412,11 @@ class Mediator:
 
             # возвращаем также события
             d["events"] = events
-            return {**d, "info": info}
-            except Exception:
-                # запасной путь — выполнить напрямую по типу действия
-                pass
+            d["info"] = info
+            return d
+        except Exception:
+            # запасной путь — выполнить напрямую по типу действия
+            pass
 
         # иначе — прямое исполнение через LOB
         trades: List[Tuple[float, float, bool, bool]] = []
