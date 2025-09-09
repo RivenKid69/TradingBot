@@ -403,6 +403,7 @@ class Mediator:
         """
         # локальный буфер событий
         events: list[dict] = []
+        pre_cancelled: list[int] = []
 
         now_ts = int(timestamp)
         try:
@@ -410,9 +411,10 @@ class Mediator:
         except Exception:
             pass
         try:
-            decay_fn = getattr(self.lob, "decay_ttl_and_cancel", None)
-            if callable(decay_fn):
-                decay_fn()
+            if not self._use_exec:
+                decay_fn = getattr(self.lob, "decay_ttl_and_cancel", None)
+                if callable(decay_fn):
+                    pre_cancelled = [int(x) for x in decay_fn()]
         except Exception:
             pass
 
@@ -529,7 +531,7 @@ class Mediator:
         trades: List[Tuple[float, float, bool, bool]] = []
         new_order_ids: List[int] = []
         new_order_pos: List[int] = []
-        cancelled_ids: List[int] = []
+        cancelled_ids: List[int] = list(pre_cancelled)
         fee_total: float = 0.0
 
         if proto.action_type == ActionType.HOLD:

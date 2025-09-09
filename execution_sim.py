@@ -584,19 +584,26 @@ class ExecutionSimulator:
         cancelled_ids: List[int] = list(self._cancelled_on_submit)
         self._cancelled_on_submit = []
         cancelled_ids.extend(int(p.client_order_id) for p in timed_out)
-        ttl_alive: List[Tuple[int, int]] = []
-        for oid, ttl in self._ttl_orders:
-            ttl -= 1
-            if ttl <= 0:
-                cancelled_ids.append(int(oid))
-                if self.lob and hasattr(self.lob, "remove_order"):
-                    try:
-                        self.lob.remove_order(int(oid))
-                    except Exception:
-                        pass
-            else:
-                ttl_alive.append((oid, ttl))
-        self._ttl_orders = ttl_alive
+        if self.lob and hasattr(self.lob, "decay_ttl_and_cancel"):
+            try:
+                expired = self.lob.decay_ttl_and_cancel()
+                cancelled_ids.extend(int(x) for x in expired)
+            except Exception:
+                pass
+        else:
+            ttl_alive: List[Tuple[int, int]] = []
+            for oid, ttl in self._ttl_orders:
+                ttl -= 1
+                if ttl <= 0:
+                    cancelled_ids.append(int(oid))
+                    if self.lob and hasattr(self.lob, "remove_order"):
+                        try:
+                            self.lob.remove_order(int(oid))
+                        except Exception:
+                            pass
+                else:
+                    ttl_alive.append((oid, ttl))
+            self._ttl_orders = ttl_alive
         new_order_ids: List[int] = []
         new_order_pos: List[int] = []
         fee_total: float = 0.0
@@ -869,7 +876,14 @@ class ExecutionSimulator:
                             new_order_ids.append(int(oid))
                             new_order_pos.append(int(qpos) if qpos is not None else 0)
                             if ttl_steps > 0:
-                                self._ttl_orders.append((int(oid), int(ttl_steps)))
+                                ttl_set = False
+                                if hasattr(self.lob, "set_order_ttl"):
+                                    try:
+                                        ttl_set = bool(self.lob.set_order_ttl(int(oid), int(ttl_steps)))
+                                    except Exception:
+                                        ttl_set = False
+                                if not ttl_set:
+                                    self._ttl_orders.append((int(oid), int(ttl_steps)))
                     except Exception:
                         cancelled_ids.append(int(p.client_order_id))
                 else:
