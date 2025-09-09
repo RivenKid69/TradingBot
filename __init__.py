@@ -17,7 +17,11 @@ from .execution_algos import (
 )
 from .latency import LatencyModel
 from .risk import RiskManager, RiskConfig, RiskEvent
-from .logging import LogWriter, LogConfig
+try:
+    from .logging import LogWriter, LogConfig
+except Exception:  # pragma: no cover - optional dependency
+    LogWriter = None  # type: ignore
+    LogConfig = None  # type: ignore
 
 __all__ = [
     "Quantizer",
