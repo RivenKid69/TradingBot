@@ -66,6 +66,10 @@ class FeaturePipeline:
         if not frames:
             raise ValueError("No dataframes to fit FeaturePipeline.")
         big = pd.concat(frames, axis=0, ignore_index=True)
+        if "close_orig" in big.columns:
+            pass
+        elif "close" in big.columns:
+            big["close"] = big["close"].shift(1)
         cols = _columns_to_scale(big)
         stats = {}
         for c in cols:
@@ -84,6 +88,10 @@ class FeaturePipeline:
         if not self.stats:
             raise ValueError("FeaturePipeline is empty; call fit() or load().")
         out = df.copy()
+        if "close_orig" in out.columns:
+            pass
+        elif "close" in out.columns:
+            out["close"] = out["close"].shift(1)
         for c, ms in self.stats.items():
             if c not in out.columns:
                 # silently skip columns missing in this DF
