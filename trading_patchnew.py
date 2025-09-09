@@ -607,6 +607,8 @@ class TradingEnv(gym.Env):
 class _SimpleMarketSim:
     def __init__(self, rng: np.random.Generator | None = None) -> None:
         import numpy as _np
+        import json as _json
+        import os as _os
 
         self._rng = rng or _np.random.default_rng()
         self._regime_distribution = _np.array([0.8, 0.05, 0.10, 0.05], dtype=float)
@@ -614,6 +616,16 @@ class _SimpleMarketSim:
         self._shocks_enabled = False
         self._flash_prob = 0.01
         self._fired_steps: set[int] = set()
+
+        cfg_path = _os.getenv("MARKET_REGIMES_JSON", "configs/market_regimes.json")
+        try:
+            with open(cfg_path, "r") as f:
+                cfg = _json.load(f)
+            self._regime_distribution = _np.array(cfg.get("regime_probs", self._regime_distribution), dtype=float)
+            flash_cfg = cfg.get("flash_shock", {})
+            self._flash_prob = float(flash_cfg.get("probability", self._flash_prob))
+        except Exception:
+            pass
 
     def set_regime_distribution(self, p_vec: Sequence[float]) -> None:
         p = np.asarray(p_vec, dtype=float)

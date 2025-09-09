@@ -1,0 +1,13 @@
+{
+  "regimes": {
+    "NORMAL": {"mu": 0.0000, "sigma": 0.0100, "kappa": 0.0, "avg_volume": 1000.0, "avg_spread": 0.0005},
+    "CHOPPY_FLAT": {"mu": 0.0000, "sigma": 0.0040, "kappa": 0.5, "avg_volume": 800.0, "avg_spread": 0.0007},
+    "STRONG_TREND": {"mu": 0.0008, "sigma": 0.0120, "kappa": 0.0, "avg_volume": 1200.0, "avg_spread": 0.0004},
+    "ILLIQUID": {"mu": 0.0000, "sigma": 0.0200, "kappa": 0.0, "avg_volume": 500.0, "avg_spread": 0.0010}
+  },
+  "regime_probs": [0.25, 0.25, 0.25, 0.25],
+  "flash_shock": {
+    "probability": 0.01,
+    "magnitudes": [0.005, 0.01, 0.015, 0.02]
+  }
+}

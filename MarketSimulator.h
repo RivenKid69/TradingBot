@@ -87,6 +87,8 @@ private:
         double mu;         // средний дрейф лог-доходности
         double sigma;      // волатильность лог-доходности
         double kappa;      // сила возврата к среднему (для CHOPPY_FLAT)
+        double avg_volume; // средний объём
+        double avg_spread; // средний спред
     };
     std::array<RegimeParams, 4> m_params;
 
@@ -101,6 +103,7 @@ private:
     bool m_shocks_enabled;
     double m_shock_p;
     std::vector<int> m_shock_marks; // -1,0,+1
+    std::vector<double> m_shock_mags; // распределение величины шока
 
     // "Черные лебеди" (флаги по шагам)
     std::vector<int> m_black_swan_marks; // -1 crash, +1 mania, 0 none
