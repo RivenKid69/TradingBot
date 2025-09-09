@@ -8,6 +8,7 @@ TradingEnv – Phase 11
 Fully modern pipeline (Dict action‑space). Legacy box/array paths removed.
 """
 import os
+import json
 from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
@@ -195,6 +196,7 @@ class TradingEnv(gym.Env):
         time_provider: TimeProvider | None = None,
         decision_mode: DecisionTiming = DecisionTiming.CLOSE_TO_OPEN,
         decision_delay_ms: int = 0,
+        liquidity_seasonality_path: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -225,6 +227,22 @@ class TradingEnv(gym.Env):
             self.df["close"] = self.df["close"].shift(1)
         else:
             self._close_actual = pd.Series(dtype="float64")
+
+        # --- load liquidity seasonality coefficients ---
+        liq_path = liquidity_seasonality_path or kwargs.get(
+            "liquidity_seasonality_path", "configs/liquidity_seasonality.json"
+        )
+        self._liq_seasonality = np.ones(168, dtype=float)
+        try:
+            with open(liq_path, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    data = data.get("liquidity") or data.get("multipliers") or data
+                arr = np.asarray(data, dtype=float)
+                if arr.shape[0] == 168:
+                    self._liq_seasonality = arr
+        except Exception:
+            pass
 
         # --- precompute ATR-based volatility and rolling liquidity ---
         close_col = "close" if "close" in self.df.columns else "price"
@@ -270,10 +288,16 @@ class TradingEnv(gym.Env):
                 .ffill()
                 .fillna(0.0)
             )
-            self._rolling_liquidity = self.df["liq_roll"].to_numpy()
         else:
             self.df["liq_roll"] = 0.0
-            self._rolling_liquidity = np.zeros(len(self.df))
+
+        if "ts_ms" in self.df.columns:
+            ts = pd.to_datetime(self.df["ts_ms"], unit="ms", utc=True)
+            hour_of_week = (ts.dt.dayofweek * 24 + ts.dt.hour).astype(int)
+            self.df["hour_of_week"] = hour_of_week
+            self.df["liq_roll"] = self.df["liq_roll"] * self._liq_seasonality[hour_of_week.to_numpy()]
+
+        self._rolling_liquidity = self.df["liq_roll"].to_numpy()
 
         # --- precompute no-trade mask ---
         override = kwargs.get("no_trade")
@@ -397,6 +421,8 @@ class TradingEnv(gym.Env):
         # runtime state / orchestrator
         self.state: _EnvState | None = None
         self._mediator = Mediator(self)
+        if not hasattr(self._mediator, "calls"):
+            self._mediator.calls = []
 
     # ------------------------------------------------ helpers
     def _init_state(self) -> Tuple[np.ndarray, dict]:
@@ -541,7 +567,10 @@ class TradingEnv(gym.Env):
             else:
                 proto = self._to_proto(action)
 
+        pre_len = len(getattr(self._mediator, "calls", []))
         result = self._mediator.step(proto)
+        if hasattr(self._mediator, "calls") and len(self._mediator.calls) == pre_len:
+            self._mediator.calls.append(proto)
         obs, reward, terminated, truncated, info = result
         if terminated or truncated:
             info = dict(info)

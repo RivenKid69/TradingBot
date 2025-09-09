@@ -55,6 +55,9 @@ MarketSimulator::MarketSimulator(
     if (m_high) std::memset(m_high, 0, sizeof(double) * m_n);
     if (m_low) std::memset(m_low, 0, sizeof(double) * m_n);
     if (m_volume_usd) std::memset(m_volume_usd, 0, sizeof(double) * m_n);
+
+    // seasonality multipliers default to 1
+    m_liq_mult.fill(1.0);
 }
 
 void MarketSimulator::initialize_defaults() {
@@ -217,6 +220,10 @@ void MarketSimulator::apply_flash_shock_if_any(std::size_t i, double& close_ref)
     close_ref = close_ref * (1.0 + mag);
 }
 
+void MarketSimulator::set_liquidity_seasonality(const std::array<double, 168>& multipliers) {
+    m_liq_mult = multipliers;
+}
+
 void MarketSimulator::update_ohlc_and_volume(std::size_t i, double prev_close, double new_close) {
     // Простейшая модель формирования high/low вокруг open/close:
     double openv = prev_close;
@@ -237,6 +244,7 @@ void MarketSimulator::update_ohlc_and_volume(std::size_t i, double prev_close, d
     double base_vol = 1e3; // базовый условный объём
     double vol_mult = 1.0 + 25.0 * swing / std::max(1.0, openv);
     double vol_usd = std::max(0.0, base_vol * vol_mult);
+    vol_usd *= m_liq_mult[i % 168];
     if (m_volume_usd) m_volume_usd[i] = vol_usd;
 }
 

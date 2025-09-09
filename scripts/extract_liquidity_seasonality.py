@@ -1,0 +1,46 @@
+import argparse
+import json
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+
+
+def load_ohlcv(path: Path) -> pd.DataFrame:
+    if path.suffix == '.parquet':
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
+def compute_multipliers(df: pd.DataFrame) -> np.ndarray:
+    if 'ts_ms' not in df.columns:
+        raise ValueError('ts_ms column required')
+    vol_col = next((c for c in ['quote_asset_volume', 'quote_volume', 'volume'] if c in df.columns), None)
+    if vol_col is None:
+        raise ValueError('volume column not found')
+    ts = pd.to_datetime(df['ts_ms'], unit='ms', utc=True)
+    how = ts.dt.dayofweek * 24 + ts.dt.hour
+    df = df.assign(hour_of_week=how)
+    grouped = df.groupby('hour_of_week')[vol_col].mean()
+    overall = df[vol_col].mean()
+    mult = grouped / overall if overall else grouped * 0.0 + 1.0
+    mult = mult.reindex(range(168), fill_value=1.0)
+    return mult.to_numpy(dtype=float)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Extract liquidity seasonality multipliers')
+    parser.add_argument('--data', required=True, help='Path to OHLCV data (csv or parquet)')
+    parser.add_argument('--out', default='configs/liquidity_seasonality.json', help='Output JSON path')
+    args = parser.parse_args()
+
+    df = load_ohlcv(Path(args.data))
+    multipliers = compute_multipliers(df)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.out, 'w') as f:
+        json.dump(multipliers.tolist(), f, indent=2)
+    print(f'Saved liquidity seasonality to {args.out}')
+
+
+if __name__ == '__main__':
+    main()
