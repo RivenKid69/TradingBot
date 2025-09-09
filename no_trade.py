@@ -55,14 +55,24 @@ def _in_funding_buffer(ts_ms: np.ndarray, buf_min: int) -> np.ndarray:
 def _in_custom_window(ts_ms: np.ndarray, windows: List[Dict[str, int]]) -> np.ndarray:
     if not windows:
         return np.zeros_like(ts_ms, dtype=bool)
+
     mask = np.zeros_like(ts_ms, dtype=bool)
     for w in windows:
         try:
-            s = int(w.get("start_ts_ms"))
-            e = int(w.get("end_ts_ms"))
-            mask |= (ts_ms >= s) & (ts_ms <= e)
-        except Exception:
-            continue
+            s = int(w["start_ts_ms"])
+            e = int(w["end_ts_ms"])
+        except Exception as exc:  # pragma: no cover - defensive
+            raise ValueError(
+                f"Invalid custom window {w}: expected integer 'start_ts_ms' and 'end_ts_ms'"
+            ) from exc
+
+        if s >= e:
+            raise ValueError(
+                f"Invalid custom window {w}: start_ts_ms ({s}) must be < end_ts_ms ({e})"
+            )
+
+        mask |= (ts_ms >= s) & (ts_ms <= e)
+
     return mask
 
 

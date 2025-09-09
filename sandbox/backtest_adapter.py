@@ -281,12 +281,21 @@ class BacktestAdapter:
     def _in_custom_window(self, ts_ms: int) -> bool:
         for w in (self._no_trade.custom_ms or []):
             try:
-                s = int(w.get("start_ts_ms"))
-                e = int(w.get("end_ts_ms"))
-                if s <= int(ts_ms) <= e:
-                    return True
-            except Exception:
-                continue
+                s = int(w["start_ts_ms"])
+                e = int(w["end_ts_ms"])
+            except Exception as exc:  # pragma: no cover - defensive
+                raise ValueError(
+                    f"Invalid custom window {w}: expected integer 'start_ts_ms' and 'end_ts_ms'"
+                ) from exc
+
+            if s >= e:
+                raise ValueError(
+                    f"Invalid custom window {w}: start_ts_ms ({s}) must be < end_ts_ms ({e})"
+                )
+
+            if s <= int(ts_ms) <= e:
+                return True
+
         return False
 
     def _no_trade_block(self, ts_ms: int) -> bool:
