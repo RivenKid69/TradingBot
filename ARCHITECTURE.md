@@ -83,6 +83,22 @@ from core_config import load_config
 cfg = load_config("configs/config_sim.yaml")
 ```
 
+Отдельные параметры можно переопределить из командной строки. Например,
+так временно изменяются проскальзывание и задержка:
+
+```bash
+python train_model_multi_patch.py --config configs/config_train.yaml --slippage.bps 5 --latency.mean_ms 50
+```
+
+Те же значения можно указать напрямую в YAML:
+
+```yaml
+slippage:
+  bps: 5
+latency:
+  mean_ms: 50
+```
+
 ### Профили исполнения
 
 Конфигурация может содержать несколько профилей исполнения. Каждый профиль
@@ -129,6 +145,7 @@ profiles:
 флаг `--config` и запускают соответствующие сервисы через `from_config`:
 
 ```
+python train_model_multi_patch.py --config configs/config_train.yaml
 python script_live.py    --config configs/config_live.yaml
 python script_backtest.py --config configs/config_sim.yaml
 python script_eval.py    --config configs/config_eval.yaml --profile vwap

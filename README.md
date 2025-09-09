@@ -20,6 +20,21 @@ python script_compare_runs.py run1 metrics.json --stdout  # вывод в stdout
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
 ```
 
+Параметры симуляции можно временно переопределить через CLI:
+
+```bash
+python train_model_multi_patch.py --config configs/config_train.yaml --slippage.bps 5 --latency.mean_ms 50
+```
+
+Те же значения можно задать в YAML‑конфиге:
+
+```yaml
+slippage:
+  bps: 5
+latency:
+  mean_ms: 50
+```
+
 Обработка окон **no‑trade** описывается в конфигурации; подробности
 см. [docs/no_trade.md](docs/no_trade.md).
 

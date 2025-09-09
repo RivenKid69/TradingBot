@@ -624,11 +624,16 @@ with tabs[10]:
     if mode.startswith("A"):
         st.markdown("### Режим A — запуск твоего train_model_multi_patch")
 
-        st.caption("Введи точную команду запуска. Примеры: "
-                   "`python scripts/train_model_multi_patch.py --config configs/train.yaml` "
-                   "или `python train_model_multi_patch.py` "
-                   "или любая другая подходящая команда.")
-        custom_cmd = st.text_input("Команда запуска обучения", value="python scripts/train_model_multi_patch.py", key="mt_custom_cmd")
+        st.caption(
+            "Введи точную команду запуска. Пример: "
+            "`python train_model_multi_patch.py --config configs/config_train.yaml` "
+            "или любая другая подходящая команда."
+        )
+        custom_cmd = st.text_input(
+            "Команда запуска обучения",
+            value="python train_model_multi_patch.py --config configs/config_train.yaml",
+            key="mt_custom_cmd",
+        )
         custom_log = os.path.join(logs_dir, "train_custom.log")
         st.caption(f"Лог обучения: `{custom_log}`")
 
