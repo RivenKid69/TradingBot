@@ -7,8 +7,11 @@ import weakref
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv, CloudpickleWrapper
 from collections import OrderedDict
 from gymnasium import spaces
-from multiprocessing.context import BrokenBarrierError
 import atexit, signal
+try:
+    from multiprocessing.context import BrokenBarrierError
+except Exception:  # Python 3.12: no BrokenBarrierError in multiprocessing
+    from threading import BrokenBarrierError
 
 DTYPE_TO_CSTYLE = {
     np.float32: 'f',
@@ -22,25 +25,35 @@ DTYPE_TO_CSTYLE = {
     'int16': 'h',
 }
 
-def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, dones_shm, info_queue, barrier, reset_signal, close_signal, obs_dtype, action_dtype, action_shape):
+def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, dones_shm, info_queue, barrier, reset_signal, close_signal, obs_dtype, action_dtype, action_shape, base_seed: int = 0):
     try:
         # 1. Создаем среду и получаем numpy-представления
-        env = env_fn_wrapper.data()
-        # присваиваем ранг и инициализируем независимый генератор
+        env = env_fn_wrapper.var()
         if not hasattr(env, "rank"):
             env.rank = rank
-        # увеличиваем seed на ранг, чтобы избежать синхронности
-        if hasattr(env, "seed_value"):
-            base_seed = env.seed_value or 0
-        env._rng = np.random.default_rng(base_seed + rank)
+
+        # рассчитываем seed для данного воркера
+        seed = int(base_seed) + int(rank)
+        # инициализируем глобальный генератор numpy для совместимости
+        np.random.seed(seed)
+        # собственный генератор среды (если используется)
+        env._rng = np.random.default_rng(seed)
         obs_space_shape = env.observation_space.shape
         actions_np = np.frombuffer(actions_shm.get_obj(), dtype=action_dtype).reshape((num_envs,) + action_shape)
         obs_np = np.frombuffer(obs_shm.get_obj(), dtype=obs_dtype).reshape((num_envs,) + obs_space_shape)
         rewards_np = np.frombuffer(rewards_shm.get_obj(), dtype=np.float32)
         dones_np = np.frombuffer(dones_shm.get_obj(), dtype=np.bool_)
 
-        # 2. Первоначальный reset
-        obs, info = env.reset()
+        # 2. Первоначальный reset с заданным seed
+        try:
+            obs, info = env.reset(seed=seed)
+        except TypeError:
+            if hasattr(env, "seed"):
+                try:
+                    env.seed(seed)
+                except Exception:
+                    pass
+            obs, info = env.reset()
         obs_np[rank] = obs
         dones_np[rank] = False
         info_queue.put((rank, info))
@@ -102,11 +115,12 @@ def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, do
 
 
 class SharedMemoryVecEnv(VecEnv):
-    def __init__(self, env_fns, worker_timeout: float = 300.0):
+    def __init__(self, env_fns, worker_timeout: float = 300.0, base_seed: int = 0):
         self.num_envs = len(env_fns)
         # Ждем, пока дочерние процессы не будут готовы
         self.waiting = False
         self.closed = False
+        self._base_seed = base_seed
         
         # Создаем временную среду, чтобы получить размерности пространств
         temp_env = env_fns[0]()
@@ -152,7 +166,7 @@ class SharedMemoryVecEnv(VecEnv):
         for i, env_fn in enumerate(env_fns):
             process = mp.Process(
                 target=worker,
-                args=(i, self.num_envs, CloudpickleWrapper(env_fn), self.actions_shm, self.obs_shm, self.rewards_shm, self.dones_shm, self.info_queue, self.barrier, self.reset_signal, self.close_signal, obs_dtype, self.action_space.dtype, self.action_space.shape)
+                args=(i, self.num_envs, CloudpickleWrapper(env_fn), self.actions_shm, self.obs_shm, self.rewards_shm, self.dones_shm, self.info_queue, self.barrier, self.reset_signal, self.close_signal, obs_dtype, self.action_space.dtype, self.action_space.shape, self._base_seed)
             )
             process.daemon = True
             process.start()
@@ -368,3 +382,23 @@ class SharedMemoryVecEnv(VecEnv):
                 self.close()
         except Exception:
             pass
+
+    # === Stub implementations required by VecEnv base class ===
+    def _indices(self, indices):
+        if indices is None:
+            return range(self.num_envs)
+        if isinstance(indices, int):
+            indices = [indices]
+        return indices
+
+    def env_is_wrapped(self, wrapper_class, indices=None):
+        return [False for _ in self._indices(indices)]
+
+    def env_method(self, method_name, *method_args, indices=None, **method_kwargs):
+        return [None for _ in self._indices(indices)]
+
+    def get_attr(self, attr_name, indices=None):
+        return [None for _ in self._indices(indices)]
+
+    def set_attr(self, attr_name, value, indices=None):
+        pass
