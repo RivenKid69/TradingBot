@@ -33,3 +33,13 @@ python compare_slippage_curve.py hist.csv sim.csv --tolerance 5
 
 Критерий акцептанса: абсолютное различие между средним `slippage_bps`
 в соответствующих квантилях не должно превышать указанного порога в bps.
+
+## Проверка PnL симулятора
+
+Скрипт `tests/pnl_report_check.py` прогоняет серию сделок через
+`ExecutionSimulator` и сверяет сумму `realized_pnl + unrealized_pnl` из отчёта
+с пересчитанным значением по трейдам и полям `bid/ask/mtm_price`.
+
+```bash
+python tests/pnl_report_check.py
+```
