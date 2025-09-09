@@ -193,6 +193,10 @@ class Mediator:
         """Очистить внутреннее состояние посредника (портфельное состояние живёт в env.state)."""
         # логируем накопленную статистику латентности за предыдущий эпизод
         self.on_episode_end()
+        try:
+            self.risk.reset()
+        except Exception:
+            pass
         self._ttl_queue.clear()
         self._pending_buy_volume = 0.0
         self._pending_sell_volume = 0.0

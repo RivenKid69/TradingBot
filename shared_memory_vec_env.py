@@ -230,7 +230,9 @@ class SharedMemoryVecEnv(VecEnv):
             infos[rank] = info
 
         self.waiting = False
-        return np.copy(self.obs_np), np.copy(self.rewards_np), np.copy(self.dones_np), infos
+        # Возвращаем копии данных, чтобы исключить передачу указателей на
+        # разделяемую память вызывающему коду.
+        return self.obs_np.copy(), self.rewards_np.copy(), self.dones_np.copy(), infos
     def _force_kill(self):
         """Жёсткое завершение воркеров + попытка освободить ресурсы."""
         try:
@@ -294,7 +296,9 @@ class SharedMemoryVecEnv(VecEnv):
             infos[rank] = info
 
         # 6. Возвращаем новые наблюдения и инфо
-        return np.copy(self.obs_np), infos
+        # Возвращаем копию наблюдений, чтобы исключить передачу указателей на
+        # разделяемый буфер.
+        return self.obs_np.copy(), infos
 
     def close(self):
         """
@@ -347,20 +351,20 @@ class SharedMemoryVecEnv(VecEnv):
         except Exception:
             pass
 
-    self.closed = True
+        self.closed = True
 
-        def __enter__(self):
-            return self
+    def __enter__(self):
+        return self
 
-        def __exit__(self, exc_type, exc, tb):
-            try:
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.close()
+        finally:
+            return False  # не подавлять исключения
+
+    def __del__(self):
+        try:
+            if not getattr(self, "closed", True):
                 self.close()
-            finally:
-                return False  # не подавлять исключения
-
-        def __del__(self):
-            try:
-                if not getattr(self, "closed", True):
-                    self.close()
-            except Exception:
-                pass
+        except Exception:
+            pass

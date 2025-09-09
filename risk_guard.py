@@ -64,6 +64,12 @@ class RiskGuard:
         self._peak_nw_window: Deque[float] = deque(maxlen=self.cfg.dd_window)
         self._last_event: RiskEvent = RiskEvent.NONE
 
+    def reset(self) -> None:
+        """Reset internal statistics collected during an episode."""
+        self._nw_hist.clear()
+        self._peak_nw_window.clear()
+        self._last_event = RiskEvent.NONE
+
     # ---------- ВСПОМОГАТЕЛЬНЫЕ РАСЧЁТЫ ----------
 
     @staticmethod
