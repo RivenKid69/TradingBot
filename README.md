@@ -13,11 +13,15 @@
 
 ```bash
 python script_backtest.py --config configs/config_sim.yaml
-python script_train.py --config configs/train.yaml --trainer-module mypackage.trainer:MyTrainer
+python script_train.py --config configs/train.yaml --trainer-module mypackage.trainer:MyTrainer --no-trade-mode weight
 python script_compare_runs.py run1 run2 run3            # сохранит compare_runs.csv
 python script_compare_runs.py run1 metrics.json --stdout  # вывод в stdout
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
 ```
+
+Флаг `--no-trade-mode` управляет применением **no‑trade** окон из конфигурации:
+`drop` удаляет такие строки из датасета, а `weight` оставляет их с
+добавленным столбцом `train_weight=0.0`.
 
 ## Профили исполнения
 

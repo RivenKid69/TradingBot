@@ -39,6 +39,12 @@ def main() -> None:
         default=None,
         help="Dotted path to module providing trainer",
     )
+    p.add_argument(
+        "--no-trade-mode",
+        choices=["drop", "weight"],
+        default="drop",
+        help="How to handle no-trade windows: drop rows or assign train_weight=0",
+    )
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -46,7 +52,7 @@ def main() -> None:
         trainer = _load_trainer(args.trainer_module)
     else:
         class DummyTrainer:
-            def fit(self, X, y=None):
+            def fit(self, X, y=None, sample_weight=None):
                 return None
 
             def save(self, path: str) -> str:
@@ -66,6 +72,8 @@ def main() -> None:
         input_format=fmt,
         artifacts_dir=cfg.artifacts_dir,
         snapshot_config_path=args.config,
+        no_trade_mode=args.no_trade_mode,
+        no_trade_config_path=args.config,
     )
 
     res = from_config(cfg, trainer=trainer, train_cfg=train_cfg)
