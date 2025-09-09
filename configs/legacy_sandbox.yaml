@@ -20,6 +20,7 @@ sim_guards:
 min_signal_gap_s: 300
 
 # Чёрные окна (UTC): не выдавать сигналы в указанные интервалы и вокруг funding (каждые 8ч: 00:00/08:00/16:00 UTC)
+# See ../docs/no_trade.md for details
 no_trade:
   funding_buffer_min: 5
   daily_utc:

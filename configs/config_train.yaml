@@ -59,6 +59,7 @@ risk:
   pause_seconds_on_violation: 300
   daily_reset_utc_hour: 0
 
+# See ../docs/no_trade.md for details
 no_trade:
   funding_buffer_min: 0
   daily_utc: []
