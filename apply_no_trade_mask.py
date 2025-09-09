@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Sequence
 
+import numpy as np
 import pandas as pd
 
 from no_trade import compute_no_trade_mask, estimate_block_ratio
@@ -32,6 +34,23 @@ def _write_table(df: pd.DataFrame, path: str) -> None:
     raise ValueError(f"Неизвестный формат файла вывода: {ext}")
 
 
+def _blocked_durations(ts_ms: Sequence[int], mask: Sequence[bool]) -> np.ndarray:
+    """Return durations of consecutive blocked intervals in minutes."""
+    ts = pd.to_numeric(ts_ms, errors="coerce").to_numpy(dtype=np.int64)
+    m = np.asarray(mask, dtype=bool)
+    if ts.size == 0 or not m.any():
+        return np.empty(0, dtype=float)
+    diff = np.diff(m.astype(int))
+    start_idx = np.where(diff == 1)[0] + 1
+    end_idx = np.where(diff == -1)[0] + 1
+    if m[0]:
+        start_idx = np.r_[0, start_idx]
+    if m[-1]:
+        end_idx = np.r_[end_idx, len(m)]
+    durations_ms = ts[end_idx - 1] - ts[start_idx]
+    return durations_ms / 60_000.0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Применить no_trade-маску к датасету: удалить запрещённые строки или пометить weight=0.")
     ap.add_argument("--data", required=True, help="Входной датасет (CSV/Parquet) с колонкой ts_ms (UTC, миллисекунды).")
@@ -39,6 +58,13 @@ def main():
     ap.add_argument("--sandbox_config", default="configs/legacy_sandbox.yaml", help="Путь к legacy_sandbox.yaml (раздел no_trade).")
     ap.add_argument("--ts_col", default="ts_ms", help="Колонка метки времени в мс UTC.")
     ap.add_argument("--mode", choices=["drop", "weight"], default="drop", help="drop — удалить строки; weight — оставить и добавить train_weight=0.")
+    ap.add_argument(
+        "--histogram",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="Вывести гистограмму длительностей блоков (в минутах) в stdout или сохранить в файл PATH.",
+    )
     args = ap.parse_args()
 
     df = _read_table(args.data)
@@ -68,10 +94,29 @@ def main():
     total = int(len(df))
     blocked = int(mask_block.sum())
     kept = int(len(out_df))
-    print(f"Готово. Всего строк: {total}. Запрещённых (no_trade): {blocked}. Вышло: {kept}.")
+    print(
+        f"Готово. Всего строк: {total}. Запрещённых (no_trade): {blocked} ({actual_ratio:.2%}). Вышло: {kept}."
+    )
+    print(f"NoTradeConfig: {cfg.dict()}")
     if args.mode == "weight":
         z = int((out_df.get('train_weight', pd.Series(dtype=float)) == 0.0).sum())
         print(f"Режим weight: назначено train_weight=0 для {z} строк.")
+
+    if args.histogram is not None:
+        durations = _blocked_durations(df[args.ts_col], mask_block)
+        if durations.size:
+            hist, bin_edges = np.histogram(durations, bins="auto")
+            lines = ["Гистограмма длительностей блоков (минуты):"]
+            for count, start, end in zip(hist, bin_edges[:-1], bin_edges[1:]):
+                lines.append(f"{start:.1f}-{end:.1f}: {int(count)}")
+        else:
+            lines = ["Гистограмма длительностей блоков (минуты):", "(пусто)"]
+        out = "\n".join(lines)
+        if args.histogram:
+            with open(args.histogram, "w", encoding="utf-8") as f:
+                f.write(out + "\n")
+        else:
+            print(out)
 
 
 if __name__ == "__main__":
