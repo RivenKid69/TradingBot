@@ -10,6 +10,7 @@ Fully modern pipeline (Dict action‑space). Legacy box/array paths removed.
 import os
 import random
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any, Sequence, Tuple
 from core_constants import PRICE_SCALE
 import gymnasium as gym
@@ -80,6 +81,11 @@ except Exception:
     # PATCH‑ID:P15_TENV_enum
 from action_proto import ActionProto, ActionType
 from mediator import Mediator
+
+
+class DecisionTiming(IntEnum):
+    CLOSE_TO_OPEN = 0
+    INTRA_HOUR_WITH_LATENCY = 1
 
 
 def _dynamic_spread_bps(vol_factor: float, liquidity: float, cfg: DynSpreadCfg) -> float:
@@ -174,6 +180,7 @@ def __init__(
     rng: np.random.Generator | None = None,
     validate_data: bool = False,
     time_provider: TimeProvider | None = None,
+    decision_mode: DecisionTiming = DecisionTiming.CLOSE_TO_OPEN,
     **kwargs: Any,
 ) -> None:
     super().__init__()
@@ -190,6 +197,7 @@ def __init__(
     base_seed = seed or 0
     self._rng: np.random.Generator = rng or np.random.default_rng(base_seed + rank_offset)
     self.time = time_provider or RealTimeProvider()
+    self.decision_mode = decision_mode
     # price data
     self.df = df.reset_index(drop=True).copy()
 
