@@ -29,6 +29,7 @@ import random
 import math
 import argparse
 import yaml
+import hashlib
 from features_pipeline import FeaturePipeline
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from optuna.pruners import HyperbandPruner
 from optuna.exceptions import TrialPruned
 from torch.optim.lr_scheduler import OneCycleLR
 import multiprocessing as mp
+from leakguard import LeakGuard
 class AdversarialCallback(BaseCallback):
     """
     Проводит стресс-тесты в специальных рыночных режимах и СОХРАНЯЕТ
@@ -364,11 +366,14 @@ def objective(trial: optuna.Trial,
 
     n_envs = 8
     print(f"Запускаем {n_envs} параллельных сред...")
+    leak_guard_train = LeakGuard()
+    leak_guard_val = LeakGuard()
+
     def make_env_train(rank: int):
         def _init():
             # Создаем уникальный seed для каждого trial-а и каждого воркера
             # Это гарантирует воспроизводимость и декорреляцию
-            unique_seed = trial.number * 100 + rank 
+            unique_seed = trial.number * 100 + rank
             env_params = {
                 # 1. Параметры, которые подбирает Optuna
                 "risk_aversion_drawdown": params["risk_aversion_drawdown"],
@@ -408,21 +413,19 @@ def objective(trial: optuna.Trial,
             env_params.update(sim_config)
 
             # Создаем и возвращаем экземпляр среды
-            return TradingEnv(**env_params)
+            return TradingEnv(**env_params, leak_guard=leak_guard_train)
         return _init
 
     env_constructors = [make_env_train(rank=i) for i in range(n_envs)]
-    stats_path = trials_dir / f"vec_normalize_{trial.number}.pkl"
+    train_stats_path = trials_dir / f"vec_normalize_train_{trial.number}.pkl"
     os.makedirs(trials_dir, exist_ok=True)
 
     base_env_tr = WatchdogVecEnv(env_constructors)
     monitored_env_tr = VecMonitor(base_env_tr)
     env_tr = VecNormalize(monitored_env_tr, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=params["gamma"])
 
-    
-
-    env_tr.save(str(stats_path))
-    save_sidecar_metadata(str(stats_path), extra={"kind": "vecnorm_stats"})
+    env_tr.save(str(train_stats_path))
+    save_sidecar_metadata(str(train_stats_path), extra={"kind": "vecnorm_stats", "phase": "train"})
 
     def make_env_val():
         env_val_params = {
@@ -451,15 +454,17 @@ def objective(trial: optuna.Trial,
             "obv_ma_window": OBV_MA_WINDOW
         }
         env_val_params.update(sim_config)
-        return TradingEnv(**env_val_params)
+        return TradingEnv(**env_val_params, leak_guard=leak_guard_val)
 
     monitored_env_va = VecMonitor(DummyVecEnv([make_env_val]))
-    check_model_compat(str(stats_path))
-    env_va = VecNormalize.load(str(stats_path), monitored_env_va)
+    check_model_compat(str(train_stats_path))
+    env_va = VecNormalize.load(str(train_stats_path), monitored_env_va)
     env_va.training = False
     env_va.norm_reward = False
-    env_va.training = False
-    env_va.norm_reward = False
+
+    val_stats_path = trials_dir / f"vec_normalize_val_{trial.number}.pkl"
+    env_va.save(str(val_stats_path))
+    save_sidecar_metadata(str(val_stats_path), extra={"kind": "vecnorm_stats", "phase": "val"})
 
     policy_kwargs = {
         "arch_params": policy_arch_params,
@@ -538,6 +543,7 @@ def objective(trial: optuna.Trial,
     
 
     print(f"<<< Trial {trial.number+1} finished training, starting unified final evaluation…")
+    _log_sha(val_paths, "test")
 
     # 1. Определяем все режимы для оценки
     regimes_to_evaluate = ['normal', 'choppy_flat', 'strong_trend']
@@ -560,14 +566,18 @@ def objective(trial: optuna.Trial,
                 "cci_window": CCI_WINDOW, "bb_window": BB_WINDOW, "obv_ma_window": OBV_MA_WINDOW,
             }
             final_env_params.update(sim_config)
-            return TradingEnv(**final_env_params)
+            return TradingEnv(**final_env_params, leak_guard=LeakGuard())
 
-        check_model_compat(str(stats_path))
+        check_model_compat(str(train_stats_path))
         final_eval_env = VecMonitor(
-            VecNormalize.load(str(stats_path), DummyVecEnv([make_final_eval_env]))
+            VecNormalize.load(str(train_stats_path), DummyVecEnv([make_final_eval_env]))
         )
         final_eval_env.training = False
         final_eval_env.norm_reward = False
+        test_stats_path = trials_dir / f"vec_normalize_test_{trial.number}.pkl"
+        if not test_stats_path.exists():
+            final_eval_env.save(str(test_stats_path))
+            save_sidecar_metadata(str(test_stats_path), extra={"kind": "vecnorm_stats", "phase": "test"})
 
         if regime != 'normal':
             final_eval_env.env_method("set_market_regime", regime=regime, duration=regime_duration)
@@ -661,6 +671,7 @@ def main():
             f"Run prepare_advanced_data.py (Fear&Greed), prepare_events.py (macro events), "
             f"incremental_klines.py (1h candles), then prepare_and_run.py (merge/export).",
         )
+    path_by_key = {Path(p).stem: p for p in all_feather_files}
 
     all_dfs_dict, all_obs_dict = load_all_data(all_feather_files, synthetic_fraction=0, seed=42)
 
@@ -707,6 +718,19 @@ def main():
         if key in all_obs_dict:
             full_val_obs[key] = all_obs_dict[key]
 
+    train_paths = {path_by_key[k] for k in train_keys}
+    val_paths = {path_by_key[k] for k in val_keys}
+    if train_paths & val_paths:
+        raise ValueError("Train and validation path sets overlap")
+
+    def _log_sha(paths, phase):
+        for p in sorted(paths):
+            with open(p, "rb") as fh:
+                sha = hashlib.sha256(fh.read()).hexdigest()
+            print(f"[DATA] phase={phase} file={os.path.basename(p)} sha256={sha}")
+
+    _log_sha(train_paths, "train")
+    _log_sha(val_paths, "val")
 
     print(f"Data split: {len(full_train_data)} assets for training, {len(full_val_data)} for validation.")
 
