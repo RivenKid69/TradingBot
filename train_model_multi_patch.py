@@ -566,11 +566,19 @@ def objective(trial: optuna.Trial,
 
         num_episodes = len(val_data_by_token.keys())
         _rewards, equity_curves = evaluate_policy_custom_cython(model, final_eval_env, num_episodes=num_episodes)
-    
+
         all_returns = [pd.Series(c).pct_change().dropna().to_numpy() for c in equity_curves if len(c) > 1]
         flat_returns = np.concatenate(all_returns) if all_returns else np.array([0.0])
         final_metrics[regime] = sortino_ratio(flat_returns)
-    
+
+        nt_stats = final_eval_env.env_method("get_no_trade_stats")
+        total_steps = sum(s["total_steps"] for s in nt_stats if s)
+        blocked_steps = sum(s["blocked_steps"] for s in nt_stats if s)
+        ratio = blocked_steps / total_steps if total_steps else 0.0
+        print(
+            f"No-trade blocks: {blocked_steps}/{total_steps} steps ({ratio:.2%})"
+        )
+
         final_eval_env.close()
 
     # --- РАСЧЕТ ИТОГОВОЙ ВЗВЕШЕННОЙ МЕТРИКИ ---

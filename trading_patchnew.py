@@ -297,6 +297,7 @@ class TradingEnv(gym.Env):
         else:
             self._no_trade_mask = np.zeros(len(self.df), dtype=bool)
         self.no_trade_blocks = 0
+        self.total_steps = 0
         self.no_trade_block_ratio = float(self._no_trade_mask.mean()) if len(self._no_trade_mask) else 0.0
 
         self.last_bid: float | None = None
@@ -398,6 +399,8 @@ class TradingEnv(gym.Env):
 
     # ------------------------------------------------ helpers
     def _init_state(self) -> Tuple[np.ndarray, dict]:
+        self.total_steps = 0
+        self.no_trade_blocks = 0
         self.state = _EnvState(
             cash=self.initial_cash,
             units=0.0,
@@ -475,6 +478,7 @@ class TradingEnv(gym.Env):
         return obs, info
 
     def step(self, action):
+        self.total_steps += 1
         row_idx = self.state.step_idx
         if self.decision_mode == DecisionTiming.INTRA_HOUR_WITH_LATENCY:
             row_idx = max(0, row_idx - self.latency_steps)
@@ -541,7 +545,18 @@ class TradingEnv(gym.Env):
                 proto = self._to_proto(action)
 
         result = self._mediator.step(proto)
-        return result
+        obs, reward, terminated, truncated, info = result
+        if terminated or truncated:
+            info = dict(info)
+            info["no_trade_stats"] = self.get_no_trade_stats()
+        return obs, reward, terminated, truncated, info
+
+    def get_no_trade_stats(self) -> dict:
+        """Return total and blocked step counts."""
+        return {
+            "total_steps": int(self.total_steps),
+            "blocked_steps": int(self.no_trade_blocks),
+        }
 
 
 
