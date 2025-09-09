@@ -19,6 +19,53 @@ python script_compare_runs.py run1 metrics.json --stdout  # вывод в stdout
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
 ```
 
+## Профили исполнения
+
+В конфигурации можно описать несколько профилей исполнения. Каждый профиль
+задаёт параметры симуляции и ожидаемое поведение выставляемых ордеров.
+
+| Профиль       | `slippage_bps` | `offset_bps` | `ttl`, мс | `tif` | Поведение |
+|---------------|----------------|--------------|-----------|-------|-----------|
+| `conservative`| 5              | 2            | 5000      | GTC   | Пассивные лимитные заявки, ожидание исполнения |
+| `balanced`    | 3              | 0            | 2000      | GTC   | Заявки около середины книги, умеренное ожидание |
+| `aggressive`  | 1              | -1           | 500       | IOC   | Кроссует спред и быстро отменяет невыполненные заявки |
+
+Пример YAML‑конфига с переключением профиля:
+
+```yaml
+profile: balanced  # используется по умолчанию
+profiles:
+  conservative:
+    slippage_bps: 5
+    offset_bps: 2
+    ttl: 5000
+    tif: GTC
+  balanced:
+    slippage_bps: 3
+    offset_bps: 0
+    ttl: 2000
+    tif: GTC
+  aggressive:
+    slippage_bps: 1
+    offset_bps: -1
+    ttl: 500
+    tif: IOC
+```
+
+Скрипт `script_eval.py` позволяет выбрать конкретный профиль или
+оценить все сразу:
+
+```bash
+python script_eval.py --config configs/config_eval.yaml --profile aggressive
+python script_eval.py --config configs/config_eval.yaml --all-profiles
+```
+
+При мульти‑профильной оценке метрики (`Sharpe`, `PnL` и т.д.)
+сохраняются отдельно для каждого профиля (`metrics_conservative.json`,
+`metrics_balanced.json`, ...). Их следует интерпретировать как результаты
+при соответствующих предположениях исполнения и сравнивать между
+профилями.
+
 
 ## Проверка кривой проскальзывания
 
