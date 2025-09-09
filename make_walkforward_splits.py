@@ -41,6 +41,18 @@ def _write_manifest(manifest, json_path: str, yaml_path: str) -> None:
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
 
+def _write_phase_tables(df_out: pd.DataFrame, base: str, ext: str) -> tuple[list[str], list[str]]:
+    train_df = df_out[df_out["wf_role"] == "train"].copy()
+    val_df = df_out[df_out["wf_role"] == "val"].copy()
+    if set(train_df.index) & set(val_df.index):
+        raise ValueError("Train/validation rows overlap")
+    train_path = f"{base}_train{ext}"
+    val_path = f"{base}_val{ext}"
+    _write_table(train_df, train_path)
+    _write_table(val_df, val_path)
+    return [train_path], [val_path]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Сгенерировать walk-forward сплиты с PURGE (горизонт h) и EMBARGO (буфер).")
     ap.add_argument("--data", required=True, help="Входной датасет (CSV/Parquet) с колонкой ts_ms (UTC миллисекунды).")
@@ -73,6 +85,7 @@ def main():
     base, ext = os.path.splitext(args.data)
     out_path = args.out.strip() or f"{base}_wf{ext if ext.lower() in ('.csv', '.parquet', '.pq', '.txt') else '.parquet'}"
     _write_table(df_out, out_path)
+    train_paths, val_paths = _write_phase_tables(df_out, base, ext)
 
     json_path = os.path.join(args.manifest_dir, "walkforward_manifest.json")
     yaml_path = os.path.join(args.manifest_dir, "walkforward_manifest.yaml")
@@ -84,7 +97,9 @@ def main():
     n_val = int((df_out["wf_role"] == "val").sum())
     print(f"Готово. Записан датасет со сплитами: {out_path}")
     print(f"Всего строк: {total}. В сплитах train: {n_train}, val: {n_val}, вне окон: {total - used}.")
+    print(f"Train path: {train_paths[0]}, Val path: {val_paths[0]}")
     print(f"Манифесты: {json_path} и {yaml_path}")
+    return train_paths, val_paths
 
 
 if __name__ == "__main__":
