@@ -38,6 +38,18 @@ no-trade-mask --data data.csv --sandbox_config configs/legacy_sandbox.yaml --mod
 no-trade-mask --data data.csv --sandbox_config configs/legacy_sandbox.yaml --mode weight
 ```
 
+После выполнения утилита выводит процент заблокированных строк и сводку
+`NoTradeConfig`. При указании `--histogram` дополнительно печатается
+гистограмма длительностей блоков:
+
+```bash
+$ no-trade-mask --data data.csv --sandbox_config configs/legacy_sandbox.yaml --mode drop --histogram
+Готово. Всего строк: 3. Запрещённых (no_trade): 2 (66.67%). Вышло: 1.
+NoTradeConfig: {'funding_buffer_min': 5, 'daily_utc': ['00:00-00:05', '08:00-08:05', '16:00-16:05'], 'custom_ms': []}
+Гистограмма длительностей блоков (минуты):
+-0.5-0.5: 2
+```
+
 Загрузка настроек `no_trade` централизована: функция
 `no_trade_config.get_no_trade_config()` считывает секцию `no_trade` из YAML‑файла
 и возвращает модель `NoTradeConfig`. Все модули используют её как единый
