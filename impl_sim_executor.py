@@ -23,6 +23,7 @@ from core_contracts import TradeExecutor
 from compat_shims import sim_report_dict_to_core_exec_reports
 from execution_sim import ExecutionSimulator, SimStepReport  # type: ignore
 from action_proto import ActionProto, ActionType
+from core_config import ExecutionProfile, ExecutionParams
 
 # новые компонентные имплементации
 from impl_quantizer import QuantizerImpl, QuantizerConfig
@@ -75,6 +76,16 @@ class SimExecutor(TradeExecutor):
         rc_slippage = getattr(run_config, "slippage", {}) if run_config else {}
         rc_fees = getattr(run_config, "fees", {}) if run_config else {}
         self._no_trade_cfg = getattr(run_config, "no_trade", {}) if run_config else {}
+        self._exec_profile: ExecutionProfile = (
+            getattr(run_config, "execution_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
+            if run_config is not None
+            else ExecutionProfile.MKT_OPEN_NEXT_H1
+        )
+        self._exec_params: ExecutionParams = (
+            getattr(run_config, "execution_params", ExecutionParams())
+            if run_config is not None
+            else ExecutionParams()
+        )
 
         if quantizer is None:
             quantizer = QuantizerImpl.from_dict(rc_quantizer)
@@ -98,6 +109,15 @@ class SimExecutor(TradeExecutor):
             slippage.attach_to(self._sim)
         if fees is not None:
             fees.attach_to(self._sim)
+
+        try:
+            if hasattr(self._sim, "set_execution_profile"):
+                self._sim.set_execution_profile(str(self._exec_profile), self._exec_params.dict())
+            else:
+                setattr(self._sim, "execution_profile", str(self._exec_profile))
+                setattr(self._sim, "execution_params", self._exec_params.dict())
+        except Exception:
+            pass
 
     @staticmethod
     def from_config(
@@ -152,7 +172,6 @@ class SimExecutor(TradeExecutor):
         - LIMIT:  volume_frac аналогично; если price задан — кладём в proto.abs_price
         """
         qty = float(order.quantity)
-        vol_frac = 0.0
         base = float(self._ctx.max_position_abs_base) if self._ctx.max_position_abs_base > 0 else 1.0
         if base <= 0:
             base = 1.0
@@ -160,23 +179,39 @@ class SimExecutor(TradeExecutor):
         if str(order.side).upper().endswith("SELL"):
             vol_frac = -vol_frac
 
-        tif = str(getattr(order, "time_in_force", "GTC"))
+        tif = str(getattr(self._exec_params, "tif", "GTC"))
+        ttl_steps = int(getattr(self._exec_params, "ttl_steps", 0))
 
-        if str(order.order_type).upper().endswith("MARKET"):
-            proto = ActionProto(action_type=ActionType.MARKET, volume_frac=float(vol_frac))
+        profile = getattr(self, "_exec_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
+
+        if profile == ExecutionProfile.LIMIT_MID_BPS:
+            proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=float(vol_frac))
             setattr(proto, "tif", tif)
+            setattr(proto, "ttl_steps", ttl_steps)
             setattr(proto, "client_tag", getattr(order, "client_order_id", "") or "")
-            return ActionType.MARKET, proto
+            price = getattr(order, "price", None)
+            if price is None:
+                mid = getattr(self._sim, "_last_ref_price", None)
+                if mid is None:
+                    bid = getattr(self._sim, "_last_bid", None)
+                    ask = getattr(self._sim, "_last_ask", None)
+                    if bid is not None and ask is not None:
+                        mid = (float(bid) + float(ask)) / 2.0
+                if mid is not None:
+                    off = float(getattr(self._exec_params, "limit_offset_bps", 0.0)) / 1e4
+                    if vol_frac > 0:
+                        price = mid * (1 - off)
+                    else:
+                        price = mid * (1 + off)
+            if price is not None:
+                setattr(proto, "abs_price", float(price))
+            return ActionType.LIMIT, proto
 
-        # LIMIT
-        proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=float(vol_frac))
+        proto = ActionProto(action_type=ActionType.MARKET, volume_frac=float(vol_frac))
         setattr(proto, "tif", tif)
+        setattr(proto, "ttl_steps", ttl_steps)
         setattr(proto, "client_tag", getattr(order, "client_order_id", "") or "")
-        price = order.price
-        if price is not None:
-            # execution_sim понимает proto.abs_price
-            setattr(proto, "abs_price", float(price))
-        return ActionType.LIMIT, proto
+        return ActionType.MARKET, proto
 
     # ---- интерфейс TradeExecutor ----
     def execute(self, order: Order) -> ExecReport:
