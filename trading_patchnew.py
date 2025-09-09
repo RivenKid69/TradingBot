@@ -22,6 +22,13 @@ import event_bus
 from infra.event_bus import publish, Topics
 from infra.time_provider import TimeProvider, RealTimeProvider
 from leakguard import LeakGuard, LeakConfig
+from no_trade import (
+    NoTradeConfig,
+    _parse_daily_windows_min,
+    _in_daily_window,
+    _in_funding_buffer,
+    _in_custom_window,
+)
 
 try:  # existing dynamic-spread config (pydantic model)
     from trainingtcost import DynSpreadCfg
@@ -268,6 +275,21 @@ class TradingEnv(gym.Env):
             self.df["liq_roll"] = 0.0
             self._rolling_liquidity = np.zeros(len(self.df))
 
+        # --- precompute no-trade mask ---
+        cfg_nt = NoTradeConfig(**(kwargs.get("no_trade", {}) or {}))
+        self._no_trade_cfg = cfg_nt
+        if "ts_ms" in self.df.columns:
+            ts = pd.to_numeric(self.df["ts_ms"], errors="coerce").astype("Int64").to_numpy(dtype="int64")
+            daily_min = _parse_daily_windows_min(cfg_nt.daily_utc or [])
+            m_daily = _in_daily_window(ts, daily_min)
+            m_funding = _in_funding_buffer(ts, int(cfg_nt.funding_buffer_min or 0))
+            m_custom = _in_custom_window(ts, cfg_nt.custom_ms or [])
+            self._no_trade_mask = m_daily | m_funding | m_custom
+        else:
+            self._no_trade_mask = np.zeros(len(self.df), dtype=bool)
+        self.no_trade_blocks = 0
+        self.no_trade_block_ratio = float(self._no_trade_mask.mean()) if len(self._no_trade_mask) else 0.0
+
         self.last_bid: float | None = None
         self.last_ask: float | None = None
         self.last_mid: float | None = None
@@ -489,19 +511,25 @@ class TradingEnv(gym.Env):
         self.last_bid = bid
         self.last_ask = ask
         self.last_mid = mid
-
-        if self.decision_mode == DecisionTiming.CLOSE_TO_OPEN:
-            proto = self._pending_action or ActionProto(ActionType.HOLD, 0.0)
-            self._pending_action = self._to_proto(action)
-        elif self.decision_mode == DecisionTiming.INTRA_HOUR_WITH_LATENCY:
-            proto = (
-                self._action_queue.popleft()
-                if self._action_queue
-                else ActionProto(ActionType.HOLD, 0.0)
-            )
-            self._action_queue.append(self._to_proto(action))
+        blocked = bool(self._no_trade_mask[row_idx]) if row_idx < len(self._no_trade_mask) else False
+        if blocked:
+            self.no_trade_blocks += 1
+            proto = ActionProto(ActionType.HOLD, 0.0)
+            self._pending_action = None
+            self._action_queue.clear()
         else:
-            proto = self._to_proto(action)
+            if self.decision_mode == DecisionTiming.CLOSE_TO_OPEN:
+                proto = self._pending_action or ActionProto(ActionType.HOLD, 0.0)
+                self._pending_action = self._to_proto(action)
+            elif self.decision_mode == DecisionTiming.INTRA_HOUR_WITH_LATENCY:
+                proto = (
+                    self._action_queue.popleft()
+                    if self._action_queue
+                    else ActionProto(ActionType.HOLD, 0.0)
+                )
+                self._action_queue.append(self._to_proto(action))
+            else:
+                proto = self._to_proto(action)
 
         result = self._mediator.step(proto)
         return result
