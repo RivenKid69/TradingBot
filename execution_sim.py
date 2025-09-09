@@ -275,6 +275,7 @@ class ExecutionSimulator:
         if self.step_ms <= 0:
             self.step_ms = 1
         self._cancelled_on_submit: List[int] = []
+        self._ttl_orders: List[Tuple[int, int]] = []
 
         # квантайзер — опционально
         self.quantizer: Optional[Quantizer] = None
@@ -583,6 +584,19 @@ class ExecutionSimulator:
         cancelled_ids: List[int] = list(self._cancelled_on_submit)
         self._cancelled_on_submit = []
         cancelled_ids.extend(int(p.client_order_id) for p in timed_out)
+        ttl_alive: List[Tuple[int, int]] = []
+        for oid, ttl in self._ttl_orders:
+            ttl -= 1
+            if ttl <= 0:
+                cancelled_ids.append(int(oid))
+                if self.lob and hasattr(self.lob, "remove_order"):
+                    try:
+                        self.lob.remove_order(int(oid))
+                    except Exception:
+                        pass
+            else:
+                ttl_alive.append((oid, ttl))
+        self._ttl_orders = ttl_alive
         new_order_ids: List[int] = []
         new_order_pos: List[int] = []
         fee_total: float = 0.0
@@ -779,6 +793,7 @@ class ExecutionSimulator:
                 is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
                 side = "BUY" if is_buy else "SELL"
                 qty_raw = abs(float(getattr(proto, "volume_frac", 0.0)))
+                ttl_steps = int(getattr(proto, "ttl_steps", 0))
 
                 # Определяем лимитную цену
                 abs_price = getattr(proto, "abs_price", None)
@@ -853,12 +868,16 @@ class ExecutionSimulator:
                         if oid:
                             new_order_ids.append(int(oid))
                             new_order_pos.append(int(qpos) if qpos is not None else 0)
+                            if ttl_steps > 0:
+                                self._ttl_orders.append((int(oid), int(ttl_steps)))
                     except Exception:
                         cancelled_ids.append(int(p.client_order_id))
                 else:
                     # без LOB — считаем, что заявка размещена
                     new_order_ids.append(int(p.client_order_id))
                     new_order_pos.append(0)
+                    if ttl_steps > 0:
+                        self._ttl_orders.append((int(p.client_order_id), int(ttl_steps)))
                 continue
 
             # прочее — no-op
