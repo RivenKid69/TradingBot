@@ -1,6 +1,10 @@
 import numpy as np
 import pandas as pd
 import pytest
+import os
+import sys
+
+sys.path.append(os.getcwd())
 
 from no_trade import (
     compute_no_trade_mask,
