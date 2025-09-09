@@ -250,7 +250,14 @@ class Mediator:
         order_id, qpos = self.lob.add_limit_order(bool(is_buy_side), int(price_ticks), float(volume), int(timestamp),
                                                   bool(taker_is_agent))
         if int(ttl_steps) > 0:
-            self._ttl_queue.append((int(order_id), int(timestamp) + int(ttl_steps)))
+            ttl_set = False
+            if hasattr(self.lob, "set_order_ttl"):
+                try:
+                    ttl_set = bool(self.lob.set_order_ttl(int(order_id), int(ttl_steps)))
+                except Exception:
+                    ttl_set = False
+            if not ttl_set:
+                self._ttl_queue.append((int(order_id), int(timestamp) + int(ttl_steps)))
         # учёт «ожидаемого» объёма
         if is_buy_side:
             self._pending_buy_volume += float(volume)
@@ -345,6 +352,18 @@ class Mediator:
         """
         # локальный буфер событий
         events: list[dict] = []
+
+        now_ts = int(timestamp)
+        try:
+            self._process_ttl_queue(now_ts)
+        except Exception:
+            pass
+        try:
+            decay_fn = getattr(self.lob, "decay_ttl_and_cancel", None)
+            if callable(decay_fn):
+                decay_fn()
+        except Exception:
+            pass
 
         # Сформировать Order из proto (или legacy dict)
         ctx = OrderContext(
