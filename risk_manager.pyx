@@ -144,8 +144,15 @@ cdef ClosedReason check_max_drawdown(EnvState* state) nogil:
         return ClosedReason.MAX_DRAWDOWN
     return ClosedReason.NONE
 
-cdef ClosedReason apply_close_if_needed(EnvState* state) nogil:
-    """Apply position close if any risk or TP/SL condition is triggered. Returns the close reason code (or NONE)."""
+cdef ClosedReason apply_close_if_needed(EnvState* state, bint readonly=False) nogil:
+    """Apply position close if any risk or TP/SL condition is triggered. Returns the close reason code (or NONE).
+
+    If ``readonly`` is True the original ``state`` remains unmodified.
+    """
+    cdef EnvState local_state
+    if readonly:
+        local_state = state[0]
+        state = &local_state
     cdef ClosedReason reason = ClosedReason.NONE
     cdef ClosedReason res_check
     # Check critical conditions first (bankruptcy, drawdown)
