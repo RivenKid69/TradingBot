@@ -27,8 +27,12 @@ from datetime import datetime
 import shutil
 import random
 import math
+import argparse
+import yaml
 from features_pipeline import FeaturePipeline
 from pathlib import Path
+
+from core_config import load_config
 
 from distributional_ppo import DistributionalPPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, DummyVecEnv
@@ -269,8 +273,8 @@ def sharpe_ratio(returns: np.ndarray, risk_free_rate: float = 0.0) -> float:
     return np.mean(returns - risk_free_rate) / (std + 1e-9) * np.sqrt(365 * 24)
 
 def sortino_ratio(returns: np.ndarray, risk_free_rate: float = 0.0) -> float:
-    downside = returns[returns < risk_free_rate] - risk_free_rate
-    if downside.size == 0:
+    downside = returns[returns < risk_free_rate] - risk_free_rate
+    if downside.size == 0:
         # Если нет убытков, используем стандартное отклонение (как в Шарпе).
         # Это более адекватно оценивает риск, чем возврат константы.
         std = np.std(returns)
@@ -279,8 +283,8 @@ def sortino_ratio(returns: np.ndarray, risk_free_rate: float = 0.0) -> float:
             return 0.0
         return np.mean(returns - risk_free_rate) / std * np.sqrt(365 * 24)
 
-    downside_std = np.sqrt(np.mean(downside**2)) + 1e-9
-    # Эта проверка становится избыточной, если downside_std используется только один раз, 
+    downside_std = np.sqrt(np.mean(downside**2)) + 1e-9
+    # Эта проверка становится избыточной, если downside_std используется только один раз,
     # но оставим для безопасности.
     return np.mean(returns - risk_free_rate) / downside_std * np.sqrt(365 * 24)
 
@@ -292,7 +296,9 @@ def objective(trial: optuna.Trial,
               train_obs_by_token: dict,
               val_data_by_token: dict,
               val_obs_by_token: dict,
-              norm_stats: dict):
+              norm_stats: dict,
+              sim_config: dict,
+              trials_dir: Path):
 
     print(f">>> Trial {trial.number+1} with budget={total_timesteps}")
     
@@ -397,17 +403,17 @@ def objective(trial: optuna.Trial,
                 "cci_window": CCI_WINDOW,
                 "bb_window": BB_WINDOW,
                 "obv_ma_window": OBV_MA_WINDOW,
-                 
+
             }
-            
+            env_params.update(sim_config)
+
             # Создаем и возвращаем экземпляр среды
             return TradingEnv(**env_params)
         return _init
 
     env_constructors = [make_env_train(rank=i) for i in range(n_envs)]
-
-    stats_path = f"models/trials/vec_normalize_{trial.number}.pkl"
-    os.makedirs(os.path.dirname(stats_path), exist_ok=True)
+    stats_path = trials_dir / f"vec_normalize_{trial.number}.pkl"
+    os.makedirs(trials_dir, exist_ok=True)
 
     base_env_tr = WatchdogVecEnv(env_constructors)
     monitored_env_tr = VecMonitor(base_env_tr)
@@ -415,8 +421,8 @@ def objective(trial: optuna.Trial,
 
     
 
-    env_tr.save(stats_path)
-    save_sidecar_metadata(stats_path, extra={"kind": "vecnorm_stats"})
+    env_tr.save(str(stats_path))
+    save_sidecar_metadata(str(stats_path), extra={"kind": "vecnorm_stats"})
 
     def make_env_val():
         env_val_params = {
@@ -444,11 +450,12 @@ def objective(trial: optuna.Trial,
             "bb_window": BB_WINDOW,
             "obv_ma_window": OBV_MA_WINDOW
         }
+        env_val_params.update(sim_config)
         return TradingEnv(**env_val_params)
 
     monitored_env_va = VecMonitor(DummyVecEnv([make_env_val]))
-    check_model_compat(stats_path)
-    env_va = VecNormalize.load(stats_path, monitored_env_va)
+    check_model_compat(str(stats_path))
+    env_va = VecNormalize.load(str(stats_path), monitored_env_va)
     env_va.training = False
     env_va.norm_reward = False
     env_va.training = False
@@ -524,9 +531,9 @@ def objective(trial: optuna.Trial,
         env_tr.close()
         env_va.close()
 
-    trial_model_path = f"models/trials/trial_{trial.number}_model.zip"
-    model.save(trial_model_path)
-    save_sidecar_metadata(trial_model_path, extra={"kind": "sb3_model", "trial": int(trial.number)})
+    trial_model_path = trials_dir / f"trial_{trial.number}_model.zip"
+    model.save(str(trial_model_path))
+    save_sidecar_metadata(str(trial_model_path), extra={"kind": "sb3_model", "trial": int(trial.number)})
 
     
 
@@ -550,13 +557,14 @@ def objective(trial: optuna.Trial,
                 "ma5_window": MA5_WINDOW, "ma20_window": MA20_WINDOW, "atr_window": ATR_WINDOW,
                 "rsi_window": RSI_WINDOW, "macd_fast": MACD_FAST, "macd_slow": MACD_SLOW,
                 "macd_signal": MACD_SIGNAL, "momentum_window": MOMENTUM_WINDOW,
-                "cci_window": CCI_WINDOW, "bb_window": BB_WINDOW, "obv_ma_window": OBV_MA_WINDOW
+                "cci_window": CCI_WINDOW, "bb_window": BB_WINDOW, "obv_ma_window": OBV_MA_WINDOW,
             }
+            final_env_params.update(sim_config)
             return TradingEnv(**final_env_params)
 
-        check_model_compat(stats_path)
+        check_model_compat(str(stats_path))
         final_eval_env = VecMonitor(
-            VecNormalize.load(stats_path, DummyVecEnv([make_final_eval_env]))
+            VecNormalize.load(str(stats_path), DummyVecEnv([make_final_eval_env]))
         )
         final_eval_env.training = False
         final_eval_env.norm_reward = False
@@ -607,29 +615,56 @@ def objective(trial: optuna.Trial,
     return objective_score
 
 def main():
-    PROCESSED_DATA_DIR = "data/processed"
-    N_ENSEMBLE = 5
-    # --- Добавленный блок очистки ---
-    trials_dir = "models/trials"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/config_train.yaml", help="Path to YAML config")
+    args, unknown = parser.parse_known_args()
+
+    cfg = load_config(args.config)
+
+    overrides = {}
+    i = 0
+    while i < len(unknown):
+        if unknown[i].startswith("--") and "." in unknown[i]:
+            key = unknown[i][2:]
+            if i + 1 >= len(unknown):
+                raise ValueError(f"Missing value for argument {unknown[i]}")
+            block, field = key.split('.', 1)
+            value = yaml.safe_load(unknown[i + 1])
+            overrides.setdefault(block, {})[field] = value
+            i += 2
+        else:
+            i += 1
+
+    cfg_dict = cfg.dict()
+    for block, params in overrides.items():
+        cfg_dict.setdefault(block, {}).update(params)
+    cfg = cfg.__class__.parse_obj(cfg_dict)
+
+    sim_config = {k: getattr(cfg, k) for k in ("quantizer", "slippage", "fees", "latency", "risk", "no_trade")}
+
+    processed_data_dir = getattr(cfg.data, "processed_dir", "data/processed")
+    run_id = getattr(cfg, "run_id", "default-run")
+    artifacts_root = Path(getattr(cfg, "artifacts_dir", "models")) / run_id
+    trials_dir = artifacts_root / "trials"
+    N_ENSEMBLE = int(cfg.model.params.get("n_ensemble", 5))
+
     if os.path.exists(trials_dir):
         print(f"Очистка старых артефактов из директории '{trials_dir}'...")
         shutil.rmtree(trials_dir)
-    # Пересоздаем пустую директорию
     os.makedirs(trials_dir, exist_ok=True)
 
     print("Loading all pre-processed data...")
-    all_feather_files = glob.glob(os.path.join(PROCESSED_DATA_DIR, "*.feather"))
+    all_feather_files = glob.glob(os.path.join(processed_data_dir, "*.feather"))
     if not all_feather_files:
         raise FileNotFoundError(
-            f"No .feather files found in {PROCESSED_DATA_DIR}. "
+            f"No .feather files found in {processed_data_dir}. "
             f"Run prepare_advanced_data.py (Fear&Greed), prepare_events.py (macro events), "
-            f"incremental_klines.py (1h candles), then prepare_and_run.py (merge/export)."
+            f"incremental_klines.py (1h candles), then prepare_and_run.py (merge/export).",
         )
 
     all_dfs_dict, all_obs_dict = load_all_data(all_feather_files, synthetic_fraction=0, seed=42)
 
-    # Fit/Save pipeline on full training data and add standardized features (_z)
-    PREPROC_PATH = Path("models") / "preproc_pipeline.json"
+    PREPROC_PATH = artifacts_root / "preproc_pipeline.json"
     pipe = FeaturePipeline()
     pipe.fit(all_dfs_dict)
     PREPROC_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -704,7 +739,8 @@ def main():
                 # 4. Сохраняем индивидуальные статистики для этого токена
                 norm_stats[str(token_id)] = {'mean': mean_stats, 'std': std_stats}
 
-    with open("models/norm_stats.json", "w") as f:
+    norm_stats_path = artifacts_root / "norm_stats.json"
+    with open(norm_stats_path, "w") as f:
         json.dump(norm_stats, f, indent=4)
     print(f"Per-asset normalization stats for {len(norm_stats)} tokens calculated and saved.")
 
@@ -719,12 +755,19 @@ def main():
 
     # Запускаем оптимизацию на ПОЛНОМ, диверсифицированном наборе данных
     study.optimize(
-        lambda t: objective(t, HPO_BUDGET_PER_TRIAL,
-                            full_train_data, full_train_obs,
-                            full_val_data, full_val_obs,
-                            norm_stats),
+        lambda t: objective(
+            t,
+            HPO_BUDGET_PER_TRIAL,
+            full_train_data,
+            full_train_obs,
+            full_val_data,
+            full_val_obs,
+            norm_stats,
+            sim_config,
+            trials_dir,
+        ),
         n_trials=HPO_TRIALS,
-        n_jobs=1
+        n_jobs=1,
     )
 
     # Сохраняем итоговое исследование
@@ -733,8 +776,9 @@ def main():
     # <-- КОНЕЦ БЛОКА ДЛЯ ЗАМЕНЫ -->
 
     print(f"\nSaving best {N_ENSEMBLE} models from the final stage...")
-    ensemble_dir = "models/ensemble"
-    if os.path.exists(ensemble_dir): shutil.rmtree(ensemble_dir)
+    ensemble_dir = artifacts_root / "ensemble"
+    if os.path.exists(ensemble_dir):
+        shutil.rmtree(ensemble_dir)
     os.makedirs(ensemble_dir)
 
     top_trials = sorted(final_study.trials, key=lambda tr: tr.value or -1e9, reverse=True)[:N_ENSEMBLE]
@@ -742,25 +786,26 @@ def main():
     ensemble_meta = []
     for i, trial in enumerate(top_trials):
         model_idx = i + 1
-        src_model = f"models/trials/trial_{trial.number}_model.zip"
-        src_stats = f"models/trials/vec_normalize_{trial.number}.pkl"
+        src_model = trials_dir / f"trial_{trial.number}_model.zip"
+        src_stats = trials_dir / f"vec_normalize_{trial.number}.pkl"
 
         if os.path.exists(src_model):
-            shutil.copyfile(src_model, os.path.join(ensemble_dir, f"model_{model_idx}.zip"))
+            shutil.copyfile(src_model, ensemble_dir / f"model_{model_idx}.zip")
             if os.path.exists(src_stats):
-                shutil.copyfile(src_stats, os.path.join(ensemble_dir, f"vec_normalize_{model_idx}.pkl"))
+                shutil.copyfile(src_stats, ensemble_dir / f"vec_normalize_{model_idx}.pkl")
 
             ensemble_meta.append({"ensemble_index": model_idx, "trial_number": trial.number, "value": trial.value, "params": trial.params})
         else:
             print(f"⚠️ WARNING: Could not find model for trial {trial.number}. Skipping.")
     # Копируем единый файл со статистиками нормализации наблюдений,
     # так как он является неотъемлемой частью всех моделей в ансамбле.
-    src_norm_stats = "models/norm_stats.json"
+    src_norm_stats = artifacts_root / "norm_stats.json"
     if os.path.exists(src_norm_stats):
-        shutil.copyfile(src_norm_stats, os.path.join(ensemble_dir, "norm_stats.json"))
+        shutil.copyfile(src_norm_stats, ensemble_dir / "norm_stats.json")
     else:
         print(f"⚠️ CRITICAL WARNING: Could not find the global 'norm_stats.json' file. The saved ensemble will not be usable for inference.")
-    with open(os.path.join(ensemble_dir, "ensemble_meta.json"), "w") as f: json.dump(ensemble_meta, f, indent=4)
+    with open(ensemble_dir / "ensemble_meta.json", "w") as f:
+        json.dump(ensemble_meta, f, indent=4)
     print(f"\n✅ Ensemble of {len(ensemble_meta)} models saved to '{ensemble_dir}'. HPO complete.")
 
 if __name__ == "__main__":
