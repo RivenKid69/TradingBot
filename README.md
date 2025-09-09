@@ -1,8 +1,9 @@
 # TradingBot
 
-Скрипты `script_*.py` выступают CLI‑точками входа в сервисы. Все они
-используют dependency injection и не содержат бизнес‑логики, ограничиваясь
-описанием аргументов и вызовом соответствующих сервисов.
+Скрипты `script_*.py` и `train_model_multi_patch.py` выступают CLI‑точками
+входа в сервисы. Все они используют dependency injection и не содержат
+бизнес‑логики, ограничиваясь описанием аргументов и вызовом соответствующих
+сервисов.
 
 ## Примеры запуска
 
@@ -13,15 +14,14 @@
 
 ```bash
 python script_backtest.py --config configs/config_sim.yaml
-python script_train.py --config configs/train.yaml --trainer-module mypackage.trainer:MyTrainer --no-trade-mode weight
+python train_model_multi_patch.py --config configs/config_train.yaml
 python script_compare_runs.py run1 run2 run3            # сохранит compare_runs.csv
 python script_compare_runs.py run1 metrics.json --stdout  # вывод в stdout
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
 ```
 
-Флаг `--no-trade-mode` управляет применением **no‑trade** окон из конфигурации:
-`drop` удаляет такие строки из датасета, а `weight` оставляет их с
-добавленным столбцом `train_weight=0.0`.
+Обработка окон **no‑trade** описывается в конфигурации; подробности
+см. [docs/no_trade.md](docs/no_trade.md).
 
 ### no-trade-mask утилита
 
