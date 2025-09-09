@@ -91,7 +91,8 @@ cfg = load_config("configs/config_sim.yaml")
 ```
 python script_live.py    --config configs/config_live.yaml
 python script_backtest.py --config configs/config_sim.yaml
-python script_eval.py    --config configs/config_eval.yaml
+python script_eval.py    --config configs/config_eval.yaml --profile vwap
+python script_eval.py    --config configs/config_eval.yaml --all-profiles
 ```
 
 ### Сравнение запусков
@@ -117,7 +118,7 @@ python script_compare_runs.py run1/ run2/metrics.json --csv summary.csv
 
 - `script_train.py` — запускает обучение через `ServiceTrain`.
 - `script_backtest.py` — проводит бэктест через `ServiceBacktest`.
-- `script_eval.py` — рассчитывает метрики через `ServiceEval`.
+- `script_eval.py` — рассчитывает метрики через `ServiceEval` (поддерживает `--profile` и `--all-profiles`).
 - `script_live.py` — исполняет стратегию на живых данных через `ServiceSignalRunner`.
 - `script_calibrate_tcost.py` — калибрует параметры T‑cost через `ServiceCalibrateTCost`.
 - `script_calibrate_slippage.py` — калибрует проскальзывание через `ServiceCalibrateSlippage`.

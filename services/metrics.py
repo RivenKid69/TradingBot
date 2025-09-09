@@ -373,8 +373,8 @@ def compute_equity_metrics(
 
 
 def calculate_metrics(
-    trades: pd.DataFrame,
-    equity: pd.DataFrame,
+    trades: pd.DataFrame | Dict[str, pd.DataFrame],
+    equity: pd.DataFrame | Dict[str, pd.DataFrame],
     *,
     ts_col: str = "ts_ms",
     pnl_col: str = "pnl",
@@ -382,7 +382,27 @@ def calculate_metrics(
     capital_base: float = 10_000.0,
     rf_annual: float = 0.0,
 ) -> Dict[str, Any]:
-    """Convenience wrapper returning both trade and equity metrics (with CVaR)."""
+    """Convenience wrapper returning both trade and equity metrics (with CVaR).
+
+    ``trades`` and ``equity`` may be dataframes or dictionaries mapping
+    ``profile_name`` to dataframe.  In the latter case metrics are
+    computed for each profile separately.
+    """
+    if isinstance(trades, dict):
+        metrics: Dict[str, Any] = {}
+        for name, tdf in trades.items():
+            eq_df = equity.get(name) if isinstance(equity, dict) else equity
+            metrics[name] = calculate_metrics(
+                tdf,
+                eq_df,
+                ts_col=ts_col,
+                pnl_col=pnl_col,
+                equity_col=equity_col,
+                capital_base=capital_base,
+                rf_annual=rf_annual,
+            )
+        return metrics
+
     if ts_col != "ts_ms" or equity_col != "equity":
         equity = equity.rename(columns={ts_col: "ts_ms", equity_col: "equity"})
     eqm = compute_equity_metrics(equity, capital_base=capital_base, rf_annual=rf_annual)

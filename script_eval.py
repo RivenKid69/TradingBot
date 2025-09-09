@@ -17,10 +17,21 @@ def main() -> None:
         default="configs/config_eval.yaml",
         help="Путь к YAML-конфигу запуска",
     )
+    p.add_argument("--profile", help="Оценить конкретный профиль", default=None)
+    p.add_argument(
+        "--all-profiles",
+        action="store_true",
+        help="Оценить все профили из конфигурации",
+    )
     args = p.parse_args()
 
     cfg = load_config(args.config)
-    metrics = from_config(cfg, snapshot_config_path=args.config)
+    metrics = from_config(
+        cfg,
+        snapshot_config_path=args.config,
+        profile=args.profile,
+        all_profiles=args.all_profiles,
+    )
     print(metrics)
 
 
