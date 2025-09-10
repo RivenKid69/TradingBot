@@ -152,3 +152,41 @@ python compare_slippage_curve.py hist.csv sim.csv --tolerance 5
 ```bash
 python tests/pnl_report_check.py
 ```
+
+## Проверка реалистичности симуляции
+
+`scripts/sim_reality_check.py` сопоставляет метрики симуляции с
+историческими данными и эталонной кривой капитала. Скрипт принимает пути к
+логу сделок симуляции (`--trades`), историческому логу (`--historical-trades`),
+опциональному файлу капитальной кривой (`--equity`), бенчмарку (`--benchmark`) и
+JSON‑файлу с допустимыми диапазонами KPI (`--kpi-thresholds`). Параметр
+`--quantiles` задаёт число квантилей для построения статистики по размерам
+ордеров.
+
+При запуске формируются отчёты `sim_reality_check.json` и
+`sim_reality_check.md`, а также файл `sim_reality_check_buckets.csv` и график
+среднего `spread/slippage` по квантилям. Если значения KPI выходят за
+пороговые диапазоны, список нарушений выводится в консоль и попадает в отчёт.
+
+```bash
+# все KPI в пределах порогов
+python scripts/sim_reality_check.py \
+  --trades sim_trades.parquet \
+  --historical-trades hist_trades.parquet \
+  --equity sim_equity.parquet \
+  --benchmark bench_equity.parquet
+Saved reports to run/sim_reality_check.json and run/sim_reality_check.md
+Saved bucket stats to run/sim_reality_check_buckets.csv and run/sim_reality_check_buckets.png
+
+# пример с нарушением порогов
+python scripts/sim_reality_check.py \
+  --trades sim_bad.parquet \
+  --historical-trades hist_trades.parquet \
+  --equity sim_equity.parquet \
+  --benchmark bench_equity.parquet \
+  --kpi-thresholds benchmarks/sim_kpi_thresholds.json
+Saved reports to run/sim_reality_check.json and run/sim_reality_check.md
+Saved bucket stats to run/sim_reality_check_buckets.csv and run/sim_reality_check_buckets.png
+Unrealistic KPIs detected:
+ - equity.sharpe: нереалистично
+```
