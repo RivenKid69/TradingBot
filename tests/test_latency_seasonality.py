@@ -3,6 +3,7 @@ import pathlib
 import sys
 import json
 import datetime
+import pytest
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
 
@@ -87,3 +88,44 @@ def test_latency_seasonality_disabled(tmp_path):
     d_low = lat.sample()
     assert d_high["total_ms"] == 100
     assert d_low["total_ms"] == 100
+
+
+def test_seasonal_latency_statistics_regression(tmp_path):
+    multipliers = [1.0] * 168
+    multipliers[0] = 2.0
+    multipliers[1] = 0.5
+    path = tmp_path / "latency.json"
+    path.write_text(json.dumps({"latency": multipliers}))
+
+    cfg = {
+        "base_ms": 100,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seasonality_path": str(path),
+    }
+    impl = LatencyImpl.from_dict(cfg)
+
+    class Dummy:
+        pass
+
+    sim = Dummy()
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+
+    ts0 = int(base_dt.timestamp() * 1000)
+    for _ in range(5):
+        lat.sample(ts0)
+    stats0 = lat.stats()
+    assert stats0["p50_ms"] == pytest.approx(200)
+    assert stats0["p95_ms"] == pytest.approx(200)
+
+    lat.reset_stats()
+    ts1 = int(base_dt.timestamp() * 1000 + 3_600_000)
+    for _ in range(5):
+        lat.sample(ts1)
+    stats1 = lat.stats()
+    assert stats1["p50_ms"] == pytest.approx(50)
+    assert stats1["p95_ms"] == pytest.approx(50)
