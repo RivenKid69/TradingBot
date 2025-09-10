@@ -112,7 +112,7 @@ def _normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
     if "symbol" not in r.columns:
         r["symbol"] = "UNKNOWN"
 
-    for c in ["equity", "fee_total", "funding_cashflow"]:
+    for c in ["equity", "fee_total", "funding_cashflow", "bid", "ask", "mtm_price"]:
         if c not in r.columns:
             r[c] = pd.NA
 
@@ -120,14 +120,108 @@ def _normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
     r["equity"] = pd.to_numeric(r["equity"], errors="coerce")
     r["fee_total"] = pd.to_numeric(r["fee_total"], errors="coerce")
     r["funding_cashflow"] = pd.to_numeric(r["funding_cashflow"], errors="coerce")
+    r["bid"] = pd.to_numeric(r["bid"], errors="coerce")
+    r["ask"] = pd.to_numeric(r["ask"], errors="coerce")
+    r["mtm_price"] = pd.to_numeric(r["mtm_price"], errors="coerce")
 
-    return r[["ts_ms", "symbol", "equity", "fee_total", "funding_cashflow"]]
+    return r[["ts_ms", "symbol", "equity", "fee_total", "funding_cashflow", "bid", "ask", "mtm_price"]]
 
 
 def _bucket_ts_ms(ts_ms: pd.Series, *, bar_seconds: int) -> pd.Series:
     """Floors ms timestamp to bar_seconds buckets."""
     step = int(bar_seconds) * 1000
     return (pd.to_numeric(ts_ms, errors="coerce").astype("Int64") // step) * step
+
+
+def recompute_pnl(trades: pd.DataFrame, reports: pd.DataFrame) -> pd.Series:
+    """Recompute total PnL for each report row.
+
+    Trades must contain ``ts``, ``price``, ``quantity`` and ``side`` columns and
+    are expected to be in milliseconds. Reports should include ``ts_ms`` along
+    with ``bid``, ``ask`` and optional ``mtm_price`` used for mark to market.
+
+    Returns a :class:`pandas.Series` aligned with ``reports`` containing the
+    recomputed PnL (realized + unrealized) at each report timestamp.
+    """
+
+    if trades is None or trades.empty or reports is None or reports.empty:
+        return pd.Series(dtype=float)
+
+    t = trades.sort_values("ts").copy()
+    r = reports.sort_values("ts_ms").copy()
+
+    pos = 0.0
+    avg = None
+    realized = 0.0
+    i = 0
+    out: list[float] = []
+    t_ts = t["ts"].values.tolist()
+    t_side = t["side"].astype(str).str.upper().values.tolist()
+    t_price = t["price"].astype(float).values.tolist()
+    t_qty = t["quantity"].astype(float).abs().values.tolist()
+
+    for _, rep in r.iterrows():
+        ts = float(rep["ts_ms"]) if pd.notna(rep["ts_ms"]) else float("inf")
+        while i < len(t_ts) and t_ts[i] <= ts:
+            price = t_price[i]
+            qty = t_qty[i]
+            side = t_side[i]
+            if side == "BUY":
+                if pos < 0.0:
+                    close_qty = min(qty, -pos)
+                    if avg is not None:
+                        realized += (avg - price) * close_qty
+                    pos += close_qty
+                    qty -= close_qty
+                    if qty > 0.0:
+                        pos += qty
+                        avg = price
+                    elif pos == 0.0:
+                        avg = None
+                else:
+                    new_pos = pos + qty
+                    avg = (avg * pos + price * qty) / new_pos if pos > 0.0 and avg is not None else price
+                    pos = new_pos
+            else:  # SELL
+                if pos > 0.0:
+                    close_qty = min(qty, pos)
+                    if avg is not None:
+                        realized += (price - avg) * close_qty
+                    pos -= close_qty
+                    qty -= close_qty
+                    if qty > 0.0:
+                        pos -= qty
+                        avg = price
+                    elif pos == 0.0:
+                        avg = None
+                else:
+                    new_pos = pos - qty
+                    avg = (avg * (-pos) + price * qty) / (-new_pos) if pos < 0.0 and avg is not None else price
+                    pos = new_pos
+            i += 1
+
+        bid = rep.get("bid")
+        ask = rep.get("ask")
+        mark_p = rep.get("mtm_price")
+        if pd.isna(mark_p):
+            mark_p = None
+        if mark_p is None:
+            if pos > 0.0 and pd.notna(bid):
+                mark_p = float(bid)
+            elif pos < 0.0 and pd.notna(ask):
+                mark_p = float(ask)
+            elif pd.notna(bid) and pd.notna(ask):
+                mark_p = float((float(bid) + float(ask)) / 2.0)
+
+        unrealized = 0.0
+        if mark_p is not None and avg is not None and pos != 0.0:
+            if pos > 0.0:
+                unrealized = (float(mark_p) - avg) * pos
+            else:
+                unrealized = (avg - float(mark_p)) * (-pos)
+        out.append(realized + unrealized)
+
+    return pd.Series(out, index=r.index)
 
 
 def aggregate(
