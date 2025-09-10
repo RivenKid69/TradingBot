@@ -145,12 +145,39 @@ python compare_slippage_curve.py hist.csv sim.csv --tolerance 5
 
 ## Проверка PnL симулятора
 
-Скрипт `tests/pnl_report_check.py` прогоняет серию сделок через
-`ExecutionSimulator` и сверяет сумму `realized_pnl + unrealized_pnl` из отчёта
-с пересчитанным значением по трейдам и полям `bid/ask/mtm_price`.
+`ExecutionSimulator` исполняет сделки по лучшим котировкам:
+ордер `BUY` заполняется по цене `ask`, а ордер `SELL` — по `bid`.
+Незакрытые позиции помечаются по рынку (mark‑to‑market) также
+по лучшим котировкам: для длинной позиции используется `bid`,
+для короткой — `ask`. Если в отчёте присутствует поле `mtm_price`,
+оно переопределяет цену маркировки.
+
+В отчётах симуляции присутствуют поля:
+
+* `bid` и `ask` — текущие лучшие котировки;
+* `mtm_price` — фактическая цена для mark‑to‑market
+  (может отсутствовать/быть `0`, тогда используется `bid/ask`).
+
+Проверочный скрипт пересчитывает `realized_pnl + unrealized_pnl`
+по логу трейдов и указанным ценам. Пример пересчёта:
+
+```python
+from tests.test_pnl_report_check import _recompute_total
+
+trades = [
+    {"side": "BUY", "price": 101.0, "qty": 1.0},
+    {"side": "SELL", "price": 102.0, "qty": 1.0},
+]
+total = _recompute_total(trades, bid=102.0, ask=103.0, mtm_price=None)
+# total == 1.0 (realized_pnl + unrealized_pnl)
+```
+
+Регрессионный тест `tests/test_pnl_report_check.py` запускает
+симулятор и сравнивает отчёт с пересчитанным результатом.
+Выполнить его можно командой:
 
 ```bash
-python tests/pnl_report_check.py
+pytest tests/test_pnl_report_check.py
 ```
 
 ## Проверка реалистичности симуляции
