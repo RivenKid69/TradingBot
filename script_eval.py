@@ -51,7 +51,7 @@ def main() -> None:
         cfg,
         snapshot_config_path=args.config,
         profile=args.profile,
-        all_profiles=args.all_profiles,
+        all_profiles=args.all_profiles or getattr(cfg, "all_profiles", False),
     )
     print(metrics)
 

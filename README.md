@@ -122,6 +122,20 @@ python script_eval.py --config configs/config_eval.yaml --profile aggressive
 python script_eval.py --config configs/config_eval.yaml --all-profiles
 ```
 
+Альтернативно режим оценки всех профилей можно включить непосредственно в
+YAML‑конфиге:
+
+```yaml
+all_profiles: true
+input:
+  trades_path: "logs/log_trades_<profile>.csv"
+  equity_path: "logs/report_equity_<profile>.csv"
+```
+
+```bash
+python script_eval.py --config configs/config_eval.yaml
+```
+
 При мульти‑профильной оценке метрики (`Sharpe`, `PnL` и т.д.)
 сохраняются отдельно для каждого профиля (`metrics_conservative.json`,
 `metrics_balanced.json`, ...). Их следует интерпретировать как результаты
