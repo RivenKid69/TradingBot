@@ -381,6 +381,11 @@ class TradeLogRow:
     equity: Optional[Decimal] = None           # equity после трейда
     notional: Optional[Decimal] = None         # absolute price*quantity
     drawdown: Optional[Decimal] = None         # drawdown после трейда
+    slippage_bps: Optional[Decimal] = None     # slippage в bps
+    spread_bps: Optional[Decimal] = None       # спред в bps
+    latency_ms: Optional[int] = None           # латентность запроса
+    tif: Optional[str] = None                  # Time in force
+    ttl_steps: Optional[int] = None            # TTL в шагах
     meta: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
@@ -405,6 +410,11 @@ class TradeLogRow:
             mark_price=to_decimal_opt(er.meta.get("mark_price")),
             equity=to_decimal_opt(er.meta.get("equity")),
             drawdown=to_decimal_opt(er.meta.get("drawdown")),
+            slippage_bps=to_decimal_opt(er.meta.get("slippage_bps")),
+            spread_bps=to_decimal_opt(er.meta.get("spread_bps")),
+            latency_ms=int(er.meta.get("latency_ms", 0)) if er.meta.get("latency_ms") is not None else None,
+            tif=str(er.meta.get("tif")) if er.meta.get("tif") is not None else None,
+            ttl_steps=int(er.meta.get("ttl_steps", 0)) if er.meta.get("ttl_steps") is not None else None,
             meta=dict(er.meta),
         )
 

@@ -156,6 +156,8 @@ class ExecTrade:
     spread_bps: float = 0.0
     latency_ms: int = 0
     latency_spike: bool = False
+    tif: str = "GTC"
+    ttl_steps: int = 0
 
 
 @dataclass
@@ -688,6 +690,8 @@ class ExecutionSimulator:
         for p in ready:
             proto = p.proto
             atype = int(getattr(proto, "action_type", ActionType.HOLD))
+            ttl_steps = int(getattr(proto, "ttl_steps", 0))
+            tif = str(getattr(proto, "tif", "GTC")).upper()
             # HOLD
             if atype == ActionType.HOLD:
                 continue
@@ -827,6 +831,8 @@ class ExecutionSimulator:
                         spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
                         latency_ms=int(p.lat_ms),
                         latency_spike=bool(p.spike),
+                        tif=tif,
+                        ttl_steps=ttl_steps,
                     ))
                 continue
             # Определение направления и базовой цены для прочих типов
@@ -885,6 +891,8 @@ class ExecutionSimulator:
                 spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
                 latency_ms=int(p.lat_ms),
                 latency_spike=bool(p.spike),
+                tif=tif,
+                ttl_steps=ttl_steps,
             ))
             continue
 
@@ -893,8 +901,6 @@ class ExecutionSimulator:
                 is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
                 side = "BUY" if is_buy else "SELL"
                 qty_raw = abs(float(getattr(proto, "volume_frac", 0.0)))
-                ttl_steps = int(getattr(proto, "ttl_steps", 0))
-                tif = str(getattr(proto, "tif", "GTC")).upper()
 
                 # Определяем лимитную цену
                 abs_price = getattr(proto, "abs_price", None)
@@ -967,6 +973,8 @@ class ExecutionSimulator:
                         spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
                         latency_ms=int(p.lat_ms),
                         latency_spike=bool(p.spike),
+                        tif=tif,
+                        ttl_steps=ttl_steps,
                     ))
                     if exec_qty + 1e-12 < qty_q:
                         if tif == "IOC":
@@ -1002,6 +1010,8 @@ class ExecutionSimulator:
                         spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
                         latency_ms=int(p.lat_ms),
                         latency_spike=bool(p.spike),
+                        tif=tif,
+                        ttl_steps=ttl_steps,
                     ))
                     continue
 
@@ -1170,6 +1180,8 @@ class ExecutionSimulator:
                 is_buy = bool(vol > 0.0)
                 side = "BUY" if is_buy else "SELL"
                 qty_raw = abs(float(vol))
+                ttl_steps = int(getattr(proto, "ttl_steps", 0))
+                tif = str(getattr(proto, "tif", "GTC")).upper()
                 ref = self._last_ref_price
                 if ref is None:
                     cancelled_ids.append(int(cli_id))
@@ -1299,6 +1311,8 @@ class ExecutionSimulator:
                         spread_bps=float(sbps if sbps is not None else (self.slippage_cfg.default_spread_bps if self.slippage_cfg is not None else 0.0)),
                         latency_ms=int(lat_ms),
                         latency_spike=bool(lat_spike),
+                        tif=tif,
+                        ttl_steps=ttl_steps,
                     ))
             else:
                 # пока другие типы не поддержаны — отменяем
