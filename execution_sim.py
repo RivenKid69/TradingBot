@@ -23,7 +23,7 @@ ExecutionSimulator v2
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any, Dict
 import math
 import time
 
@@ -164,6 +164,7 @@ class ExecTrade:
 class SimStepReport:
     trades: List[ExecTrade] = field(default_factory=list)
     cancelled_ids: List[int] = field(default_factory=list)
+    cancelled_reasons: dict[int, str] = field(default_factory=dict)
     new_order_ids: List[int] = field(default_factory=list)
     fee_total: float = 0.0
     new_order_pos: List[int] = field(default_factory=list)
@@ -190,6 +191,7 @@ class SimStepReport:
         return {
             "trades": [t.__dict__ for t in self.trades],
             "cancelled_ids": list(self.cancelled_ids),
+            "cancelled_reasons": {int(k): str(v) for k, v in self.cancelled_reasons.items()},
             "new_order_ids": list(self.new_order_ids),
             "fee_total": float(self.fee_total),
             "new_order_pos": list(self.new_order_pos),
@@ -657,12 +659,21 @@ class ExecutionSimulator:
         ready, timed_out = self._q.pop_ready()
         trades: List[ExecTrade] = []
         cancelled_ids: List[int] = list(self._cancelled_on_submit)
+        cancelled_reasons: dict[int, str] = {int(cid): "OTHER" for cid in cancelled_ids}
         self._cancelled_on_submit = []
-        cancelled_ids.extend(int(p.client_order_id) for p in timed_out)
+
+        def _cancel(cid: int | str, reason: str = "OTHER") -> None:
+            cid_i = int(cid)
+            cancelled_ids.append(cid_i)
+            cancelled_reasons[cid_i] = reason
+
+        for p in timed_out:
+            _cancel(p.client_order_id, "OTHER")
         if self.lob and hasattr(self.lob, "decay_ttl_and_cancel"):
             try:
                 expired = self.lob.decay_ttl_and_cancel()
-                cancelled_ids.extend(int(x) for x in expired)
+                for x in expired:
+                    _cancel(x, "TTL")
             except Exception:
                 pass
         else:
@@ -670,7 +681,7 @@ class ExecutionSimulator:
             for oid, ttl in self._ttl_orders:
                 ttl -= 1
                 if ttl <= 0:
-                    cancelled_ids.append(int(oid))
+                    _cancel(oid, "TTL")
                     if self.lob and hasattr(self.lob, "remove_order"):
                         try:
                             self.lob.remove_order(int(oid))
@@ -703,11 +714,11 @@ class ExecutionSimulator:
                 qty_raw = abs(float(getattr(proto, "volume_frac", 0.0)))
                 qty_total = self._apply_filters_market(side, qty_raw, ref)
                 if qty_total <= 0.0:
-                    cancelled_ids.append(int(p.client_order_id))
+                    _cancel(p.client_order_id)
                     continue
 
                 if ref is None or not math.isfinite(ref):
-                    cancelled_ids.append(int(p.client_order_id))
+                    _cancel(p.client_order_id)
                     continue
 
                 # риск: пауза/клампинг размера перед планом
@@ -717,7 +728,7 @@ class ExecutionSimulator:
                     risk_events_local.extend(self.risk.pop_events())
                     qty_total = float(adj_qty)
                     if qty_total <= 0.0:
-                        cancelled_ids.append(int(p.client_order_id))
+                        _cancel(p.client_order_id)
                         # накопим события риска
                         # (дальше они будут добавлены к отчёту)
                         continue
@@ -737,7 +748,7 @@ class ExecutionSimulator:
 
                 # если план пуст — отклоняем
                 if not plan:
-                    cancelled_ids.append(int(p.client_order_id))
+                    _cancel(p.client_order_id)
                     continue
 
                 lat_ms = int(p.lat_ms)
@@ -916,7 +927,7 @@ class ExecutionSimulator:
 
                 price_q, qty_q, ok = self._apply_filters_limit(side, float(abs_price), qty_raw, ref)
                 if qty_q <= 0.0 or not ok:
-                    cancelled_ids.append(int(p.client_order_id))
+                    _cancel(p.client_order_id)
                     continue
 
                 filled = False
@@ -951,7 +962,7 @@ class ExecutionSimulator:
 
                 if filled and liquidity_role == "taker":
                     if tif == "FOK" and exec_qty + 1e-12 < qty_q:
-                        cancelled_ids.append(int(p.client_order_id))
+                        _cancel(p.client_order_id, "FOK")
                         continue
                     fee = 0.0
                     if self.fees is not None:
@@ -978,7 +989,7 @@ class ExecutionSimulator:
                     ))
                     if exec_qty + 1e-12 < qty_q:
                         if tif == "IOC":
-                            cancelled_ids.append(int(p.client_order_id))
+                            _cancel(p.client_order_id, "IOC")
                             continue
                         qty_q = qty_q - exec_qty
                         filled = False
@@ -988,7 +999,7 @@ class ExecutionSimulator:
 
                 if filled and liquidity_role == "maker":
                     if tif in ("IOC", "FOK"):
-                        cancelled_ids.append(int(p.client_order_id))
+                        _cancel(p.client_order_id, tif)
                         continue
                     fee = 0.0
                     if self.fees is not None:
@@ -1016,7 +1027,7 @@ class ExecutionSimulator:
                     continue
 
                 if tif in ("IOC", "FOK"):
-                    cancelled_ids.append(int(p.client_order_id))
+                    _cancel(p.client_order_id, tif)
                     continue
 
                 if self.lob and hasattr(self.lob, "add_limit_order"):
@@ -1035,7 +1046,7 @@ class ExecutionSimulator:
                                 if not ttl_set:
                                     self._ttl_orders.append((int(oid), int(ttl_steps)))
                     except Exception:
-                        cancelled_ids.append(int(p.client_order_id))
+                        _cancel(p.client_order_id)
                 else:
                     new_order_ids.append(int(p.client_order_id))
                     new_order_pos.append(0)
@@ -1044,7 +1055,7 @@ class ExecutionSimulator:
                 continue
 
             # прочее — no-op
-            cancelled_ids.append(int(p.client_order_id))
+            _cancel(p.client_order_id)
 
         # funding: начислить по текущей позиции и актуальной рыночной цене (используем ref как mark)
         funding_cashflow = 0.0
@@ -1083,6 +1094,7 @@ class ExecutionSimulator:
         report = SimStepReport(
             trades=trades,
             cancelled_ids=cancelled_ids,
+            cancelled_reasons=cancelled_reasons,
             new_order_ids=new_order_ids,
             fee_total=fee_total,
             new_order_pos=new_order_pos,
@@ -1161,12 +1173,18 @@ class ExecutionSimulator:
         # --- инициализация аккамуляторов ---
         trades: list[ExecTrade] = []
         cancelled_ids: list[int] = []
+        cancelled_reasons: dict[int, str] = {}
         new_order_ids: list[int] = []
         new_order_pos: list[int] = []
         fee_total: float = 0.0
 
         # --- обработать действия ---
         acts = list(actions or [])
+        def _cancel(cid: int | str, reason: str = "OTHER") -> None:
+            cid_i = int(cid)
+            cancelled_ids.append(cid_i)
+            cancelled_reasons[cid_i] = reason
+
         for atype, proto in acts:
             # оформление client_order_id
             cli_id = int(self._next_cli_id)
@@ -1184,13 +1202,13 @@ class ExecutionSimulator:
                 tif = str(getattr(proto, "tif", "GTC")).upper()
                 ref = self._last_ref_price
                 if ref is None:
-                    cancelled_ids.append(int(cli_id))
+                    _cancel(cli_id)
                     continue
 
                 # применить фильтры рынка (квантизация/minNotional и т.п. внутри вспом. функции)
                 qty_total = self._apply_filters_market(side, qty_raw, ref)
                 if qty_total <= 0.0:
-                    cancelled_ids.append(int(cli_id))
+                    _cancel(cli_id)
                     continue
 
                 # риск: корректировка/пауза
@@ -1201,7 +1219,7 @@ class ExecutionSimulator:
                         # события риска будут добавлены позже через on_mark(); здесь просто очищаем очередь
                         pass
                     if qty_total <= 0.0:
-                        cancelled_ids.append(int(cli_id))
+                        _cancel(cli_id)
                         continue
 
                 # планирование исполнения
@@ -1217,7 +1235,7 @@ class ExecutionSimulator:
                 }
                 plan = executor.plan_market(now_ts_ms=ts, side=side, target_qty=qty_total, snapshot=snapshot)
                 if not plan:
-                    cancelled_ids.append(int(cli_id))
+                    _cancel(cli_id)
                     continue
 
                 # пройтись по детям с учётом латентности/слиппеджа/комиссий/инвентаря/рейт-лимита
@@ -1249,7 +1267,7 @@ class ExecutionSimulator:
                         lat_ms = int(d.get("total_ms", 0))
                         lat_spike = bool(d.get("spike", False))
                         if bool(d.get("timeout", False)):
-                            cancelled_ids.append(int(cli_id))
+                            _cancel(cli_id)
                             continue
                     ts_fill = int(ts_fill + lat_ms)
                     # цена исполнения
@@ -1316,7 +1334,7 @@ class ExecutionSimulator:
                     ))
             else:
                 # пока другие типы не поддержаны — отменяем
-                cancelled_ids.append(int(cli_id))
+                _cancel(cli_id)
 
         # funding начисление
         funding_cashflow = 0.0
@@ -1348,6 +1366,7 @@ class ExecutionSimulator:
         return ExecReport(
             trades=trades,
             cancelled_ids=cancelled_ids,
+            cancelled_reasons=cancelled_reasons,
             new_order_ids=new_order_ids,
             fee_total=float(fee_total),
             new_order_pos=new_order_pos,

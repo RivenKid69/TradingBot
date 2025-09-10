@@ -1,6 +1,7 @@
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import numpy as np
@@ -76,6 +77,37 @@ def _order_fill_stats(df: pd.DataFrame) -> dict:
     }
 
 
+def _cancel_stats(df: pd.DataFrame) -> dict:
+    """Return cancellation counts by reason and their shares."""
+    if "exec_status" not in df.columns:
+        raise ValueError("missing 'exec_status' column")
+    if "meta" not in df.columns:
+        raise ValueError("missing 'meta' column")
+    cancelled = df[df["exec_status"].astype(str) == "CANCELED"]
+    total = len(cancelled)
+    if total == 0:
+        return {"counts": {}, "shares": {}}
+
+    def _parse(m: Any) -> dict:
+        if isinstance(m, dict):
+            return m
+        if isinstance(m, str):
+            try:
+                return json.loads(m)
+            except Exception:
+                try:
+                    import ast
+                    return ast.literal_eval(m)
+                except Exception:
+                    return {}
+        return {}
+
+    reasons = cancelled["meta"].apply(lambda m: str(_parse(m).get("reason", "OTHER")))
+    counts = reasons.value_counts().to_dict()
+    shares = {k: float(v / total) for k, v in counts.items()}
+    return {"counts": counts, "shares": shares}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate reality check report for simulated vs benchmark logs",
@@ -119,6 +151,8 @@ def main() -> None:
     hist_latency = _latency_stats(hist_trades_df)
     sim_fill = _order_fill_stats(trades_df)
     hist_fill = _order_fill_stats(hist_trades_df)
+    sim_cancel = _cancel_stats(trades_df)
+    hist_cancel = _cancel_stats(hist_trades_df)
 
     sim_buckets = _bucket_stats(trades_df, args.quantiles)
     sim_buckets.insert(0, "dataset", "simulation")
@@ -159,11 +193,13 @@ def main() -> None:
 
     latency_summary = {"simulation": sim_latency, "historical": hist_latency}
     fill_summary = {"simulation": sim_fill, "historical": hist_fill}
+    cancel_summary = {"simulation": sim_cancel, "historical": hist_cancel}
     summary = {
         "simulation": sim_metrics,
         "benchmark": benchmark_metrics,
         "latency_ms": latency_summary,
         "order_fill": fill_summary,
+        "cancellations": cancel_summary,
     }
 
     json_path = out_base.with_suffix(".json")
@@ -194,6 +230,13 @@ def main() -> None:
             f.write(f"### {name.capitalize()}\n")
             for k, v in stats.items():
                 f.write(f"- {k}: {v}\n")
+            f.write("\n")
+        f.write("## Cancellation Breakdown\n")
+        for name, stats in cancel_summary.items():
+            f.write(f"### {name.capitalize()}\n")
+            for reason, cnt in stats.get("counts", {}).items():
+                share = stats.get("shares", {}).get(reason, 0.0)
+                f.write(f"- {reason}: {cnt} ({share:.2%})\n")
             f.write("\n")
 
     print(f"Saved reports to {json_path} and {md_path}")
