@@ -16,7 +16,7 @@ def _floor_ts(ts_ms: int, step_ms: int) -> int:
     return (int(ts_ms) // step_ms) * step_ms
 
 
-def _agg(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+def _agg(df: pd.DataFrame, interval: str, drop_partial: bool = False) -> pd.DataFrame:
     if df.empty:
         return df.copy()
     step_map = {
@@ -33,6 +33,40 @@ def _agg(df: pd.DataFrame, interval: str) -> pd.DataFrame:
         raise ValueError(f"unsupported interval: {interval}")
     step = step_map[interval]
     d = df.copy()
+
+    # проверка минимального/максимального ts_ms для каждого символа
+    cleaned: List[pd.DataFrame] = []
+    problems: List[str] = []
+    for sym, g in d.groupby("symbol", group_keys=False):
+        ts = g["ts_ms"].astype("int64").sort_values()
+        min_ts = int(ts.iloc[0])
+        max_ts = int(ts.iloc[-1])
+        diffs = ts.diff().dropna()
+        diffs = diffs[diffs > 0]
+        base_step = int(diffs.min()) if not diffs.empty else step
+        start_ok = (min_ts % step) == 0
+        end_ok = ((max_ts + base_step) % step) == 0
+        if start_ok and end_ok:
+            cleaned.append(g)
+            continue
+        if not drop_partial:
+            parts = []
+            if not start_ok:
+                parts.append(f"min_ts={min_ts}")
+            if not end_ok:
+                parts.append(f"max_ts={max_ts}")
+            problems.append(f"{sym}: {'; '.join(parts)}")
+            cleaned.append(g)
+            continue
+        # drop_partial=True: отбрасываем неполные окна
+        start_bound = _floor_ts(min_ts, step) + step
+        end_bound = _floor_ts(max_ts, step)
+        g2 = g[(g["ts_ms"] >= start_bound) & (g["ts_ms"] < end_bound)]
+        cleaned.append(g2)
+    if problems:
+        raise ValueError("partial windows detected: " + "; ".join(problems))
+    d = pd.concat(cleaned, ignore_index=True)
+
     d["bucket"] = d["ts_ms"].astype("int64").map(lambda x: _floor_ts(int(x), step))
     g = d.groupby(["symbol", "bucket"])
     out = g.agg(
@@ -74,10 +108,15 @@ def main():
     p.add_argument("--in-path", required=True, help="Входной parquet 1m (или другой низкой частоты)")
     p.add_argument("--interval", required=True, help="Целевой интервал: 5m/15m/1h/4h/1d ...")
     p.add_argument("--out-path", required=True, help="Куда сохранить parquet агрегации")
+    p.add_argument(
+        "--drop-partial",
+        action="store_true",
+        help="Отбрасывать неполные начальные/конечные окна вместо ошибки",
+    )
     args = p.parse_args()
 
     df = _read_parquet(args.in_path)
-    out = _agg(df, args.interval)
+    out = _agg(df, args.interval, drop_partial=args.drop_partial)
     os.makedirs(os.path.dirname(args.out_path) or ".", exist_ok=True)
     out.to_parquet(args.out_path, index=False)
     print(f"Wrote {len(out)} rows to {args.out_path}")
