@@ -4,7 +4,17 @@ from datetime import datetime, timezone
 from typing import Optional, Sequence, Union
 import os
 import json
+import hashlib
+import importlib.util
+import sysconfig
+from pathlib import Path
 import numpy as np
+
+_logging_spec = importlib.util.spec_from_file_location(
+    "py_logging", Path(sysconfig.get_path("stdlib")) / "logging/__init__.py"
+)
+logging = importlib.util.module_from_spec(_logging_spec)
+_logging_spec.loader.exec_module(logging)
 
 
 HOUR_MS = 3_600_000
@@ -30,7 +40,7 @@ def hour_of_week(ts_ms: Union[int, Sequence[int], np.ndarray]) -> Union[int, np.
     return vec(arr)
 
 
-def load_hourly_seasonality(path: str, *keys: str) -> np.ndarray | None:
+def load_hourly_seasonality(path: str, *keys: str, expected_hash: str | None = None) -> np.ndarray | None:
     """Load hourly multipliers array from JSON file.
 
     Parameters
@@ -48,8 +58,19 @@ def load_hourly_seasonality(path: str, *keys: str) -> np.ndarray | None:
     if not path or not os.path.exists(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "rb") as f:
+            raw = f.read()
+        digest = hashlib.sha256(raw).hexdigest()
+        logger = logging.getLogger(__name__)
+        logger.info("Loaded seasonality multipliers from %s (sha256=%s)", path, digest)
+        if expected_hash and digest.lower() != expected_hash.lower():
+            logger.warning(
+                "Seasonality hash mismatch for %s: expected %s got %s",
+                path,
+                expected_hash,
+                digest,
+            )
+        data = json.loads(raw.decode("utf-8"))
         if isinstance(data, dict):
             for k in keys:
                 if k in data:
