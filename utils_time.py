@@ -9,16 +9,25 @@ import numpy as np
 
 HOUR_MS = 3_600_000
 HOURS_IN_WEEK = 168
-EPOCH_HOW_OFFSET = 72
 
 
 def hour_of_week(ts_ms: Union[int, Sequence[int], np.ndarray]) -> Union[int, np.ndarray]:
-    """Return hour-of-week (0-167) for timestamps in milliseconds."""
+    """Return hour-of-week (0-167) for timestamps in milliseconds.
+
+    The calculation uses :func:`datetime.utcfromtimestamp` to avoid any
+    dependence on the local timezone.
+    """
     arr = np.asarray(ts_ms, dtype=np.int64)
-    how = ((arr // HOUR_MS) + EPOCH_HOW_OFFSET) % HOURS_IN_WEEK
+
+    def _calc(ts: int) -> int:
+        dt = datetime.utcfromtimestamp(int(ts) / 1000)
+        return dt.weekday() * 24 + dt.hour
+
     if arr.shape == ():
-        return int(how)
-    return how.astype(int)
+        return _calc(int(arr))
+
+    vec = np.vectorize(_calc, otypes=[int])
+    return vec(arr)
 
 
 def load_hourly_seasonality(path: str, *keys: str) -> np.ndarray | None:
