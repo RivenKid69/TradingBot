@@ -1,0 +1,45 @@
+# Hour-of-Week Seasonality
+
+Certain hours of the week exhibit systematic patterns in market depth and order-processing delays. To capture this behaviour, the simulator supports **hour-of-week multipliers** that scale baseline liquidity and latency parameters. Multipliers are indexed from `0` (Monday 00:00 UTC) to `167` (Sunday 23:00 UTC).
+
+## `liquidity_latency_seasonality.json` format
+
+The JSON file contains up to two arrays with 168 floating-point numbers each:
+
+```json
+{
+  "liquidity": [1.0, 1.1, ...],
+  "latency":   [1.0, 0.9, ...]
+}
+```
+
+`liquidity` multiplies available volume while `latency` scales simulated execution delays. Missing arrays or indices default to `1.0`.
+
+## Regenerating multipliers from historical data
+
+1. Prepare a CSV or Parquet file with columns such as `ts_ms`, `quantity` or `latency_ms`.
+2. Run the helper script to compute averages for each hour of week and normalise them:
+
+   ```bash
+   python scripts/build_hourly_seasonality.py --data path/to/trades.parquet --out configs/liquidity_latency_seasonality.json
+   ```
+3. Optionally verify the multipliers against the original dataset:
+
+   ```bash
+   python scripts/validate_seasonality.py --historical path/to/trades.parquet --multipliers configs/liquidity_latency_seasonality.json
+   ```
+
+## Enabling seasonality in configs
+
+Seasonality can be activated either via CLI flags or directly in YAML configs:
+
+```bash
+python script_backtest.py --config configs/config_sim.yaml --liquidity-seasonality configs/liquidity_latency_seasonality.json
+```
+
+```yaml
+liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
+
+latency:
+  seasonality_path: "configs/liquidity_latency_seasonality.json"
+```
