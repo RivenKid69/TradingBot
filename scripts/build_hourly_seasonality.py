@@ -6,6 +6,7 @@ the simulator to modulate these parameters during backtests.
 """
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -49,11 +50,23 @@ def compute_multipliers(df: pd.DataFrame) -> dict[str, np.ndarray]:
     return metrics
 
 
+def write_checksum(path: Path) -> Path:
+    """Compute sha256 checksum for *path* and write `<path>.sha256`."""
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    checksum_path = path.with_suffix(path.suffix + '.sha256')
+    checksum_path.write_text(digest)
+    return checksum_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Build hourly seasonality multipliers for liquidity, latency and spread'
     )
-    parser.add_argument('--data', required=True, help='Path to trade/latency logs (csv or parquet)')
+    parser.add_argument(
+        '--data',
+        default='data/seasonality_source/latest.parquet',
+        help='Path to trade/latency logs (csv or parquet)',
+    )
     parser.add_argument(
         '--out',
         default='configs/liquidity_latency_seasonality.json',
@@ -61,12 +74,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    df = load_logs(Path(args.data))
+    data_path = Path(args.data)
+    df = load_logs(data_path)
     multipliers = compute_multipliers(df)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, 'w') as f:
         json.dump({k: v.tolist() for k, v in multipliers.items()}, f, indent=2)
+    checksum_path = write_checksum(data_path)
     print(f'Saved seasonality multipliers to {args.out}')
+    print(f'Input data checksum written to {checksum_path}')
 
 
 if __name__ == '__main__':
