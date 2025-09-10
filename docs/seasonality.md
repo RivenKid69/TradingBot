@@ -16,6 +16,16 @@ The JSON file contains up to three arrays with 168 floating-point numbers each:
 
 `liquidity` multiplies available volume, `latency` scales simulated execution delays while `spread` adjusts the baseline bid-ask spread (in bps). Missing arrays or indices default to `1.0`.
 
+## Quick inspection
+
+Visualise the multipliers to ensure they look reasonable:
+
+```bash
+python scripts/plot_seasonality.py --multipliers configs/liquidity_latency_seasonality.json
+```
+
+The script writes line charts and heatmaps for liquidity and latency multipliers to `reports/seasonality/plots`.
+
 ## Regenerating multipliers from historical data
 
 1. Prepare a CSV or Parquet file with columns such as `ts_ms`, `quantity`, `latency_ms` or `spread_bps`.
