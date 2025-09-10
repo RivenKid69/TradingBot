@@ -116,11 +116,8 @@ def test_mkt_open_next_h1_profile(base_sim):
 
 
 def test_vwap_current_h1_profile(base_sim):
-    sim = ExecutionSimulator(execution_config={"algo": "VWAP"}, execution_profile="VWAP_CURRENT_H1")
-    sim.set_symbol("BTCUSDT")
-    sim.set_quantizer(DummyQuantizer())
-    sim.fees = DummyFees()
-    sim.risk = DummyRisk()
+    sim = base_sim
+    sim.set_execution_profile("VWAP_CURRENT_H1")
     proto = ActionProto(action_type=ActionType.MARKET, volume_frac=2.0)
     rep = sim.run_step(
         ts=1_800_000,
@@ -165,7 +162,7 @@ def test_limit_mid_bps_profile(base_sim):
 
 
 def test_executor_switching():
-    sim = ExecutionSimulator(execution_config={"algo": "VWAP"}, execution_profile="VWAP_CURRENT_H1")
+    sim = ExecutionSimulator(execution_profile="VWAP_CURRENT_H1")
     assert isinstance(sim._executor, VWAPExecutor)
     sim.set_execution_profile("MKT_OPEN_NEXT_H1")
     assert isinstance(sim._executor, MarketOpenH1Executor)

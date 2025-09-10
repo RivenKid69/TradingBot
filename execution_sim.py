@@ -447,6 +447,9 @@ class ExecutionSimulator:
         if profile == "MKT_OPEN_NEXT_H1" and MarketOpenH1Executor is not None:
             self._executor = MarketOpenH1Executor()
             return
+        if profile == "VWAP_CURRENT_H1" and VWAPExecutor is not None:
+            self._executor = VWAPExecutor()
+            return
         cfg = dict(self._execution_cfg or {})
         algo = str(cfg.get("algo", "TAKER")).upper()
         if algo == "TWAP":
