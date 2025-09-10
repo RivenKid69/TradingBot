@@ -68,7 +68,19 @@ class LogWriter:
         rep_dict = report.to_dict() if hasattr(report, "to_dict") else {}
         for t in rep_dict.get("trades", []):
             er = trade_dict_to_core_exec_report(t, parent=rep_dict, symbol=str(symbol), run_id=self._run_id)
+            for k in ["slippage_bps", "spread_bps", "latency_ms", "tif", "ttl_steps"]:
+                v = t.get(k)
+                if v is not None:
+                    er.meta[k] = v
             row = TradeLogRow.from_exec(er).to_dict()
+            if row.get("slippage_bps") is not None:
+                row["slippage_bps"] = float(row["slippage_bps"])
+            if row.get("spread_bps") is not None:
+                row["spread_bps"] = float(row["spread_bps"])
+            if row.get("latency_ms") is not None:
+                row["latency_ms"] = int(row["latency_ms"])
+            if row.get("ttl_steps") is not None:
+                row["ttl_steps"] = int(row["ttl_steps"])
             row["mark_price"] = float(getattr(report, "mark_price", row.get("mark_price", 0.0)))
             row["equity"] = float(getattr(report, "equity", row.get("equity", 0.0)))
             row["drawdown"] = (
