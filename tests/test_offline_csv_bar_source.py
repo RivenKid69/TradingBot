@@ -28,6 +28,20 @@ def test_duplicate_bar_raises(tmp_path):
         list(src.stream_bars(["BTC"], 60_000))
 
 
+def test_duplicate_hour_bar_raises(tmp_path):
+    path = _write_csv(
+        tmp_path,
+        [
+            {"ts": 0, "symbol": "BTC", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+            {"ts": 0, "symbol": "BTC", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+        ],
+    )
+    cfg = OfflineCSVConfig(paths=[path], timeframe="1h")
+    src = OfflineCSVBarSource(cfg)
+    with pytest.raises(ValueError, match="Duplicate bar for BTC.*0"):
+        list(src.stream_bars(["BTC"], 3_600_000))
+
+
 def test_missing_bar_raises(tmp_path):
     path = _write_csv(
         tmp_path,
@@ -43,6 +57,23 @@ def test_missing_bar_raises(tmp_path):
     msg = str(exc.value)
     assert "Missing bars for BTC" in msg
     assert "60000" in msg
+
+
+def test_missing_hour_bar_raises(tmp_path):
+    path = _write_csv(
+        tmp_path,
+        [
+            {"ts": 0, "symbol": "BTC", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+            {"ts": 7_200_000, "symbol": "BTC", "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1},
+        ],
+    )
+    cfg = OfflineCSVConfig(paths=[path], timeframe="1h")
+    src = OfflineCSVBarSource(cfg)
+    with pytest.raises(ValueError) as exc:
+        list(src.stream_bars(["BTC"], 3_600_000))
+    msg = str(exc.value)
+    assert "Missing bars for BTC" in msg
+    assert "3600000" in msg
 
 
 def test_timezone_bar_passes(tmp_path):
