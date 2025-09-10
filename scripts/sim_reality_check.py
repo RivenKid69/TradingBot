@@ -60,6 +60,22 @@ def _latency_stats(df: pd.DataFrame) -> dict:
     return {"p50_ms": float(p50), "p95_ms": float(p95)}
 
 
+def _order_fill_stats(df: pd.DataFrame) -> dict:
+    """Return fractions of partially filled and unfilled orders."""
+    if "exec_status" not in df.columns:
+        raise ValueError("missing 'exec_status' column")
+    status = df["exec_status"].astype(str)
+    total = len(status)
+    if total == 0:
+        return {"fraction_partially_filled": 0.0, "fraction_unfilled": 0.0}
+    partial = (status == "PARTIALLY_FILLED").sum()
+    unfilled = (status == "CANCELED").sum()
+    return {
+        "fraction_partially_filled": float(partial / total),
+        "fraction_unfilled": float(unfilled / total),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate reality check report for simulated vs benchmark logs",
@@ -101,6 +117,8 @@ def main() -> None:
     benchmark_metrics = compute_equity_metrics(benchmark_df).to_dict()
     sim_latency = _latency_stats(trades_df)
     hist_latency = _latency_stats(hist_trades_df)
+    sim_fill = _order_fill_stats(trades_df)
+    hist_fill = _order_fill_stats(hist_trades_df)
 
     sim_buckets = _bucket_stats(trades_df, args.quantiles)
     sim_buckets.insert(0, "dataset", "simulation")
@@ -140,10 +158,12 @@ def main() -> None:
         pass
 
     latency_summary = {"simulation": sim_latency, "historical": hist_latency}
+    fill_summary = {"simulation": sim_fill, "historical": hist_fill}
     summary = {
         "simulation": sim_metrics,
         "benchmark": benchmark_metrics,
         "latency_ms": latency_summary,
+        "order_fill": fill_summary,
     }
 
     json_path = out_base.with_suffix(".json")
@@ -165,6 +185,12 @@ def main() -> None:
         f.write("\n")
         f.write("## Latency Metrics\n")
         for name, stats in latency_summary.items():
+            f.write(f"### {name.capitalize()}\n")
+            for k, v in stats.items():
+                f.write(f"- {k}: {v}\n")
+            f.write("\n")
+        f.write("## Order Fill KPIs\n")
+        for name, stats in fill_summary.items():
             f.write(f"### {name.capitalize()}\n")
             for k, v in stats.items():
                 f.write(f"- {k}: {v}\n")
