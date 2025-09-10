@@ -1,0 +1,4 @@
+ts_ms,pnl,side,order_size,spread_bps,slippage_bps,latency_ms,exec_status,meta,price,qty
+1,0,BUY,120,1.1,0.4,40,FILLED,"{}",100,1
+2,8,SELL,220,1.8,0.9,80,PARTIALLY_FILLED,"{}",101,1
+3,-4,BUY,160,1.6,0.3,60,CANCELED,"{""reason"":""NO_LIQ""}",102,1
