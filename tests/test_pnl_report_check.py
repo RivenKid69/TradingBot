@@ -2,17 +2,23 @@ import importlib.util
 import pathlib
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("execution_sim", ROOT / "execution_sim.py")
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-assert spec.loader is not None
-spec.loader.exec_module(module)
-ExecutionSimulator = module.ExecutionSimulator
-ActionProto = module.ActionProto
-ActionType = module.ActionType
+import pytest
 
-def recompute_total(trades, bid, ask, mtm_price):
+BASE = pathlib.Path(__file__).resolve().parent.parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+spec = importlib.util.spec_from_file_location("execution_sim", BASE / "execution_sim.py")
+exec_mod = importlib.util.module_from_spec(spec)
+sys.modules["execution_sim"] = exec_mod
+spec.loader.exec_module(exec_mod)
+
+ActionProto = exec_mod.ActionProto
+ActionType = exec_mod.ActionType
+ExecutionSimulator = exec_mod.ExecutionSimulator
+
+
+def _recompute_total(trades, bid, ask, mtm_price):
     pos = 0.0
     avg = None
     realized = 0.0
@@ -29,9 +35,8 @@ def recompute_total(trades, bid, ask, mtm_price):
                 if qty > 0.0:
                     pos += qty
                     avg = price
-                else:
-                    if pos == 0.0:
-                        avg = None
+                elif pos == 0.0:
+                    avg = None
             else:
                 new_pos = pos + qty
                 avg = (avg * pos + price * qty) / new_pos if pos > 0.0 and avg is not None else price
@@ -46,9 +51,8 @@ def recompute_total(trades, bid, ask, mtm_price):
                 if qty > 0.0:
                     pos -= qty
                     avg = price
-                else:
-                    if pos == 0.0:
-                        avg = None
+                elif pos == 0.0:
+                    avg = None
             else:
                 new_pos = pos - qty
                 avg = (avg * (-pos) + price * qty) / (-new_pos) if pos < 0.0 and avg is not None else price
@@ -69,28 +73,23 @@ def recompute_total(trades, bid, ask, mtm_price):
             unrealized = (avg - mark_p) * (-pos)
     return realized + unrealized
 
-def main() -> None:
-    sim = ExecutionSimulator()
-    class DummyExec:
-        def plan_market(self, now_ts_ms, side, target_qty, snapshot):
-            return [type("C", (), {"ts_offset_ms": 0, "qty": target_qty, "liquidity_hint": None})()]
-    sim._executor = DummyExec()
-    sim.set_market_snapshot(bid=100.0, ask=101.0)
 
+def test_pnl_report_recompute_matches() -> None:
+    sim = ExecutionSimulator()
+    sim.set_market_snapshot(bid=100.0, ask=101.0)
     trades_log = []
 
+    # Buy 1 unit
     sim.submit(ActionProto(action_type=ActionType.MARKET, volume_frac=1.0))
-    report1 = sim.pop_ready(ref_price=100.5)
-    trades_log.extend(report1.trades)
-    total1 = recompute_total(trades_log, report1.bid, report1.ask, report1.mark_price)
-    assert abs(report1.realized_pnl + report1.unrealized_pnl - total1) < 1e-9
+    rep1 = sim.pop_ready(ref_price=100.5)
+    trades_log.extend(rep1.trades)
+    total1 = _recompute_total(trades_log, rep1.bid, rep1.ask, rep1.mtm_price)
+    assert rep1.realized_pnl + rep1.unrealized_pnl == pytest.approx(total1, abs=1e-9)
 
+    # Sell 1 unit after price moves higher
     sim.set_market_snapshot(bid=102.0, ask=103.0)
     sim.submit(ActionProto(action_type=ActionType.MARKET, volume_frac=-1.0))
-    report2 = sim.pop_ready(ref_price=102.5)
-    trades_log.extend(report2.trades)
-    total2 = recompute_total(trades_log, report2.bid, report2.ask, report2.mark_price)
-    assert abs(report2.realized_pnl + report2.unrealized_pnl - total2) < 1e-9
-
-if __name__ == "__main__":
-    main()
+    rep2 = sim.pop_ready(ref_price=102.5)
+    trades_log.extend(rep2.trades)
+    total2 = _recompute_total(trades_log, rep2.bid, rep2.ask, rep2.mtm_price)
+    assert rep2.realized_pnl + rep2.unrealized_pnl == pytest.approx(total2, abs=1e-9)
