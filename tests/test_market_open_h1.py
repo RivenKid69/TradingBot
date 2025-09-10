@@ -45,3 +45,33 @@ def test_market_open_next_h1_slippage():
         side="BUY", quote_price=100.0, slippage_bps=expected_bps
     )
     assert trade.price == pytest.approx(expected_price)
+
+
+def test_market_open_next_h1_snapshot_price():
+    sim = ExecutionSimulator(execution_profile="MKT_OPEN_NEXT_H1")
+    sim.set_market_snapshot(bid=None, ask=None, ts_ms=0, trade_price=95.0, trade_qty=1.0)
+    sim.set_market_snapshot(bid=None, ask=None, ts_ms=3_600_000, trade_price=100.0, trade_qty=1.0)
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=1.0)
+    rep = sim.run_step(
+        ts=1_800_000,
+        ref_price=100.0,
+        bid=None,
+        ask=None,
+        vol_factor=1.0,
+        liquidity=1.0,
+        actions=[(ActionType.MARKET, proto)],
+    )
+    assert len(rep.trades) == 1
+    trade = rep.trades[0]
+    assert trade.ts == 3_600_000
+    expected_bps = estimate_slippage_bps(
+        spread_bps=2.0,
+        size=1.0,
+        liquidity=1.0,
+        vol_factor=1.0,
+        cfg=sim.slippage_cfg,
+    )
+    expected_price = apply_slippage_price(
+        side="BUY", quote_price=100.0, slippage_bps=expected_bps
+    )
+    assert trade.price == pytest.approx(expected_price)

@@ -132,6 +132,36 @@ except Exception:
         MarketOpenH1Executor = None  # type: ignore
         VWAPExecutor = None  # type: ignore
 
+if MarketChild is None:
+    @dataclass
+    class MarketChild:  # type: ignore[override]
+        ts_offset_ms: int
+        qty: float
+        liquidity_hint: Optional[float] = None
+
+if TakerExecutor is None:
+    class TakerExecutor:  # type: ignore[override]
+        def plan_market(
+            self, *, now_ts_ms: int, side: str, target_qty: float, snapshot: Dict[str, Any]
+        ) -> List[MarketChild]:
+            q = float(abs(target_qty))
+            if q <= 0.0:
+                return []
+            return [MarketChild(ts_offset_ms=0, qty=q, liquidity_hint=None)]
+
+if MarketOpenH1Executor is None:
+    class MarketOpenH1Executor:  # type: ignore[override]
+        def plan_market(
+            self, *, now_ts_ms: int, side: str, target_qty: float, snapshot: Dict[str, Any]
+        ) -> List[MarketChild]:
+            q = float(abs(target_qty))
+            if q <= 0.0:
+                return []
+            hour_ms = 3_600_000
+            next_open = ((now_ts_ms // hour_ms) + 1) * hour_ms
+            offset = int(max(0, next_open - now_ts_ms))
+            return [MarketChild(ts_offset_ms=offset, qty=q, liquidity_hint=None)]
+
 # --- Импорт модели латентности ---
 try:
     from sim.latency import LatencyModel
@@ -376,6 +406,7 @@ class ExecutionSimulator:
         self._last_spread_bps: Optional[float] = None
         self._last_vol_factor: Optional[float] = None
         self._last_liquidity: Optional[float] = None
+        self._snapshot_hour: Optional[int] = None
 
         # логирование
         self._logger = (
@@ -449,6 +480,14 @@ class ExecutionSimulator:
                 if mid is not None:
                     self._last_ref_price = float(mid)
         if ts_ms is not None:
+            hour_ms = 3_600_000
+            hour = int(ts_ms // hour_ms)
+            if self._snapshot_hour is None:
+                self._snapshot_hour = hour
+            elif hour != self._snapshot_hour:
+                if trade_price is not None:
+                    self._next_h1_open_price = float(trade_price)
+                self._snapshot_hour = hour
             price_tick = trade_price if trade_price is not None else self._last_ref_price
             qty_tick = trade_qty if trade_qty is not None else liquidity
             if price_tick is not None and qty_tick is not None:
@@ -885,7 +924,7 @@ class ExecutionSimulator:
                         if q_child <= 0.0:
                             continue
                     # базовая котировка
-                    if isinstance(executor, VWAPExecutor):
+                    if VWAPExecutor is not None and isinstance(executor, VWAPExecutor):
                         self._vwap_on_tick(ts_fill, None, None)
                         base_price = (
                             self._last_hour_vwap
@@ -896,9 +935,13 @@ class ExecutionSimulator:
                     elif (
                         str(getattr(self, "execution_profile", "")).upper()
                         == "MKT_OPEN_NEXT_H1"
-                        and self._next_h1_open_price is not None
                     ):
-                        filled_price = float(self._next_h1_open_price)
+                        if self._next_h1_open_price is not None:
+                            filled_price = float(self._next_h1_open_price)
+                        else:
+                            filled_price = float(ref)
+                            if ref is not None:
+                                self._next_h1_open_price = float(ref)
                     else:
                         if side == "BUY":
                             base_price = self._last_ask if self._last_ask is not None else ref
@@ -1402,7 +1445,7 @@ class ExecutionSimulator:
                             continue
                     ts_fill = int(ts_fill + lat_ms)
                     # цена исполнения
-                    if isinstance(executor, VWAPExecutor):
+                    if VWAPExecutor is not None and isinstance(executor, VWAPExecutor):
                         self._vwap_on_tick(ts_fill, None, None)
                         base_price = (
                             self._last_hour_vwap
