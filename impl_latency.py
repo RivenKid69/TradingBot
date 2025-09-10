@@ -10,9 +10,17 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Sequence
 import json
 import os
-import logging
+import importlib.util
+import sysconfig
+from pathlib import Path
 
 import numpy as np
+
+_logging_spec = importlib.util.spec_from_file_location(
+    "py_logging", Path(sysconfig.get_path("stdlib")) / "logging/__init__.py"
+)
+logging = importlib.util.module_from_spec(_logging_spec)
+_logging_spec.loader.exec_module(logging)
 
 try:
     from utils_time import load_hourly_seasonality
@@ -40,6 +48,7 @@ class LatencyCfg:
     use_seasonality: bool = True
     seasonality_override: Sequence[float] | None = None
     seasonality_override_path: str | None = None
+    seasonality_hash: str | None = None
 
 
 class _LatencyWithSeasonality:
@@ -116,22 +125,11 @@ class LatencyImpl:
         path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
         self._has_seasonality = bool(cfg.use_seasonality)
         if self._has_seasonality:
-            if path and os.path.exists(path):
-                try:
-                    with open(path, "r") as f:
-                        data = json.load(f)
-                    if isinstance(data, dict):
-                        data = data.get("latency")
-                    if isinstance(data, list) and len(data) == 168:
-                        self.latency = [float(x) for x in data]
-                    else:  # pragma: no cover - defensive
-                        self._has_seasonality = False
-                except Exception:  # pragma: no cover - graceful fallback
-                    logger.warning(
-                        "Failed to load latency seasonality from %s; using defaults.",
-                        path,
-                    )
-                    self._has_seasonality = False
+            arr = load_hourly_seasonality(
+                path, "latency", expected_hash=cfg.seasonality_hash
+            )
+            if arr is not None:
+                self.latency = [float(x) for x in arr]
             else:
                 logger.warning(
                     "Latency seasonality config %s not found; using default multipliers.",
@@ -207,4 +205,5 @@ class LatencyImpl:
             use_seasonality=bool(d.get("use_seasonality", True)),
             seasonality_override=d.get("seasonality_override"),
             seasonality_override_path=d.get("seasonality_override_path"),
+            seasonality_hash=d.get("seasonality_hash"),
         ))

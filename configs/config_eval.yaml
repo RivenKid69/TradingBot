@@ -11,6 +11,8 @@ execution_params:
 
 # Optional path to 168 hourly liquidity multipliers (indexed by UTC hour-of-week)
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
+# Optional SHA256 hash of the above multipliers for integrity checking
+liquidity_seasonality_hash: null
 # Optional path to 168 hourly overrides multiplied with the above multipliers
 liquidity_seasonality_override_path: null
 use_seasonality: true  # set false to ignore liquidity/spread multipliers
@@ -27,6 +29,7 @@ latency:
   seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
   seasonality_path: "configs/liquidity_latency_seasonality.json"  # UTC hour-of-week
   seasonality_override_path: null
+  seasonality_hash: null
   use_seasonality: true
 components:
   market_data:

@@ -338,6 +338,7 @@ class ExecutionSimulator:
                  liquidity_seasonality: Optional[Sequence[float]] = None,
                  spread_seasonality: Optional[Sequence[float]] = None,
                  liquidity_seasonality_path: Optional[str] = None,
+                 liquidity_seasonality_hash: Optional[str] = None,
                  liquidity_seasonality_override: Optional[Sequence[float]] = None,
                  spread_seasonality_override: Optional[Sequence[float]] = None,
                  seasonality_override_path: Optional[str] = None,
@@ -454,14 +455,22 @@ class ExecutionSimulator:
             liq_arr: Optional[Sequence[float]] = liquidity_seasonality
             spread_arr: Optional[Sequence[float]] = spread_seasonality
             path = liquidity_seasonality_path
-            if path is None and run_config is not None:
-                path = getattr(run_config, "liquidity_seasonality_path", None)
+            expected_hash = liquidity_seasonality_hash
+            if run_config is not None:
+                if path is None:
+                    path = getattr(run_config, "liquidity_seasonality_path", None)
+                if expected_hash is None:
+                    expected_hash = getattr(run_config, "liquidity_seasonality_hash", None)
             if path is None:
                 path = "configs/liquidity_seasonality.json"
             if path and (liq_arr is None or spread_arr is None):
                 if os.path.exists(path):
-                    file_liq = load_hourly_seasonality(path, "liquidity", "multipliers")
-                    file_spread = load_hourly_seasonality(path, "spread", "latency")
+                    file_liq = load_hourly_seasonality(
+                        path, "liquidity", "multipliers", expected_hash=expected_hash
+                    )
+                    file_spread = load_hourly_seasonality(
+                        path, "spread", "latency", expected_hash=expected_hash
+                    )
                     if liq_arr is None:
                         liq_arr = file_liq
                     if spread_arr is None:
