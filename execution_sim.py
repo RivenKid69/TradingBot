@@ -67,6 +67,11 @@ except Exception:
         LIMIT = 2
 
 
+# --- Constants ---
+HOUR_MS = 3_600_000
+HOURS_IN_WEEK = 168
+EPOCH_HOW_OFFSET = 72
+
 # --- Импорт квантизатора, комиссий/funding и слиппеджа ---
 try:
     from sim.quantizer import Quantizer, load_filters
@@ -440,16 +445,16 @@ class ExecutionSimulator:
         self.use_seasonality = bool(
             getattr(run_config, "use_seasonality", use_seasonality)
         )
-        default_seasonality = [1.0] * 168
-        self._liq_seasonality: List[float] = default_seasonality.copy()
-        self._spread_seasonality: List[float] = default_seasonality.copy()
+        default_seasonality = np.ones(168, dtype=float)
+        self._liq_seasonality = default_seasonality.copy()
+        self._spread_seasonality = default_seasonality.copy()
         if self.use_seasonality:
-            liq_arr: Optional[List[float]] = None
-            spread_arr: Optional[List[float]] = None
+            liq_arr: Optional[Sequence[float]] = None
+            spread_arr: Optional[Sequence[float]] = None
             if liquidity_seasonality is not None:
-                liq_arr = list(liquidity_seasonality)
+                liq_arr = liquidity_seasonality
             if spread_seasonality is not None:
-                spread_arr = list(spread_seasonality)
+                spread_arr = spread_seasonality
             path = liquidity_seasonality_path
             if path is None and run_config is not None:
                 path = getattr(run_config, "liquidity_seasonality_path", None)
@@ -479,14 +484,14 @@ class ExecutionSimulator:
                     path,
                 )
             if liq_arr is not None and len(liq_arr) == 168:
-                self._liq_seasonality = liq_arr
+                self._liq_seasonality = np.asarray(liq_arr, dtype=float)
             else:
                 logger.warning(
                     "Using default liquidity seasonality multipliers of 1.0; "
                     "run scripts/build_hourly_seasonality.py to generate them.",
                 )
             if spread_arr is not None and len(spread_arr) == 168:
-                self._spread_seasonality = spread_arr
+                self._spread_seasonality = np.asarray(spread_arr, dtype=float)
             else:
                 logger.warning(
                     "Using default spread seasonality multipliers of 1.0; "
@@ -543,13 +548,10 @@ class ExecutionSimulator:
         spread_mult = 1.0
         how: Optional[int] = None
         if ts_ms is not None:
-            tm = time.gmtime(ts_ms / 1000.0)
-            how = tm.tm_wday * 24 + tm.tm_hour
+            how = ((int(ts_ms) // HOUR_MS) + EPOCH_HOW_OFFSET) % HOURS_IN_WEEK
         if self.use_seasonality and how is not None:
-            if 0 <= how < len(self._liq_seasonality):
-                liq_mult = float(self._liq_seasonality[how])
-            if 0 <= how < len(self._spread_seasonality):
-                spread_mult = float(self._spread_seasonality[how])
+            liq_mult = float(self._liq_seasonality[how])
+            spread_mult = float(self._spread_seasonality[how])
 
         sbps: Optional[float]
         if spread_bps is not None:

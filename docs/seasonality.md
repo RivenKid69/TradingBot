@@ -80,3 +80,19 @@ Retain at least 12 months of snapshots so that previous seasonality runs
 can be reproduced. Snapshot sizes depend on the exchange feed but
 typically require several hundred megabytes per month; plan storage
 accordingly.
+
+## Performance
+
+Microbenchmarks repeatedly invoking `ExecutionSimulator.set_market_snapshot`
+for 100k synthetic ticks show that enabling hourly multipliers adds only a
+small overhead:
+
+```
+$ python benchmarks/simulator_seasonality_bench.py
+use_seasonality=False: 0.161s
+use_seasonality=True: 0.195s
+```
+
+Lookup now avoids `time.gmtime` and uses precomputed NumPy arrays for the
+168 multipliers, reducing datetime conversions and keeping the cost of
+seasonality modest.
