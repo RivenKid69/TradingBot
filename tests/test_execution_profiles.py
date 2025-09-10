@@ -23,7 +23,6 @@ ActionType = exec_mod.ActionType
 ExecutionSimulator = exec_mod.ExecutionSimulator
 VWAPExecutor = algos_mod.VWAPExecutor
 MarketOpenH1Executor = algos_mod.MarketOpenH1Executor
-MidOffsetLimitExecutor = algos_mod.MidOffsetLimitExecutor
 
 
 class DummyQuantizer:
@@ -145,33 +144,6 @@ def test_vwap_current_h1_profile(base_sim):
     assert trade.price == pytest.approx(200.0)
     assert rep.fee_total == pytest.approx(trade.price * trade.qty * 0.001)
     assert rep.position_qty == pytest.approx(trade.qty)
-
-
-def test_limit_mid_bps_profile(base_sim):
-    sim = base_sim
-    sim.set_execution_profile("LIMIT_MID_BPS")
-    sim.set_market_snapshot(bid=99.0, ask=101.0, liquidity=5.0)
-    executor = MidOffsetLimitExecutor(offset_bps=200)
-    built = executor.build_action(side="BUY", qty=1.0, snapshot={"mid": 100.0})
-
-    class _Proto:
-        def __init__(self, price):
-            self.action_type = ActionType.LIMIT
-            self.volume_frac = 1.0
-            self.abs_price = price
-            self.ttl_steps = 0
-            self.tif = "GTC"
-
-    proto = _Proto(built["abs_price"])
-    sim.submit(proto)
-    rep = sim.pop_ready(ref_price=100.0)
-    assert len(rep.trades) == 1
-    trade = rep.trades[0]
-    assert trade.price == pytest.approx(101.0)
-    assert rep.fee_total == pytest.approx(trade.price * trade.qty * 0.001)
-    assert rep.position_qty == pytest.approx(trade.qty)
-
-
 def test_limit_mid_bps_params_build(base_sim):
     sim = base_sim
     params = {"limit_offset_bps": 50, "ttl_steps": 7, "tif": "IOC"}

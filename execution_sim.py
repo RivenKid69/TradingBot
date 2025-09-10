@@ -100,6 +100,7 @@ try:
         POVExecutor,
         MarketOpenH1Executor,
         VWAPExecutor,
+        MidOffsetLimitExecutor,
     )
 except Exception:
     try:
@@ -111,6 +112,7 @@ except Exception:
             POVExecutor,
             MarketOpenH1Executor,
             VWAPExecutor,
+            MidOffsetLimitExecutor,
         )
     except Exception:
         BaseExecutor = None  # type: ignore
@@ -714,6 +716,41 @@ class ExecutionSimulator:
             ok = self.quantizer.check_percent_price_by_side(self.symbol, side, p, ref_price)
         return p, q, ok
 
+    def _build_limit_action(self, side: str, qty: float) -> Optional[ActionProto]:
+        """Build a LIMIT ActionProto around the mid price."""
+        if MidOffsetLimitExecutor is None:
+            return None
+        try:
+            mid = None
+            if self._last_bid is not None and self._last_ask is not None:
+                mid = (self._last_bid + self._last_ask) / 2.0
+            elif self._last_ref_price is not None:
+                mid = float(self._last_ref_price)
+            if mid is None or qty <= 0.0:
+                return None
+            execu = MidOffsetLimitExecutor(
+                offset_bps=float(self.execution_params.get("limit_offset_bps", 0.0)),
+                ttl_steps=int(self.execution_params.get("ttl_steps", 0)),
+                tif=str(self.execution_params.get("tif", "GTC")),
+            )
+            snap = {"mid": float(mid)}
+            built = execu.build_action(side=str(side), qty=float(qty), snapshot=snap)
+            if built is None:
+                return None
+            if isinstance(built, ActionProto):
+                ap = built
+            else:
+                ap = ActionProto(
+                    action_type=ActionType.LIMIT,
+                    volume_frac=float(built.get("volume_frac", 0.0)),
+                    tif=str(built.get("tif", "GTC")),
+                )
+                object.__setattr__(ap, "ttl_steps", int(built.get("ttl_steps", 0)))
+                object.__setattr__(ap, "abs_price", built.get("abs_price"))
+            return ap
+        except Exception:
+            return None
+
     # ---- исполнение ----
     def pop_ready(self, now_ts: Optional[int] = None, ref_price: Optional[float] = None) -> ExecReport:
         ready, timed_out = self._q.pop_ready()
@@ -1251,6 +1288,17 @@ class ExecutionSimulator:
 
         # --- обработать действия ---
         acts = list(actions or [])
+        if str(getattr(self, "execution_profile", "")).upper() == "LIMIT_MID_BPS":
+            for atype, proto in acts:
+                if str(getattr(atype, "name", getattr(atype, "__class__", type(atype)))).upper().endswith("MARKET") or str(atype).upper().endswith("MARKET"):
+                    vol = float(getattr(proto, "volume_frac", 0.0))
+                    side = "BUY" if vol > 0.0 else "SELL"
+                    qty = abs(vol)
+                    built = self._build_limit_action(side, qty)
+                    if built is not None:
+                        self.submit(built, now_ts=ts)
+            return self.pop_ready(now_ts=ts, ref_price=ref_price)
+
         def _cancel(cid: int | str, reason: str = "OTHER") -> None:
             cid_i = int(cid)
             cancelled_ids.append(cid_i)
