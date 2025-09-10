@@ -131,6 +131,11 @@ def main() -> None:
         help="Path to benchmark equity log (CSV or Parquet)",
     )
     parser.add_argument(
+        "--kpi-thresholds",
+        default="benchmarks/sim_kpi_thresholds.json",
+        help="Path to JSON file with KPI thresholds",
+    )
+    parser.add_argument(
         "--quantiles",
         type=int,
         default=10,
@@ -153,6 +158,35 @@ def main() -> None:
     hist_fill = _order_fill_stats(hist_trades_df)
     sim_cancel = _cancel_stats(trades_df)
     hist_cancel = _cancel_stats(hist_trades_df)
+
+    # Load KPI thresholds and check simulated metrics
+    thresholds = {}
+    try:
+        with open(Path(args.kpi_thresholds)) as f:
+            thresholds = json.load(f)
+    except Exception:
+        thresholds = {}
+
+    kpi_values = {
+        "equity": sim_metrics.get("equity", {}),
+        "trades": sim_metrics.get("trades", {}),
+        "latency_ms": sim_latency,
+        "order_fill": sim_fill,
+        "cancellations": sim_cancel,
+    }
+
+    flags: dict[str, str] = {}
+
+    def _check(values: dict, specs: dict, prefix: str = "") -> None:
+        for key, spec in specs.items():
+            if isinstance(spec, dict) and {"min", "max"} <= set(spec.keys()):
+                actual = values.get(key)
+                if actual is None or not (spec["min"] <= actual <= spec["max"]):
+                    flags[prefix + key] = "нереалистично"
+            elif isinstance(spec, dict):
+                _check(values.get(key, {}), spec, prefix + key + ".")
+
+    _check(kpi_values, thresholds)
 
     sim_buckets = _bucket_stats(trades_df, args.quantiles)
     sim_buckets.insert(0, "dataset", "simulation")
@@ -200,6 +234,7 @@ def main() -> None:
         "latency_ms": latency_summary,
         "order_fill": fill_summary,
         "cancellations": cancel_summary,
+        "flags": flags,
     }
 
     json_path = out_base.with_suffix(".json")
@@ -209,6 +244,11 @@ def main() -> None:
     md_path = out_base.with_suffix(".md")
     with open(md_path, "w") as f:
         f.write("# Simulation Reality Check\n\n")
+        if flags:
+            f.write("## KPI Flags\n")
+            for k, v in flags.items():
+                f.write(f"- {k}: {v}\n")
+            f.write("\n")
         f.write("## Simulation Metrics\n")
         for section, metrics in sim_metrics.items():
             f.write(f"### {section.capitalize()}\n")
@@ -241,6 +281,10 @@ def main() -> None:
 
     print(f"Saved reports to {json_path} and {md_path}")
     print(f"Saved bucket stats to {bucket_csv} and {bucket_png}")
+    if flags:
+        print("Unrealistic KPIs detected:")
+        for k, v in flags.items():
+            print(f" - {k}: {v}")
 
 
 if __name__ == "__main__":
