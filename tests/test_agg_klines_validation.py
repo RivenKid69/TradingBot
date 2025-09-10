@@ -37,3 +37,21 @@ def test_valid_no_gap():
     df = _mk([0, 60_000, 120_000])
     out = _agg(df, "1m")
     assert len(out) == 3
+
+
+def test_partial_start_raises():
+    df = _mk([60_000, 120_000, 180_000, 240_000, 300_000])
+    with pytest.raises(ValueError):
+        _agg(df, "3m")
+
+
+def test_partial_end_raises():
+    df = _mk([0, 60_000, 120_000, 180_000, 240_000])
+    with pytest.raises(ValueError):
+        _agg(df, "3m")
+
+
+def test_drop_partial():
+    df = _mk([60_000, 120_000, 180_000, 240_000, 300_000, 360_000, 420_000])
+    out = _agg(df, "3m", drop_partial=True)
+    assert out["ts_ms"].tolist() == [180_000]
