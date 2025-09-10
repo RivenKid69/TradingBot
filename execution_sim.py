@@ -377,7 +377,9 @@ class ExecutionSimulator:
 
         # слиппедж
         self.slippage_cfg = (
-            SlippageConfig.from_dict(slippage_config or {}) if SlippageConfig is not None else None
+            SlippageConfig.from_dict(slippage_config)
+            if (SlippageConfig is not None and slippage_config is not None)
+            else None
         )
 
         # исполнители
@@ -469,6 +471,11 @@ class ExecutionSimulator:
             if spread_arr is not None and len(spread_arr) == 168:
                 self._spread_seasonality = spread_arr
 
+        # накопители статистики по сезонности ликвидности
+        self._liq_mult_sum: List[float] = [0.0] * 168
+        self._liq_val_sum: List[float] = [0.0] * 168
+        self._liq_count: List[int] = [0] * 168
+
     def set_execution_profile(self, profile: str, params: dict | None = None) -> None:
         """Установить профиль исполнения и параметры."""
         self.execution_profile = str(profile).upper()
@@ -512,9 +519,11 @@ class ExecutionSimulator:
 
         liq_mult = 1.0
         spread_mult = 1.0
-        if self.use_seasonality and ts_ms is not None:
+        how: Optional[int] = None
+        if ts_ms is not None:
             tm = time.gmtime(ts_ms / 1000.0)
             how = tm.tm_wday * 24 + tm.tm_hour
+        if self.use_seasonality and how is not None:
             if 0 <= how < len(self._liq_seasonality):
                 liq_mult = float(self._liq_seasonality[how])
             if 0 <= how < len(self._spread_seasonality):
@@ -532,6 +541,11 @@ class ExecutionSimulator:
         self._last_vol_factor = float(vol_factor) if vol_factor is not None else None
         liq_val = float(liquidity) if liquidity is not None else None
         self._last_liquidity = liq_val * liq_mult if liq_val is not None else None
+        if how is not None and 0 <= how < 168:
+            self._liq_mult_sum[how] += liq_mult
+            if self._last_liquidity is not None:
+                self._liq_val_sum[how] += self._last_liquidity
+            self._liq_count[how] += 1
         if self._last_ref_price is None:
             if mid_from_quotes is not None:
                 mid = mid_from_quotes(bid=self._last_bid, ask=self._last_ask)
@@ -550,6 +564,34 @@ class ExecutionSimulator:
             qty_tick = trade_qty if trade_qty is not None else liquidity
             if price_tick is not None and qty_tick is not None:
                 self._vwap_on_tick(int(ts_ms), float(price_tick), float(qty_tick))
+
+    def get_hourly_liquidity_stats(self) -> dict:
+        """Return averaged liquidity multiplier/value per hour of week."""
+        avg_mult = [
+            self._liq_mult_sum[i] / self._liq_count[i] if self._liq_count[i] else 0.0
+            for i in range(168)
+        ]
+        avg_liq = [
+            self._liq_val_sum[i] / self._liq_count[i] if self._liq_count[i] else 0.0
+            for i in range(168)
+        ]
+        return {"multiplier": avg_mult, "liquidity": avg_liq, "count": list(self._liq_count)}
+
+    def reset_hourly_liquidity_stats(self) -> None:
+        """Reset accumulated liquidity seasonality statistics."""
+        self._liq_mult_sum = [0.0] * 168
+        self._liq_val_sum = [0.0] * 168
+        self._liq_count = [0] * 168
+
+    def get_hourly_seasonality_stats(self) -> dict:
+        """Return combined hourly liquidity and latency statistics."""
+        result = {"liquidity": self.get_hourly_liquidity_stats(), "latency": None}
+        if self.latency is not None and hasattr(self.latency, "hourly_stats"):
+            try:
+                result["latency"] = self.latency.hourly_stats()  # type: ignore[attr-defined]
+            except Exception:
+                result["latency"] = None
+        return result
     def _build_executor(self) -> None:
         """
         Построить исполнителя согласно self._execution_cfg.
