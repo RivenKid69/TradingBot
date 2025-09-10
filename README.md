@@ -16,7 +16,7 @@
 python script_backtest.py --config configs/config_sim.yaml
 python train_model_multi_patch.py --config configs/config_train.yaml \
   --regime-config configs/market_regimes.json \
-  --liquidity-seasonality configs/liquidity_seasonality.json
+  --liquidity-seasonality configs/liquidity_latency_seasonality.json
 python script_compare_runs.py run1 run2 run3            # сохранит compare_runs.csv
 python script_compare_runs.py run1 metrics.json --stdout  # вывод в stdout
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
@@ -36,8 +36,10 @@ python train_model_multi_patch.py --config configs/config_train.yaml --slippage.
 
 Дополнительно доступны опции `--regime-config` и `--liquidity-seasonality`,
 позволяющие указать пути к откалиброванным JSON‑файлам с параметрами
-рыночных режимов и сезонностью ликвидности соответственно. По умолчанию
-используются файлы из каталога `configs/`.
+рыночных режимов и сезонностью ликвидности и задержек соответственно. По
+умолчанию используются файлы из каталога `configs/`, где
+`liquidity_latency_seasonality.json` содержит массивы `liquidity` и
+`latency` для 168 часов недели.
 
 Те же значения можно задать в YAML‑конфиге:
 

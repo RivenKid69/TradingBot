@@ -42,13 +42,16 @@ class LatencyImpl:
             seed=int(cfg.seed),
         ) if LatencyModel is not None else None
         self.latency: List[float] = [1.0] * 168
-        self._has_seasonality = bool(cfg.seasonality_path)
-        if cfg.seasonality_path:
+        path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
+        self._has_seasonality = bool(path)
+        if path:
             try:
-                with open(cfg.seasonality_path, "r") as f:
-                    arr = json.load(f)
-                if isinstance(arr, list) and len(arr) == 168:
-                    self.latency = [float(x) for x in arr]
+                with open(path, "r") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    data = data.get("latency")
+                if isinstance(data, list) and len(data) == 168:
+                    self.latency = [float(x) for x in data]
                 else:  # pragma: no cover - defensive
                     self._has_seasonality = False
             except Exception:  # pragma: no cover - graceful fallback

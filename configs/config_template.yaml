@@ -10,7 +10,7 @@ execution_params:
   ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
   tif: GTC               # e.g. IOC or FOK
 
-# Optional path to 168 hourly liquidity multipliers
+# Optional path to 168 hourly liquidity and latency multipliers
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
 
 market: spot  # or futures
@@ -51,6 +51,7 @@ latency:
   timeout_ms: 2500
   retries: 1
   seed: 0
+  seasonality_path: "configs/liquidity_latency_seasonality.json"  # optional hourly latency multipliers
 
 risk:
   enabled: true
