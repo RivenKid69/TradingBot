@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from typing import Dict, Sequence
 
 import requests
@@ -61,9 +62,16 @@ def run(
             "minNotional": min_notional,
         }
 
+    meta = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "source_dataset": f"binance_exchangeInfo_{market}",
+        "version": 1,
+    }
+    payload = {"metadata": meta, "specs": by_symbol}
+
     _ensure_dir(out)
     with open(out, "w", encoding="utf-8") as f:
-        json.dump(by_symbol, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"Saved {len(by_symbol)} symbols to {out}")
     return by_symbol
 

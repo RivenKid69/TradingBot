@@ -5,7 +5,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Tuple
 
 Number = float
 
@@ -162,20 +162,26 @@ class Quantizer:
     @classmethod
     def from_json_file(cls, path: str, strict: bool = True) -> "Quantizer":
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw = json.load(f) or {}
+        data = raw.get("filters", raw)
         return cls(data, strict=strict)
 
     @staticmethod
-    def load_filters(path: str) -> Dict[str, Dict[str, Any]]:
-        """Загружает словарь фильтров из JSON. Возвращает {} если файл отсутствует."""
-        if not path:
-            return {}
-        if not os.path.exists(path):
-            return {}
+    def load_filters(path: str) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+        """Загружает словарь фильтров и метаданные из JSON.
+
+        Возвращает пару ``(filters, metadata)`` или ``({}, {})`` если файл отсутствует.
+        Совместимо с прежним форматом без метаданных.
+        """
+        if not path or not os.path.exists(path):
+            return {}, {}
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f) or {}
+        if "filters" in raw:
+            return raw.get("filters", {}), raw.get("metadata", {})
+        return raw, {}
 
 
 # для обратной совместимости
-def load_filters(path: str) -> Dict[str, Dict[str, Any]]:
+def load_filters(path: str) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     return Quantizer.load_filters(path)

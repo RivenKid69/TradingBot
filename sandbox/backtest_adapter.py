@@ -1,6 +1,7 @@
 # sandbox/backtest_adapter.py
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence
@@ -104,7 +105,9 @@ class BacktestAdapter:
         self._last_ref_by_symbol: Dict[str, float] = {}
 
         # спецификации биржи
-        self._specs = load_specs(exchange_specs_path or "")
+        self._specs, self._specs_meta = load_specs(exchange_specs_path or "")
+        if self._specs_meta:
+            logging.getLogger(__name__).info("Loaded exchange specs metadata: %s", self._specs_meta)
 
         # состояние гвардов
         self._hist_bars: Dict[str, int] = {}

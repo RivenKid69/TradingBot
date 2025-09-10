@@ -167,7 +167,7 @@ class Mediator:
         self.enforce_ppbs = bool(qcfg.get("enforce_percent_price_by_side", True))
         if Quantizer is not None and filters_path:
             try:
-                filters = load_filters(filters_path)
+                filters, _meta = load_filters(filters_path)
                 if filters:
                     self.quantizer = Quantizer(filters, strict=strict)
             except Exception:

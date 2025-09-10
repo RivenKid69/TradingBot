@@ -27,7 +27,7 @@ class QuantizerImpl:
         self.cfg = cfg
         self._quantizer = None
         if Quantizer is not None and cfg.path:
-            filters = Quantizer.load_filters(cfg.path)
+            filters, _meta = Quantizer.load_filters(cfg.path)
             if filters:
                 self._quantizer = Quantizer(filters, strict=bool(cfg.strict))
 

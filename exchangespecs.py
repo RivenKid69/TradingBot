@@ -5,7 +5,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, Tuple
 
 
 @dataclass
@@ -33,18 +33,20 @@ class ExchangeSpecs:
         return self._rules.get(str(symbol).upper())
 
 
-def load_specs(path: str) -> ExchangeSpecs:
+def load_specs(path: str) -> Tuple[ExchangeSpecs, Dict[str, Any]]:
     if not path or not os.path.exists(path):
-        return ExchangeSpecs({})
+        return ExchangeSpecs({}), {}
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f) or {}
+    meta = raw.get("metadata", {})
+    body = raw.get("specs", raw)
     rules: Dict[str, ExchangeRule] = {}
-    for k, v in raw.items():
+    for k, v in (body or {}).items():
         try:
             rules[str(k).upper()] = ExchangeRule.from_dict(str(k), v or {})
         except Exception:
             continue
-    return ExchangeSpecs(rules)
+    return ExchangeSpecs(rules), meta
 
 
 def _round_to_step(x: float, step: float, *, mode: str = "nearest") -> float:
