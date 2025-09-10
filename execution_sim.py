@@ -26,9 +26,14 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any, Dict, Sequence
 import math
 import time
-import json
 import os
 import logging
+try:
+    from utils_time import HOUR_MS, HOURS_IN_WEEK, hour_of_week, load_hourly_seasonality
+except Exception:  # pragma: no cover - fallback when running as standalone file
+    import pathlib, sys
+    sys.path.append(str(pathlib.Path(__file__).resolve().parent))
+    from utils_time import HOUR_MS, HOURS_IN_WEEK, hour_of_week, load_hourly_seasonality
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +71,6 @@ except Exception:
         MARKET = 1
         LIMIT = 2
 
-
-# --- Constants ---
-HOUR_MS = 3_600_000
-HOURS_IN_WEEK = 168
-EPOCH_HOW_OFFSET = 72
 
 # --- Импорт квантизатора, комиссий/funding и слиппеджа ---
 try:
@@ -167,8 +167,7 @@ if MarketOpenH1Executor is None:
             q = float(abs(target_qty))
             if q <= 0.0:
                 return []
-            hour_ms = 3_600_000
-            next_open = ((now_ts_ms // hour_ms) + 1) * hour_ms
+            next_open = ((now_ts_ms // HOUR_MS) + 1) * HOUR_MS
             offset = int(max(0, next_open - now_ts_ms))
             return [MarketChild(ts_offset_ms=offset, qty=q, liquidity_hint=None)]
 
@@ -445,52 +444,45 @@ class ExecutionSimulator:
         self.use_seasonality = bool(
             getattr(run_config, "use_seasonality", use_seasonality)
         )
-        default_seasonality = np.ones(168, dtype=float)
+        default_seasonality = np.ones(HOURS_IN_WEEK, dtype=float)
         self._liq_seasonality = default_seasonality.copy()
         self._spread_seasonality = default_seasonality.copy()
         if self.use_seasonality:
-            liq_arr: Optional[Sequence[float]] = None
-            spread_arr: Optional[Sequence[float]] = None
-            if liquidity_seasonality is not None:
-                liq_arr = liquidity_seasonality
-            if spread_seasonality is not None:
-                spread_arr = spread_seasonality
+            liq_arr: Optional[Sequence[float]] = liquidity_seasonality
+            spread_arr: Optional[Sequence[float]] = spread_seasonality
             path = liquidity_seasonality_path
             if path is None and run_config is not None:
                 path = getattr(run_config, "liquidity_seasonality_path", None)
             if path is None:
-                path = "configs/liquidity_latency_seasonality.json"
-            if path and os.path.exists(path) and (liq_arr is None or spread_arr is None):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    if isinstance(data, dict):
-                        if liq_arr is None:
-                            arr = data.get("liquidity")
-                            if isinstance(arr, list):
-                                liq_arr = [float(x) for x in arr]
-                        if spread_arr is None:
-                            arr = data.get("spread")
-                            if isinstance(arr, list):
-                                spread_arr = [float(x) for x in arr]
-                except Exception:
+                path = "configs/liquidity_seasonality.json"
+            if path and (liq_arr is None or spread_arr is None):
+                if os.path.exists(path):
+                    file_liq = load_hourly_seasonality(path, "liquidity", "multipliers")
+                    file_spread = load_hourly_seasonality(path, "spread", "latency")
+                    if liq_arr is None:
+                        liq_arr = file_liq
+                    if spread_arr is None:
+                        spread_arr = file_spread
+                    if (liq_arr is None and file_liq is None) or (
+                        spread_arr is None and file_spread is None
+                    ):
+                        logger.warning(
+                            "Failed to load seasonality multipliers from %s; using defaults.",
+                            path,
+                        )
+                else:
                     logger.warning(
-                        "Failed to load seasonality multipliers from %s; using defaults.",
+                        "Seasonality config %s not found; using default multipliers.",
                         path,
                     )
-            elif path and not os.path.exists(path):
-                logger.warning(
-                    "Seasonality config %s not found; using default multipliers.",
-                    path,
-                )
-            if liq_arr is not None and len(liq_arr) == 168:
+            if liq_arr is not None and len(liq_arr) == HOURS_IN_WEEK:
                 self._liq_seasonality = np.asarray(liq_arr, dtype=float)
             else:
                 logger.warning(
                     "Using default liquidity seasonality multipliers of 1.0; "
                     "run scripts/build_hourly_seasonality.py to generate them.",
                 )
-            if spread_arr is not None and len(spread_arr) == 168:
+            if spread_arr is not None and len(spread_arr) == HOURS_IN_WEEK:
                 self._spread_seasonality = np.asarray(spread_arr, dtype=float)
             else:
                 logger.warning(
@@ -499,9 +491,9 @@ class ExecutionSimulator:
                 )
 
         # накопители статистики по сезонности ликвидности
-        self._liq_mult_sum: List[float] = [0.0] * 168
-        self._liq_val_sum: List[float] = [0.0] * 168
-        self._liq_count: List[int] = [0] * 168
+        self._liq_mult_sum: List[float] = [0.0] * HOURS_IN_WEEK
+        self._liq_val_sum: List[float] = [0.0] * HOURS_IN_WEEK
+        self._liq_count: List[int] = [0] * HOURS_IN_WEEK
 
     def set_execution_profile(self, profile: str, params: dict | None = None) -> None:
         """Установить профиль исполнения и параметры."""
@@ -548,7 +540,7 @@ class ExecutionSimulator:
         spread_mult = 1.0
         how: Optional[int] = None
         if ts_ms is not None:
-            how = ((int(ts_ms) // HOUR_MS) + EPOCH_HOW_OFFSET) % HOURS_IN_WEEK
+            how = hour_of_week(int(ts_ms))
         if self.use_seasonality and how is not None:
             liq_mult = float(self._liq_seasonality[how])
             spread_mult = float(self._spread_seasonality[how])
@@ -565,7 +557,7 @@ class ExecutionSimulator:
         self._last_vol_factor = float(vol_factor) if vol_factor is not None else None
         liq_val = float(liquidity) if liquidity is not None else None
         self._last_liquidity = liq_val * liq_mult if liq_val is not None else None
-        if how is not None and 0 <= how < 168:
+        if how is not None and 0 <= how < HOURS_IN_WEEK:
             self._liq_mult_sum[how] += liq_mult
             if self._last_liquidity is not None:
                 self._liq_val_sum[how] += self._last_liquidity
@@ -576,8 +568,7 @@ class ExecutionSimulator:
                 if mid is not None:
                     self._last_ref_price = float(mid)
         if ts_ms is not None:
-            hour_ms = 3_600_000
-            hour = int(ts_ms // hour_ms)
+            hour = int(ts_ms // HOUR_MS)
             if self._snapshot_hour is None:
                 self._snapshot_hour = hour
             elif hour != self._snapshot_hour:
@@ -593,19 +584,19 @@ class ExecutionSimulator:
         """Return averaged liquidity multiplier/value per hour of week."""
         avg_mult = [
             self._liq_mult_sum[i] / self._liq_count[i] if self._liq_count[i] else 0.0
-            for i in range(168)
+            for i in range(HOURS_IN_WEEK)
         ]
         avg_liq = [
             self._liq_val_sum[i] / self._liq_count[i] if self._liq_count[i] else 0.0
-            for i in range(168)
+            for i in range(HOURS_IN_WEEK)
         ]
         return {"multiplier": avg_mult, "liquidity": avg_liq, "count": list(self._liq_count)}
 
     def reset_hourly_liquidity_stats(self) -> None:
         """Reset accumulated liquidity seasonality statistics."""
-        self._liq_mult_sum = [0.0] * 168
-        self._liq_val_sum = [0.0] * 168
-        self._liq_count = [0] * 168
+        self._liq_mult_sum = [0.0] * HOURS_IN_WEEK
+        self._liq_val_sum = [0.0] * HOURS_IN_WEEK
+        self._liq_count = [0] * HOURS_IN_WEEK
 
     def get_hourly_seasonality_stats(self) -> dict:
         """Return combined hourly liquidity and latency statistics."""
@@ -649,8 +640,7 @@ class ExecutionSimulator:
             self._executor = TakerExecutor()
 
     def _vwap_on_tick(self, ts_ms: int, price: Optional[float], volume: Optional[float]) -> None:
-        hour_ms = 3_600_000
-        hour = int(ts_ms // hour_ms)
+        hour = int(ts_ms // HOUR_MS)
         if self._vwap_hour is None:
             self._vwap_hour = hour
         elif hour != self._vwap_hour:
