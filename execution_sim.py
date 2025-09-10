@@ -27,6 +27,10 @@ from typing import List, Optional, Tuple, Any, Dict, Sequence
 import math
 import time
 import json
+import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
@@ -437,8 +441,8 @@ class ExecutionSimulator:
             getattr(run_config, "use_seasonality", use_seasonality)
         )
         default_seasonality = [1.0] * 168
-        self._liq_seasonality: List[float] = default_seasonality
-        self._spread_seasonality: List[float] = default_seasonality
+        self._liq_seasonality: List[float] = default_seasonality.copy()
+        self._spread_seasonality: List[float] = default_seasonality.copy()
         if self.use_seasonality:
             liq_arr: Optional[List[float]] = None
             spread_arr: Optional[List[float]] = None
@@ -451,7 +455,7 @@ class ExecutionSimulator:
                 path = getattr(run_config, "liquidity_seasonality_path", None)
             if path is None:
                 path = "configs/liquidity_latency_seasonality.json"
-            if path and (liq_arr is None or spread_arr is None):
+            if path and os.path.exists(path) and (liq_arr is None or spread_arr is None):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         data = json.load(f)
@@ -465,11 +469,29 @@ class ExecutionSimulator:
                             if isinstance(arr, list):
                                 spread_arr = [float(x) for x in arr]
                 except Exception:
-                    pass
+                    logger.warning(
+                        "Failed to load seasonality multipliers from %s; using defaults.",
+                        path,
+                    )
+            elif path and not os.path.exists(path):
+                logger.warning(
+                    "Seasonality config %s not found; using default multipliers.",
+                    path,
+                )
             if liq_arr is not None and len(liq_arr) == 168:
                 self._liq_seasonality = liq_arr
+            else:
+                logger.warning(
+                    "Using default liquidity seasonality multipliers of 1.0; "
+                    "run scripts/build_hourly_seasonality.py to generate them.",
+                )
             if spread_arr is not None and len(spread_arr) == 168:
                 self._spread_seasonality = spread_arr
+            else:
+                logger.warning(
+                    "Using default spread seasonality multipliers of 1.0; "
+                    "run scripts/build_hourly_seasonality.py to generate them.",
+                )
 
         # накопители статистики по сезонности ликвидности
         self._liq_mult_sum: List[float] = [0.0] * 168

@@ -9,6 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Any, List, Sequence
 import json
+import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     from latency import LatencyModel
@@ -98,18 +102,34 @@ class LatencyImpl:
         self.latency: List[float] = [1.0] * 168
         path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
         self._has_seasonality = bool(cfg.use_seasonality)
-        if self._has_seasonality and path:
-            try:
-                with open(path, "r") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    data = data.get("latency")
-                if isinstance(data, list) and len(data) == 168:
-                    self.latency = [float(x) for x in data]
-                else:  # pragma: no cover - defensive
+        if self._has_seasonality:
+            if path and os.path.exists(path):
+                try:
+                    with open(path, "r") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        data = data.get("latency")
+                    if isinstance(data, list) and len(data) == 168:
+                        self.latency = [float(x) for x in data]
+                    else:  # pragma: no cover - defensive
+                        self._has_seasonality = False
+                except Exception:  # pragma: no cover - graceful fallback
+                    logger.warning(
+                        "Failed to load latency seasonality from %s; using defaults.",
+                        path,
+                    )
                     self._has_seasonality = False
-            except Exception:  # pragma: no cover - graceful fallback
+            else:
+                logger.warning(
+                    "Latency seasonality config %s not found; using default multipliers.",
+                    path,
+                )
                 self._has_seasonality = False
+            if not self._has_seasonality:
+                logger.warning(
+                    "Using default latency seasonality multipliers of 1.0; "
+                    "run scripts/build_hourly_seasonality.py to generate them.",
+                )
         self.attached_sim = None
         self._wrapper: _LatencyWithSeasonality | None = None
 

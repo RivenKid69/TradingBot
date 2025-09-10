@@ -9,6 +9,7 @@ Fully modern pipeline (Dict action‑space). Legacy box/array paths removed.
 """
 import os
 import json
+import logging
 from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
@@ -28,6 +29,8 @@ from no_trade import (
     _in_funding_buffer,
     _in_custom_window,
 )
+
+logger = logging.getLogger(__name__)
 from no_trade_config import get_no_trade_config
 
 try:  # existing dynamic-spread config (pydantic model)
@@ -233,16 +236,26 @@ class TradingEnv(gym.Env):
             "liquidity_seasonality_path", "configs/liquidity_seasonality.json"
         )
         self._liq_seasonality = np.ones(168, dtype=float)
-        try:
-            with open(liq_path, "r") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    data = data.get("liquidity") or data.get("multipliers") or data
-                arr = np.asarray(data, dtype=float)
-                if arr.shape[0] == 168:
-                    self._liq_seasonality = arr
-        except Exception:
-            pass
+        if os.path.exists(liq_path):
+            try:
+                with open(liq_path, "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        data = data.get("liquidity") or data.get("multipliers") or data
+                    arr = np.asarray(data, dtype=float)
+                    if arr.shape[0] == 168:
+                        self._liq_seasonality = arr
+            except Exception:
+                logger.warning(
+                    "Failed to load liquidity seasonality from %s; using defaults.",
+                    liq_path,
+                )
+        else:
+            logger.warning(
+                "Liquidity seasonality config %s not found; using default multipliers of 1.0; "
+                "run scripts/build_hourly_seasonality.py to generate them.",
+                liq_path,
+            )
 
         # --- precompute ATR-based volatility and rolling liquidity ---
         close_col = "close" if "close" in self.df.columns else "price"
