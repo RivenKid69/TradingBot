@@ -7,14 +7,13 @@ impl_latency.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Sequence
 import json
 
 try:
-    from latency import LatencyModel, SeasonalLatencyModel
+    from latency import LatencyModel
 except Exception:  # pragma: no cover
     LatencyModel = None  # type: ignore
-    SeasonalLatencyModel = None  # type: ignore
 
 
 @dataclass
@@ -29,6 +28,52 @@ class LatencyCfg:
     seasonality_path: str | None = None
     use_seasonality: bool = True
 
+
+class _LatencyWithSeasonality:
+    """Wraps LatencyModel applying hourly multipliers and collecting stats."""
+
+    def __init__(self, model: LatencyModel, multipliers: Sequence[float]):  # type: ignore[name-defined]
+        self._model = model
+        self._mult: List[float] = list(multipliers) if len(multipliers) == 168 else [1.0] * 168
+        self._mult_sum: List[float] = [0.0] * 168
+        self._lat_sum: List[float] = [0.0] * 168
+        self._count: List[int] = [0] * 168
+
+    def sample(self, ts_ms: int | None = None):
+        if ts_ms is None:
+            return self._model.sample()
+        hour = ((int(ts_ms) // 3_600_000) + 72) % len(self._mult)
+        m = float(self._mult[hour])
+        base, jitter, timeout = (
+            self._model.base_ms,
+            self._model.jitter_ms,
+            self._model.timeout_ms,
+        )
+        try:
+            self._model.base_ms = int(round(base * m))
+            self._model.jitter_ms = int(round(jitter * m))
+            self._model.timeout_ms = int(round(timeout * m))
+            res = self._model.sample()
+        finally:
+            self._model.base_ms, self._model.jitter_ms, self._model.timeout_ms = base, jitter, timeout
+        self._mult_sum[hour] += m
+        self._lat_sum[hour] += float(res.get("total_ms", 0))
+        self._count[hour] += 1
+        return res
+
+    def stats(self):  # pragma: no cover - simple delegation
+        return self._model.stats()
+
+    def reset_stats(self) -> None:  # pragma: no cover - simple delegation
+        self._model.reset_stats()
+        self._mult_sum = [0.0] * 168
+        self._lat_sum = [0.0] * 168
+        self._count = [0] * 168
+
+    def hourly_stats(self) -> Dict[str, List[float]]:
+        avg_mult = [self._mult_sum[i] / self._count[i] if self._count[i] else 0.0 for i in range(168)]
+        avg_lat = [self._lat_sum[i] / self._count[i] if self._count[i] else 0.0 for i in range(168)]
+        return {"multiplier": avg_mult, "latency_ms": avg_lat, "count": list(self._count)}
 
 class LatencyImpl:
     def __init__(self, cfg: LatencyCfg) -> None:
@@ -58,6 +103,7 @@ class LatencyImpl:
             except Exception:  # pragma: no cover - graceful fallback
                 self._has_seasonality = False
         self.attached_sim = None
+        self._wrapper: _LatencyWithSeasonality | None = None
 
     @property
     def model(self):
@@ -65,20 +111,28 @@ class LatencyImpl:
 
     def attach_to(self, sim) -> None:
         if self._model is not None:
-            model = self._model
-            if self._has_seasonality and SeasonalLatencyModel is not None:
-                model = SeasonalLatencyModel(model, self.latency)
-            setattr(sim, "latency", model)
+            mult = self.latency if self._has_seasonality else [1.0] * 168
+            self._wrapper = _LatencyWithSeasonality(self._model, mult)
+            setattr(sim, "latency", self._wrapper)
         self.attached_sim = sim
 
     def get_stats(self):
+        if self._wrapper is not None:
+            return self._wrapper.stats()
         if self._model is None:
             return None
         return self._model.stats()
 
     def reset_stats(self) -> None:
-        if self._model is not None:
+        if self._wrapper is not None:
+            self._wrapper.reset_stats()
+        elif self._model is not None:
             self._model.reset_stats()
+
+    def get_hourly_stats(self):
+        if self._wrapper is None:
+            return None
+        return self._wrapper.hourly_stats()
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "LatencyImpl":
