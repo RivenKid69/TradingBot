@@ -56,6 +56,7 @@ class DummyEnv:
         self.lob = lob
         self.symbol = symbol
         self.last_mid = 100.0
+        self.last_mtm_price = 100.0
         self.run_config = types.SimpleNamespace()
 
 filters = {

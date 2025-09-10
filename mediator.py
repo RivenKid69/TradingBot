@@ -283,7 +283,7 @@ class Mediator:
         price_ticks_q = int(price_ticks)
         volume_q = float(volume)
         symbol = str(getattr(self.env, "symbol", getattr(self.env, "base_symbol", ""))).upper()
-        ref_price = getattr(self.env, "last_mid", None)
+        ref_price = getattr(self.env, "last_mtm_price", getattr(self.env, "last_mid", None))
         if self.quantizer is not None:
             try:
                 price_abs = float(price_ticks_q) / PRICE_SCALE
@@ -392,7 +392,9 @@ class Mediator:
                     pass
 
         # post-trade проверки
-        mid_for_risk = trades[-1][0] if trades else float(getattr(self.env, "last_mid", 0.0))
+        mid_for_risk = trades[-1][0] if trades else float(
+            getattr(self.env, "last_mtm_price", getattr(self.env, "last_mid", 0.0))
+        )
         try:
             self.risk.on_post_trade(self.env.state, float(mid_for_risk))  # type: ignore[attr-defined]
         except Exception:
@@ -426,7 +428,11 @@ class Mediator:
         ctx = OrderContext(
             ts_ms=int(timestamp),
             symbol=str(getattr(self.env, "symbol", "UNKNOWN")),
-            ref_price=float(getattr(self.env, "last_mid", 0.0)) if hasattr(self.env, "last_mid") else None,
+            ref_price=float(
+                getattr(self.env, "last_mtm_price", getattr(self.env, "last_mid", 0.0))
+            )
+            if hasattr(self.env, "last_mtm_price") or hasattr(self.env, "last_mid")
+            else None,
             max_position_abs_base=float(getattr(getattr(self.env, "state", None), "max_position", 0.0) or getattr(self.env, "max_abs_position", 0.0) or 0.0),
             tick_size=None,  # квантование делается ниже по контуру
             price_offset_ticks=int(getattr(proto, "price_offset_ticks", 0)),
@@ -468,30 +474,64 @@ class Mediator:
             try:
                 bid = getattr(self.env, "last_bid", None)
                 ask = getattr(self.env, "last_ask", None)
+                try:
+                    self.exec.set_market_snapshot(bid=bid, ask=ask)  # type: ignore[union-attr]
+                except Exception:
+                    pass
+                mid = None
                 if bid is not None and ask is not None:
-                    try:
-                        self.exec.set_market_snapshot(bid=bid, ask=ask)  # type: ignore[union-attr]
-                    except Exception:
-                        pass
-                    mid = getattr(self.env, "last_mid", None)
-                    if mid is None:
-                        mid = (float(bid) + float(ask)) / 2.0
-                    try:
+                    mid = (float(bid) + float(ask)) / 2.0
+                else:
+                    mid = getattr(
+                        self.env, "last_mtm_price", getattr(self.env, "last_mid", None)
+                    )
+                try:
+                    if mid is not None:
                         self.exec.set_ref_price(float(mid))  # type: ignore[union-attr]
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
                 cli_id = self.exec.submit(proto)  # type: ignore[union-attr]
                 # в простом варианте считаем, что latency=0 и сразу «поп» (если latency>0 — поп произойдёт на тик)
                 report: ExecReport = self.exec.pop_ready()  # type: ignore  # ExecReport — это alias на SimStepReport
                 try:
-                    setattr(self.env, "last_bid", float(getattr(report, "bid", getattr(self.env, "last_bid", 0.0))))
-                    setattr(self.env, "last_ask", float(getattr(report, "ask", getattr(self.env, "last_ask", 0.0))))
-                    setattr(self.env, "last_mid", float(getattr(report, "mtm_price", getattr(self.env, "last_mid", 0.0))))
+                    setattr(
+                        self.env,
+                        "last_bid",
+                        float(getattr(report, "bid", getattr(self.env, "last_bid", 0.0))),
+                    )
+                    setattr(
+                        self.env,
+                        "last_ask",
+                        float(getattr(report, "ask", getattr(self.env, "last_ask", 0.0))),
+                    )
+                    mtm = float(
+                        getattr(
+                            report,
+                            "mtm_price",
+                            getattr(
+                                self.env,
+                                "last_mtm_price",
+                                getattr(self.env, "last_mid", 0.0),
+                            ),
+                        )
+                    )
+                    setattr(self.env, "last_mtm_price", mtm)
+                    setattr(self.env, "last_mid", mtm)
                 except Exception:
                     pass
                 # применить и пост-проверки
                 self._apply_trades_to_state(report.trades)
-                mid_for_risk = float(getattr(report, "mtm_price", getattr(self.env, "last_mid", 0.0)))
+                mid_for_risk = float(
+                    getattr(
+                        report,
+                        "mtm_price",
+                        getattr(
+                            self.env,
+                            "last_mtm_price",
+                            getattr(self.env, "last_mid", 0.0),
+                        ),
+                    )
+                )
                 self.risk.on_post_trade(self.env.state, mid_for_risk)  # type: ignore[attr-defined]
                 d = report.to_dict()
                 try:
@@ -564,7 +604,9 @@ class Mediator:
                 new_order_pos.append(int(qpos))
 
         # пост-проверки и отчёт
-        mid_for_risk = trades[-1][0] if trades else float(getattr(self.env, "last_mid", 0.0))
+        mid_for_risk = trades[-1][0] if trades else float(
+            getattr(self.env, "last_mtm_price", getattr(self.env, "last_mid", 0.0))
+        )
         try:
             self.risk.on_post_trade(self.env.state, float(mid_for_risk))  # type: ignore[attr-defined]
         except Exception:

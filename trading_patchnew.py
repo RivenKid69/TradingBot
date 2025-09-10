@@ -328,6 +328,7 @@ class TradingEnv(gym.Env):
         self.last_bid: float | None = None
         self.last_ask: float | None = None
         self.last_mid: float | None = None
+        self.last_mtm_price: float | None = None
 
         # optional strict data validation
         if validate_data or os.getenv("DATA_VALIDATE") == "1":
@@ -547,6 +548,7 @@ class TradingEnv(gym.Env):
         self.last_bid = bid
         self.last_ask = ask
         self.last_mid = mid
+        self.last_mtm_price = mid
         blocked = bool(self._no_trade_mask[row_idx]) if row_idx < len(self._no_trade_mask) else False
         if blocked:
             self.no_trade_blocks += 1
