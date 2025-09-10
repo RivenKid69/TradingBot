@@ -8,6 +8,8 @@ api:
 data:
   symbols: ["BTCUSDT"]
   timeframe: "1m"
+# Optional path to 168 hourly liquidity multipliers
+liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
 components:
   market_data:
     target: impl_binance_public:BinancePublicBarSource

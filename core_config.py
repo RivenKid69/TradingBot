@@ -41,6 +41,7 @@ class CommonRunConfig(BaseModel):
     logs_dir: str = Field(default="logs")
     artifacts_dir: str = Field(default="artifacts")
     timezone: Optional[str] = None
+    liquidity_seasonality_path: Optional[str] = Field(default=None)
     components: Components
 
 

@@ -23,9 +23,10 @@ ExecutionSimulator v2
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Any, Dict
+from typing import List, Optional, Tuple, Any, Dict, Sequence
 import math
 import time
+import json
 
 try:
     import numpy as np
@@ -326,6 +327,8 @@ class ExecutionSimulator:
                  pnl_config: Optional[dict] = None,
                  risk_config: Optional[dict] = None,
                  logging_config: Optional[dict] = None,
+                 liquidity_seasonality: Optional[Sequence[float]] = None,
+                 liquidity_seasonality_path: Optional[str] = None,
                  run_config: Any = None):
         self.symbol = str(symbol).upper()
         self.latency_steps = int(max(0, latency_steps))
@@ -425,6 +428,30 @@ class ExecutionSimulator:
         self._vwap_hour: Optional[int] = None
         self._last_hour_vwap: Optional[float] = None
 
+        # сезонность ликвидности/спреда по часам недели
+        default_seasonality = [1.0] * 168
+        arr: Optional[List[float]] = None
+        if liquidity_seasonality is not None:
+            arr = list(liquidity_seasonality)
+        else:
+            path = liquidity_seasonality_path
+            if path is None and run_config is not None:
+                path = getattr(run_config, "liquidity_seasonality_path", None)
+            if path:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, dict):
+                            data = data.get("liquidity")
+                        if isinstance(data, list):
+                            arr = [float(x) for x in data]
+                except Exception:
+                    arr = None
+        if arr is not None and len(arr) == 168:
+            self._liq_seasonality: List[float] = arr
+        else:
+            self._liq_seasonality = default_seasonality
+
     def set_execution_profile(self, profile: str, params: dict | None = None) -> None:
         """Установить профиль исполнения и параметры."""
         self.execution_profile = str(profile).upper()
@@ -465,15 +492,26 @@ class ExecutionSimulator:
         """
         self._last_bid = float(bid) if bid is not None else None
         self._last_ask = float(ask) if ask is not None else None
+
+        mult = 1.0
+        if ts_ms is not None:
+            tm = time.gmtime(ts_ms / 1000.0)
+            how = tm.tm_wday * 24 + tm.tm_hour
+            if 0 <= how < len(self._liq_seasonality):
+                mult = float(self._liq_seasonality[how])
+
+        sbps: Optional[float]
         if spread_bps is not None:
-            self._last_spread_bps = float(spread_bps)
+            sbps = float(spread_bps)
         else:
             if compute_spread_bps_from_quotes is not None and self.slippage_cfg is not None:
-                self._last_spread_bps = compute_spread_bps_from_quotes(bid=self._last_bid, ask=self._last_ask, cfg=self.slippage_cfg)
+                sbps = compute_spread_bps_from_quotes(bid=self._last_bid, ask=self._last_ask, cfg=self.slippage_cfg)
             else:
-                self._last_spread_bps = None
+                sbps = None
+        self._last_spread_bps = sbps * mult if sbps is not None else None
         self._last_vol_factor = float(vol_factor) if vol_factor is not None else None
-        self._last_liquidity = float(liquidity) if liquidity is not None else None
+        liq_val = float(liquidity) if liquidity is not None else None
+        self._last_liquidity = liq_val * mult if liq_val is not None else None
         if self._last_ref_price is None:
             if mid_from_quotes is not None:
                 mid = mid_from_quotes(bid=self._last_bid, ask=self._last_ask)
