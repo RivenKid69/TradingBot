@@ -81,6 +81,33 @@ can be reproduced. Snapshot sizes depend on the exchange feed but
 typically require several hundred megabytes per month; plan storage
 accordingly.
 
+## Automated updates
+
+The helper script `scripts/cron_update_seasonality.sh` can be executed
+periodically (e.g. via `cron`) to rebuild the multipliers from the latest
+snapshot and commit the updated
+`configs/liquidity_latency_seasonality.json`.
+
+The script performs two comparisons against the previously committed
+version:
+
+* if the maximum absolute difference across all multipliers is below
+  `SEASONALITY_THRESHOLD` (default `0.01`), the update is discarded;
+* if the difference exceeds `SEASONALITY_MAX_DELTA` (default `0.5`), the
+  run aborts for manual inspection.
+
+Only changes that pass these checks are committed and pushed. The cron
+job requires write access to the repository and credentials capable of
+pushing to the remote. The executing user must also have read access to
+the raw snapshot under `data/seasonality_source/`.
+
+Example crontab entry (UTC):
+
+```
+5 3 * * 1 /path/to/repo/scripts/cron_update_seasonality.sh >> /var/log/seasonality.log 2>&1
+```
+
+
 ## Performance
 
 Microbenchmarks repeatedly invoking `ExecutionSimulator.set_market_snapshot`

@@ -2,3 +2,5 @@ SHELL=/bin/bash
 TZ=UTC
 # Every hour at :02, single-run guarded by flock in the wrapper
 2 * * * * /bin/bash -lc '/path/to/project/deploy/run_update.sh'
+# Weekly seasonality rebuild every Monday 03:05 UTC
+5 3 * * 1 /bin/bash -lc '/path/to/project/scripts/cron_update_seasonality.sh'
