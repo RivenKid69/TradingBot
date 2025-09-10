@@ -1,7 +1,11 @@
+import os
+import sys
 import pandas as pd
 import pytest
+from datetime import datetime, timedelta, timezone
 
-from impl_offline_data import OfflineCSVConfig, OfflineCSVBarSource
+sys.path.append(os.getcwd())
+from impl_offline_data import OfflineCSVConfig, OfflineCSVBarSource, to_ms
 
 
 def _write_csv(tmp_path, rows):
@@ -39,3 +43,27 @@ def test_missing_bar_raises(tmp_path):
     msg = str(exc.value)
     assert "Missing bars for BTC" in msg
     assert "60000" in msg
+
+
+def test_timezone_bar_passes(tmp_path):
+    tz = timezone(timedelta(hours=3))
+    dt_local = datetime(1970, 1, 1, 3, 0, tzinfo=tz)
+    assert to_ms(dt_local) == 0
+    path = _write_csv(
+        tmp_path,
+        [
+            {
+                "ts": dt_local,
+                "symbol": "BTC",
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "volume": 1,
+            }
+        ],
+    )
+    cfg = OfflineCSVConfig(paths=[path], timeframe="1m")
+    src = OfflineCSVBarSource(cfg)
+    bars = list(src.stream_bars(["BTC"], 60_000))
+    assert bars[0].ts == 0

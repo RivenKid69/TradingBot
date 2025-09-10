@@ -159,5 +159,7 @@ def to_ms(dt: Any) -> int:
     if isinstance(dt, datetime):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
         return int(dt.timestamp() * 1000)
     raise TypeError(f"Unsupported datetime type: {type(dt)}")
