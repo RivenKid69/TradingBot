@@ -1,6 +1,7 @@
 import argparse
 import json
 import datetime as dt
+import hashlib
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -22,6 +23,14 @@ def _load_dataset(path: Path) -> pd.DataFrame:
     ts = pd.to_datetime(df[ts_col], unit="ms", utc=True)
     df = df.assign(hour_of_week=ts.dt.dayofweek * 24 + ts.dt.hour)
     return df
+
+
+def write_checksum(path: Path) -> Path:
+    """Compute sha256 checksum for *path* and write `<path>.sha256`."""
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    checksum_path = path.with_suffix(path.suffix + '.sha256')
+    checksum_path.write_text(digest)
+    return checksum_path
 
 
 def _historical_multipliers(df: pd.DataFrame) -> Dict[str, np.ndarray]:
@@ -88,12 +97,23 @@ def _compare(hist: Dict[str, np.ndarray], sim: Dict[str, np.ndarray], threshold:
 
 def main(argv=None) -> bool:
     parser = argparse.ArgumentParser(description="Validate hourly seasonality multipliers")
-    parser.add_argument("--historical", required=True, help="Path to historical dataset (csv or parquet)")
-    parser.add_argument("--multipliers", default="configs/liquidity_latency_seasonality.json", help="Path to multipliers JSON")
+    parser.add_argument(
+        "--historical",
+        default="data/seasonality_source/latest.parquet",
+        help="Path to historical dataset (csv or parquet)",
+    )
+    parser.add_argument(
+        "--multipliers",
+        default="configs/liquidity_latency_seasonality.json",
+        help="Path to multipliers JSON",
+    )
     parser.add_argument("--threshold", type=float, default=0.1, help="Max allowed relative difference")
     args = parser.parse_args(argv)
 
-    df = _load_dataset(Path(args.historical))
+    hist_path = Path(args.historical)
+    df = _load_dataset(hist_path)
+    checksum_path = write_checksum(hist_path)
+    print(f"Historical data checksum written to {checksum_path}")
     hist_mult = _historical_multipliers(df)
     loaded = json.loads(Path(args.multipliers).read_text())
     mult = {k: np.asarray(v, dtype=float) for k, v in loaded.items() if isinstance(v, list)}

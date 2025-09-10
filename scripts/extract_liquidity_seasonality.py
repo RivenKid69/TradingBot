@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -28,18 +29,33 @@ def compute_multipliers(df: pd.DataFrame) -> np.ndarray:
     return mult.to_numpy(dtype=float)
 
 
+def write_checksum(path: Path) -> Path:
+    """Compute sha256 checksum for *path* and write `<path>.sha256`."""
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    checksum_path = path.with_suffix(path.suffix + '.sha256')
+    checksum_path.write_text(digest)
+    return checksum_path
+
+
 def main():
     parser = argparse.ArgumentParser(description='Extract liquidity seasonality multipliers')
-    parser.add_argument('--data', required=True, help='Path to OHLCV data (csv or parquet)')
+    parser.add_argument(
+        '--data',
+        default='data/seasonality_source/latest.parquet',
+        help='Path to OHLCV data (csv or parquet)',
+    )
     parser.add_argument('--out', default='configs/liquidity_seasonality.json', help='Output JSON path')
     args = parser.parse_args()
 
-    df = load_ohlcv(Path(args.data))
+    data_path = Path(args.data)
+    df = load_ohlcv(data_path)
     multipliers = compute_multipliers(df)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, 'w') as f:
         json.dump(multipliers.tolist(), f, indent=2)
+    checksum_path = write_checksum(data_path)
     print(f'Saved liquidity seasonality to {args.out}')
+    print(f'Input data checksum written to {checksum_path}')
 
 
 if __name__ == '__main__':
