@@ -20,7 +20,37 @@ def load_logs(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def compute_multipliers(df: pd.DataFrame) -> dict[str, np.ndarray]:
+def _fill_missing(arr: np.ndarray) -> tuple[np.ndarray, list[int]]:
+    """Replace NaNs in *arr* using neighbouring-hour averages or global mean."""
+    out = arr.copy()
+    imputed: list[int] = []
+    for i, val in enumerate(out):
+        if not np.isnan(val):
+            continue
+        imputed.append(i)
+        left = right = None
+        for j in range(1, 168):
+            lval = out[(i - j) % 168]
+            if not np.isnan(lval):
+                left = lval
+                break
+        for j in range(1, 168):
+            rval = out[(i + j) % 168]
+            if not np.isnan(rval):
+                right = rval
+                break
+        if left is not None and right is not None:
+            out[i] = (left + right) / 2.0
+        elif left is not None:
+            out[i] = left
+        elif right is not None:
+            out[i] = right
+        else:
+            out[i] = 1.0
+    return out, imputed
+
+
+def compute_multipliers(df: pd.DataFrame, min_samples: int = 30) -> tuple[dict[str, np.ndarray], dict[str, list[int]]]:
     ts_col = 'ts_ms' if 'ts_ms' in df.columns else 'ts'
     if ts_col not in df.columns:
         raise ValueError('ts or ts_ms column required')
@@ -28,6 +58,7 @@ def compute_multipliers(df: pd.DataFrame) -> dict[str, np.ndarray]:
     how = ts.dt.dayofweek * 24 + ts.dt.hour
     df = df.assign(hour_of_week=how)
     metrics: dict[str, np.ndarray] = {}
+    imputed_hours: dict[str, list[int]] = {}
     cols_map = {
         'liquidity': ['liquidity', 'order_size', 'qty', 'quantity'],
         'latency': ['latency_ms'],
@@ -39,15 +70,18 @@ def compute_multipliers(df: pd.DataFrame) -> dict[str, np.ndarray]:
         if col is None:
             arr = np.ones(168, dtype=float)
         else:
-            grouped = df.groupby('hour_of_week')[col].mean()
+            grouped = df.groupby('hour_of_week')[col].agg(['mean', 'count'])
             overall = df[col].mean()
             if overall:
-                mult = grouped / overall
+                mult = grouped['mean'] / overall
             else:
-                mult = grouped * 0.0 + 1.0
-            arr = mult.reindex(range(168), fill_value=1.0).to_numpy(dtype=float)
+                mult = grouped['mean'] * 0.0 + 1.0
+            mult[grouped['count'] < min_samples] = np.nan
+            arr, imp = _fill_missing(mult.reindex(range(168)).to_numpy(dtype=float))
+            if imp:
+                imputed_hours[key] = imp
         metrics[key] = arr
-    return metrics
+    return metrics, imputed_hours
 
 
 def write_checksum(path: Path) -> Path:
@@ -72,14 +106,23 @@ def main() -> None:
         default='configs/liquidity_latency_seasonality.json',
         help='Output JSON path',
     )
+    parser.add_argument(
+        '--min-samples',
+        type=int,
+        default=30,
+        help='Minimum samples per hour required before imputation',
+    )
     args = parser.parse_args()
 
     data_path = Path(args.data)
     df = load_logs(data_path)
-    multipliers = compute_multipliers(df)
+    multipliers, imputed = compute_multipliers(df, args.min_samples)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, 'w') as f:
         json.dump({k: v.tolist() for k, v in multipliers.items()}, f, indent=2)
+    if imputed:
+        for key, hours in imputed.items():
+            print(f'Imputed {key} multipliers for hours: {sorted(hours)}')
     checksum_path = write_checksum(data_path)
     print(f'Saved seasonality multipliers to {args.out}')
     print(f'Input data checksum written to {checksum_path}')
