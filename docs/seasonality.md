@@ -44,3 +44,19 @@ liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
 latency:
   seasonality_path: "configs/liquidity_latency_seasonality.json"
 ```
+
+## Disabling seasonality
+
+Hourly multipliers are enabled by default. To ignore them, set the
+`use_seasonality` flag to `false` either globally or within the latency
+section of your config:
+
+```yaml
+use_seasonality: false          # disable liquidity and spread multipliers
+
+latency:
+  use_seasonality: false        # disable latency multipliers
+```
+
+The same flag can be passed as a constructor argument to
+`ExecutionSimulator` or `LatencyImpl`.

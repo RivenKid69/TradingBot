@@ -55,3 +55,35 @@ def test_latency_seasonality(tmp_path):
 
     assert d_high["total_ms"] == 200
     assert d_low["total_ms"] == 50
+
+
+def test_latency_seasonality_disabled(tmp_path):
+    multipliers = [1.0] * 168
+    hour_high = 5
+    hour_low = 10
+    multipliers[hour_high] = 2.0
+    multipliers[hour_low] = 0.5
+    path = tmp_path / "latency.json"
+    path.write_text(json.dumps({"latency": multipliers}))
+
+    cfg = {
+        "base_ms": 100,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seasonality_path": str(path),
+        "use_seasonality": False,
+    }
+    impl = LatencyImpl.from_dict(cfg)
+
+    class Dummy:
+        pass
+
+    sim = Dummy()
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    d_high = lat.sample()
+    d_low = lat.sample()
+    assert d_high["total_ms"] == 100
+    assert d_low["total_ms"] == 100
