@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 
 @dataclass
@@ -108,3 +108,34 @@ class LatencyModel:
         """Reset collected latency statistics."""
         self.lat_samples.clear()
         self.timeouts = 0
+
+
+class SeasonalLatencyModel:
+    """Wrapper around :class:`LatencyModel` applying hourly seasonality multipliers."""
+
+    def __init__(self, model: LatencyModel, multipliers: Sequence[float]) -> None:
+        if len(multipliers) != 168:
+            raise ValueError("multipliers must have length 168")
+        self._model = model
+        self._mult: List[float] = [float(x) for x in multipliers]
+
+    def sample(self, ts_ms: int) -> Dict[str, int | float | bool]:
+        hour = ((int(ts_ms) // 3_600_000) + 72) % len(self._mult)
+        m = float(self._mult[hour])
+        base, jitter, timeout = (
+            self._model.base_ms,
+            self._model.jitter_ms,
+            self._model.timeout_ms,
+        )
+        try:
+            self._model.base_ms = int(round(base * m))
+            self._model.jitter_ms = int(round(jitter * m))
+            self._model.timeout_ms = int(round(timeout * m))
+            return self._model.sample()
+        finally:
+            self._model.base_ms = base
+            self._model.jitter_ms = jitter
+            self._model.timeout_ms = timeout
+
+    def __getattr__(self, name: str):  # pragma: no cover - simple delegation
+        return getattr(self._model, name)

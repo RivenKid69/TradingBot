@@ -745,7 +745,11 @@ class ExecutionSimulator:
         remaining = self.latency_steps
         if self.latency is not None:
             try:
-                d = self.latency.sample()
+                ts = int(now_ts) if now_ts is not None else 0
+                try:
+                    d = self.latency.sample(ts)
+                except TypeError:  # fallback for models without ts_ms
+                    d = self.latency.sample()  # type: ignore[call-arg]
                 lat_ms = int(d.get("total_ms", 0))
                 timeout = bool(d.get("timeout", False))
                 spike = bool(d.get("spike", False))
@@ -1475,7 +1479,10 @@ class ExecutionSimulator:
                     lat_ms = 0
                     lat_spike = False
                     if self.latency is not None:
-                        d = self.latency.sample()
+                        try:
+                            d = self.latency.sample(int(ts_fill))
+                        except TypeError:  # fallback for non-seasonal models
+                            d = self.latency.sample()  # type: ignore[call-arg]
                         lat_ms = int(d.get("total_ms", 0))
                         lat_spike = bool(d.get("spike", False))
                         if bool(d.get("timeout", False)):
