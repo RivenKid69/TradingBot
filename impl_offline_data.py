@@ -88,10 +88,10 @@ class OfflineCSVBarSource(MarketDataSource):
                 prev = last_ts.get(sym)
                 if prev is not None:
                     if ts == prev:
-                        continue
+                        raise ValueError(f"Duplicate bar for {sym} at {ts}")
                     if ts - prev > interval_ms_cfg:
                         missing = list(range(prev + interval_ms_cfg, ts, interval_ms_cfg))
-                        print(f"Missing bars for {sym}: {missing}")
+                        raise ValueError(f"Missing bars for {sym}: {missing}")
                 last_ts[sym] = ts
                 yield Bar(
                     ts=ts,
