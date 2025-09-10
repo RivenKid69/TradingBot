@@ -88,6 +88,7 @@ class LogWriter:
                 if getattr(report, "drawdown", None) is not None
                 else (float(row["drawdown"]) if row.get("drawdown") is not None else None)
             )
+            row["execution_profile"] = getattr(er, "execution_profile", None)
             try:
                 row["notional"] = float(row.get("notional", 0.0))
             except Exception:
@@ -102,6 +103,7 @@ class LogWriter:
                 ts=int(ts_ms),
                 run_id=self._run_id,
                 symbol=str(symbol),
+                execution_profile=str(getattr(report, "execution_profile", "")) or None,
                 side=Side.BUY,
                 order_type=OrderType.MARKET,
                 price=Decimal("0"),
@@ -127,6 +129,7 @@ class LogWriter:
             ts=int(ts_ms),
             run_id=self._run_id,
             symbol=str(symbol),
+            execution_profile=str(getattr(report, "execution_profile", "")) or None,
             fee_total=Decimal(str(getattr(report, "fee_total", 0.0))),
             position_qty=Decimal(str(getattr(report, "position_qty", 0.0))),
             realized_pnl=Decimal(str(getattr(report, "realized_pnl", 0.0))),

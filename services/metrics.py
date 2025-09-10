@@ -388,6 +388,22 @@ def calculate_metrics(
     ``profile_name`` to dataframe.  In the latter case metrics are
     computed for each profile separately.
     """
+    if isinstance(trades, pd.DataFrame) and "execution_profile" in trades.columns:
+        tdict = {n: g.drop(columns=["execution_profile"]) for n, g in trades.groupby("execution_profile")}
+        if isinstance(equity, pd.DataFrame) and "execution_profile" in equity.columns:
+            edict = {n: equity[equity["execution_profile"] == n].drop(columns=["execution_profile"]) for n in tdict}
+        else:
+            edict = {n: equity for n in tdict}
+        return calculate_metrics(
+            tdict,
+            edict,
+            ts_col=ts_col,
+            pnl_col=pnl_col,
+            equity_col=equity_col,
+            capital_base=capital_base,
+            rf_annual=rf_annual,
+        )
+
     if isinstance(trades, dict):
         metrics: Dict[str, Any] = {}
         for name, tdf in trades.items():
@@ -402,6 +418,18 @@ def calculate_metrics(
                 rf_annual=rf_annual,
             )
         return metrics
+
+    if isinstance(equity, pd.DataFrame) and "execution_profile" in equity.columns:
+        edict = {n: g.drop(columns=["execution_profile"]) for n, g in equity.groupby("execution_profile")}
+        return calculate_metrics(
+            trades if isinstance(trades, dict) else {"": trades},
+            edict,
+            ts_col=ts_col,
+            pnl_col=pnl_col,
+            equity_col=equity_col,
+            capital_base=capital_base,
+            rf_annual=rf_annual,
+        )
 
     if ts_col != "ts_ms" or equity_col != "equity":
         equity = equity.rename(columns={ts_col: "ts_ms", equity_col: "equity"})

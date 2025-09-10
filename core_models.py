@@ -268,6 +268,7 @@ class ExecReport:
     order_id: Optional[str] = None
     trade_id: Optional[str] = None
     pnl: Optional[Decimal] = None          # реализованный PnL по этой сделке, если считается на лету
+    execution_profile: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -291,6 +292,7 @@ class ExecReport:
             order_id=str(d["order_id"]) if d.get("order_id") is not None else None,
             trade_id=str(d["trade_id"]) if d.get("trade_id") is not None else None,
             pnl=to_decimal_opt(d.get("pnl")),
+            execution_profile=str(d.get("execution_profile")) if d.get("execution_profile") is not None else None,
             meta=dict(d.get("meta", {})),
         )
 
@@ -386,6 +388,7 @@ class TradeLogRow:
     latency_ms: Optional[int] = None           # латентность запроса
     tif: Optional[str] = None                  # Time in force
     ttl_steps: Optional[int] = None            # TTL в шагах
+    execution_profile: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
@@ -415,6 +418,7 @@ class TradeLogRow:
             latency_ms=int(er.meta.get("latency_ms", 0)) if er.meta.get("latency_ms") is not None else None,
             tif=str(er.meta.get("tif")) if er.meta.get("tif") is not None else None,
             ttl_steps=int(er.meta.get("ttl_steps", 0)) if er.meta.get("ttl_steps") is not None else None,
+            execution_profile=er.execution_profile,
             meta=dict(er.meta),
         )
 
@@ -443,6 +447,7 @@ class EquityPoint:
     funding_events_count: int = 0
     funding_cashflow: Optional[Decimal] = None
     cash: Optional[Decimal] = None
+    execution_profile: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

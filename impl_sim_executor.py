@@ -261,6 +261,7 @@ class SimExecutor(TradeExecutor):
             "client_order_id": str(getattr(order, "client_order_id", "") or ""),
             "order_id": None,
             "meta": {},
+            "execution_profile": str(self._exec_profile),
         })
 
     def cancel(self, client_order_id: str) -> None:
