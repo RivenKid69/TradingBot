@@ -41,6 +41,11 @@ python train_model_multi_patch.py --config configs/config_train.yaml --slippage.
 `liquidity_latency_seasonality.json` содержит массивы `liquidity` и
 `latency` для 168 часов недели.
 
+Сезонные множители позволяют масштабировать базовые значения ликвидности и
+задержек для каждого часа недели (от понедельника 00:00 до воскресенья
+23:00 UTC). Формат файла и процесс пересчёта коэффициентов из исторических
+данных описаны в [docs/seasonality.md](docs/seasonality.md).
+
 Те же значения можно задать в YAML‑конфиге:
 
 ```yaml
