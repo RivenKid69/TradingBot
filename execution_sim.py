@@ -383,8 +383,12 @@ class ExecutionSimulator:
 
     def set_execution_profile(self, profile: str, params: dict | None = None) -> None:
         """Установить профиль исполнения и параметры."""
-        self.execution_profile = str(profile)
+        self.execution_profile = str(profile).upper()
         self.execution_params = dict(params or {})
+        if self.execution_profile == "LIMIT_MID_BPS":
+            self.limit_offset_bps = float(self.execution_params.get("limit_offset_bps", 0.0))
+            self.ttl_steps = int(self.execution_params.get("ttl_steps", 0))
+            self.tif = str(self.execution_params.get("tif", "GTC")).upper()
         self._build_executor()
 
     def set_quantizer(self, q: Quantizer) -> None:

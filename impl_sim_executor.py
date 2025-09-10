@@ -179,8 +179,8 @@ class SimExecutor(TradeExecutor):
         if str(order.side).upper().endswith("SELL"):
             vol_frac = -vol_frac
 
-        tif = str(getattr(self._exec_params, "tif", "GTC"))
-        ttl_steps = int(getattr(self._exec_params, "ttl_steps", 0))
+        tif = str(self._exec_params.tif)
+        ttl_steps = int(self._exec_params.ttl_steps)
 
         profile = getattr(self, "_exec_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
 
@@ -198,7 +198,7 @@ class SimExecutor(TradeExecutor):
                     if bid is not None and ask is not None:
                         mid = (float(bid) + float(ask)) / 2.0
                 if mid is not None:
-                    off = float(getattr(self._exec_params, "limit_offset_bps", 0.0)) / 1e4
+                    off = float(self._exec_params.limit_offset_bps) / 1e4
                     if vol_frac > 0:
                         price = mid * (1 - off)
                     else:

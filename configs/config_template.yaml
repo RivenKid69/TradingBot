@@ -6,9 +6,9 @@ artifacts_dir: artifacts
 execution_profile: MKT_OPEN_NEXT_H1
 execution_params:
   slippage_bps: 0.0
-  limit_offset_bps: 0.0
-  ttl_steps: 0
-  tif: GTC
+  limit_offset_bps: 0.0  # e.g. 25 for 0.25% offset when using LIMIT_MID_BPS
+  ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
+  tif: GTC               # e.g. IOC or FOK
 
 market: spot  # or futures
 spot_symbols: &spot_symbols ["BTCUSDT"]
