@@ -1,8 +1,57 @@
 # data/utils_time.py
 from __future__ import annotations
-
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence, Union
+import os
+import json
+import numpy as np
+
+
+HOUR_MS = 3_600_000
+HOURS_IN_WEEK = 168
+EPOCH_HOW_OFFSET = 72
+
+
+def hour_of_week(ts_ms: Union[int, Sequence[int], np.ndarray]) -> Union[int, np.ndarray]:
+    """Return hour-of-week (0-167) for timestamps in milliseconds."""
+    arr = np.asarray(ts_ms, dtype=np.int64)
+    how = ((arr // HOUR_MS) + EPOCH_HOW_OFFSET) % HOURS_IN_WEEK
+    if arr.shape == ():
+        return int(how)
+    return how.astype(int)
+
+
+def load_hourly_seasonality(path: str, *keys: str) -> np.ndarray | None:
+    """Load hourly multipliers array from JSON file.
+
+    Parameters
+    ----------
+    path : str
+        Path to JSON file.
+    keys : str
+        Candidate keys within JSON mapping to extract array from.
+
+    Returns
+    -------
+    numpy.ndarray | None
+        Array of length 168 if successful, otherwise ``None``.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for k in keys:
+                if k in data:
+                    data = data[k]
+                    break
+        arr = np.asarray(data, dtype=float)
+        if arr.shape[0] == HOURS_IN_WEEK:
+            return arr
+    except Exception:
+        return None
+    return None
 
 
 def parse_time_to_ms(s: str) -> int:

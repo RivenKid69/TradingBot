@@ -32,6 +32,11 @@ from no_trade import (
 
 logger = logging.getLogger(__name__)
 from no_trade_config import get_no_trade_config
+from utils_time import (
+    hour_of_week as _hour_of_week,
+    load_hourly_seasonality,
+    HOURS_IN_WEEK,
+)
 
 try:  # existing dynamic-spread config (pydantic model)
     from trainingtcost import DynSpreadCfg
@@ -235,27 +240,16 @@ class TradingEnv(gym.Env):
         liq_path = liquidity_seasonality_path or kwargs.get(
             "liquidity_seasonality_path", "configs/liquidity_seasonality.json"
         )
-        self._liq_seasonality = np.ones(168, dtype=float)
-        if os.path.exists(liq_path):
-            try:
-                with open(liq_path, "r") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
-                        data = data.get("liquidity") or data.get("multipliers") or data
-                    arr = np.asarray(data, dtype=float)
-                    if arr.shape[0] == 168:
-                        self._liq_seasonality = arr
-            except Exception:
-                logger.warning(
-                    "Failed to load liquidity seasonality from %s; using defaults.",
-                    liq_path,
-                )
-        else:
+        self._liq_seasonality = load_hourly_seasonality(
+            liq_path, "liquidity", "multipliers"
+        )
+        if self._liq_seasonality is None:
             logger.warning(
-                "Liquidity seasonality config %s not found; using default multipliers of 1.0; "
+                "Liquidity seasonality config %s not found or invalid; using default multipliers of 1.0; "
                 "run scripts/build_hourly_seasonality.py to generate them.",
                 liq_path,
             )
+            self._liq_seasonality = np.ones(HOURS_IN_WEEK, dtype=float)
 
         # --- precompute ATR-based volatility and rolling liquidity ---
         close_col = "close" if "close" in self.df.columns else "price"
@@ -305,10 +299,9 @@ class TradingEnv(gym.Env):
             self.df["liq_roll"] = 0.0
 
         if "ts_ms" in self.df.columns:
-            ts = pd.to_datetime(self.df["ts_ms"], unit="ms", utc=True)
-            hour_of_week = (ts.dt.dayofweek * 24 + ts.dt.hour).astype(int)
-            self.df["hour_of_week"] = hour_of_week
-            self.df["liq_roll"] = self.df["liq_roll"] * self._liq_seasonality[hour_of_week.to_numpy()]
+            how = _hour_of_week(self.df["ts_ms"].to_numpy())
+            self.df["hour_of_week"] = how
+            self.df["liq_roll"] = self.df["liq_roll"] * self._liq_seasonality[how]
 
         self._rolling_liquidity = self.df["liq_roll"].to_numpy()
 
