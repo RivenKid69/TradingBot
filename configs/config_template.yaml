@@ -12,6 +12,8 @@ execution_params:
 
 # Optional path to 168 hourly liquidity and latency multipliers
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
+# Optional path to 168 hourly overrides multiplied with the above multipliers
+liquidity_seasonality_override_path: null
 use_seasonality: true  # set false to ignore liquidity/spread multipliers
 
 market: spot  # or futures
@@ -53,6 +55,7 @@ latency:
   retries: 1
   seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
   seasonality_path: "configs/liquidity_latency_seasonality.json"  # optional hourly latency multipliers
+  seasonality_override_path: null  # optional hourly latency overrides
   use_seasonality: true  # set false to ignore latency multipliers
 
 risk:

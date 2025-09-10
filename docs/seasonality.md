@@ -45,6 +45,36 @@ latency:
   seasonality_path: "configs/liquidity_latency_seasonality.json"
 ```
 
+## Manual overrides
+
+In some cases you may want to tweak the computed multipliers. Both
+`ExecutionSimulator` and `LatencyImpl` accept **override arrays** of 168
+values that are multiplied element-wise with the base multipliers. The
+override file shares the same structure as
+`liquidity_latency_seasonality.json`:
+
+```json
+{
+  "liquidity": [1.0, 0.8, ...],
+  "latency":   [1.0, 1.2, ...],
+  "spread":    [1.0, 1.1, ...]
+}
+```
+
+Overrides can be supplied via constructor arguments
+(`liquidity_seasonality_override`, `spread_seasonality_override` or
+`seasonality_override`) or by specifying paths in config files
+(`liquidity_seasonality_override_path`, `latency.seasonality_override_path`).
+Precedence is as follows:
+
+1. Arrays passed directly to constructors.
+2. Arrays embedded in config objects.
+3. Arrays loaded from `*_override_path` files.
+4. Base multipliers from `liquidity_latency_seasonality.json`.
+5. Default multipliers of `1.0`.
+
+Missing entries default to `1.0`, so partial overrides are permitted.
+
 ## Disabling seasonality
 
 Hourly multipliers are enabled by default. To ignore them, set the

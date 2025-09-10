@@ -338,6 +338,9 @@ class ExecutionSimulator:
                  liquidity_seasonality: Optional[Sequence[float]] = None,
                  spread_seasonality: Optional[Sequence[float]] = None,
                  liquidity_seasonality_path: Optional[str] = None,
+                 liquidity_seasonality_override: Optional[Sequence[float]] = None,
+                 spread_seasonality_override: Optional[Sequence[float]] = None,
+                 seasonality_override_path: Optional[str] = None,
                  use_seasonality: bool = True,
                  run_config: Any = None):
         self.symbol = str(symbol).upper()
@@ -489,6 +492,44 @@ class ExecutionSimulator:
                     "Using default spread seasonality multipliers of 1.0; "
                     "run scripts/build_hourly_seasonality.py to generate them.",
                 )
+
+            # Apply optional overrides (element-wise multiplication)
+            liq_override = liquidity_seasonality_override
+            spread_override = spread_seasonality_override
+            override_path = seasonality_override_path
+            if run_config is not None:
+                if liq_override is None:
+                    liq_override = getattr(run_config, "liquidity_seasonality_override", None)
+                if spread_override is None:
+                    spread_override = getattr(run_config, "spread_seasonality_override", None)
+                if override_path is None:
+                    override_path = getattr(
+                        run_config, "liquidity_seasonality_override_path", None
+                    ) or getattr(run_config, "seasonality_override_path", None)
+            if override_path and (liq_override is None or spread_override is None):
+                if os.path.exists(override_path):
+                    file_liq = load_hourly_seasonality(
+                        override_path, "liquidity", "multipliers"
+                    )
+                    file_spread = load_hourly_seasonality(
+                        override_path, "spread", "latency"
+                    )
+                    if liq_override is None:
+                        liq_override = file_liq
+                    if spread_override is None:
+                        spread_override = file_spread
+                else:
+                    logger.warning(
+                        "Seasonality override %s not found; ignoring.", override_path
+                    )
+            if liq_override is not None and len(liq_override) == HOURS_IN_WEEK:
+                self._liq_seasonality *= np.asarray(liq_override, dtype=float)
+            elif liq_override is not None:
+                logger.warning("Liquidity override must have length 168; ignoring.")
+            if spread_override is not None and len(spread_override) == HOURS_IN_WEEK:
+                self._spread_seasonality *= np.asarray(spread_override, dtype=float)
+            elif spread_override is not None:
+                logger.warning("Spread override must have length 168; ignoring.")
 
         # накопители статистики по сезонности ликвидности
         self._liq_mult_sum: List[float] = [0.0] * HOURS_IN_WEEK
