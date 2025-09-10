@@ -39,10 +39,18 @@ class DummyQuantizer:
     def check_percent_price_by_side(self, symbol, side, price, ref_price):
         return True
 
+    def attach_to(self, sim, *, strict=True, enforce_percent_price_by_side=True):
+        sim.quantizer = self
+        setattr(sim, "enforce_ppbs", enforce_percent_price_by_side)
+        setattr(sim, "strict_filters", strict)
+
 
 class DummyFees:
     def compute(self, *, side, price, qty, liquidity):
         return float(price) * float(qty) * 0.001
+
+    def attach_to(self, sim):
+        sim.fees = self
 
 
 from dataclasses import dataclass, field
@@ -81,6 +89,9 @@ class DummyRisk:
 
     def _emit(self, ts_ms, code, message, **data):
         self.events.append(DummyRiskEvent(ts_ms=int(ts_ms), code=str(code), message=str(message), data=dict(data)))
+
+    def attach_to(self, sim):
+        sim.risk = self
 
 
 @pytest.fixture
@@ -159,6 +170,62 @@ def test_limit_mid_bps_profile(base_sim):
     assert trade.price == pytest.approx(101.0)
     assert rep.fee_total == pytest.approx(trade.price * trade.qty * 0.001)
     assert rep.position_qty == pytest.approx(trade.qty)
+
+
+def test_limit_mid_bps_params_build(base_sim):
+    sim = base_sim
+    params = {"limit_offset_bps": 50, "ttl_steps": 7, "tif": "IOC"}
+    sim.set_ref_price(100.0)
+    sim.set_execution_profile("LIMIT_MID_BPS", params)
+
+    from decimal import Decimal
+    from core_models import Order, Side, OrderType
+    import impl_sim_executor as impl_mod
+    from core_config import ExecutionParams, ExecutionProfile
+
+    class _AP:
+        def __init__(self, action_type, volume_frac, price_offset_ticks=0, ttl_steps=0, abs_price=None, tif="GTC", client_tag=None):
+            self.action_type = action_type
+            self.volume_frac = volume_frac
+            self.price_offset_ticks = price_offset_ticks
+            self.ttl_steps = ttl_steps
+            self.abs_price = abs_price
+            self.tif = tif
+            self.client_tag = client_tag
+
+    impl_mod.ActionProto = _AP
+    SimExecutor = impl_mod.SimExecutor
+
+    executor = SimExecutor(
+        sim,
+        symbol="BTCUSDT",
+        quantizer=DummyQuantizer(),
+        risk=DummyRisk(),
+        fees=DummyFees(),
+    )
+    executor._exec_profile = ExecutionProfile.LIMIT_MID_BPS
+    executor._exec_params = ExecutionParams(**params)
+
+    order = Order(
+        ts=0,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=Decimal("1"),
+    )
+
+    atype, proto = executor._order_to_action(order)
+    assert atype == ActionType.LIMIT
+    assert proto.abs_price == pytest.approx(100.0 * (1 - 0.005))
+    assert proto.tif == "IOC"
+    assert proto.ttl_steps == 7
+
+    sim.set_market_snapshot(bid=98.0, ask=99.0, liquidity=1.0)
+    sim.submit(proto)
+    rep = sim.pop_ready(ref_price=100.0)
+    trade = rep.trades[0]
+    assert trade.tif == "IOC"
+    assert trade.ttl_steps == 7
 
 
 def test_executor_switching():
