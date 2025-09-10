@@ -20,6 +20,7 @@ def test_limit_order_ttl_expires():
     assert report1.new_order_ids == [oid]
     report2 = sim.pop_ready(ref_price=100.0)
     assert report2.cancelled_ids == [oid]
+    assert report2.cancelled_reasons == {oid: "TTL"}
     assert report2.trades == []
 
 
@@ -35,6 +36,7 @@ def test_limit_order_ttl_survives():
     assert report3.cancelled_ids == []
     report4 = sim.pop_ready(ref_price=100.0)
     assert report4.cancelled_ids == [oid]
+    assert report4.cancelled_reasons == {oid: "TTL"}
 
 
 from fast_lob import CythonLOB
@@ -58,6 +60,7 @@ def test_limit_order_ioc_partial_cancel():
     report = sim.pop_ready(ref_price=100.0)
     assert [t.qty for t in report.trades] == [5.0]
     assert report.cancelled_ids == [oid]
+    assert report.cancelled_reasons == {oid: "IOC"}
     assert report.new_order_ids == []
 
 
@@ -69,4 +72,5 @@ def test_limit_order_fok_partial_cancel():
     report = sim.pop_ready(ref_price=100.0)
     assert report.trades == []
     assert report.cancelled_ids == [oid]
+    assert report.cancelled_reasons == {oid: "FOK"}
     assert report.new_order_ids == []

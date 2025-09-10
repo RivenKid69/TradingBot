@@ -95,7 +95,9 @@ class LogWriter:
                     Decimal(str(row.get("price", 0.0))) * Decimal(str(row.get("quantity", 0.0)))
                 )
             self._trades_buf.append(row)
+        cancel_map = rep_dict.get("cancelled_reasons", {}) or {}
         for cid in rep_dict.get("cancelled_ids", []):
+            reason = cancel_map.get(cid) or cancel_map.get(str(cid)) or "OTHER"
             er_cancel = ExecReport(
                 ts=int(ts_ms),
                 run_id=self._run_id,
@@ -116,6 +118,7 @@ class LogWriter:
                     "mark_price": float(getattr(report, "mark_price", 0.0)),
                     "equity": float(getattr(report, "equity", 0.0)),
                     "drawdown": float(getattr(report, "drawdown", 0.0)) if getattr(report, "drawdown", None) is not None else None,
+                    "reason": str(reason),
                 },
             )
             row_cancel = TradeLogRow.from_exec(er_cancel).to_dict()

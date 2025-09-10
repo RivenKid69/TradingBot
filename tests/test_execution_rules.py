@@ -90,6 +90,7 @@ def test_ttl_two_steps_sim():
     assert rep2.cancelled_ids == []
     rep3 = sim.pop_ready(ref_price=100.0)
     assert rep3.cancelled_ids == [oid]
+    assert rep3.cancelled_reasons == {oid: "TTL"}
 
 
 # --- C++ LOB tests (using stub) ---
