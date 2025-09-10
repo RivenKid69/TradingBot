@@ -28,7 +28,7 @@ def test_latency_seasonality(tmp_path):
     multipliers[hour_high] = 2.0
     multipliers[hour_low] = 0.5
     path = tmp_path / "latency.json"
-    path.write_text(json.dumps(multipliers))
+    path.write_text(json.dumps({"latency": multipliers}))
 
     cfg = {
         "base_ms": 100,

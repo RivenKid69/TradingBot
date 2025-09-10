@@ -437,6 +437,8 @@ class ExecutionSimulator:
             path = liquidity_seasonality_path
             if path is None and run_config is not None:
                 path = getattr(run_config, "liquidity_seasonality_path", None)
+            if path is None:
+                path = "configs/liquidity_latency_seasonality.json"
             if path:
                 try:
                     with open(path, "r", encoding="utf-8") as f:
