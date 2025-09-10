@@ -12,6 +12,8 @@ import json
 import os
 import logging
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -38,7 +40,11 @@ class _LatencyWithSeasonality:
 
     def __init__(self, model: LatencyModel, multipliers: Sequence[float]):  # type: ignore[name-defined]
         self._model = model
-        self._mult: List[float] = list(multipliers) if len(multipliers) == 168 else [1.0] * 168
+        self._mult = (
+            np.asarray(multipliers, dtype=float)
+            if len(multipliers) == 168
+            else np.ones(168, dtype=float)
+        )
         self._mult_sum: List[float] = [0.0] * 168
         self._lat_sum: List[float] = [0.0] * 168
         self._count: List[int] = [0] * 168
