@@ -55,3 +55,10 @@ def test_drop_partial():
     df = _mk([60_000, 120_000, 180_000, 240_000, 300_000, 360_000, 420_000])
     out = _agg(df, "3m", drop_partial=True)
     assert out["ts_ms"].tolist() == [180_000]
+
+
+def test_hourly_aggregation_alignment():
+    df = _mk(list(range(0, 2 * 3_600_000, 60_000)))
+    out = _agg(df, "1h")
+    assert out["ts_ms"].tolist() == [0, 3_600_000]
+    assert all(ts % 3_600_000 == 0 for ts in out["ts_ms"])
