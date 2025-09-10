@@ -10,6 +10,8 @@ data:
   timeframe: "1m"
 # Optional path to 168 hourly liquidity multipliers
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
+# Optional path to 168 hourly overrides multiplied with the above multipliers
+liquidity_seasonality_override_path: null
 use_seasonality: true  # set false to ignore liquidity/spread multipliers
 latency:
   base_ms: 250
@@ -20,6 +22,7 @@ latency:
   retries: 1
   seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
   seasonality_path: "configs/liquidity_latency_seasonality.json"
+  seasonality_override_path: null
   use_seasonality: true
 components:
   market_data:

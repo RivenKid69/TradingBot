@@ -81,3 +81,26 @@ def test_seasonality_edge_hours_wraparound():
     check(167, 0.5, 1.3)
     # Wrap-around to the start of the week
     check(168, 1.5, 1.1)
+
+
+def test_seasonality_override_applied():
+    liq_mult = [1.0] * 168
+    spr_mult = [1.0] * 168
+    hour_idx = 12
+    liq_mult[hour_idx] = 2.0
+    spr_mult[hour_idx] = 3.0
+    liq_override = [1.0] * 168
+    spr_override = [1.0] * 168
+    liq_override[hour_idx] = 0.75
+    spr_override[hour_idx] = 0.5
+    sim = ExecutionSimulator(
+        liquidity_seasonality=liq_mult,
+        spread_seasonality=spr_mult,
+        liquidity_seasonality_override=liq_override,
+        spread_seasonality_override=spr_override,
+    )
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    ts_ms = int(base_dt.timestamp() * 1000 + hour_idx * 3_600_000)
+    sim.set_market_snapshot(bid=100.0, ask=101.0, liquidity=4.0, spread_bps=1.0, ts_ms=ts_ms)
+    assert sim._last_liquidity == pytest.approx(4.0 * 2.0 * 0.75)
+    assert sim._last_spread_bps == pytest.approx(1.0 * 3.0 * 0.5)

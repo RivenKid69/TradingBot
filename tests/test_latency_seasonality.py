@@ -90,6 +90,45 @@ def test_latency_seasonality_disabled(tmp_path):
     assert d_low["total_ms"] == 100
 
 
+def test_latency_seasonality_override(tmp_path):
+    base_mult = [1.0] * 168
+    hour_high = 5
+    hour_override = 8
+    base_mult[hour_high] = 2.0
+    base_path = tmp_path / "lat_base.json"
+    base_path.write_text(json.dumps({"latency": base_mult}))
+
+    override_mult = [1.0] * 168
+    override_mult[hour_high] = 0.5
+    override_mult[hour_override] = 2.0
+    override_path = tmp_path / "lat_override.json"
+    override_path.write_text(json.dumps({"latency": override_mult}))
+
+    cfg = {
+        "base_ms": 100,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seasonality_path": str(base_path),
+        "seasonality_override_path": str(override_path),
+    }
+    impl = LatencyImpl.from_dict(cfg)
+
+    class Dummy:
+        pass
+
+    sim = Dummy()
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    ts_high = int(base_dt.timestamp() * 1000 + hour_high * 3_600_000)
+    ts_override = int(base_dt.timestamp() * 1000 + hour_override * 3_600_000)
+
+    assert lat.sample(ts_high)["total_ms"] == 100  # 2 * 0.5 -> 1x
+    assert lat.sample(ts_override)["total_ms"] == 200  # 1 * 2 -> 2x
+
+
 def test_seasonal_latency_statistics_regression(tmp_path):
     multipliers = [1.0] * 168
     multipliers[0] = 2.0

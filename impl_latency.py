@@ -14,6 +14,11 @@ import logging
 
 import numpy as np
 
+try:
+    from utils_time import load_hourly_seasonality
+except Exception:  # pragma: no cover - fallback
+    load_hourly_seasonality = lambda *a, **k: None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -33,6 +38,8 @@ class LatencyCfg:
     seed: int = 0
     seasonality_path: str | None = None
     use_seasonality: bool = True
+    seasonality_override: Sequence[float] | None = None
+    seasonality_override_path: str | None = None
 
 
 class _LatencyWithSeasonality:
@@ -136,6 +143,24 @@ class LatencyImpl:
                     "Using default latency seasonality multipliers of 1.0; "
                     "run scripts/build_hourly_seasonality.py to generate them.",
                 )
+            override = cfg.seasonality_override
+            o_path = cfg.seasonality_override_path
+            if override is None and o_path:
+                override = load_hourly_seasonality(o_path, "latency")
+                if override is None:
+                    logger.warning(
+                        "Latency override %s not found or invalid; ignoring.", o_path
+                    )
+            if override is not None:
+                arr = np.asarray(override, dtype=float)
+                if len(arr) == 168:
+                    self.latency = (
+                        np.asarray(self.latency, dtype=float) * arr
+                    ).tolist()
+                else:
+                    logger.warning(
+                        "Latency override array must have length 168; ignoring."
+                    )
         self.attached_sim = None
         self._wrapper: _LatencyWithSeasonality | None = None
 
@@ -180,4 +205,6 @@ class LatencyImpl:
             seed=int(d.get("seed", 0)),
             seasonality_path=d.get("seasonality_path"),
             use_seasonality=bool(d.get("use_seasonality", True)),
+            seasonality_override=d.get("seasonality_override"),
+            seasonality_override_path=d.get("seasonality_override_path"),
         ))
