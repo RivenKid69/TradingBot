@@ -1,23 +1,24 @@
 # Hour-of-Week Seasonality
 
-Certain hours of the week exhibit systematic patterns in market depth and order-processing delays. To capture this behaviour, the simulator supports **hour-of-week multipliers** that scale baseline liquidity and latency parameters. Multipliers are indexed from `0` (Monday 00:00 UTC) to `167` (Sunday 23:00 UTC).
+Certain hours of the week exhibit systematic patterns in market depth, bid-ask spreads and order-processing delays. To capture this behaviour, the simulator supports **hour-of-week multipliers** that scale baseline liquidity, spread and latency parameters. Multipliers are indexed from `0` (Monday 00:00 UTC) to `167` (Sunday 23:00 UTC).
 
 ## `liquidity_latency_seasonality.json` format
 
-The JSON file contains up to two arrays with 168 floating-point numbers each:
+The JSON file contains up to three arrays with 168 floating-point numbers each:
 
 ```json
 {
   "liquidity": [1.0, 1.1, ...],
-  "latency":   [1.0, 0.9, ...]
+  "latency":   [1.0, 0.9, ...],
+  "spread":    [1.0, 0.8, ...]
 }
 ```
 
-`liquidity` multiplies available volume while `latency` scales simulated execution delays. Missing arrays or indices default to `1.0`.
+`liquidity` multiplies available volume, `latency` scales simulated execution delays while `spread` adjusts the baseline bid-ask spread (in bps). Missing arrays or indices default to `1.0`.
 
 ## Regenerating multipliers from historical data
 
-1. Prepare a CSV or Parquet file with columns such as `ts_ms`, `quantity` or `latency_ms`.
+1. Prepare a CSV or Parquet file with columns such as `ts_ms`, `quantity`, `latency_ms` or `spread_bps`.
 2. Run the helper script to compute averages for each hour of week and normalise them:
 
    ```bash

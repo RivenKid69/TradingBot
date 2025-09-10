@@ -28,7 +28,7 @@ def _historical_multipliers(df: pd.DataFrame) -> Dict[str, np.ndarray]:
     metrics: Dict[str, np.ndarray] = {}
     cols_map = {
         "liquidity": ["liquidity", "order_size", "qty", "quantity"],
-        "spread_bps": ["spread_bps"],
+        "spread_bps": ["spread_bps", "spread"],
         "latency_ms": ["latency_ms"],
     }
     for key, candidates in cols_map.items():
@@ -47,7 +47,10 @@ def _historical_multipliers(df: pd.DataFrame) -> Dict[str, np.ndarray]:
 
 def _simulate(multipliers: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     base_dt = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
-    sim = ExecutionSimulator(liquidity_seasonality=multipliers.get("liquidity"))
+    sim = ExecutionSimulator(
+        liquidity_seasonality=multipliers.get("liquidity"),
+        spread_seasonality=multipliers.get("spread"),
+    )
     sim_liq, sim_spread = [], []
     for hour in range(168):
         ts = int(base_dt.timestamp() * 1000 + hour * 3_600_000)
