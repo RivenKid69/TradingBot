@@ -372,6 +372,9 @@ class ExecutionSimulator:
         )
         self._step_counter: int = 0
 
+        # журнал исполненных трейдов для валидации PnL
+        self._trade_log: List[ExecTrade] = []
+
         # накопители для VWAP
         self._vwap_pv: float = 0.0
         self._vwap_vol: float = 0.0
@@ -545,25 +548,13 @@ class ExecutionSimulator:
         return float(realized)
 
     def _mark_price(self, ref: Optional[float], bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+        """Возвращает цену маркировки позиции.
+
+        Лонги маркируются по bid, шорты — по ask. При отсутствии позиции
+        используется mid (если доступны обе стороны) либо ref_price.
         """
-        Возвращает цену маркировки в зависимости от режима:
-          - "side": long → bid, short → ask, flat → mid/ref
-          - "mid": (bid+ask)/2 или ref
-          - "bid": bid или ref
-          - "ask": ask или ref
-        """
-        mode = str(self._pnl_mark_to).lower() if hasattr(self, "_pnl_mark_to") else "side"
-        b = bid if (bid is not None) else None
-        a = ask if (ask is not None) else None
-        if mode == "mid":
-            if b is not None and a is not None:
-                return float((float(b) + float(a)) / 2.0)
-            return float(ref) if ref is not None else None
-        if mode == "bid":
-            return float(b) if b is not None else (float(ref) if ref is not None else None)
-        if mode == "ask":
-            return float(a) if a is not None else (float(ref) if ref is not None else None)
-        # mode == "side"
+        b = bid if bid is not None else None
+        a = ask if ask is not None else None
         if self.position_qty > 0.0:
             return float(b) if b is not None else (float(ref) if ref is not None else None)
         if self.position_qty < 0.0:
@@ -584,6 +575,68 @@ class ExecutionSimulator:
             return float((mp - ap) * self.position_qty)
         else:
             return float((ap - mp) * (-self.position_qty))
+
+    def _recompute_pnl_from_log(self, mark_price: Optional[float]) -> tuple[float, float]:
+        """Пере вычислить реализованный и нереализованный PnL из журнала трейдов."""
+        pos = 0.0
+        avg: Optional[float] = None
+        realized = 0.0
+        for t in self._trade_log:
+            q = float(abs(t.qty))
+            px = float(t.price)
+            if str(t.side).upper() == "BUY":
+                if pos < 0.0:
+                    close_qty = min(q, -pos)
+                    if avg is not None:
+                        realized += (avg - px) * close_qty
+                    pos += close_qty
+                    q_rem = q - close_qty
+                    if q_rem > 0.0:
+                        pos = q_rem
+                        avg = px
+                    else:
+                        if pos == 0.0:
+                            avg = None
+                else:
+                    new_pos = pos + q
+                    if new_pos > 0.0:
+                        if pos > 0.0 and avg is not None:
+                            avg = (avg * pos + px * q) / new_pos
+                        else:
+                            avg = px
+                    else:
+                        avg = None
+                    pos = new_pos
+            else:
+                if pos > 0.0:
+                    close_qty = min(q, pos)
+                    if avg is not None:
+                        realized += (px - avg) * close_qty
+                    pos -= close_qty
+                    q_rem = q - close_qty
+                    if q_rem > 0.0:
+                        pos = -q_rem
+                        avg = px
+                    else:
+                        if pos == 0.0:
+                            avg = None
+                else:
+                    new_pos = pos - q
+                    if new_pos < 0.0:
+                        if pos < 0.0 and avg is not None:
+                            avg = (avg * (-pos) + px * q) / (-new_pos)
+                        else:
+                            avg = px
+                    else:
+                        avg = None
+                    pos = new_pos
+        unrl = 0.0
+        if mark_price is not None and avg is not None and pos != 0.0:
+            if pos > 0.0:
+                unrl = (mark_price - avg) * pos
+            else:
+                unrl = (avg - mark_price) * (-pos)
+        return float(realized), float(unrl)
 
     # ---- очередь ----
     def submit(self, proto: ActionProto, now_ts: Optional[int] = None) -> int:
@@ -792,9 +845,10 @@ class ExecutionSimulator:
                     ):
                         filled_price = float(self._next_h1_open_price)
                     else:
-                        base_price = self._last_ask if side == "BUY" else self._last_bid
-                        if base_price is None:
-                            base_price = ref
+                        if side == "BUY":
+                            base_price = self._last_ask if self._last_ask is not None else ref
+                        else:
+                            base_price = self._last_bid if self._last_bid is not None else ref
                         filled_price = float(base_price) if base_price is not None else float(ref)
 
                     # слиппедж на ребёнка
@@ -828,7 +882,7 @@ class ExecutionSimulator:
                     # обновить позицию с расчётом реализованного PnL
                     _ = self._apply_trade_inventory(side=side, price=filled_price, qty=q_child)
 
-                    trades.append(ExecTrade(
+                    trade = ExecTrade(
                         ts=ts_fill,
                         side=side,
                         price=filled_price,
@@ -844,15 +898,18 @@ class ExecutionSimulator:
                         latency_spike=bool(p.spike),
                         tif=tif,
                         ttl_steps=ttl_steps,
-                    ))
+                    )
+                    trades.append(trade)
+                    self._trade_log.append(trade)
                 continue
             # Определение направления и базовой цены для прочих типов
             is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
             side = "BUY" if is_buy else "SELL"
             qty = abs(float(getattr(proto, "volume_frac", 0.0)))
-            base_price = self._last_ask if side == "BUY" else self._last_bid
-            if base_price is None:
-                base_price = ref
+            if side == "BUY":
+                base_price = self._last_ask if self._last_ask is not None else ref
+            else:
+                base_price = self._last_bid if self._last_bid is not None else ref
             filled_price = float(base_price) if base_price is not None else float(ref)
 
             # слиппедж
@@ -881,14 +938,12 @@ class ExecutionSimulator:
             if self.fees is not None:
                 fee = self.fees.compute(side=side, price=filled_price, qty=qty, liquidity="taker")
             fee_total += float(fee)
+            self.fees_cum += float(fee)
 
-            # обновить позицию
-            if side == "BUY":
-                self.position_qty += float(qty)
-            else:
-                self.position_qty -= float(qty)
+            # обновить позицию с расчётом реализованного PnL
+            _ = self._apply_trade_inventory(side=side, price=filled_price, qty=qty)
 
-            trades.append(ExecTrade(
+            trade = ExecTrade(
                 ts=ts,
                 side=side,
                 price=filled_price,
@@ -904,7 +959,9 @@ class ExecutionSimulator:
                 latency_spike=bool(p.spike),
                 tif=tif,
                 ttl_steps=ttl_steps,
-            ))
+            )
+            trades.append(trade)
+            self._trade_log.append(trade)
             continue
 
             # LIMIT
@@ -970,7 +1027,7 @@ class ExecutionSimulator:
                     fee_total += float(fee)
                     _ = self._apply_trade_inventory(side=side, price=filled_price, qty=exec_qty)
                     sbps = self._last_spread_bps
-                    trades.append(ExecTrade(
+                    trade = ExecTrade(
                         ts=ts,
                         side=side,
                         price=filled_price,
@@ -986,7 +1043,9 @@ class ExecutionSimulator:
                         latency_spike=bool(p.spike),
                         tif=tif,
                         ttl_steps=ttl_steps,
-                    ))
+                    )
+                    trades.append(trade)
+                    self._trade_log.append(trade)
                     if exec_qty + 1e-12 < qty_q:
                         if tif == "IOC":
                             _cancel(p.client_order_id, "IOC")
@@ -1007,7 +1066,7 @@ class ExecutionSimulator:
                     fee_total += float(fee)
                     _ = self._apply_trade_inventory(side=side, price=filled_price, qty=qty_q)
                     sbps = self._last_spread_bps
-                    trades.append(ExecTrade(
+                    trade = ExecTrade(
                         ts=ts,
                         side=side,
                         price=filled_price,
@@ -1023,7 +1082,9 @@ class ExecutionSimulator:
                         latency_spike=bool(p.spike),
                         tif=tif,
                         ttl_steps=ttl_steps,
-                    ))
+                    )
+                    trades.append(trade)
+                    self._trade_log.append(trade)
                     continue
 
                 if tif in ("IOC", "FOK"):
@@ -1070,6 +1131,9 @@ class ExecutionSimulator:
         mark_p = self._mark_price(ref=ref, bid=self._last_bid, ask=self._last_ask)
         unrl = self._unrealized_pnl(mark_p)
         eq = float(self.realized_pnl_cum + unrl - self.fees_cum + self.funding_cum)
+        if self._trade_log:
+            r_chk, u_chk = self._recompute_pnl_from_log(mark_p)
+            assert abs((self.realized_pnl_cum + unrl) - (r_chk + u_chk)) < 1e-6
 
         # риск: обновить дневной PnL и возможную паузу
         risk_events_all: List[RiskEvent] = []
@@ -1286,9 +1350,10 @@ class ExecutionSimulator:
                     ):
                         filled_price = float(self._next_h1_open_price)
                     else:
-                        base_price = self._last_ask if side == "BUY" else self._last_bid
-                        if base_price is None:
-                            base_price = ref
+                        if side == "BUY":
+                            base_price = self._last_ask if self._last_ask is not None else ref
+                        else:
+                            base_price = self._last_bid if self._last_bid is not None else ref
                         filled_price = float(base_price) if base_price is not None else float(ref)
                     slip_bps = 0.0
                     sbps = self._last_spread_bps
@@ -1315,7 +1380,7 @@ class ExecutionSimulator:
                     _ = self._apply_trade_inventory(side=side, price=filled_price, qty=q_child)
 
                     # запись трейда
-                    trades.append(ExecTrade(
+                    trade = ExecTrade(
                         ts=ts_fill,
                         side=side,
                         price=filled_price,
@@ -1331,7 +1396,9 @@ class ExecutionSimulator:
                         latency_spike=bool(lat_spike),
                         tif=tif,
                         ttl_steps=ttl_steps,
-                    ))
+                    )
+                    trades.append(trade)
+                    self._trade_log.append(trade)
             else:
                 # пока другие типы не поддержаны — отменяем
                 _cancel(cli_id)
@@ -1350,6 +1417,9 @@ class ExecutionSimulator:
         mark_p = self._mark_price(ref=self._last_ref_price, bid=self._last_bid, ask=self._last_ask)
         unrl = self._unrealized_pnl(mark_p)
         eq = float(self.realized_pnl_cum + unrl - self.fees_cum + self.funding_cum)
+        if self._trade_log:
+            r_chk, u_chk = self._recompute_pnl_from_log(mark_p)
+            assert abs((self.realized_pnl_cum + unrl) - (r_chk + u_chk)) < 1e-6
 
         # риск: дневной лосс/пауза + собрать события
         risk_events_all: list[RiskEvent] = []
