@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 from services.metrics import (
     read_any,
@@ -50,6 +51,15 @@ def _bucket_stats(df: pd.DataFrame, quantiles: int) -> pd.DataFrame:
     ]
 
 
+def _latency_stats(df: pd.DataFrame) -> dict:
+    """Return latency percentiles in milliseconds."""
+    if "latency_ms" not in df.columns:
+        raise ValueError("missing 'latency_ms' column")
+    latencies = df["latency_ms"].dropna()
+    p50, p95 = np.percentile(latencies, [50, 95])
+    return {"p50_ms": float(p50), "p95_ms": float(p95)}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate reality check report for simulated vs benchmark logs",
@@ -89,6 +99,8 @@ def main() -> None:
 
     sim_metrics = calculate_metrics(trades_df, equity_df)
     benchmark_metrics = compute_equity_metrics(benchmark_df).to_dict()
+    sim_latency = _latency_stats(trades_df)
+    hist_latency = _latency_stats(hist_trades_df)
 
     sim_buckets = _bucket_stats(trades_df, args.quantiles)
     sim_buckets.insert(0, "dataset", "simulation")
@@ -127,7 +139,12 @@ def main() -> None:
     except Exception:
         pass
 
-    summary = {"simulation": sim_metrics, "benchmark": benchmark_metrics}
+    latency_summary = {"simulation": sim_latency, "historical": hist_latency}
+    summary = {
+        "simulation": sim_metrics,
+        "benchmark": benchmark_metrics,
+        "latency_ms": latency_summary,
+    }
 
     json_path = out_base.with_suffix(".json")
     with open(json_path, "w") as f:
@@ -145,6 +162,13 @@ def main() -> None:
         f.write("## Benchmark Metrics\n")
         for k, v in benchmark_metrics.items():
             f.write(f"- {k}: {v}\n")
+        f.write("\n")
+        f.write("## Latency Metrics\n")
+        for name, stats in latency_summary.items():
+            f.write(f"### {name.capitalize()}\n")
+            for k, v in stats.items():
+                f.write(f"- {k}: {v}\n")
+            f.write("\n")
 
     print(f"Saved reports to {json_path} and {md_path}")
     print(f"Saved bucket stats to {bucket_csv} and {bucket_png}")
