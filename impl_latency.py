@@ -7,12 +7,14 @@ impl_latency.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, List
+import json
 
 try:
-    from latency import LatencyModel
+    from latency import LatencyModel, SeasonalLatencyModel
 except Exception:  # pragma: no cover
     LatencyModel = None  # type: ignore
+    SeasonalLatencyModel = None  # type: ignore
 
 
 @dataclass
@@ -24,6 +26,7 @@ class LatencyCfg:
     timeout_ms: int = 2500
     retries: int = 1
     seed: int = 0
+    seasonality_path: str | None = None
 
 
 class LatencyImpl:
@@ -38,6 +41,18 @@ class LatencyImpl:
             retries=int(cfg.retries),
             seed=int(cfg.seed),
         ) if LatencyModel is not None else None
+        self.latency: List[float] = [1.0] * 168
+        self._has_seasonality = bool(cfg.seasonality_path)
+        if cfg.seasonality_path:
+            try:
+                with open(cfg.seasonality_path, "r") as f:
+                    arr = json.load(f)
+                if isinstance(arr, list) and len(arr) == 168:
+                    self.latency = [float(x) for x in arr]
+                else:  # pragma: no cover - defensive
+                    self._has_seasonality = False
+            except Exception:  # pragma: no cover - graceful fallback
+                self._has_seasonality = False
         self.attached_sim = None
 
     @property
@@ -46,7 +61,10 @@ class LatencyImpl:
 
     def attach_to(self, sim) -> None:
         if self._model is not None:
-            setattr(sim, "latency", self._model)
+            model = self._model
+            if self._has_seasonality and SeasonalLatencyModel is not None:
+                model = SeasonalLatencyModel(model, self.latency)
+            setattr(sim, "latency", model)
         self.attached_sim = sim
 
     def get_stats(self):
@@ -68,4 +86,5 @@ class LatencyImpl:
             timeout_ms=int(d.get("timeout_ms", 2500)),
             retries=int(d.get("retries", 1)),
             seed=int(d.get("seed", 0)),
+            seasonality_path=d.get("seasonality_path"),
         ))
