@@ -129,3 +129,49 @@ def test_seasonal_latency_statistics_regression(tmp_path):
     stats1 = lat.stats()
     assert stats1["p50_ms"] == pytest.approx(50)
     assert stats1["p95_ms"] == pytest.approx(50)
+
+
+def test_latency_seed_deterministic(tmp_path):
+    multipliers = [1.0] * 168
+    multipliers[0] = 2.0
+    path = tmp_path / "latency.json"
+    path.write_text(json.dumps({"latency": multipliers}))
+
+    cfg = {
+        "base_ms": 100,
+        "jitter_ms": 50,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seed": 123,
+        "seasonality_path": str(path),
+    }
+    impl1 = LatencyImpl.from_dict(cfg)
+    impl2 = LatencyImpl.from_dict(cfg)
+
+    class Dummy:
+        pass
+
+    sim1 = Dummy()
+    impl1.attach_to(sim1)
+    lat1 = sim1.latency
+
+    sim2 = Dummy()
+    impl2.attach_to(sim2)
+    lat2 = sim2.latency
+
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    ts0 = int(base_dt.timestamp() * 1000)
+    ts1 = ts0 + 3_600_000
+
+    seq1 = [
+        lat1.sample(ts0)["total_ms"],
+        lat1.sample(ts1)["total_ms"],
+        lat1.sample(ts0)["total_ms"],
+    ]
+    seq2 = [
+        lat2.sample(ts0)["total_ms"],
+        lat2.sample(ts1)["total_ms"],
+        lat2.sample(ts0)["total_ms"],
+    ]
+
+    assert seq1 == seq2
