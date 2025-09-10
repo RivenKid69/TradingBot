@@ -50,7 +50,7 @@ latency:
   spike_mult: 5.0
   timeout_ms: 2500
   retries: 1
-  seed: 0
+  seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
   seasonality_path: "configs/liquidity_latency_seasonality.json"
   use_seasonality: true
 

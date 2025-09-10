@@ -61,6 +61,14 @@ latency:
 The same flag can be passed as a constructor argument to
 `ExecutionSimulator` or `LatencyImpl`.
 
+## Seeds and determinism
+
+The latency model's random draws are controlled by the `seed` field in
+the `latency` section of simulation configs. Hourly multipliers only
+scale deterministic parameters and do not reseed or otherwise affect the
+random number generator. Runs executed with the same `seed` and
+multiplier set will therefore produce identical latency samples.
+
 ## Data storage and retention
 
 Raw historical snapshots used to derive the multipliers are stored under

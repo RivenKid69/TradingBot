@@ -49,13 +49,21 @@ class _LatencyWithSeasonality:
             self._model.jitter_ms,
             self._model.timeout_ms,
         )
+        seed = getattr(self._model, "seed", None)
+        state_after = None
         try:
             self._model.base_ms = int(round(base * m))
             self._model.jitter_ms = int(round(jitter * m))
             self._model.timeout_ms = int(round(timeout * m))
             res = self._model.sample()
+            if hasattr(self._model, "_rng"):
+                state_after = self._model._rng.getstate()
         finally:
             self._model.base_ms, self._model.jitter_ms, self._model.timeout_ms = base, jitter, timeout
+            if seed is not None:
+                self._model.seed = seed
+            if state_after is not None and hasattr(self._model, "_rng"):
+                self._model._rng.setstate(state_after)
         self._mult_sum[hour] += m
         self._lat_sum[hour] += float(res.get("total_ms", 0))
         self._count[hour] += 1
