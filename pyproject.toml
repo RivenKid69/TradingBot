@@ -58,4 +58,7 @@ extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
  # Include NumPy headers for this module
  include-dirs = ["numpy.get_include()"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [DONE]

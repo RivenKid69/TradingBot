@@ -2,6 +2,7 @@ import importlib.util
 import pathlib
 import sys
 import datetime
+import pytest
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
 
@@ -46,3 +47,37 @@ def test_seasonality_toggle_off():
     sim.set_market_snapshot(bid=100.0, ask=101.0, liquidity=5.0, spread_bps=1.0, ts_ms=ts_ms)
     assert sim._last_liquidity == 5.0
     assert sim._last_spread_bps == 1.0
+
+
+def test_seasonality_edge_hours_wraparound():
+    liq_mult = [1.0] * 168
+    spr_mult = [1.0] * 168
+    liq_mult[0] = 1.5
+    liq_mult[1] = 2.0
+    liq_mult[167] = 0.5
+    spr_mult[0] = 1.1
+    spr_mult[1] = 1.2
+    spr_mult[167] = 1.3
+    sim = ExecutionSimulator(
+        liquidity_seasonality=liq_mult,
+        spread_seasonality=spr_mult,
+    )
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+
+    def check(hour: int, liq_expected: float, spr_expected: float) -> None:
+        ts_ms = int(base_dt.timestamp() * 1000 + hour * 3_600_000)
+        sim.set_market_snapshot(
+            bid=100.0,
+            ask=101.0,
+            liquidity=10.0,
+            spread_bps=1.0,
+            ts_ms=ts_ms,
+        )
+        assert sim._last_liquidity == pytest.approx(10.0 * liq_expected)
+        assert sim._last_spread_bps == pytest.approx(1.0 * spr_expected)
+
+    check(0, 1.5, 1.1)
+    check(1, 2.0, 1.2)
+    check(167, 0.5, 1.3)
+    # Wrap-around to the start of the week
+    check(168, 1.5, 1.1)
