@@ -20,7 +20,13 @@ python train_model_multi_patch.py --config configs/config_train.yaml \
 python script_compare_runs.py run1 run2 run3            # сохранит compare_runs.csv
 python script_compare_runs.py run1 metrics.json --stdout  # вывод в stdout
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
+python scripts/validate_seasonality.py --historical path/to/trades.csv --multipliers configs/liquidity_latency_seasonality.json
 ```
+
+Скрипт `scripts/validate_seasonality.py` воспроизводит почасовое поведение
+ликвидности, спреда и задержек и сравнивает его с историческим датасетом.
+Проверка завершится ошибкой, если максимальное относительное отклонение
+превысит допуск `--threshold` (по умолчанию 10%).
 
 Параметры симуляции можно временно переопределить через CLI:
 
