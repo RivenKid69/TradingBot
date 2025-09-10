@@ -1,6 +1,6 @@
 # Hour-of-Week Seasonality
 
-Certain hours of the week exhibit systematic patterns in market depth, bid-ask spreads and order-processing delays. To capture this behaviour, the simulator supports **hour-of-week multipliers** that scale baseline liquidity, spread and latency parameters. Multipliers are indexed from `0` (Monday 00:00 UTC) to `167` (Sunday 23:00 UTC).
+Certain hours of the week exhibit systematic patterns in market depth, bid-ask spreads and order-processing delays. To capture this behaviour, the simulator supports **hour-of-week multipliers** that scale baseline liquidity, spread and latency parameters. Multipliers are indexed from `0` (Monday 00:00 UTC) to `167` (Sunday 23:00 UTC). All hour-of-week calculations use `datetime.utcfromtimestamp`, so timestamps must be interpreted as UTC.
 
 ## `liquidity_latency_seasonality.json` format
 

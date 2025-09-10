@@ -8,7 +8,7 @@ api:
 data:
   symbols: ["BTCUSDT"]
   timeframe: "1m"
-# Optional path to 168 hourly liquidity multipliers
+# Optional path to 168 hourly liquidity multipliers (indexed by UTC hour-of-week)
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
 # Optional path to 168 hourly overrides multiplied with the above multipliers
 liquidity_seasonality_override_path: null
@@ -21,7 +21,7 @@ latency:
   timeout_ms: 2500
   retries: 1
   seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
-  seasonality_path: "configs/liquidity_latency_seasonality.json"
+  seasonality_path: "configs/liquidity_latency_seasonality.json"  # UTC hour-of-week
   seasonality_override_path: null
   use_seasonality: true
 components:

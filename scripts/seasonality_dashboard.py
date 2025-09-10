@@ -14,11 +14,13 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from datetime import datetime
 
 
 def _hour_of_week(ts_ms: int) -> int:
     """Return hour-of-week index (0..167) for a timestamp in milliseconds."""
-    return (int(ts_ms) // 3_600_000 + 72) % 168
+    dt = datetime.utcfromtimestamp(int(ts_ms) / 1000)
+    return dt.weekday() * 24 + dt.hour
 
 
 def main() -> None:
