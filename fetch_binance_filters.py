@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime
 from typing import Dict, Any, List
 
 from binance_public import BinancePublicClient
@@ -21,9 +22,17 @@ def main():
     except Exception as e:
         print(f"ERROR: failed to fetch exchangeInfo: {e}", file=sys.stderr)
         sys.exit(1)
+
+    meta = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "source_dataset": "binance_exchange_filters",
+        "version": 1,
+    }
+    payload = {"metadata": meta, "filters": normalized}
+
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(normalized, f, ensure_ascii=False, indent=2, sort_keys=True)
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
     print(f"Wrote {len(normalized)} symbols to {out_path}")
 
 

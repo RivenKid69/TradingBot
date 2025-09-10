@@ -372,9 +372,11 @@ class ExecutionSimulator:
         self.strict_filters = bool(strict_filters)
         try:
             if Quantizer is not None and filters_path:
-                filters = load_filters(filters_path)
+                filters, meta = load_filters(filters_path)
                 if filters:
                     self.quantizer = Quantizer(filters, strict=strict_filters)
+                if meta:
+                    logger.info("Loaded filter metadata: %s", meta)
         except Exception:
             # не ломаемся, если файл отсутствует; квантизация просто не активна
             self.quantizer = None
