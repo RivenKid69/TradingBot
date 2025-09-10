@@ -1,3 +1,10 @@
+"""Utility helpers for deriving hour-of-week multipliers.
+
+The script scans a trade/latency log and computes relative multipliers for
+liquidity, latency and bid-ask spread.  The output JSON can then be consumed by
+the simulator to modulate these parameters during backtests.
+"""
+
 import argparse
 import json
 from pathlib import Path
@@ -23,7 +30,8 @@ def compute_multipliers(df: pd.DataFrame) -> dict[str, np.ndarray]:
     cols_map = {
         'liquidity': ['liquidity', 'order_size', 'qty', 'quantity'],
         'latency': ['latency_ms'],
-        'spread': ['spread_bps'],
+        # Some datasets may label spread either in absolute terms or in bps.
+        'spread': ['spread', 'spread_bps'],
     }
     for key, candidates in cols_map.items():
         col = next((c for c in candidates if c in df.columns), None)
