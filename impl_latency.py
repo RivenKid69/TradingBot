@@ -27,6 +27,7 @@ class LatencyCfg:
     retries: int = 1
     seed: int = 0
     seasonality_path: str | None = None
+    use_seasonality: bool = True
 
 
 class LatencyImpl:
@@ -43,8 +44,8 @@ class LatencyImpl:
         ) if LatencyModel is not None else None
         self.latency: List[float] = [1.0] * 168
         path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
-        self._has_seasonality = bool(path)
-        if path:
+        self._has_seasonality = bool(cfg.use_seasonality)
+        if self._has_seasonality and path:
             try:
                 with open(path, "r") as f:
                     data = json.load(f)
@@ -90,4 +91,5 @@ class LatencyImpl:
             retries=int(d.get("retries", 1)),
             seed=int(d.get("seed", 0)),
             seasonality_path=d.get("seasonality_path"),
+            use_seasonality=bool(d.get("use_seasonality", True)),
         ))

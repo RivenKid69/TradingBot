@@ -330,6 +330,7 @@ class ExecutionSimulator:
                  liquidity_seasonality: Optional[Sequence[float]] = None,
                  spread_seasonality: Optional[Sequence[float]] = None,
                  liquidity_seasonality_path: Optional[str] = None,
+                 use_seasonality: bool = True,
                  run_config: Any = None):
         self.symbol = str(symbol).upper()
         self.latency_steps = int(max(0, latency_steps))
@@ -430,46 +431,43 @@ class ExecutionSimulator:
         self._last_hour_vwap: Optional[float] = None
 
         # сезонность ликвидности и спреда по часам недели
+        self.use_seasonality = bool(
+            getattr(run_config, "use_seasonality", use_seasonality)
+        )
         default_seasonality = [1.0] * 168
-
-        liq_arr: Optional[List[float]] = None
-        spread_arr: Optional[List[float]] = None
-
-        if liquidity_seasonality is not None:
-            liq_arr = list(liquidity_seasonality)
-        if spread_seasonality is not None:
-            spread_arr = list(spread_seasonality)
-
-        path = liquidity_seasonality_path
-        if path is None and run_config is not None:
-            path = getattr(run_config, "liquidity_seasonality_path", None)
-        if path is None:
-            path = "configs/liquidity_latency_seasonality.json"
-        if path and (liq_arr is None or spread_arr is None):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    if liq_arr is None:
-                        arr = data.get("liquidity")
-                        if isinstance(arr, list):
-                            liq_arr = [float(x) for x in arr]
-                    if spread_arr is None:
-                        arr = data.get("spread")
-                        if isinstance(arr, list):
-                            spread_arr = [float(x) for x in arr]
-            except Exception:
-                pass
-
-        if liq_arr is not None and len(liq_arr) == 168:
-            self._liq_seasonality = liq_arr
-        else:
-            self._liq_seasonality = default_seasonality
-
-        if spread_arr is not None and len(spread_arr) == 168:
-            self._spread_seasonality = spread_arr
-        else:
-            self._spread_seasonality = default_seasonality
+        self._liq_seasonality: List[float] = default_seasonality
+        self._spread_seasonality: List[float] = default_seasonality
+        if self.use_seasonality:
+            liq_arr: Optional[List[float]] = None
+            spread_arr: Optional[List[float]] = None
+            if liquidity_seasonality is not None:
+                liq_arr = list(liquidity_seasonality)
+            if spread_seasonality is not None:
+                spread_arr = list(spread_seasonality)
+            path = liquidity_seasonality_path
+            if path is None and run_config is not None:
+                path = getattr(run_config, "liquidity_seasonality_path", None)
+            if path is None:
+                path = "configs/liquidity_latency_seasonality.json"
+            if path and (liq_arr is None or spread_arr is None):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        if liq_arr is None:
+                            arr = data.get("liquidity")
+                            if isinstance(arr, list):
+                                liq_arr = [float(x) for x in arr]
+                        if spread_arr is None:
+                            arr = data.get("spread")
+                            if isinstance(arr, list):
+                                spread_arr = [float(x) for x in arr]
+                except Exception:
+                    pass
+            if liq_arr is not None and len(liq_arr) == 168:
+                self._liq_seasonality = liq_arr
+            if spread_arr is not None and len(spread_arr) == 168:
+                self._spread_seasonality = spread_arr
 
     def set_execution_profile(self, profile: str, params: dict | None = None) -> None:
         """Установить профиль исполнения и параметры."""
@@ -514,7 +512,7 @@ class ExecutionSimulator:
 
         liq_mult = 1.0
         spread_mult = 1.0
-        if ts_ms is not None:
+        if self.use_seasonality and ts_ms is not None:
             tm = time.gmtime(ts_ms / 1000.0)
             how = tm.tm_wday * 24 + tm.tm_hour
             if 0 <= how < len(self._liq_seasonality):

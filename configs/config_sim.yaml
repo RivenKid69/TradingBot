@@ -11,6 +11,7 @@ execution_params:
 
 # Optional path to 168 hourly liquidity multipliers
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
+use_seasonality: true  # set false to ignore liquidity/spread multipliers
 
 market: spot
 spot_symbols: ["BTCUSDT"]
@@ -50,6 +51,8 @@ latency:
   timeout_ms: 2500
   retries: 1
   seed: 0
+  seasonality_path: "configs/liquidity_latency_seasonality.json"
+  use_seasonality: true
 
 risk:
   enabled: true
