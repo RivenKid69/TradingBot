@@ -84,11 +84,20 @@ try:
         mid_from_quotes,
     )
 except Exception:
-    SlippageConfig = None  # type: ignore
-    estimate_slippage_bps = None  # type: ignore
-    apply_slippage_price = None  # type: ignore
-    compute_spread_bps_from_quotes = None  # type: ignore
-    mid_from_quotes = None  # type: ignore
+    try:
+        from slippage import (
+            SlippageConfig,  # type: ignore
+            estimate_slippage_bps,  # type: ignore
+            apply_slippage_price,  # type: ignore
+            compute_spread_bps_from_quotes,  # type: ignore
+            mid_from_quotes,  # type: ignore
+        )
+    except Exception:
+        SlippageConfig = None  # type: ignore
+        estimate_slippage_bps = None  # type: ignore
+        apply_slippage_price = None  # type: ignore
+        compute_spread_bps_from_quotes = None  # type: ignore
+        mid_from_quotes = None  # type: ignore
 
 # --- Импорт исполнителей ---
 try:
@@ -188,6 +197,7 @@ class SimStepReport:
     latency_p50_ms: float = 0.0
     latency_p95_ms: float = 0.0
     latency_timeout_ratio: float = 0.0
+    execution_profile: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -215,6 +225,7 @@ class SimStepReport:
             "latency_p50_ms": float(self.latency_p50_ms),
             "latency_p95_ms": float(self.latency_p95_ms),
             "latency_timeout_ratio": float(self.latency_timeout_ratio),
+            "execution_profile": str(self.execution_profile),
         }
 
 
@@ -1224,6 +1235,7 @@ class ExecutionSimulator:
             latency_p50_ms=float(lat_stats.get("p50_ms", 0.0)),
             latency_p95_ms=float(lat_stats.get("p95_ms", 0.0)),
             latency_timeout_ratio=float(lat_stats.get("timeout_rate", 0.0)),
+            execution_profile=str(getattr(self, "execution_profile", "")),
         )
 
 # логирование
@@ -1510,4 +1522,5 @@ class ExecutionSimulator:
             spread_bps=self._last_spread_bps,
             vol_factor=self._last_vol_factor,
             liquidity=self._last_liquidity,
+            execution_profile=str(getattr(self, "execution_profile", "")),
         )

@@ -34,6 +34,8 @@ class ActionProto:
     action_type: ActionType
     volume_frac: float
     price_offset_ticks: int = 0
+    ttl_steps: int = 0
+    abs_price: float | None = None
     tif: str = "GTC"           # 'GTC'|'IOC'|'FOK'
     client_tag: str | None = None
 
