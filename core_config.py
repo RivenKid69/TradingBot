@@ -160,6 +160,7 @@ class EvalConfig(CommonRunConfig):
     metrics: List[str] = Field(default_factory=lambda: ["sharpe", "sortino", "mdd", "pnl"])
     execution_profile: ExecutionProfile = Field(default=ExecutionProfile.MKT_OPEN_NEXT_H1)
     execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
+    all_profiles: bool = Field(default=False)
 
 
 def load_config(path: str) -> CommonRunConfig:

@@ -6,7 +6,7 @@ Includes equity metrics such as Sharpe, Sortino and Conditional Value at Risk (C
 Example
 -------
 ```python
-from core_config import CommonRunConfig
+from core_config import CommonRunConfig, ExecutionProfile
 from service_eval import from_config, EvalConfig
 
 cfg = CommonRunConfig(...)
@@ -26,7 +26,7 @@ import pandas as pd
 from services.utils_config import snapshot_config
 
 from services.metrics import calculate_metrics, read_any, plot_equity_curve
-from core_config import CommonRunConfig
+from core_config import CommonRunConfig, ExecutionProfile
 import di_registry
 
 
@@ -159,25 +159,69 @@ def from_config(
     profile: str | None = None,
     all_profiles: bool = False,
 ) -> Dict[str, Dict[str, float]]:
-    """Run :class:`ServiceEval` using dependencies described in ``cfg``."""
+    """Run :class:`ServiceEval` using dependencies described in ``cfg``.
+
+    If ``all_profiles`` is set, metrics are computed separately for each
+    :class:`core_config.ExecutionProfile` and returned as a dictionary
+    ``{"PROFILE": metrics_dict}``.
+    """
+
+    def _apply_profile(path: str, prof: str) -> str:
+        if not path:
+            return ""
+        if "<profile>" in path:
+            return path.replace("<profile>", prof)
+        if "{profile}" in path:
+            try:
+                return path.format(profile=prof)
+            except Exception:
+                pass
+        root, ext = os.path.splitext(path)
+        return f"{root}_{prof}{ext}"
+
+    container = di_registry.build_graph(cfg.components, cfg)
+
+    if all_profiles:
+        results: Dict[str, Dict[str, float]] = {}
+        base_trades = cfg.input.trades_path
+        base_reports = getattr(cfg.input, "equity_path", "")
+        for prof in ExecutionProfile:
+            tp = _apply_profile(base_trades, prof.value) if isinstance(base_trades, str) else base_trades.get(prof.value, "")
+            rp: str = ""
+            if base_reports:
+                if isinstance(base_reports, str):
+                    rp = _apply_profile(base_reports, prof.value)
+                else:
+                    rp = base_reports.get(prof.value, "")
+            eval_cfg = EvalConfig(
+                trades_path=tp,
+                reports_path=rp,
+                out_json=_apply_profile(f"{cfg.logs_dir}/metrics.json", prof.value),
+                out_md=_apply_profile(f"{cfg.logs_dir}/metrics.md", prof.value),
+                equity_png=_apply_profile(f"{cfg.logs_dir}/equity.png", prof.value),
+                capital_base=10_000.0,
+                rf_annual=0.0,
+                snapshot_config_path=snapshot_config_path,
+                artifacts_dir=cfg.artifacts_dir,
+            )
+            service = ServiceEval(eval_cfg, container)
+            results[prof.value] = service.run()
+        return results
 
     trades_path = cfg.input.trades_path
     reports_path = getattr(cfg.input, "equity_path", "")
-    if isinstance(trades_path, dict):
-        if profile:
-            trades_path = {profile: trades_path[profile]}
-            reports_path = (
-                {profile: reports_path[profile]}
-                if isinstance(reports_path, dict)
-                else {}
-            )
-        elif all_profiles:
-            if not isinstance(reports_path, dict):
-                reports_path = {k: "" for k in trades_path}
-        else:
-            first = next(iter(trades_path))
-            trades_path = trades_path[first]
-            reports_path = reports_path[first] if isinstance(reports_path, dict) else ""
+
+    if profile:
+        trades_path = (
+            trades_path[profile] if isinstance(trades_path, dict) else _apply_profile(str(trades_path), profile)
+        )
+        reports_path = (
+            reports_path.get(profile, "") if isinstance(reports_path, dict) else _apply_profile(str(reports_path), profile)
+        )
+    elif isinstance(trades_path, dict):
+        first = next(iter(trades_path))
+        trades_path = trades_path[first]
+        reports_path = reports_path[first] if isinstance(reports_path, dict) else ""
 
     eval_cfg = EvalConfig(
         trades_path=trades_path,
@@ -191,7 +235,6 @@ def from_config(
         artifacts_dir=cfg.artifacts_dir,
     )
 
-    container = di_registry.build_graph(cfg.components, cfg)
     service = ServiceEval(eval_cfg, container)
     return service.run()
 
