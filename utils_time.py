@@ -20,28 +20,8 @@ _logging_spec = importlib.util.spec_from_file_location(
 logging = importlib.util.module_from_spec(_logging_spec)
 _logging_spec.loader.exec_module(logging)
 
-
-HOUR_MS = 3_600_000
-HOURS_IN_WEEK = 168
-
-
-def hour_of_week(ts_ms: Union[int, Sequence[int], np.ndarray]) -> Union[int, np.ndarray]:
-    """Return hour-of-week index where ``0`` is Monday 00:00 UTC.
-
-    The calculation uses :func:`datetime.utcfromtimestamp` to avoid any
-    dependence on the local timezone.
-    """
-    arr = np.asarray(ts_ms, dtype=np.int64)
-
-    def _calc(ts: int) -> int:
-        dt = datetime.utcfromtimestamp(int(ts) / 1000)
-        return dt.weekday() * 24 + dt.hour
-
-    if arr.shape == ():
-        return _calc(int(arr))
-
-    vec = np.vectorize(_calc, otypes=[int])
-    return vec(arr)
+# Re-export shared time utilities to avoid duplicate implementations.
+from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
 
 
 def load_hourly_seasonality(
