@@ -40,6 +40,7 @@ try:
         load_seasonality,
         get_hourly_multiplier,
         get_liquidity_multiplier,
+        load_hourly_seasonality,
     )
 except Exception:  # pragma: no cover - fallback when running as standalone file
     import pathlib, sys
@@ -49,6 +50,7 @@ except Exception:  # pragma: no cover - fallback when running as standalone file
         load_seasonality,
         get_hourly_multiplier,
         get_liquidity_multiplier,
+        load_hourly_seasonality,
     )
 
 logger = logging.getLogger(__name__)
@@ -493,42 +495,26 @@ class ExecutionSimulator:
                 path = getattr(run_config, "liquidity_seasonality_path", None)
             if path is None:
                 path = "configs/liquidity_seasonality.json"
-            if path and (liq_arr is None or spread_arr is None):
-                try:
-                    data = load_seasonality(path)
-                except FileNotFoundError:
-                    logger.warning(
-                        "Seasonality config %s not found; using default multipliers.",
-                        path,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Error loading seasonality multipliers from %s; using defaults.",
-                        path,
-                    )
-                else:
-                    if liq_arr is None:
-                        liq_arr = data.get("liquidity") or data.get("multipliers")
-                    if spread_arr is None:
-                        spread_arr = data.get("spread") or data.get("latency")
-                    if liq_arr is None or spread_arr is None:
-                        logger.warning(
-                            "Failed to load seasonality multipliers from %s; using defaults.",
-                            path,
-                        )
+            if path:
+                if liq_arr is None:
+                    liq_arr = load_hourly_seasonality(path, "liquidity", "multipliers")
+                if spread_arr is None:
+                    spread_arr = load_hourly_seasonality(path, "spread", "latency")
             if liq_arr is not None and len(liq_arr) == HOURS_IN_WEEK:
                 self._liq_seasonality = np.asarray(liq_arr, dtype=float)
             else:
                 logger.warning(
-                    "Using default liquidity seasonality multipliers of 1.0; "
+                    "Liquidity seasonality config %s not found or invalid; using default multipliers of 1.0; "
                     "run scripts/build_hourly_seasonality.py to generate them.",
+                    path,
                 )
             if spread_arr is not None and len(spread_arr) == HOURS_IN_WEEK:
                 self._spread_seasonality = np.asarray(spread_arr, dtype=float)
             else:
                 logger.warning(
-                    "Using default spread seasonality multipliers of 1.0; "
+                    "Spread seasonality config %s not found or invalid; using default multipliers of 1.0; "
                     "run scripts/build_hourly_seasonality.py to generate them.",
+                    path,
                 )
 
             # Apply optional overrides (element-wise multiplication)
@@ -545,21 +531,14 @@ class ExecutionSimulator:
                         run_config, "liquidity_seasonality_override_path", None
                     ) or getattr(run_config, "seasonality_override_path", None)
             if override_path and (liq_override is None or spread_override is None):
-                try:
-                    data = load_seasonality(override_path)
-                except FileNotFoundError:
-                    logger.warning(
-                        "Seasonality override %s not found; ignoring.", override_path
+                if liq_override is None:
+                    liq_override = load_hourly_seasonality(
+                        override_path, "liquidity", "multipliers"
                     )
-                except Exception:
-                    logger.warning(
-                        "Error loading seasonality override %s; ignoring.", override_path
+                if spread_override is None:
+                    spread_override = load_hourly_seasonality(
+                        override_path, "spread", "latency"
                     )
-                else:
-                    if liq_override is None:
-                        liq_override = data.get("liquidity") or data.get("multipliers")
-                    if spread_override is None:
-                        spread_override = data.get("spread") or data.get("latency")
             if liq_override is not None and len(liq_override) == HOURS_IN_WEEK:
                 self._liq_seasonality *= np.asarray(liq_override, dtype=float)
             elif liq_override is not None:

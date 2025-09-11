@@ -31,14 +31,15 @@ logging = importlib.util.module_from_spec(_logging_spec)
 _logging_spec.loader.exec_module(logging)
 
 try:
-    from utils_time import load_seasonality, get_latency_multiplier
+    from utils_time import load_hourly_seasonality, get_latency_multiplier
 except Exception:  # pragma: no cover - fallback
     try:
         import pathlib, sys
         sys.path.append(str(pathlib.Path(__file__).resolve().parent))
-        from utils_time import load_seasonality, get_latency_multiplier
+        from utils_time import load_hourly_seasonality, get_latency_multiplier
     except Exception:  # pragma: no cover
-        load_seasonality = lambda *a, **k: {}  # type: ignore
+        def load_hourly_seasonality(*a, **k):
+            return None  # type: ignore
 
 logger = logging.getLogger(__name__)
 seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
@@ -168,30 +169,20 @@ class LatencyImpl:
         path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
         self._has_seasonality = bool(cfg.use_seasonality and seasonality_enabled())
         if self._has_seasonality:
-            try:
-                data = load_seasonality(path)
-            except FileNotFoundError:
+            arr = load_hourly_seasonality(
+                path,
+                "latency",
+                symbol=cfg.symbol,
+                expected_hash=cfg.seasonality_hash,
+            )
+            if arr is None or len(arr) != 168:
                 logger.warning(
-                    "Latency seasonality config %s not found; using default multipliers.",
-                    path,
-                )
-                self._has_seasonality = False
-            except Exception:
-                logger.warning(
-                    "Error loading latency seasonality config %s; using defaults.",
+                    "Latency seasonality config %s not found or invalid; using default multipliers.",
                     path,
                 )
                 self._has_seasonality = False
             else:
-                arr = data.get("latency")
-                if arr is not None:
-                    self.latency = [float(x) for x in arr]
-                else:
-                    logger.warning(
-                        "Latency seasonality config %s missing 'latency'; using default multipliers.",
-                        path,
-                    )
-                    self._has_seasonality = False
+                self.latency = [float(x) for x in arr]
             if not self._has_seasonality:
                 logger.warning(
                     "Using default latency seasonality multipliers of 1.0; "
@@ -200,23 +191,11 @@ class LatencyImpl:
             override = cfg.seasonality_override
             o_path = cfg.seasonality_override_path
             if override is None and o_path:
-                try:
-                    odata = load_seasonality(o_path)
-                except FileNotFoundError:
+                override = load_hourly_seasonality(o_path, "latency", symbol=cfg.symbol)
+                if override is None:
                     logger.warning(
                         "Latency override %s not found or invalid; ignoring.", o_path
                     )
-                except Exception:
-                    logger.warning(
-                        "Error loading latency override %s; ignoring.", o_path
-                    )
-                else:
-                    override = odata.get("latency")
-                    if override is None:
-                        logger.warning(
-                            "Latency override %s not found or invalid; ignoring.",
-                            o_path,
-                        )
             if override is not None:
                 arr = np.asarray(override, dtype=float)
                 if len(arr) == 168:

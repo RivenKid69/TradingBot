@@ -13,6 +13,8 @@ import pandas as pd
 import streamlit as st
 import yaml
 
+from utils_time import load_seasonality
+
 from core_config import load_config, load_config_from_str
 from ingest_config import load_config as load_ingest_config, load_config_from_str as parse_ingest_config
 from legacy_sandbox_config import (
@@ -57,10 +59,13 @@ def fetch_seasonality(
     _: None = Depends(_check_auth),
 ) -> Dict[str, Any]:
     """Return seasonality multipliers from JSON file."""
-    if not os.path.exists(path):
+    try:
+        data = load_seasonality(path)
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Seasonality file not found")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {k: v.tolist() for k, v in data.items()}
 
 
 @api.post("/seasonality/refresh")
@@ -81,10 +86,13 @@ def refresh_seasonality(
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         raise HTTPException(status_code=500, detail=res.stderr)
-    if not os.path.exists(out):
+    try:
+        sdata = load_seasonality(out)
+    except FileNotFoundError:
         raise HTTPException(status_code=500, detail="Seasonality JSON not generated")
-    with open(out, "r", encoding="utf-8") as f:
-        return json.load(f)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {k: v.tolist() for k, v in sdata.items()}
 
 
 # --------------------------- Utility ---------------------------
