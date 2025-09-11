@@ -70,6 +70,21 @@ The script writes line charts and heatmaps for liquidity and latency multipliers
    ```
    See [seasonality_QA.md](seasonality_QA.md) for QA steps and acceptance thresholds.
 
+5. Optionally iterate on the multipliers by feeding previous validation metrics
+   back into the generator. Save per-hour relative errors from a validation run
+   to a JSON file and pass it via `--prior-metrics`:
+
+   ```bash
+   python scripts/build_hourly_seasonality.py \
+     --data path/to/trades.parquet \
+     --out configs/liquidity_latency_seasonality.json \
+     --prior-metrics reports/seasonality/validation_metrics.json
+   ```
+   The script converts each error ``e`` into a weight ``1/(1+e)`` to down-weight
+   hours that previously deviated from historical data, then renormalises the
+   multipliers so their average remains close to ``1.0``. Repeat the
+   generate→validate cycle until the validation metrics stabilise.
+
 ## Enabling seasonality in configs
 
 Seasonality can be activated either via CLI flags or directly in YAML configs:

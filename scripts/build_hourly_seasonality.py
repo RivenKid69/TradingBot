@@ -11,6 +11,7 @@ import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -66,7 +67,11 @@ def _rolling_mean_circular(arr: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(extended, kernel, mode="valid")
 
 
-def compute_multipliers(df: pd.DataFrame, min_samples: int = 30) -> tuple[dict[str, np.ndarray], dict[str, list[int]]]:
+def compute_multipliers(
+    df: pd.DataFrame,
+    min_samples: int = 30,
+    prior_metrics: Optional[Dict[str, np.ndarray]] = None,
+) -> tuple[dict[str, np.ndarray], dict[str, list[int]]]:
     ts_col = 'ts_ms' if 'ts_ms' in df.columns else 'ts'
     if ts_col not in df.columns:
         raise ValueError('ts or ts_ms column required')
@@ -97,6 +102,14 @@ def compute_multipliers(df: pd.DataFrame, min_samples: int = 30) -> tuple[dict[s
             arr, imp = _fill_missing(mult.reindex(range(168)).to_numpy(dtype=float))
             if imp:
                 imputed_hours[key] = imp
+        if prior_metrics and key in prior_metrics:
+            weights = np.asarray(prior_metrics[key], dtype=float)
+            if weights.shape[0] != 168:
+                raise ValueError(f"prior_metrics for {key} must have length 168")
+            w = 1.0 / (1.0 + weights)
+            arr = arr * w
+            mean = float(np.mean(arr)) or 1.0
+            arr = arr / mean
         metrics[key] = arr
     return metrics, imputed_hours
 
@@ -146,11 +159,21 @@ def main() -> None:
         default=0.0,
         help='Regularisation strength towards 1.0 (0 to disable)',
     )
+    parser.add_argument(
+        '--prior-metrics',
+        default=None,
+        help='Optional path to JSON with per-hour validation metrics',
+    )
     args = parser.parse_args()
 
     data_path = Path(args.data)
     df = load_logs(data_path)
-    multipliers, imputed = compute_multipliers(df, args.min_samples)
+    prior: Optional[Dict[str, np.ndarray]] = None
+    if args.prior_metrics:
+        with open(args.prior_metrics, 'r') as f:
+            raw = json.load(f)
+        prior = {k: np.asarray(v, dtype=float) for k, v in raw.items() if isinstance(v, list)}
+    multipliers, imputed = compute_multipliers(df, args.min_samples, prior)
     if args.smooth_window > 1:
         for key, arr in multipliers.items():
             multipliers[key] = _rolling_mean_circular(arr, args.smooth_window)
