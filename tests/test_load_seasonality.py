@@ -40,6 +40,13 @@ def test_load_seasonality_nested(tmp_path):
     assert np.allclose(res["spread"], 3.0)
 
 
+def test_load_seasonality_legacy_top_level(tmp_path):
+    p = tmp_path / "legacy.json"
+    p.write_text(json.dumps(_arr(4.0)))
+    res = load_seasonality(str(p))
+    assert np.allclose(res["multipliers"], 4.0)
+
+
 def test_load_seasonality_file_missing(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_seasonality(str(tmp_path / "missing.json"))
@@ -75,3 +82,10 @@ def test_hourly_seasonality_clamping(tmp_path):
     p2.write_text(json.dumps({"latency": [20.0] * HOURS_IN_WEEK}))
     arr2 = load_hourly_seasonality(str(p2), "latency")
     assert arr2.max() == SEASONALITY_MULT_MAX
+
+
+def test_hourly_seasonality_legacy_key(tmp_path):
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps({"multipliers": _arr(5.0)}))
+    arr = load_hourly_seasonality(str(p), "liquidity")
+    assert np.allclose(arr, 5.0)

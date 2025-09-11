@@ -727,17 +727,30 @@ class ExecutionSimulator:
         """
 
         liq = data.get("liquidity")
+        spread = data.get("spread")
+        legacy = data.get("multipliers")
+
         if liq is not None:
             arr = np.asarray(liq, dtype=float)
             if arr.size != HOURS_IN_WEEK:
                 raise ValueError("liquidity multipliers must have length 168")
             self._liq_seasonality = arr.copy()
+        elif legacy is not None:
+            arr = np.asarray(legacy, dtype=float)
+            if arr.size != HOURS_IN_WEEK:
+                raise ValueError("multipliers must have length 168")
+            self._liq_seasonality = arr.copy()
 
-        spread = data.get("spread")
         if spread is not None:
             arr = np.asarray(spread, dtype=float)
             if arr.size != HOURS_IN_WEEK:
                 raise ValueError("spread multipliers must have length 168")
+            self._spread_seasonality = arr.copy()
+        elif legacy is not None and spread is None and liq is None:
+            # Legacy single-array structure applied to both
+            arr = np.asarray(legacy, dtype=float)
+            if arr.size != HOURS_IN_WEEK:
+                raise ValueError("multipliers must have length 168")
             self._spread_seasonality = arr.copy()
     def _build_executor(self) -> None:
         """
