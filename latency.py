@@ -5,6 +5,10 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
 import threading
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -139,9 +143,16 @@ class SeasonalLatencyModel:
             seed = getattr(self._model, "seed", None)
             state_after = None
             try:
-                self._model.base_ms = int(round(base * m))
+                scaled_base = int(round(base * m))
+                if scaled_base > timeout:
+                    logger.warning(
+                        "scaled base_ms %s exceeds timeout_ms %s; capping",
+                        scaled_base,
+                        timeout,
+                    )
+                    scaled_base = timeout
+                self._model.base_ms = scaled_base
                 self._model.jitter_ms = int(round(jitter * m))
-                self._model.timeout_ms = int(round(timeout * m))
                 res = self._model.sample()
                 if hasattr(self._model, "_rng"):
                     state_after = self._model._rng.getstate()

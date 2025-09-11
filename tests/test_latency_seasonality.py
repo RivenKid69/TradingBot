@@ -4,8 +4,10 @@ import sys
 import json
 import datetime
 import pytest
+import logging
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
+sys.path.append(str(BASE))
 
 # Load latency module
 spec_lat = importlib.util.spec_from_file_location("latency", BASE / "latency.py")
@@ -271,3 +273,30 @@ def test_latency_seed_deterministic(tmp_path):
     ]
 
     assert seq1 == seq2
+
+
+def test_latency_impl_caps_timeout(tmp_path, caplog):
+    multipliers = [10.0] * 168
+    path = tmp_path / "latency.json"
+    path.write_text(json.dumps({"latency": multipliers}))
+
+    cfg = {
+        "base_ms": 300,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seasonality_path": str(path),
+    }
+    impl = LatencyImpl.from_dict(cfg)
+
+    class Dummy:
+        pass
+
+    sim = Dummy()
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    with caplog.at_level(logging.WARNING):
+        res = lat.sample(0)
+
+    assert res["total_ms"] == 1000
