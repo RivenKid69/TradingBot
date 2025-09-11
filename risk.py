@@ -66,6 +66,8 @@ class RiskManager:
       - pre_trade_adjust() → корректирует целевой размер перед планированием детей
       - can_send_order() / on_new_order() → ограничение частоты
       - on_mark() → обновляет дневной PnL и выставляет паузу
+      - Методы принимают сезонные коэффициенты ликвидности/латентности для
+        масштабирования лимитов при необходимости.
     """
     def __init__(self, cfg: Optional[RiskConfig] = None):
         self.cfg = cfg or RiskConfig()
@@ -132,12 +134,28 @@ class RiskManager:
             self._emit(ts_ms, "DAILY_LOSS_PAUSE", f"Daily loss limit breached: PnL={daily_pnl:.2f} <= -{self.cfg.daily_loss_limit:.2f}",
                        equity=float(equity), equity_day_start=float(self._equity_day_start), paused_until_ms=int(self._paused_until_ms))
 
-    def can_send_order(self, ts_ms: int) -> bool:
+    def can_send_order(self, ts_ms: int, *, latency_mult: float = 1.0) -> bool:
+        """Check whether a new order can be sent respecting rate limits.
+
+        Parameters
+        ----------
+        ts_ms : int
+            Current timestamp in milliseconds.
+        latency_mult : float, optional
+            Seasonal multiplier for latency where ``>1`` means slower execution
+            (fewer orders allowed per unit time). ``1.0`` keeps the original
+            configuration unchanged. Values ``<=0`` are treated as ``1.0``.
+        """
         if not self.cfg.enabled:
             return True
         # очистить старые таймстемпы
-        window_ms = max(1, int(self.cfg.max_orders_window_s)) * 1000
-        limit = max(1, int(self.cfg.max_orders_per_min))
+        base_window_ms = max(1, int(self.cfg.max_orders_window_s)) * 1000
+        base_limit = max(1, int(self.cfg.max_orders_per_min))
+        lm = float(latency_mult)
+        if not math.isfinite(lm) or lm <= 0.0:
+            lm = 1.0
+        window_ms = int(base_window_ms * max(1.0, lm))
+        limit = max(1, int(base_limit / max(lm, 1e-9)))
         while self._orders_ts and (ts_ms - self._orders_ts[0]) > window_ms:
             self._orders_ts.popleft()
         return len(self._orders_ts) < limit
@@ -147,10 +165,22 @@ class RiskManager:
             return
         self._orders_ts.append(int(ts_ms))
 
-    def pre_trade_adjust(self, *, ts_ms: int, side: str, intended_qty: float, price: Optional[float], position_qty: float) -> float:
-        """
-        Возвращает допустимое количество (qty) с учётом ограничений позиции и заявки.
-        Может вернуть 0.0, если торговля на паузе или лимит не позволяет увеличивать позицию.
+    def pre_trade_adjust(
+        self,
+        *,
+        ts_ms: int,
+        side: str,
+        intended_qty: float,
+        price: Optional[float],
+        position_qty: float,
+        liquidity_mult: float = 1.0,
+    ) -> float:
+        """Return allowed quantity given risk limits.
+
+        The optional ``liquidity_mult`` parameter allows scaling position and
+        notional limits based on seasonal liquidity assumptions. Values ``>1``
+        increase limits while values ``<1`` tighten them. Non-finite or
+        non-positive values are treated as ``1.0``.
         """
         if not self.cfg.enabled:
             return float(intended_qty)
@@ -162,11 +192,19 @@ class RiskManager:
         if q == 0.0:
             return 0.0
 
+        lm = float(liquidity_mult)
+        if not math.isfinite(lm) or lm <= 0.0:
+            lm = 1.0
+
+        max_order_notional = float(self.cfg.max_order_notional) * lm
+        max_pos_qty = float(self.cfg.max_abs_position_qty) * lm
+        max_pos_notional = float(self.cfg.max_abs_position_notional) * lm
+
         # Лимит на заявку по нотионалу
-        if float(self.cfg.max_order_notional) > 0.0 and price is not None and price > 0.0:
-            max_q_by_order = float(self.cfg.max_order_notional) / float(price)
+        if max_order_notional > 0.0 and price is not None and price > 0.0:
+            max_q_by_order = max_order_notional / float(price)
             if max_q_by_order <= 0.0:
-                self._emit(ts_ms, "ORDER_NOTIONAL_BLOCK", "max_order_notional too small", max_order_notional=float(self.cfg.max_order_notional))
+                self._emit(ts_ms, "ORDER_NOTIONAL_BLOCK", "max_order_notional too small", max_order_notional=max_order_notional)
                 return 0.0
             if q > max_q_by_order:
                 self._emit(ts_ms, "ORDER_NOTIONAL_CLAMP", "clamped by max_order_notional", requested_qty=float(q), allowed_qty=float(max_q_by_order))
@@ -174,37 +212,37 @@ class RiskManager:
 
         # Лимит на абсолютную позицию (по qty)
         pos_after = float(position_qty) + (q if str(side).upper() == "BUY" else -q)
-        if float(self.cfg.max_abs_position_qty) > 0.0 and abs(pos_after) > float(self.cfg.max_abs_position_qty):
+        if max_pos_qty > 0.0 and abs(pos_after) > max_pos_qty:
             # допустимый инкремент до границы
             if str(side).upper() == "BUY":
-                room = float(self.cfg.max_abs_position_qty) - max(0.0, float(position_qty))
+                room = max_pos_qty - max(0.0, float(position_qty))
             else:
-                room = float(self.cfg.max_abs_position_qty) - max(0.0, -float(position_qty))
+                room = max_pos_qty - max(0.0, -float(position_qty))
             allowed = max(0.0, float(room))
             if allowed <= 0.0:
                 self._emit(ts_ms, "POS_QTY_BLOCK", "position qty limit blocks increase",
-                           limit=float(self.cfg.max_abs_position_qty), position=float(position_qty), side=str(side))
+                           limit=max_pos_qty, position=float(position_qty), side=str(side))
                 return 0.0
             if q > allowed:
                 self._emit(ts_ms, "POS_QTY_CLAMP", "clamped by position qty limit",
-                           requested_qty=float(q), allowed_qty=float(allowed), limit=float(self.cfg.max_abs_position_qty), position=float(position_qty))
+                           requested_qty=float(q), allowed_qty=float(allowed), limit=max_pos_qty, position=float(position_qty))
                 q = float(allowed)
 
         # Лимит на абсолютную позицию (по нотионалу)
-        if float(self.cfg.max_abs_position_notional) > 0.0 and price is not None and price > 0.0:
+        if max_pos_notional > 0.0 and price is not None and price > 0.0:
             notional_after = abs(pos_after) * float(price)
-            if notional_after > float(self.cfg.max_abs_position_notional):
+            if notional_after > max_pos_notional:
                 # сколько ещё можно добавить
                 current_notional = abs(float(position_qty)) * float(price)
-                room_notional = max(0.0, float(self.cfg.max_abs_position_notional) - current_notional)
+                room_notional = max(0.0, max_pos_notional - current_notional)
                 allowed = room_notional / float(price)
                 if allowed <= 0.0:
                     self._emit(ts_ms, "POS_NOTIONAL_BLOCK", "position notional limit blocks increase",
-                               limit=float(self.cfg.max_abs_position_notional), position=float(position_qty), price=float(price))
+                               limit=max_pos_notional, position=float(position_qty), price=float(price))
                     return 0.0
                 if q > allowed:
                     self._emit(ts_ms, "POS_NOTIONAL_CLAMP", "clamped by position notional limit",
-                               requested_qty=float(q), allowed_qty=float(allowed), limit=float(self.cfg.max_abs_position_notional), position=float(position_qty), price=float(price))
+                               requested_qty=float(q), allowed_qty=float(allowed), limit=max_pos_notional, position=float(position_qty), price=float(price))
                     q = float(allowed)
 
         return float(q)

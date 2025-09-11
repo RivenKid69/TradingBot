@@ -2,6 +2,9 @@
 """
 impl_risk_basic.py
 Обёртка над risk.RiskManager/RiskConfig. Подключает риск в симулятор.
+Учтены сезонные коэффициенты ликвидности/латентности, которые могут
+масштабировать лимиты RiskManager через параметры ``liquidity_mult`` и
+``latency_mult`` соответствующих методов.
 """
 
 from __future__ import annotations
