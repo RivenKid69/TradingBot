@@ -1,6 +1,7 @@
 # ## Имя файла: data_validation.py
 import pandas as pd
 import numpy as np
+import re
 
 class DataValidator:
     """
@@ -29,6 +30,7 @@ class DataValidator:
         self._check_ohlc_invariants(df)
         self._check_timestamp_continuity(df, frequency)
         self._check_schema_and_order(df)
+        self._check_no_pii(df)
         print("Валидация данных успешно завершена.")
         return df
 
@@ -106,6 +108,25 @@ class DataValidator:
         head = list(df.columns[:len(prefix)])
         if head != prefix:
             raise ValueError(f"Нарушен порядок колонок. Ожидается префикс {prefix}, получено {head}")
+
+    def _check_no_pii(self, df: pd.DataFrame):
+        """Проверяет отсутствие очевидных персональных данных в строковых колонках."""
+        # Простые паттерны для e-mail и телефонов/SSN
+        patterns = [
+            re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+            re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),  # SSN
+            re.compile(r"\b(?:\+?\d{1,3}[- ]?)?\d{3}[- ]?\d{3}[- ]?\d{4}\b"),
+        ]
+        object_cols = df.select_dtypes(include="object")
+        for col in object_cols:
+            series = object_cols[col].dropna().astype(str)
+            for pattern in patterns:
+                matches = series.str.contains(pattern, regex=True)
+                if matches.any():
+                    idx = matches.idxmax()
+                    raise ValueError(
+                        f"Обнаружены возможные персональные данные в колонке '{col}' по индексу {idx}: {series[idx]}"
+                    )
 
     def _check_timestamp_continuity(self, df: pd.DataFrame, frequency: str = None):
         # если индекс не DateTimeIndex, проверяем, что разница == 1
