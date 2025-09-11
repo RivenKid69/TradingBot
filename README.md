@@ -7,6 +7,10 @@
 
 Документация по утилите скользящего среднего доступна в [docs/moving_average.md](docs/moving_average.md) (English/Russian).
 
+## File Ownership and Permissions
+
+Информация о ролях, владении файлами и необходимых правах доступа приведена в [docs/permissions.md](docs/permissions.md).
+
 ## Установка зависимостей для скриптов
 
 Скрипты построения и валидации данных полагаются на библиотеки
