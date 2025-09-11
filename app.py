@@ -5,8 +5,10 @@ import os
 import sys
 import json
 import time
+import subprocess
 from typing import Any, Dict, List, Optional
 
+from fastapi import Depends, FastAPI, HTTPException, Header
 import pandas as pd
 import streamlit as st
 import yaml
@@ -34,6 +36,55 @@ from services.utils_app import (
 from service_backtest import BacktestConfig, from_config as backtest_from_config
 from service_signal_runner import ServiceSignalRunner, RunnerConfig
 from service_eval import ServiceEval, EvalConfig
+
+
+# --------------------------- Seasonality API ---------------------------
+
+API_TOKEN = os.environ.get("SEASONALITY_API_TOKEN", "changeme")
+
+api = FastAPI()
+
+
+def _check_auth(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
+    """Simple header-based authentication."""
+    if x_api_key != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+@api.get("/seasonality")
+def fetch_seasonality(
+    path: str = "configs/liquidity_latency_seasonality.json",
+    _: None = Depends(_check_auth),
+) -> Dict[str, Any]:
+    """Return seasonality multipliers from JSON file."""
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Seasonality file not found")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@api.post("/seasonality/refresh")
+def refresh_seasonality(
+    data: str = "data/seasonality_source/latest.parquet",
+    out: str = "configs/liquidity_latency_seasonality.json",
+    _: None = Depends(_check_auth),
+) -> Dict[str, Any]:
+    """Rebuild seasonality JSON from historical data and return it."""
+    cmd = [
+        sys.executable,
+        "scripts/build_hourly_seasonality.py",
+        "--data",
+        data,
+        "--out",
+        out,
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise HTTPException(status_code=500, detail=res.stderr)
+    if not os.path.exists(out):
+        raise HTTPException(status_code=500, detail="Seasonality JSON not generated")
+    with open(out, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 # --------------------------- Utility ---------------------------
