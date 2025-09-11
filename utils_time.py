@@ -201,21 +201,43 @@ def watch_seasonality_file(
 
     The callback receives the mapping returned by :func:`load_seasonality`.
     Reloading is attempted whenever the file modification time increases.
-    The watcher runs in a daemon thread and ignores errors, retrying on the
-    next polling interval.
+    The watcher runs in a daemon thread and logs any file read errors,
+    retaining the last successfully loaded multipliers for operator
+    awareness.
     """
 
     def _loop() -> None:
         last_mtime: float | None = None
+        last_data: Dict[str, np.ndarray] | None = None
         while True:
             try:
                 mtime = os.path.getmtime(path)
                 if last_mtime is None or mtime > last_mtime:
-                    data = load_seasonality(path)
-                    callback(data)
-                    last_mtime = mtime
+                    try:
+                        data = load_seasonality(path)
+                    except Exception:
+                        seasonality_logger.exception(
+                            "Failed to reload seasonality multipliers from %s", path
+                        )
+                        if last_data is not None:
+                            seasonality_logger.warning(
+                                "Retaining last known good multipliers from %s", path
+                            )
+                            try:
+                                callback(last_data)
+                            except Exception:
+                                seasonality_logger.exception(
+                                    "Failed to reapply previous multipliers from %s",
+                                    path,
+                                )
+                    else:
+                        callback(data)
+                        last_data = data
+                        last_mtime = mtime
             except Exception:
-                pass
+                seasonality_logger.exception(
+                    "Error while watching seasonality file %s", path
+                )
             time.sleep(float(poll_interval))
 
     t = threading.Thread(target=_loop, daemon=True)
