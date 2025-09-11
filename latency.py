@@ -2,14 +2,57 @@
 from __future__ import annotations
 
 import random
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
 import threading
 import logging
 
+from utils_time import SEASONALITY_MULT_MAX
+
 
 logger = logging.getLogger(__name__)
 seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
+
+
+def validate_multipliers(
+    multipliers: Sequence[float], *, expected_len: int = 168, cap: float = SEASONALITY_MULT_MAX
+) -> List[float]:
+    """Return ``multipliers`` as a list after validation.
+
+    Parameters
+    ----------
+    multipliers:
+        Sequence of multiplier values to validate.
+    expected_len:
+        Required length of the sequence. Defaults to ``168``.
+    cap:
+        Maximum allowed value for each multiplier. Values must also be
+        positive and finite.
+
+    Returns
+    -------
+    List[float]
+        Validated multiplier values.
+
+    Raises
+    ------
+    ValueError
+        If the sequence length differs from ``expected_len`` or any value is
+        non-finite, non-positive or exceeds ``cap``.
+    """
+
+    arr = [float(x) for x in multipliers]
+    if len(arr) != int(expected_len):
+        raise ValueError(f"multipliers must have length {expected_len}")
+    for i, v in enumerate(arr):
+        if not math.isfinite(v):
+            raise ValueError(f"multipliers[{i}] is not finite")
+        if v <= 0:
+            raise ValueError(f"multipliers[{i}] must be positive")
+        if v > cap:
+            raise ValueError(f"multipliers[{i}] {v} exceeds cap {cap}")
+    return arr
 
 
 @dataclass
@@ -126,10 +169,8 @@ class SeasonalLatencyModel:
     """
 
     def __init__(self, model: LatencyModel, multipliers: Sequence[float]) -> None:
-        if len(multipliers) != 168:
-            raise ValueError("multipliers must have length 168")
         self._model = model
-        self._mult: List[float] = [float(x) for x in multipliers]
+        self._mult = validate_multipliers(multipliers, expected_len=168)
         self._lock = threading.Lock()
 
     def sample(self, ts_ms: int) -> Dict[str, int | float | bool]:
@@ -170,13 +211,9 @@ class SeasonalLatencyModel:
     def update_multipliers(self, multipliers: Sequence[float]) -> None:
         """Atomically replace the internal multipliers array."""
 
-        arr = [float(x) for x in multipliers]
-        if len(arr) != len(self._mult):
-            raise ValueError(
-                f"multipliers must have length {len(self._mult)}"
-            )
+        arr = validate_multipliers(multipliers, expected_len=len(self._mult))
         with self._lock:
-            self._mult = list(arr)
+            self._mult = arr
 
     def __getattr__(self, name: str):  # pragma: no cover - simple delegation
         return getattr(self._model, name)

@@ -60,9 +60,11 @@ _LATENCY_MULT_COUNTER = Counter(
 )
 
 try:
-    from latency import LatencyModel
+    from latency import LatencyModel, validate_multipliers
 except Exception:  # pragma: no cover
     LatencyModel = None  # type: ignore
+    def validate_multipliers(multipliers, *, expected_len=168, cap=10.0):  # type: ignore
+        return [float(x) for x in multipliers]
 
 
 @dataclass
@@ -92,11 +94,10 @@ class _LatencyWithSeasonality:
         self, model: LatencyModel, multipliers: Sequence[float], *, interpolate: bool = False
     ):  # type: ignore[name-defined]
         self._model = model
-        arr = np.asarray(multipliers, dtype=float)
-        n = len(arr)
+        n = len(multipliers)
         if n not in (7, 168):
-            arr = np.ones(168, dtype=float)
-            n = 168
+            raise ValueError("multipliers must have length 7 or 168")
+        arr = np.asarray(validate_multipliers(multipliers, expected_len=n), dtype=float)
         self._mult = arr
         self._interpolate = bool(interpolate)
         self._mult_sum: List[float] = [0.0] * n
@@ -243,6 +244,7 @@ class LatencyImpl:
                     logger.warning(
                         "Latency override array must have length 168 or 7; ignoring."
                     )
+        self.latency = validate_multipliers(self.latency, expected_len=len(self.latency))
         self.attached_sim = None
         self._wrapper: _LatencyWithSeasonality | None = None
         if self._has_seasonality and cfg.seasonality_auto_reload and path:
@@ -304,10 +306,8 @@ class LatencyImpl:
         simulator, the underlying wrapper is updated as well.
         """
 
-        arr_list = [float(x) for x in arr]
         expected = 7 if self.cfg.seasonality_day_only else 168
-        if len(arr_list) != expected:
-            raise ValueError(f"multipliers array must have length {expected}")
+        arr_list = validate_multipliers(arr, expected_len=expected)
         with self._mult_lock:
             self.latency = arr_list
             if self._wrapper is not None:
