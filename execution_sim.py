@@ -38,6 +38,7 @@ except Exception:  # pragma: no cover - fallback when running as standalone file
     from utils_time import load_hourly_seasonality
 
 logger = logging.getLogger(__name__)
+seasonality_logger = logger.getChild("seasonality")
 
 try:
     import numpy as np
@@ -645,6 +646,13 @@ class ExecutionSimulator:
         self._last_vol_factor = float(vol_factor) if vol_factor is not None else None
         liq_val = float(liquidity) if liquidity is not None else None
         self._last_liquidity = liq_val * liq_mult if liq_val is not None else None
+        if seasonality_logger.isEnabledFor(logging.DEBUG) and ts_ms is not None:
+            seasonality_logger.debug(
+                "snapshot h%03d mult=%.3f liquidity=%s",
+                how,
+                liq_mult,
+                self._last_liquidity,
+            )
         if how is not None and 0 <= how < HOURS_IN_WEEK:
             self._liq_mult_sum[how] += liq_mult
             if self._last_liquidity is not None:
