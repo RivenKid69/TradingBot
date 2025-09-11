@@ -52,7 +52,18 @@ The script writes line charts and heatmaps for liquidity and latency multipliers
    # To wrap the arrays under a specific symbol:
    python scripts/build_hourly_seasonality.py --data path/to/trades.parquet --out configs/liquidity_latency_seasonality.json --symbol BTCUSDT
    ```
-3. Optionally verify the multipliers against the original dataset:
+3. Optionally smooth the multipliers by applying a circular rolling mean
+   and/or shrinking values towards 1.0:
+
+   ```bash
+   python scripts/build_hourly_seasonality.py \
+     --data path/to/trades.parquet \
+     --out configs/liquidity_latency_seasonality.json \
+     --smooth-window 3 \
+     --smooth-alpha 0.1
+   ```
+
+4. Optionally verify the multipliers against the original dataset:
 
    ```bash
    python scripts/validate_seasonality.py --historical path/to/trades.parquet --multipliers configs/liquidity_latency_seasonality.json

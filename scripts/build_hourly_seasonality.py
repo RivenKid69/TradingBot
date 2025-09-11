@@ -9,6 +9,7 @@ to modulate these parameters during backtests.
 import argparse
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,18 @@ def _fill_missing(arr: np.ndarray) -> tuple[np.ndarray, list[int]]:
         else:
             out[i] = 1.0
     return out, imputed
+
+
+def _rolling_mean_circular(arr: np.ndarray, window: int) -> np.ndarray:
+    """Apply circular rolling mean with *window* size to *arr*."""
+    if window <= 1:
+        return arr
+    k = window
+    kernel = np.ones(k) / k
+    pad_left = k // 2
+    pad_right = k - 1 - pad_left
+    extended = np.concatenate([arr[-pad_left:], arr, arr[:pad_right]])
+    return np.convolve(extended, kernel, mode="valid")
 
 
 def compute_multipliers(df: pd.DataFrame, min_samples: int = 30) -> tuple[dict[str, np.ndarray], dict[str, list[int]]]:
@@ -121,18 +134,47 @@ def main() -> None:
         default=30,
         help='Minimum samples per hour required before imputation',
     )
+    parser.add_argument(
+        '--smooth-window',
+        type=int,
+        default=0,
+        help='Apply circular rolling mean with this window (0 to disable)',
+    )
+    parser.add_argument(
+        '--smooth-alpha',
+        type=float,
+        default=0.0,
+        help='Regularisation strength towards 1.0 (0 to disable)',
+    )
     args = parser.parse_args()
 
     data_path = Path(args.data)
     df = load_logs(data_path)
     multipliers, imputed = compute_multipliers(df, args.min_samples)
+    if args.smooth_window > 1:
+        for key, arr in multipliers.items():
+            multipliers[key] = _rolling_mean_circular(arr, args.smooth_window)
+    if args.smooth_alpha > 0.0:
+        for key, arr in multipliers.items():
+            multipliers[key] = arr * (1.0 - args.smooth_alpha) + args.smooth_alpha
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    meta = {
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'smoothing': {
+            'rolling_window': args.smooth_window,
+            'regularization_alpha': args.smooth_alpha,
+        },
+    }
     if args.symbol:
-        out_data = {str(args.symbol): {k: v.tolist() for k, v in multipliers.items()}}
-        out_data['hour_of_week_definition'] = '0=Monday 00:00 UTC'
+        out_data = {
+            str(args.symbol): {k: v.tolist() for k, v in multipliers.items()},
+            'hour_of_week_definition': '0=Monday 00:00 UTC',
+            'metadata': meta,
+        }
     else:
         out_data = {k: v.tolist() for k, v in multipliers.items()}
         out_data['hour_of_week_definition'] = '0=Monday 00:00 UTC'
+        out_data['metadata'] = meta
     with open(args.out, 'w') as f:
         json.dump(out_data, f, indent=2)
     if imputed:
