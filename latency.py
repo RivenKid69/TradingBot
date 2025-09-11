@@ -4,6 +4,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
+import threading
 
 
 @dataclass
@@ -111,40 +112,48 @@ class LatencyModel:
 
 
 class SeasonalLatencyModel:
-    """Wrapper around :class:`LatencyModel` applying hourly seasonality multipliers."""
+    """Wrapper around :class:`LatencyModel` applying hourly seasonality multipliers.
+
+    The :meth:`sample` method is thread-safe and can be called from multiple
+    threads concurrently. An internal lock guards access to the underlying
+    ``LatencyModel`` to prevent races when its parameters are temporarily
+    adjusted for seasonality.
+    """
 
     def __init__(self, model: LatencyModel, multipliers: Sequence[float]) -> None:
         if len(multipliers) != 168:
             raise ValueError("multipliers must have length 168")
         self._model = model
         self._mult: List[float] = [float(x) for x in multipliers]
+        self._lock = threading.Lock()
 
     def sample(self, ts_ms: int) -> Dict[str, int | float | bool]:
         hour = ((int(ts_ms) // 3_600_000) + 72) % len(self._mult)
         m = float(self._mult[hour])
-        base, jitter, timeout = (
-            self._model.base_ms,
-            self._model.jitter_ms,
-            self._model.timeout_ms,
-        )
-        seed = getattr(self._model, "seed", None)
-        state_after = None
-        try:
-            self._model.base_ms = int(round(base * m))
-            self._model.jitter_ms = int(round(jitter * m))
-            self._model.timeout_ms = int(round(timeout * m))
-            res = self._model.sample()
-            if hasattr(self._model, "_rng"):
-                state_after = self._model._rng.getstate()
-            return res
-        finally:
-            self._model.base_ms = base
-            self._model.jitter_ms = jitter
-            self._model.timeout_ms = timeout
-            if seed is not None:
-                self._model.seed = seed
-            if state_after is not None and hasattr(self._model, "_rng"):
-                self._model._rng.setstate(state_after)
+        with self._lock:
+            base, jitter, timeout = (
+                self._model.base_ms,
+                self._model.jitter_ms,
+                self._model.timeout_ms,
+            )
+            seed = getattr(self._model, "seed", None)
+            state_after = None
+            try:
+                self._model.base_ms = int(round(base * m))
+                self._model.jitter_ms = int(round(jitter * m))
+                self._model.timeout_ms = int(round(timeout * m))
+                res = self._model.sample()
+                if hasattr(self._model, "_rng"):
+                    state_after = self._model._rng.getstate()
+                return res
+            finally:
+                self._model.base_ms = base
+                self._model.jitter_ms = jitter
+                self._model.timeout_ms = timeout
+                if seed is not None:
+                    self._model.seed = seed
+                if state_after is not None and hasattr(self._model, "_rng"):
+                    self._model._rng.setstate(state_after)
 
     def __getattr__(self, name: str):  # pragma: no cover - simple delegation
         return getattr(self._model, name)
