@@ -177,6 +177,11 @@ latency:
 The same flag can be passed as a constructor argument to
 `ExecutionSimulator` or `LatencyImpl`.
 
+At runtime, the environment variable ``ENABLE_SEASONALITY`` can be set to
+``0``/``false`` to disable all seasonality features regardless of the
+configuration files. Leaving it unset or truthy keeps seasonality
+enabled.
+
 ## Seeds and determinism
 
 The latency model's random draws are controlled by the `seed` field in

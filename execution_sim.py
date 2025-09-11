@@ -28,6 +28,11 @@ import math
 import time
 import os
 import logging
+try:
+    from runtime_flags import seasonality_enabled  # type: ignore
+except Exception:  # pragma: no cover - fallback if module not found
+    def seasonality_enabled(default: bool = True) -> bool:
+        return default
 from utils.prometheus import Counter
 try:
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
@@ -472,6 +477,7 @@ class ExecutionSimulator:
         # сезонность ликвидности и спреда по часам недели
         self.use_seasonality = bool(
             getattr(run_config, "use_seasonality", use_seasonality)
+            and seasonality_enabled()
         )
         self.seasonality_interpolate = bool(
             getattr(run_config, "seasonality_interpolate", seasonality_interpolate)
