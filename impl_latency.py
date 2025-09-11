@@ -222,6 +222,26 @@ class LatencyImpl:
             return None
         return self._wrapper.hourly_stats()
 
+    def dump_multipliers(self) -> List[float]:
+        """Return current latency seasonality multipliers as a list."""
+
+        return list(self.latency)
+
+    def load_multipliers(self, arr: Sequence[float]) -> None:
+        """Load latency seasonality multipliers from ``arr``.
+
+        ``arr`` must contain 168 float values. Raises ``ValueError`` if the
+        length is incorrect. If the implementation is already attached to a
+        simulator, the underlying wrapper is updated as well.
+        """
+
+        arr_list = [float(x) for x in arr]
+        if len(arr_list) != 168:
+            raise ValueError("multipliers array must have length 168")
+        self.latency = arr_list
+        if self._wrapper is not None:
+            self._wrapper._mult = np.asarray(self.latency, dtype=float)
+
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "LatencyImpl":
         return LatencyImpl(LatencyCfg(
