@@ -9,6 +9,7 @@ import logging
 
 
 logger = logging.getLogger(__name__)
+seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
 
 
 @dataclass
@@ -145,7 +146,7 @@ class SeasonalLatencyModel:
             try:
                 scaled_base = int(round(base * m))
                 if scaled_base > timeout:
-                    logger.warning(
+                    seasonality_logger.warning(
                         "scaled base_ms %s exceeds timeout_ms %s; capping",
                         scaled_base,
                         timeout,

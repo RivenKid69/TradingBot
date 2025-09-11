@@ -2,6 +2,7 @@ mode: live
 run_id: live-run
 logs_dir: logs
 artifacts_dir: artifacts
+seasonality_log_level: INFO
 api:
   api_key: null
   api_secret: null

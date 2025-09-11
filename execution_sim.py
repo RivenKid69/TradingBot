@@ -46,7 +46,7 @@ except Exception:  # pragma: no cover - fallback when running as standalone file
     )
 
 logger = logging.getLogger(__name__)
-seasonality_logger = logger.getChild("seasonality")
+seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
 
 try:
     import numpy as np
