@@ -114,6 +114,11 @@ def main(argv=None) -> bool:
         default="configs/liquidity_latency_seasonality.json",
         help="Path to multipliers JSON",
     )
+    parser.add_argument(
+        "--symbol",
+        default=None,
+        help="If set, load multipliers for this instrument symbol",
+    )
     parser.add_argument("--threshold", type=float, default=0.1, help="Max allowed relative difference")
     args = parser.parse_args(argv)
 
@@ -123,6 +128,8 @@ def main(argv=None) -> bool:
     print(f"Historical data checksum written to {checksum_path}")
     hist_mult = _historical_multipliers(df)
     loaded = json.loads(Path(args.multipliers).read_text())
+    if args.symbol and isinstance(loaded, dict) and args.symbol in loaded:
+        loaded = loaded[args.symbol]
     mult = {k: np.asarray(v, dtype=float) for k, v in loaded.items() if isinstance(v, list)}
     sim_mult = _simulate(mult)
     stats, ok = _compare(hist_mult, sim_mult, args.threshold)

@@ -54,6 +54,7 @@ class LatencyCfg:
     timeout_ms: int = 2500
     retries: int = 1
     seed: int = 0
+    symbol: str | None = None
     seasonality_path: str | None = None
     use_seasonality: bool = True
     seasonality_override: Sequence[float] | None = None
@@ -137,7 +138,10 @@ class LatencyImpl:
         if self._has_seasonality:
             try:
                 arr = load_hourly_seasonality(
-                    path, "latency", expected_hash=cfg.seasonality_hash
+                    path,
+                    "latency",
+                    symbol=cfg.symbol,
+                    expected_hash=cfg.seasonality_hash,
                 )
             except Exception:
                 logger.warning(
@@ -161,7 +165,7 @@ class LatencyImpl:
             o_path = cfg.seasonality_override_path
             if override is None and o_path:
                 try:
-                    override = load_hourly_seasonality(o_path, "latency")
+                    override = load_hourly_seasonality(o_path, "latency", symbol=cfg.symbol)
                 except Exception:
                     logger.warning(
                         "Error loading latency override %s; ignoring.", o_path
@@ -223,6 +227,7 @@ class LatencyImpl:
             timeout_ms=int(d.get("timeout_ms", 2500)),
             retries=int(d.get("retries", 1)),
             seed=int(d.get("seed", 0)),
+            symbol=(d.get("symbol") if d.get("symbol") is not None else None),
             seasonality_path=d.get("seasonality_path"),
             use_seasonality=bool(d.get("use_seasonality", True)),
             seasonality_override=d.get("seasonality_override"),

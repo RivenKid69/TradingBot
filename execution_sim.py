@@ -471,10 +471,18 @@ class ExecutionSimulator:
                 if os.path.exists(path):
                     try:
                         file_liq = load_hourly_seasonality(
-                            path, "liquidity", "multipliers", expected_hash=expected_hash
+                            path,
+                            "liquidity",
+                            "multipliers",
+                            symbol=self.symbol,
+                            expected_hash=expected_hash,
                         )
                         file_spread = load_hourly_seasonality(
-                            path, "spread", "latency", expected_hash=expected_hash
+                            path,
+                            "spread",
+                            "latency",
+                            symbol=self.symbol,
+                            expected_hash=expected_hash,
                         )
                     except Exception:
                         logger.warning(
@@ -530,10 +538,16 @@ class ExecutionSimulator:
                 if os.path.exists(override_path):
                     try:
                         file_liq = load_hourly_seasonality(
-                            override_path, "liquidity", "multipliers"
+                            override_path,
+                            "liquidity",
+                            "multipliers",
+                            symbol=self.symbol,
                         )
                         file_spread = load_hourly_seasonality(
-                            override_path, "spread", "latency"
+                            override_path,
+                            "spread",
+                            "latency",
+                            symbol=self.symbol,
                         )
                     except Exception:
                         logger.warning(

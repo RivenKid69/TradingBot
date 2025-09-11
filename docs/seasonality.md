@@ -4,13 +4,28 @@ Certain hours of the week exhibit systematic patterns in market depth, bid-ask s
 
 ## `liquidity_latency_seasonality.json` format
 
-The JSON file contains up to three arrays with 168 floating-point numbers each:
+The JSON file contains up to three arrays with 168 floating-point numbers each.
+It can either be a flat mapping or nested under instrument symbols:
 
 ```json
 {
   "liquidity": [1.0, 1.1, ...],
   "latency":   [1.0, 0.9, ...],
   "spread":    [1.0, 0.8, ...]
+}
+```
+
+When storing multipliers for multiple instruments in a single file the arrays
+are grouped by symbol:
+
+```json
+{
+  "BTCUSDT": {
+    "liquidity": [1.0, 1.1, ...],
+    "latency":   [1.0, 0.9, ...],
+    "spread":    [1.0, 0.8, ...]
+  },
+  "hour_of_week_definition": "0=Monday 00:00 UTC"
 }
 ```
 
@@ -33,6 +48,9 @@ The script writes line charts and heatmaps for liquidity and latency multipliers
 
    ```bash
    python scripts/build_hourly_seasonality.py --data path/to/trades.parquet --out configs/liquidity_latency_seasonality.json
+
+   # To wrap the arrays under a specific symbol:
+   python scripts/build_hourly_seasonality.py --data path/to/trades.parquet --out configs/liquidity_latency_seasonality.json --symbol BTCUSDT
    ```
 3. Optionally verify the multipliers against the original dataset:
 

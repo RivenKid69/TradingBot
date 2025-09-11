@@ -44,7 +44,12 @@ def hour_of_week(ts_ms: Union[int, Sequence[int], np.ndarray]) -> Union[int, np.
     return vec(arr)
 
 
-def load_hourly_seasonality(path: str, *keys: str, expected_hash: str | None = None) -> np.ndarray | None:
+def load_hourly_seasonality(
+    path: str,
+    *keys: str,
+    symbol: str | None = None,
+    expected_hash: str | None = None,
+) -> np.ndarray | None:
     """Load hourly multipliers array from JSON file.
 
     Parameters
@@ -53,6 +58,8 @@ def load_hourly_seasonality(path: str, *keys: str, expected_hash: str | None = N
         Path to JSON file.
     keys : str
         Candidate keys within JSON mapping to extract array from.
+    symbol : str | None
+        Optional instrument symbol if the JSON file contains mappings per symbol.
 
     Returns
     -------
@@ -76,8 +83,11 @@ def load_hourly_seasonality(path: str, *keys: str, expected_hash: str | None = N
             )
         data = json.loads(raw.decode("utf-8"))
         if isinstance(data, dict):
+            # Allow new structure {"SYMBOL": {"latency": [...]}}
+            if symbol and symbol in data:
+                data = data[symbol]
             for k in keys:
-                if k in data:
+                if isinstance(data, dict) and k in data:
                     data = data[k]
                     break
         arr = np.asarray(data, dtype=float)

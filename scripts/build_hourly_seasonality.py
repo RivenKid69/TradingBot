@@ -111,6 +111,11 @@ def main() -> None:
         help='Output JSON path',
     )
     parser.add_argument(
+        '--symbol',
+        default=None,
+        help='If provided, wrap multipliers under this instrument symbol',
+    )
+    parser.add_argument(
         '--min-samples',
         type=int,
         default=30,
@@ -122,8 +127,12 @@ def main() -> None:
     df = load_logs(data_path)
     multipliers, imputed = compute_multipliers(df, args.min_samples)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    out_data = {k: v.tolist() for k, v in multipliers.items()}
-    out_data['hour_of_week_definition'] = '0=Monday 00:00 UTC'
+    if args.symbol:
+        out_data = {str(args.symbol): {k: v.tolist() for k, v in multipliers.items()}}
+        out_data['hour_of_week_definition'] = '0=Monday 00:00 UTC'
+    else:
+        out_data = {k: v.tolist() for k, v in multipliers.items()}
+        out_data['hour_of_week_definition'] = '0=Monday 00:00 UTC'
     with open(args.out, 'w') as f:
         json.dump(out_data, f, indent=2)
     if imputed:
