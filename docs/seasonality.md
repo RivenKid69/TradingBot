@@ -33,6 +33,16 @@ are grouped by symbol:
 
 `liquidity` multiplies available volume, `latency` scales simulated execution delays while `spread` adjusts the baseline bid-ask spread (in bps). Missing arrays or indices default to `1.0`.
 
+During simulation the baseline parameters are adjusted with the hour-of-week multiplier for hour `h`:
+
+```text
+liquidity_adj = base_liq * m_liq[h]
+spread_adj    = base_spread_bps * m_spread[h]
+latency_adj   = base_latency_ms * m_lat[h]
+```
+
+Each array therefore captures the relative deviation from the baseline for the given hour of week.
+
 ## Quick inspection
 
 Visualise the multipliers to ensure they look reasonable:
@@ -83,9 +93,28 @@ The script writes line charts and heatmaps for liquidity and latency multipliers
      --prior-metrics reports/seasonality/validation_metrics.json
    ```
    The script converts each error ``e`` into a weight ``1/(1+e)`` to down-weight
-   hours that previously deviated from historical data, then renormalises the
-   multipliers so their average remains close to ``1.0``. Repeat the
-   generate→validate cycle until the validation metrics stabilise.
+    hours that previously deviated from historical data, then renormalises the
+    multipliers so their average remains close to ``1.0``. Repeat the
+    generate→validate cycle until the validation metrics stabilise.
+
+## Multiplier computation and normalisation rationale
+
+For a given metric ``x`` (liquidity, spread or latency) the helper script first
+computes the average value for each hour of week ``h`` and for the entire
+dataset:
+
+```text
+avg_h[h] = mean(x | hour_of_week == h)
+avg_all  = mean(x)
+m[h]     = avg_h[h] / avg_all
+```
+
+During simulation the baseline parameter is multiplied by ``m[h]`` as shown
+above.  Dividing by the global average normalises the multipliers so their mean
+is near ``1.0``. This preserves the overall weekly level while highlighting
+relative intraday patterns.  Using ratios rather than absolute values also
+makes the multipliers scale-free, allowing them to be reused across symbols or
+periods with different volume regimes.
 
 ## Enabling seasonality in configs
 
