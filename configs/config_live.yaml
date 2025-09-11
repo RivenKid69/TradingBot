@@ -10,11 +10,14 @@ data:
   timeframe: "1m"
 # Optional path to 168 hourly liquidity multipliers (indexed by UTC hour-of-week)
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
-# Optional SHA256 hash of the above multipliers for integrity checking
+# Optional SHA256 hash of the above liquidity multipliers for integrity checking
 liquidity_seasonality_hash: null
-# Optional path to 168 hourly overrides multiplied with the above multipliers
+# Optional path to 168 hourly liquidity overrides multiplied with the above multipliers
 liquidity_seasonality_override_path: null
-use_seasonality: true  # set false to ignore liquidity/spread multipliers
+# Optional path to 168 hourly latency multipliers (indexed by UTC hour-of-week)
+latency_seasonality_path: "configs/liquidity_latency_seasonality.json"
+# Set false to ignore liquidity and latency multipliers
+use_seasonality: true
 latency:
   base_ms: 250
   jitter_ms: 50
@@ -23,10 +26,6 @@ latency:
   timeout_ms: 2500
   retries: 1
   seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
-  seasonality_path: "configs/liquidity_latency_seasonality.json"  # UTC hour-of-week
-  seasonality_override_path: null
-  seasonality_hash: null
-  use_seasonality: true
 components:
   market_data:
     target: impl_binance_public:BinancePublicBarSource
