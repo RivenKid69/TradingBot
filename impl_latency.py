@@ -35,6 +35,7 @@ except Exception:  # pragma: no cover - fallback
         load_hourly_seasonality = lambda *a, **k: None  # type: ignore
 
 logger = logging.getLogger(__name__)
+seasonality_logger = logger.getChild("seasonality")
 
 try:
     from latency import LatencyModel
@@ -101,6 +102,13 @@ class _LatencyWithSeasonality:
         self._mult_sum[hour] += m
         self._lat_sum[hour] += float(res.get("total_ms", 0))
         self._count[hour] += 1
+        if seasonality_logger.isEnabledFor(logging.DEBUG):
+            seasonality_logger.debug(
+                "latency sample h%03d mult=%.3f total_ms=%s",
+                hour,
+                m,
+                res.get("total_ms"),
+            )
         return res
 
     def stats(self):  # pragma: no cover - simple delegation
