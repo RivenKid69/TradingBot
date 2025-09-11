@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List
 from pydantic import BaseModel, Field
 import yaml
+import os
 
 
 class PeriodConfig(BaseModel):
@@ -11,9 +12,36 @@ class PeriodConfig(BaseModel):
 
 
 class PathsConfig(BaseModel):
+    """Configuration of file-system paths used during data ingestion.
+
+    Values can be overridden via environment variables:
+
+    * ``KLINES_DIR`` – override ``klines_dir``
+    * ``FUTURES_DIR`` – override ``futures_dir``
+    * ``PRICES_OUT`` – override ``prices_out``
+    """
+
     klines_dir: str = Field("data/klines", description="Directory for klines output")
     futures_dir: str = Field("data/futures", description="Directory for futures data")
-    prices_out: str = Field("data/prices.parquet", description="Output path for normalized prices")
+    prices_out: str = Field(
+        "data/prices.parquet", description="Output path for normalized prices"
+    )
+
+    @classmethod
+    def from_env(cls, **kwargs) -> "PathsConfig":
+        """Build ``PathsConfig`` reading overrides from environment variables."""
+
+        data = dict(kwargs)
+        env_map = {
+            "klines_dir": "KLINES_DIR",
+            "futures_dir": "FUTURES_DIR",
+            "prices_out": "PRICES_OUT",
+        }
+        for field, env_name in env_map.items():
+            env_val = os.getenv(env_name)
+            if env_val:
+                data[field] = env_val
+        return cls(**data)
 
 
 class FuturesConfig(BaseModel):
@@ -39,11 +67,15 @@ class IngestConfig(BaseModel):
 def load_config(path: str) -> IngestConfig:
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
+    paths = PathsConfig.from_env(**data.get("paths", {}))
+    data["paths"] = paths
     return IngestConfig(**data)
 
 
 def load_config_from_str(content: str) -> IngestConfig:
     data = yaml.safe_load(content) or {}
+    paths = PathsConfig.from_env(**data.get("paths", {}))
+    data["paths"] = paths
     return IngestConfig(**data)
 
 
