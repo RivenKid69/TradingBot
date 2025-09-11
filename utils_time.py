@@ -91,17 +91,17 @@ def load_hourly_seasonality(
                 digest,
             )
         data = json.loads(raw.decode("utf-8"))
-        if isinstance(data, dict):
-            # Allow new structure {"SYMBOL": {"latency": [...]}}
-            if symbol and symbol in data:
-                data = data[symbol]
-            for k in keys:
-                if isinstance(data, dict) and k in data:
-                    data = data[k]
-                    break
-            # Fallback to legacy {"multipliers": [...]} structure
-            if isinstance(data, dict) and "multipliers" in data:
-                data = data["multipliers"]
+        if not isinstance(data, dict):
+            return None
+        # Allow new structure {"SYMBOL": {"latency": [...]}}
+        if symbol and symbol in data:
+            data = data[symbol]
+        for k in keys:
+            if isinstance(data, dict) and k in data:
+                data = data[k]
+                break
+        if not isinstance(data, list):
+            return None
         arr = np.asarray(data, dtype=float)
         if arr.shape[0] in (HOURS_IN_WEEK, 7):
             if any(k in {"liquidity", "latency"} for k in keys):
@@ -153,15 +153,12 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
         raise
     except Exception as exc:  # pragma: no cover - unexpected parse error
         raise ValueError(f"Invalid seasonality file {path}") from exc
-    if isinstance(data, list):
-        # Legacy files could be a bare list of multipliers
-        data = {"multipliers": data}
     if not isinstance(data, dict):
-        raise ValueError("Seasonality JSON must be an object or array")
+        raise ValueError("Seasonality JSON must be an object")
 
     def _extract(obj: Dict[str, object]) -> Dict[str, np.ndarray]:
         res: Dict[str, np.ndarray] = {}
-        for key in ("liquidity", "latency", "spread", "multipliers"):
+        for key in ("liquidity", "latency", "spread"):
             if key in obj:
                 arr = np.asarray(obj[key], dtype=float)
                 if arr.shape[0] not in (HOURS_IN_WEEK, 7):

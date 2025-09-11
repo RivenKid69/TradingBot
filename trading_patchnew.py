@@ -241,7 +241,6 @@ class TradingEnv(gym.Env):
         self._liq_seasonality = load_hourly_seasonality(
             liq_path,
             "liquidity",
-            "multipliers",
             expected_hash=liquidity_seasonality_hash,
         )
         if self._liq_seasonality is None:

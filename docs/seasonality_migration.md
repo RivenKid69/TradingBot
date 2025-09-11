@@ -16,9 +16,8 @@ The script reads a legacy file and writes a new JSON mapping with the provided
 key (default: `liquidity`). Adjust `--key` if the multipliers should be stored
 under a different name, for example `--key latency`.
 
-## Backward-compatible loading
+## Loader requirements
 
 The helper functions in `utils_time.py` (`load_hourly_seasonality` and
-`load_seasonality`) automatically recognise the legacy structures so existing
-files continue to work without conversion. However, the conversion utility
-makes it easier to adopt the new layout and remove ambiguity.
+`load_seasonality`) no longer support legacy structures. Convert old files with
+the script above before loading them to avoid errors.
