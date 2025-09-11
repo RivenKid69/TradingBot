@@ -13,6 +13,7 @@ import os
 import importlib.util
 import sysconfig
 from pathlib import Path
+import threading
 
 import numpy as np
 try:
@@ -31,12 +32,20 @@ logging = importlib.util.module_from_spec(_logging_spec)
 _logging_spec.loader.exec_module(logging)
 
 try:
-    from utils_time import load_hourly_seasonality, get_latency_multiplier
+    from utils_time import (
+        load_hourly_seasonality,
+        get_latency_multiplier,
+        watch_seasonality_file,
+    )
 except Exception:  # pragma: no cover - fallback
     try:
         import pathlib, sys
         sys.path.append(str(pathlib.Path(__file__).resolve().parent))
-        from utils_time import load_hourly_seasonality, get_latency_multiplier
+        from utils_time import (
+            load_hourly_seasonality,
+            get_latency_multiplier,
+            watch_seasonality_file,
+        )
     except Exception:  # pragma: no cover
         def load_hourly_seasonality(*a, **k):
             return None  # type: ignore
@@ -73,6 +82,7 @@ class LatencyCfg:
     seasonality_hash: str | None = None
     seasonality_interpolate: bool = False
     seasonality_day_only: bool = False
+    seasonality_auto_reload: bool = False
 
 
 class _LatencyWithSeasonality:
@@ -92,6 +102,7 @@ class _LatencyWithSeasonality:
         self._mult_sum: List[float] = [0.0] * n
         self._lat_sum: List[float] = [0.0] * n
         self._count: List[int] = [0] * n
+        self._lock = threading.Lock()
 
     def sample(self, ts_ms: int | None = None):
         if ts_ms is None:
@@ -101,45 +112,50 @@ class _LatencyWithSeasonality:
         # a UTC timestamp.  Wrap the result to the multiplier array length.
         hour = hour_of_week(int(ts_ms)) % len(self._mult)
         m = get_latency_multiplier(int(ts_ms), self._mult, interpolate=self._interpolate)
-        base, jitter, timeout = (
-            self._model.base_ms,
-            self._model.jitter_ms,
-            self._model.timeout_ms,
-        )
-        seed = getattr(self._model, "seed", None)
-        state_after = None
-        try:
-            scaled_base = int(round(base * m))
-            if scaled_base > timeout:
-                seasonality_logger.warning(
-                    "scaled base_ms %s exceeds timeout_ms %s; capping",
-                    scaled_base,
+        with self._lock:
+            base, jitter, timeout = (
+                self._model.base_ms,
+                self._model.jitter_ms,
+                self._model.timeout_ms,
+            )
+            seed = getattr(self._model, "seed", None)
+            state_after = None
+            try:
+                scaled_base = int(round(base * m))
+                if scaled_base > timeout:
+                    seasonality_logger.warning(
+                        "scaled base_ms %s exceeds timeout_ms %s; capping",
+                        scaled_base,
+                        timeout,
+                    )
+                    scaled_base = timeout
+                self._model.base_ms = scaled_base
+                self._model.jitter_ms = int(round(jitter * m))
+                res = self._model.sample()
+                if hasattr(self._model, "_rng"):
+                    state_after = self._model._rng.getstate()
+            finally:
+                self._model.base_ms, self._model.jitter_ms, self._model.timeout_ms = (
+                    base,
+                    jitter,
                     timeout,
                 )
-                scaled_base = timeout
-            self._model.base_ms = scaled_base
-            self._model.jitter_ms = int(round(jitter * m))
-            res = self._model.sample()
-            if hasattr(self._model, "_rng"):
-                state_after = self._model._rng.getstate()
-        finally:
-            self._model.base_ms, self._model.jitter_ms, self._model.timeout_ms = base, jitter, timeout
-            if seed is not None:
-                self._model.seed = seed
-            if state_after is not None and hasattr(self._model, "_rng"):
-                self._model._rng.setstate(state_after)
-        self._mult_sum[hour] += m
-        self._lat_sum[hour] += float(res.get("total_ms", 0))
-        self._count[hour] += 1
-        _LATENCY_MULT_COUNTER.labels(hour=hour).inc()
-        if seasonality_logger.isEnabledFor(logging.DEBUG):
-            seasonality_logger.debug(
-                "latency sample h%03d mult=%.3f total_ms=%s",
-                hour,
-                m,
-                res.get("total_ms"),
-            )
-        return res
+                if seed is not None:
+                    self._model.seed = seed
+                if state_after is not None and hasattr(self._model, "_rng"):
+                    self._model._rng.setstate(state_after)
+            self._mult_sum[hour] += m
+            self._lat_sum[hour] += float(res.get("total_ms", 0))
+            self._count[hour] += 1
+            _LATENCY_MULT_COUNTER.labels(hour=hour).inc()
+            if seasonality_logger.isEnabledFor(logging.DEBUG):
+                seasonality_logger.debug(
+                    "latency sample h%03d mult=%.3f total_ms=%s",
+                    hour,
+                    m,
+                    res.get("total_ms"),
+                )
+            return res
 
     def stats(self):  # pragma: no cover - simple delegation
         return self._model.stats()
@@ -168,7 +184,9 @@ class LatencyImpl:
             seed=int(cfg.seed),
         ) if LatencyModel is not None else None
         self.latency: List[float] = [1.0] * (7 if cfg.seasonality_day_only else 168)
+        self._mult_lock = threading.Lock()
         path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
+        self._seasonality_path = path
         self._has_seasonality = bool(cfg.use_seasonality and seasonality_enabled())
         if self._has_seasonality:
             arr = load_hourly_seasonality(
@@ -227,6 +245,19 @@ class LatencyImpl:
                     )
         self.attached_sim = None
         self._wrapper: _LatencyWithSeasonality | None = None
+        if self._has_seasonality and cfg.seasonality_auto_reload and path:
+            def _reload(data: Dict[str, np.ndarray]) -> None:
+                arr = data.get("latency")
+                if arr is not None:
+                    try:
+                        self.load_multipliers(arr)
+                        seasonality_logger.info("Reloaded latency multipliers from %s", path)
+                    except Exception:
+                        seasonality_logger.exception(
+                            "Failed to reload latency multipliers from %s", path
+                        )
+
+            watch_seasonality_file(path, _reload)
 
     @property
     def model(self):
@@ -277,13 +308,15 @@ class LatencyImpl:
         expected = 7 if self.cfg.seasonality_day_only else 168
         if len(arr_list) != expected:
             raise ValueError(f"multipliers array must have length {expected}")
-        self.latency = arr_list
-        if self._wrapper is not None:
-            self._wrapper._mult = np.asarray(self.latency, dtype=float)
-            n = len(self.latency)
-            self._wrapper._mult_sum = [0.0] * n
-            self._wrapper._lat_sum = [0.0] * n
-            self._wrapper._count = [0] * n
+        with self._mult_lock:
+            self.latency = arr_list
+            if self._wrapper is not None:
+                with self._wrapper._lock:
+                    self._wrapper._mult = np.asarray(self.latency, dtype=float)
+                    n = len(self.latency)
+                    self._wrapper._mult_sum = [0.0] * n
+                    self._wrapper._lat_sum = [0.0] * n
+                    self._wrapper._count = [0] * n
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "LatencyImpl":
@@ -303,4 +336,5 @@ class LatencyImpl:
             seasonality_hash=d.get("seasonality_hash"),
             seasonality_interpolate=bool(d.get("seasonality_interpolate", False)),
             seasonality_day_only=bool(d.get("seasonality_day_only", False)),
+            seasonality_auto_reload=bool(d.get("seasonality_auto_reload", False)),
         ))

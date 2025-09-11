@@ -28,6 +28,7 @@ import math
 import time
 import os
 import logging
+import threading
 try:
     from runtime_flags import seasonality_enabled  # type: ignore
 except Exception:  # pragma: no cover - fallback if module not found
@@ -41,6 +42,7 @@ try:
         get_hourly_multiplier,
         get_liquidity_multiplier,
         load_hourly_seasonality,
+        watch_seasonality_file,
     )
 except Exception:  # pragma: no cover - fallback when running as standalone file
     import pathlib, sys
@@ -51,6 +53,7 @@ except Exception:  # pragma: no cover - fallback when running as standalone file
         get_hourly_multiplier,
         get_liquidity_multiplier,
         load_hourly_seasonality,
+        watch_seasonality_file,
     )
 
 logger = logging.getLogger(__name__)
@@ -370,6 +373,7 @@ class ExecutionSimulator:
                  use_seasonality: bool = True,
                  seasonality_interpolate: bool = False,
                  seasonality_day_only: bool = False,
+                 seasonality_auto_reload: bool = False,
                  run_config: Any = None):
         self.symbol = str(symbol).upper()
         self.latency_steps = int(max(0, latency_steps))
@@ -492,6 +496,8 @@ class ExecutionSimulator:
         default_seasonality = np.ones(default_len, dtype=float)
         self._liq_seasonality = default_seasonality.copy()
         self._spread_seasonality = default_seasonality.copy()
+        self._seasonality_lock = threading.Lock()
+        self._seasonality_path: Optional[str] = None
         if self.use_seasonality:
             liq_arr: Optional[Sequence[float]] = liquidity_seasonality
             spread_arr: Optional[Sequence[float]] = spread_seasonality
@@ -573,6 +579,17 @@ class ExecutionSimulator:
                 self._liq_seasonality *= liq_override
             if spread_override is not None:
                 self._spread_seasonality *= spread_override
+
+            self._seasonality_path = path
+            if seasonality_auto_reload and path:
+                def _reload(data: Dict[str, np.ndarray]) -> None:
+                    try:
+                        self.load_seasonality_multipliers(data)
+                        seasonality_logger.info("Reloaded seasonality multipliers from %s", path)
+                    except Exception:
+                        seasonality_logger.exception("Failed to reload seasonality multipliers from %s", path)
+
+                watch_seasonality_file(path, _reload)
 
         # накопители статистики по сезонности ликвидности
         self._liq_mult_sum: List[float] = [0.0] * HOURS_IN_WEEK
@@ -738,13 +755,16 @@ class ExecutionSimulator:
 
         expected = 7 if self.seasonality_day_only else HOURS_IN_WEEK
 
+        new_liq = self._liq_seasonality
+        new_spr = self._spread_seasonality
+
         if liq is not None:
             arr = np.asarray(liq, dtype=float)
             if arr.size != expected:
                 raise ValueError(
                     f"liquidity multipliers must have length {expected}"
                 )
-            self._liq_seasonality = arr.copy()
+            new_liq = arr.copy()
 
         if spread is not None:
             arr = np.asarray(spread, dtype=float)
@@ -752,7 +772,11 @@ class ExecutionSimulator:
                 raise ValueError(
                     f"spread multipliers must have length {expected}"
                 )
-            self._spread_seasonality = arr.copy()
+            new_spr = arr.copy()
+
+        with self._seasonality_lock:
+            self._liq_seasonality = new_liq
+            self._spread_seasonality = new_spr
     def _build_executor(self) -> None:
         """
         Построить исполнителя согласно self._execution_cfg.

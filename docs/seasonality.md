@@ -161,6 +161,25 @@ Precedence is as follows:
 
 Missing entries default to `1.0`, so partial overrides are permitted.
 
+## Runtime reloading
+
+`ExecutionSimulator` and `LatencyImpl` can refresh multipliers without a
+restart. Set `seasonality_auto_reload: true` in the simulator or latency
+config to enable a background watcher. The file specified by
+`*_seasonality_path` is polled once per minute and, if modified, the new
+arrays replace the old ones atomically. Reload events are emitted via the
+`seasonality` logger.
+
+To avoid inconsistent reads, update the JSON file using an atomic rename:
+
+```bash
+python scripts/build_hourly_seasonality.py --out tmp.json
+mv tmp.json configs/liquidity_latency_seasonality.json
+```
+
+Operators can therefore tweak multipliers and have the running system pick
+up changes automatically.
+
 ## Disabling seasonality
 
 Hourly multipliers are enabled by default. To ignore them, set the

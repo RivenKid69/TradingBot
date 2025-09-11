@@ -5,12 +5,14 @@ The hour-of-week index assumes ``0 = Monday 00:00 UTC``.
 
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Callable
 import os
 import json
 import hashlib
 import importlib.util
 import sysconfig
+import threading
+import time
 from pathlib import Path
 import numpy as np
 from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
@@ -187,6 +189,38 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
     if not candidates:
         raise ValueError("No seasonality arrays found")
     raise ValueError("Multiple seasonality mappings found; specify symbol")
+
+
+def watch_seasonality_file(
+    path: str,
+    callback: Callable[[Dict[str, np.ndarray]], None],
+    *,
+    poll_interval: float = 60.0,
+) -> threading.Thread:
+    """Watch ``path`` for changes and invoke ``callback`` when updated.
+
+    The callback receives the mapping returned by :func:`load_seasonality`.
+    Reloading is attempted whenever the file modification time increases.
+    The watcher runs in a daemon thread and ignores errors, retrying on the
+    next polling interval.
+    """
+
+    def _loop() -> None:
+        last_mtime: float | None = None
+        while True:
+            try:
+                mtime = os.path.getmtime(path)
+                if last_mtime is None or mtime > last_mtime:
+                    data = load_seasonality(path)
+                    callback(data)
+                    last_mtime = mtime
+            except Exception:
+                pass
+            time.sleep(float(poll_interval))
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
 
 
 def _hour_index(ts_ms: int, length: int) -> int:
