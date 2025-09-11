@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Edit specific hourly multipliers within a JSON file.
 
-The JSON file is expected to contain an array of length 168 either at the
- top level or under a specific key (e.g. ``"liquidity"`` or ``"latency"``).
- This CLI allows overriding individual hour-of-week multipliers by specifying
- ``HOUR=VALUE`` pairs via ``--set`` arguments.
+The JSON file must contain an array of length 168 under a specific key
+(e.g. ``"liquidity"`` or ``"latency"``). This CLI allows overriding
+individual hour-of-week multipliers by specifying ``HOUR=VALUE`` pairs via
+``--set`` arguments.
 """
 
 from __future__ import annotations
@@ -30,25 +30,16 @@ def _parse_set(value: str) -> Tuple[int, float]:
     return hour, val
 
 
-def _load_array(data: dict | list, key: str | None) -> Tuple[list, dict | list]:
+def _load_array(data: dict, key: str | None) -> Tuple[list, dict]:
     """Return multipliers array and the container holding it."""
-    container: dict | list
-    if isinstance(data, list):
-        if key:
-            raise ValueError("Cannot specify --key when JSON root is a list")
-        arr = data
-        container = arr
-    else:
-        container = data
-        if key and key in data:
-            arr = data[key]
-        elif "multipliers" in data:
-            arr = data["multipliers"]
-        else:
-            raise ValueError(f"Key '{key}' not found in JSON file")
+    if not isinstance(data, dict):
+        raise ValueError("JSON root must be an object")
+    if not key or key not in data:
+        raise ValueError(f"Key '{key}' not found in JSON file")
+    arr = data[key]
     if not isinstance(arr, list):
         raise ValueError("Multipliers must be stored as a list")
-    return arr, container
+    return arr, data
 
 
 def _apply_overrides(arr: list, pairs: Iterable[Tuple[int, float]]) -> None:
@@ -67,7 +58,7 @@ def main() -> None:
     parser.add_argument("json", help="Path to multipliers JSON file")
     parser.add_argument(
         "--key",
-        default=None,
+        required=True,
         help="Key within JSON mapping containing the multipliers array",
     )
     parser.add_argument(

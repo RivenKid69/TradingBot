@@ -502,7 +502,7 @@ class ExecutionSimulator:
                 path = "configs/liquidity_seasonality.json"
             if path:
                 if liq_arr is None:
-                    liq_arr = load_hourly_seasonality(path, "liquidity", "multipliers")
+                    liq_arr = load_hourly_seasonality(path, "liquidity")
                 if spread_arr is None:
                     spread_arr = load_hourly_seasonality(path, "spread", "latency")
 
@@ -560,7 +560,7 @@ class ExecutionSimulator:
             if override_path and (liq_override is None or spread_override is None):
                 if liq_override is None:
                     liq_override = load_hourly_seasonality(
-                        override_path, "liquidity", "multipliers"
+                        override_path, "liquidity"
                     )
                 if spread_override is None:
                     spread_override = load_hourly_seasonality(
@@ -735,7 +735,6 @@ class ExecutionSimulator:
 
         liq = data.get("liquidity")
         spread = data.get("spread")
-        legacy = data.get("multipliers")
 
         expected = 7 if self.seasonality_day_only else HOURS_IN_WEEK
 
@@ -746,27 +745,12 @@ class ExecutionSimulator:
                     f"liquidity multipliers must have length {expected}"
                 )
             self._liq_seasonality = arr.copy()
-        elif legacy is not None:
-            arr = np.asarray(legacy, dtype=float)
-            if arr.size != expected:
-                raise ValueError(
-                    f"multipliers must have length {expected}"
-                )
-            self._liq_seasonality = arr.copy()
 
         if spread is not None:
             arr = np.asarray(spread, dtype=float)
             if arr.size != expected:
                 raise ValueError(
                     f"spread multipliers must have length {expected}"
-                )
-            self._spread_seasonality = arr.copy()
-        elif legacy is not None and spread is None and liq is None:
-            # Legacy single-array structure applied to both
-            arr = np.asarray(legacy, dtype=float)
-            if arr.size != expected:
-                raise ValueError(
-                    f"multipliers must have length {expected}"
                 )
             self._spread_seasonality = arr.copy()
     def _build_executor(self) -> None:
