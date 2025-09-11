@@ -90,6 +90,26 @@ def test_latency_seasonality_disabled(tmp_path):
     assert d_low["total_ms"] == 100
 
 
+def test_latency_missing_file(tmp_path):
+    cfg = {
+        "base_ms": 100,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seasonality_path": str(tmp_path / "missing.json"),
+    }
+    impl = LatencyImpl.from_dict(cfg)
+
+    class Dummy:
+        pass
+
+    sim = Dummy()
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    assert lat.sample()["total_ms"] == 100
+
+
 def test_latency_seasonality_override(tmp_path):
     base_mult = [1.0] * 168
     hour_high = 5
