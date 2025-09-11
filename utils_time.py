@@ -74,6 +74,9 @@ def load_hourly_seasonality(
                 if isinstance(data, dict) and k in data:
                     data = data[k]
                     break
+            # Fallback to legacy {"multipliers": [...]} structure
+            if isinstance(data, dict) and "multipliers" in data:
+                data = data["multipliers"]
         arr = np.asarray(data, dtype=float)
         if arr.shape[0] == HOURS_IN_WEEK:
             if any(k in {"liquidity", "latency"} for k in keys):
@@ -125,9 +128,11 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
         raise
     except Exception as exc:  # pragma: no cover - unexpected parse error
         raise ValueError(f"Invalid seasonality file {path}") from exc
-
+    if isinstance(data, list):
+        # Legacy files could be a bare list of multipliers
+        data = {"multipliers": data}
     if not isinstance(data, dict):
-        raise ValueError("Seasonality JSON must be an object")
+        raise ValueError("Seasonality JSON must be an object or array")
 
     def _extract(obj: Dict[str, object]) -> Dict[str, np.ndarray]:
         res: Dict[str, np.ndarray] = {}

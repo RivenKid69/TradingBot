@@ -35,6 +35,15 @@ def test_execution_simulator_round_trip():
     assert sim2.dump_seasonality_multipliers() == dump
 
 
+def test_execution_simulator_legacy_multipliers():
+    arr = [1.0] * 168
+    sim = ExecutionSimulator()
+    sim.load_seasonality_multipliers({"multipliers": arr})
+    dump = sim.dump_seasonality_multipliers()
+    assert dump["liquidity"] == arr
+    assert dump["spread"] == arr
+
+
 def test_latency_impl_round_trip():
     cfg = {
         "base_ms": 100,
