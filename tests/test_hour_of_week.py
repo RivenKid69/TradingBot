@@ -1,16 +1,10 @@
 from datetime import datetime, timezone, timedelta
 import numpy as np
-import importlib.util
-import pathlib
-import sys
+import pathlib, sys
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("utils_time", BASE / "utils_time.py")
-mod = importlib.util.module_from_spec(spec)
-sys.modules["utils_time"] = mod
-spec.loader.exec_module(mod)
-
-hour_of_week = mod.hour_of_week
+sys.path.insert(0, str(BASE))
+from utils.time import hour_of_week
 
 
 def test_hour_of_week_known_timestamps():
@@ -25,3 +19,14 @@ def test_hour_of_week_known_timestamps():
 
     arr = np.array([ts0, ts1, ts_last])
     np.testing.assert_array_equal(hour_of_week(arr), np.array([0, 37, 167]))
+
+
+def test_hour_of_week_week_boundary():
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    ts_last = int((base + timedelta(days=6, hours=23)).timestamp() * 1000)
+    ts_next = ts_last + 3_600_000
+
+    assert hour_of_week(ts_last) == 167
+    assert hour_of_week(ts_next) == 0
+    arr = np.array([ts_last, ts_next])
+    np.testing.assert_array_equal(hour_of_week(arr), np.array([167, 0]))
