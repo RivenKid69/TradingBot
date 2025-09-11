@@ -77,6 +77,8 @@ python train_model_multi_patch.py --config configs/config_train.yaml --slippage.
 задержек для каждого часа недели (от понедельника 00:00 до воскресенья
 23:00 UTC). Формат файла и процесс пересчёта коэффициентов из исторических
 данных описаны в [docs/seasonality.md](docs/seasonality.md).
+Краткие шаги для локального воспроизведения результатов приведены в
+[docs/seasonality_quickstart.md](docs/seasonality_quickstart.md).
 
 Те же значения можно задать в YAML‑конфиге:
 
