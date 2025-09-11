@@ -188,6 +188,37 @@ def test_latency_seasonality_override(tmp_path):
     assert lat.sample(ts_override)["total_ms"] == 200  # 1 * 2 -> 2x
 
 
+def test_latency_seasonality_interpolation(tmp_path):
+    multipliers = [1.0] * 168
+    hour = 5
+    multipliers[hour] = 1.0
+    multipliers[hour + 1] = 3.0
+    path = tmp_path / "latency.json"
+    path.write_text(json.dumps({"latency": multipliers}))
+
+    cfg = {
+        "base_ms": 100,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seasonality_path": str(path),
+        "seasonality_interpolate": True,
+    }
+    impl = LatencyImpl.from_dict(cfg)
+
+    class Dummy:
+        pass
+
+    sim = Dummy()
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    ts_mid = int(base_dt.timestamp() * 1000 + hour * 3_600_000 + 30 * 60_000)
+    res = lat.sample(ts_mid)
+    assert res["total_ms"] == 200
+
+
 def test_seasonal_latency_statistics_regression(tmp_path):
     multipliers = [1.0] * 168
     multipliers[0] = 2.0

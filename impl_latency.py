@@ -58,18 +58,22 @@ class LatencyCfg:
     seasonality_override: Sequence[float] | None = None
     seasonality_override_path: str | None = None
     seasonality_hash: str | None = None
+    seasonality_interpolate: bool = False
 
 
 class _LatencyWithSeasonality:
     """Wraps LatencyModel applying hourly multipliers and collecting stats."""
 
-    def __init__(self, model: LatencyModel, multipliers: Sequence[float]):  # type: ignore[name-defined]
+    def __init__(
+        self, model: LatencyModel, multipliers: Sequence[float], *, interpolate: bool = False
+    ):  # type: ignore[name-defined]
         self._model = model
         self._mult = (
             np.asarray(multipliers, dtype=float)
             if len(multipliers) == 168
             else np.ones(168, dtype=float)
         )
+        self._interpolate = bool(interpolate)
         self._mult_sum: List[float] = [0.0] * 168
         self._lat_sum: List[float] = [0.0] * 168
         self._count: List[int] = [0] * 168
@@ -78,7 +82,7 @@ class _LatencyWithSeasonality:
         if ts_ms is None:
             return self._model.sample()
         hour = hour_of_week(int(ts_ms)) % len(self._mult)
-        m = get_latency_multiplier(int(ts_ms), self._mult)
+        m = get_latency_multiplier(int(ts_ms), self._mult, interpolate=self._interpolate)
         base, jitter, timeout = (
             self._model.base_ms,
             self._model.jitter_ms,
@@ -217,7 +221,9 @@ class LatencyImpl:
     def attach_to(self, sim) -> None:
         if self._model is not None:
             mult = self.latency if self._has_seasonality else [1.0] * 168
-            self._wrapper = _LatencyWithSeasonality(self._model, mult)
+            self._wrapper = _LatencyWithSeasonality(
+                self._model, mult, interpolate=self.cfg.seasonality_interpolate
+            )
             setattr(sim, "latency", self._wrapper)
         self.attached_sim = sim
 
@@ -275,4 +281,5 @@ class LatencyImpl:
             seasonality_override=d.get("seasonality_override"),
             seasonality_override_path=d.get("seasonality_override_path"),
             seasonality_hash=d.get("seasonality_hash"),
+            seasonality_interpolate=bool(d.get("seasonality_interpolate", False)),
         ))

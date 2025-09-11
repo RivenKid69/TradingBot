@@ -93,13 +93,13 @@ Seasonality can be activated either via CLI flags or directly in YAML configs:
 
 ```bash
 python script_backtest.py --config configs/config_sim.yaml --liquidity-seasonality configs/liquidity_latency_seasonality.json
-```
-
 ```yaml
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
+seasonality_interpolate: true  # default false; enable minute-level interpolation
 
 latency:
   seasonality_path: "configs/liquidity_latency_seasonality.json"
+  seasonality_interpolate: true
 ```
 
 ## Manual overrides
@@ -214,13 +214,18 @@ small overhead:
 
 ```
 $ python benchmarks/simulator_seasonality_bench.py
-use_seasonality=False: 0.161s
-use_seasonality=True: 0.195s
+use_seasonality=False interpolate=False: 0.333s
+use_seasonality=True interpolate=False: 0.849s
+use_seasonality=True interpolate=True: 1.046s
 ```
 
 Lookup now avoids `time.gmtime` and uses precomputed NumPy arrays for the
 168 multipliers, reducing datetime conversions and keeping the cost of
-seasonality modest.
+seasonality modest. Enabling optional linear interpolation between adjacent
+hours (``seasonality_interpolate=True``) performs two lookups and a
+blend, which increases runtime but smooths transitions around hour
+boundaries. Leave interpolation disabled if maximum performance is
+required.
 
 ## Helper functions
 
@@ -231,9 +236,10 @@ manually indexing arrays:
 
 ```python
 from utils_time import get_liquidity_multiplier, get_latency_multiplier
-m_liq = get_liquidity_multiplier(ts_ms, liquidity_array)
-m_lat = get_latency_multiplier(ts_ms, latency_array)
+m_liq = get_liquidity_multiplier(ts_ms, liquidity_array, interpolate=True)
+m_lat = get_latency_multiplier(ts_ms, latency_array, interpolate=True)
 ```
 
 These helpers ensure consistent hour-of-week calculations and will be
-reused across future modules.
+reused across future modules. Pass ``interpolate=True`` to blend adjacent
+hours using the minute offset.
