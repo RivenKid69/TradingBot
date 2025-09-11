@@ -1,0 +1,4 @@
+# CODEOWNERS
+# Replace example teams with actual GitHub usernames or teams.
+* @example-org/maintainers
+.github/workflows/ @example-org/devops
