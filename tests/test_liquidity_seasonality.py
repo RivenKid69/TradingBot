@@ -3,6 +3,7 @@ import pathlib
 import sys
 import datetime
 import pytest
+import logging
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
 
@@ -114,3 +115,19 @@ def test_seasonality_file_missing(tmp_path):
     sim.set_market_snapshot(bid=100.0, ask=101.0, liquidity=5.0, spread_bps=1.0, ts_ms=ts_ms)
     assert sim._last_liquidity == 5.0
     assert sim._last_spread_bps == 1.0
+
+
+def test_ts_ms_none_skips_multipliers_and_logs_warning(caplog):
+    liq_mult = [2.0] * 168
+    spr_mult = [3.0] * 168
+    sim = ExecutionSimulator(
+        liquidity_seasonality=liq_mult,
+        spread_seasonality=spr_mult,
+    )
+    with caplog.at_level(logging.WARNING, logger="execution_sim"):
+        sim.set_market_snapshot(
+            bid=100.0, ask=101.0, liquidity=5.0, spread_bps=1.0, ts_ms=None
+        )
+    assert sim._last_liquidity == 5.0
+    assert sim._last_spread_bps == 1.0
+    assert "ts_ms is None" in caplog.text

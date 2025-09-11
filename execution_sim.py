@@ -624,11 +624,14 @@ class ExecutionSimulator:
         liq_mult = 1.0
         spread_mult = 1.0
         how: Optional[int] = None
-        if ts_ms is not None:
+        if ts_ms is None:
+            if self.use_seasonality:
+                logger.warning("ts_ms is None; seasonality multipliers not applied")
+        else:
             how = hour_of_week(int(ts_ms))
-        if self.use_seasonality and how is not None:
-            liq_mult = float(self._liq_seasonality[how])
-            spread_mult = float(self._spread_seasonality[how])
+            if self.use_seasonality:
+                liq_mult = float(self._liq_seasonality[how])
+                spread_mult = float(self._spread_seasonality[how])
 
         sbps: Optional[float]
         if spread_bps is not None:
