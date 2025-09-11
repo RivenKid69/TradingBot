@@ -170,6 +170,9 @@ def _hour_index(ts_ms: int, length: int) -> int:
     week. ``length`` defaults to :data:`HOURS_IN_WEEK`.
     """
 
+    # Reuse the shared hour_of_week helper which computes
+    # ``(ts_ms // HOUR_MS + 72) % 168`` so that ``0`` maps to Monday 00:00 UTC.
+    # ``ts_ms`` must therefore be a UTC timestamp.
     hour = hour_of_week(int(ts_ms))
     if length:
         hour %= int(length)
