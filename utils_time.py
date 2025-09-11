@@ -178,10 +178,15 @@ def _hour_index(ts_ms: int, length: int) -> int:
     return int(hour)
 
 
-def get_hourly_multiplier(ts_ms: int, multipliers: Sequence[float]) -> float:
-    """Return hourly multiplier for ``ts_ms`` from ``multipliers``.
+def get_hourly_multiplier(
+    ts_ms: int, multipliers: Sequence[float], *, interpolate: bool = False
+) -> float:
+    """Return multiplier for ``ts_ms`` from ``multipliers``.
 
-    Missing or short arrays gracefully default to ``1.0``.
+    If ``interpolate`` is ``False`` (default) the multiplier of the nearest
+    hour is returned.  When ``True``, the result is linearly interpolated
+    between the current hour and the next using the minute offset within the
+    hour.  Missing or short arrays gracefully default to ``1.0``.
     """
 
     if multipliers is None:
@@ -194,21 +199,30 @@ def get_hourly_multiplier(ts_ms: int, multipliers: Sequence[float]) -> float:
         return 1.0
     idx = _hour_index(ts_ms, length)
     try:
-        return float(multipliers[idx])
+        base = float(multipliers[idx])
+        if not interpolate:
+            return base
+        nxt = float(multipliers[(idx + 1) % length])
+        frac = (ts_ms % HOUR_MS) / float(HOUR_MS)
+        return base + (nxt - base) * frac
     except Exception:
         return 1.0
 
 
-def get_liquidity_multiplier(ts_ms: int, liquidity: Sequence[float]) -> float:
+def get_liquidity_multiplier(
+    ts_ms: int, liquidity: Sequence[float], *, interpolate: bool = False
+) -> float:
     """Convenience wrapper around :func:`get_hourly_multiplier` for liquidity."""
 
-    return get_hourly_multiplier(ts_ms, liquidity)
+    return get_hourly_multiplier(ts_ms, liquidity, interpolate=interpolate)
 
 
-def get_latency_multiplier(ts_ms: int, latency: Sequence[float]) -> float:
+def get_latency_multiplier(
+    ts_ms: int, latency: Sequence[float], *, interpolate: bool = False
+) -> float:
     """Convenience wrapper around :func:`get_hourly_multiplier` for latency."""
 
-    return get_hourly_multiplier(ts_ms, latency)
+    return get_hourly_multiplier(ts_ms, latency, interpolate=interpolate)
 
 
 def parse_time_to_ms(s: str) -> int:
