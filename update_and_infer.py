@@ -3,10 +3,12 @@
 Полный цикл обновления данных и инференса сигналов.
 
 Шаги (single pass):
-  1) Догрузить последние закрытые свечи по каждому символу (Binance, 1h, limit=3 — берём предпоследнюю) ->
-     data/candles/{SYMBOL}.csv    [скрипт: incremental_klines.py]
-  2) Обновить экономический календарь за окно дат ->
-     data/economic_events.csv     [скрипт: prepare_events.py]   (мягко: при ошибке — лог и продолжить)
+  1) Догрузить последние закрытые свечи по каждому символу
+     (Binance, 1h, limit=3 — берём предпоследнюю)
+     -> data/candles/{SYMBOL}.csv    [скрипт: incremental_klines.py]
+  2) Обновить экономический календарь за окно дат
+     -> data/economic_events.csv     [скрипт: prepare_events.py]
+        (мягко: при ошибке — лог и продолжить)
   3) Сборка/обогащение фич -> data/processed/*.feather
      [скрипт: prefer prepare_advanced_data.py, иначе fallback prepare_and_run.py]
   4) Валидация processed-таблиц ->
@@ -21,7 +23,8 @@ ENV:
   SLEEP_MIN=15            — пауза между проходами (мин)
   EVENTS_DAYS=90          — окно дней для prepare_events.py (по умолчанию 90)
   SKIP_EVENTS=0|1         — пропустить шаг 2 (экономкалендарь)
-  EXTRA_ARGS_PREPARE=...  — дополнительные аргументы к prepare_advanced_data.py / prepare_and_run.py
+  EXTRA_ARGS_PREPARE=...  — дополнительные аргументы к
+      prepare_advanced_data.py / prepare_and_run.py
   EXTRA_ARGS_INFER=...    — дополнительные аргументы к infer_signals.py
 """
 
@@ -31,9 +34,8 @@ import os
 import shlex
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List
 
 
 def _log(msg: str) -> None:
@@ -104,8 +106,10 @@ def _step2_prepare_events(days: int) -> None:
         return
     to = datetime.now(timezone.utc).date()
     frm = to - timedelta(days=max(1, days))
-    cmd = f'{sys.executable} prepare_events.py --from {_date_str(frm)} --to {_date_str(to)}'
-    # мягко: не роняем цикл из-за проблем investpy/сети
+    cmd = (
+        f"{sys.executable} prepare_events.py "
+        f"--from {_date_str(frm)} --to {_date_str(to)}"
+    )
     _run(cmd, check=False)
 
 
@@ -117,14 +121,15 @@ def _step3_build_features() -> None:
     if _exists_script("prepare_and_run.py"):
         _run(f"{sys.executable} prepare_and_run.py {extra}", check=True)
         return
-    _log("! step3 skipped: neither prepare_advanced_data.py nor prepare_and_run.py found")
+    _log(
+        "! step3 skipped: neither prepare_advanced_data.py nor prepare_and_run.py found"
+    )
 
 
 def _step4_validate_processed() -> None:
     if not _exists_script("validate_processed.py"):
         _log("! step4 skipped: validate_processed.py not found")
         return
-    # строго: при фейле — пробрасываем исключение
     rc = _run(f"{sys.executable} validate_processed.py", check=False)
     if rc != 0:
         raise RuntimeError("validate_processed.py reported failures")
@@ -156,23 +161,3 @@ def once() -> None:
     finally:
         _log("=== CYCLE END ===")
     _log("✓ Cycle completed")
-
-
-def main() -> None:
-    loop = _env_bool("LOOP", False)
-    sleep_min = max(1, _env_int("SLEEP_MIN", 15))
-    if not loop:
-        once()
-        return
-    _log(f"Running in LOOP mode: sleep {sleep_min} min between cycles")
-    while True:
-        try:
-            once()
-        except Exception as e:
-            # не падаем в режиме LOOP
-            _log(f"! error in cycle (LOOP continues): {e}")
-        time.sleep(sleep_min * 60)
-
-
-if __name__ == "__main__":
-    main()

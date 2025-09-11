@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -16,13 +16,19 @@ class FeatureSpec:
       - lookbacks_prices: окна для SMA и лог-ретёрнов (в минутах для 1m входа)
       - rsi_period: период RSI по Вайльдеру (EMA-уподоблённое сглаживание)
     """
+
     lookbacks_prices: List[int]
     rsi_period: int = 14
 
     def __post_init__(self) -> None:
-        if not isinstance(self.lookbacks_prices, list) or len(self.lookbacks_prices) == 0:
+        if (
+            not isinstance(self.lookbacks_prices, list)
+            or len(self.lookbacks_prices) == 0
+        ):
             self.lookbacks_prices = [5, 15, 60]
-        self.lookbacks_prices = [int(abs(x)) for x in self.lookbacks_prices if int(abs(x)) > 0]
+        self.lookbacks_prices = [
+            int(abs(x)) for x in self.lookbacks_prices if int(abs(x)) > 0
+        ]
         self.rsi_period = int(self.rsi_period)
 
 
@@ -33,6 +39,7 @@ class OnlineFeatureTransformer:
       - SMA и ретёрны из окна цен (1 точка в минуту)
       - RSI по Вайльдеру: скользящие avg_gain/avg_loss с периодом p
     """
+
     def __init__(self, spec: FeatureSpec) -> None:
         self.spec = spec
         self._state: Dict[str, Dict[str, Any]] = {}
@@ -42,10 +49,10 @@ class OnlineFeatureTransformer:
         if st is None:
             maxlen = max(self.spec.lookbacks_prices + [self.spec.rsi_period + 1])
             st = {
-                "prices": deque(maxlen=maxlen),   # type: Deque[float]
-                "avg_gain": None,                 # type: Optional[float]
-                "avg_loss": None,                 # type: Optional[float]
-                "last_close": None,               # type: Optional[float]
+                "prices": deque(maxlen=maxlen),  # type: deque[float]
+                "avg_gain": None,  # type: Optional[float]
+                "avg_loss": None,  # type: Optional[float]
+                "last_close": None,  # type: Optional[float]
             }
             self._state[symbol] = st
         return st
@@ -84,9 +91,15 @@ class OnlineFeatureTransformer:
                 sma = sum(window) / float(lb)
                 feats[f"sma_{lb}"] = float(sma)
                 first = float(window[0])
-                feats[f"ret_{lb}m"] = float(math.log(price / first)) if first > 0 else 0.0
+                feats[f"ret_{lb}m"] = (
+                    float(math.log(price / first)) if first > 0 else 0.0
+                )
 
-        if st["avg_gain"] is not None and st["avg_loss"] is not None and float(st["avg_loss"]) > 0.0:
+        if (
+            st["avg_gain"] is not None
+            and st["avg_loss"] is not None
+            and float(st["avg_loss"]) > 0.0
+        ):
             rs = float(st["avg_gain"]) / float(st["avg_loss"])
             feats["rsi"] = float(100.0 - (100.0 / (1.0 + rs)))
         else:
@@ -109,7 +122,11 @@ def apply_offline_features(
     На выходе: ts_ms, symbol, ref_price, sma_*, ret_*m, rsi.
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=[ts_col, symbol_col, "ref_price", "rsi"] + [f"sma_{x}" for x in spec.lookbacks_prices] + [f"ret_{x}m" for x in spec.lookbacks_prices])
+        return pd.DataFrame(
+            columns=[ts_col, symbol_col, "ref_price", "rsi"]
+            + [f"sma_{x}" for x in spec.lookbacks_prices]
+            + [f"ret_{x}m" for x in spec.lookbacks_prices]
+        )
 
     d = df.copy()
     if symbol_col not in d.columns or ts_col not in d.columns:

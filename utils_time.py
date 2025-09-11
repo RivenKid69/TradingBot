@@ -5,7 +5,7 @@ The hour-of-week index assumes ``0 = Monday 00:00 UTC``.
 
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Optional, Sequence, Union, Dict
+from typing import Dict, Sequence
 import os
 import json
 import hashlib
@@ -13,6 +13,7 @@ import importlib.util
 import sysconfig
 from pathlib import Path
 import numpy as np
+from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
 
 _logging_spec = importlib.util.spec_from_file_location(
     "py_logging", Path(sysconfig.get_path("stdlib")) / "logging/__init__.py"
@@ -20,9 +21,6 @@ _logging_spec = importlib.util.spec_from_file_location(
 logging = importlib.util.module_from_spec(_logging_spec)
 _logging_spec.loader.exec_module(logging)
 seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
-
-# Re-export shared time utilities to avoid duplicate implementations.
-from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
 
 # Clamp limits applied to liquidity and latency seasonality multipliers.
 SEASONALITY_MULT_MIN = 0.1
@@ -237,7 +235,9 @@ def parse_time_to_ms(s: str) -> int:
     if zs.lower() in ("now",):
         return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     if zs.lower() in ("today",):
-        dt = datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        dt = datetime.now(tz=timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
         return int(dt.timestamp() * 1000)
     if zs.isdigit():
         v = int(zs)
