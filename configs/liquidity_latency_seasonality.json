@@ -338,5 +338,6 @@
     1.0,
     1.0,
     1.0
-  ]
+  ],
+  "hour_of_week_definition": "0=Monday 00:00 UTC"
 }

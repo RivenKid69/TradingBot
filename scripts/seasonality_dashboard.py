@@ -2,8 +2,8 @@
 """Visualize deviations from historical liquidity/latency distributions.
 
 The script aggregates simulator logs by hour of week and compares observed
-liquidity and latency values against historical multipliers. It then outputs a
-PNG chart for quick inspection.
+liquidity and latency values against historical multipliers (``0 = Monday 00:00
+UTC``). It then outputs a PNG chart for quick inspection.
 """
 
 from __future__ import annotations
@@ -14,13 +14,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
-from datetime import datetime
+import numpy as np
 
-
-def _hour_of_week(ts_ms: int) -> int:
-    """Return hour-of-week index (0..167) for a timestamp in milliseconds."""
-    dt = datetime.utcfromtimestamp(int(ts_ms) / 1000)
-    return dt.weekday() * 24 + dt.hour
+from utils.time import hour_of_week
 
 
 def main() -> None:
@@ -37,7 +33,8 @@ def main() -> None:
         df = pd.read_parquet(log_path)
     else:
         df = pd.read_csv(log_path)
-    df["hour"] = df["ts_ms"].apply(_hour_of_week)
+    # ``hour_of_week`` indexes 0=Monday 00:00 UTC
+    df["hour"] = hour_of_week(df["ts_ms"].to_numpy(dtype=np.int64))
     agg = df.groupby("hour").agg({"liquidity": "mean", "latency_ms": "mean"}).fillna(0)
 
     with open(args.multipliers, "r", encoding="utf-8") as f:

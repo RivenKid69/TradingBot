@@ -1,3 +1,8 @@
+"""Validate hourly seasonality multipliers against historical data.
+
+The hour-of-week index used throughout assumes ``0 = Monday 00:00 UTC``.
+"""
+
 import argparse
 import json
 import datetime as dt
@@ -8,6 +13,7 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
+from utils.time import hour_of_week
 from execution_sim import ExecutionSimulator
 from latency import LatencyModel, SeasonalLatencyModel
 
@@ -20,8 +26,9 @@ def _load_dataset(path: Path) -> pd.DataFrame:
     ts_col = "ts_ms" if "ts_ms" in df.columns else "ts"
     if ts_col not in df.columns:
         raise ValueError("ts or ts_ms column required")
-    ts = pd.to_datetime(df[ts_col], unit="ms", utc=True)
-    df = df.assign(hour_of_week=ts.dt.dayofweek * 24 + ts.dt.hour)
+    ts_ms = df[ts_col].to_numpy(dtype=np.int64)
+    # ``hour_of_week`` indexes 0=Monday 00:00 UTC
+    df = df.assign(hour_of_week=hour_of_week(ts_ms))
     return df
 
 
