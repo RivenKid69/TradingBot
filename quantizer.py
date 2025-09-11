@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, Tuple
 
 Number = float
@@ -167,21 +169,55 @@ class Quantizer:
         return cls(data, strict=strict)
 
     @staticmethod
-    def load_filters(path: str) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    def load_filters(
+        path: str,
+        *,
+        max_age_days: int = 30,
+        fatal: bool = False,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
         """Загружает словарь фильтров и метаданные из JSON.
 
-        Возвращает пару ``(filters, metadata)`` или ``({}, {})`` если файл отсутствует.
-        Совместимо с прежним форматом без метаданных.
+        Помимо чтения файла проверяет свежесть поля ``metadata.generated_at`` и
+        предупреждает, если данные устарели. При ``fatal=True`` вместо
+        предупреждения выбрасывается :class:`RuntimeError`.
+
+        Возвращает пару ``(filters, metadata)`` или ``({}, {})`` если файл
+        отсутствует. Совместимо с прежним форматом без метаданных.
         """
         if not path or not os.path.exists(path):
             return {}, {}
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f) or {}
         if "filters" in raw:
-            return raw.get("filters", {}), raw.get("metadata", {})
-        return raw, {}
+            filters = raw.get("filters", {})
+            meta = raw.get("metadata", {})
+        else:
+            filters, meta = raw, {}
+
+        ga = meta.get("generated_at")
+        if isinstance(ga, str):
+            try:
+                ts = datetime.fromisoformat(ga.replace("Z", "+00:00"))
+                age_days = (datetime.now(timezone.utc) - ts).days
+                if age_days > int(max_age_days):
+                    msg = (
+                        f"{path} is {age_days} days old (>={max_age_days}d); "
+                        f"refresh via fetch_binance_filters.py"
+                    )
+                    if fatal:
+                        raise RuntimeError(msg)
+                    warnings.warn(msg)
+            except Exception:
+                pass
+
+        return filters, meta
 
 
 # для обратной совместимости
-def load_filters(path: str) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    return Quantizer.load_filters(path)
+def load_filters(
+    path: str,
+    *,
+    max_age_days: int = 30,
+    fatal: bool = False,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    return Quantizer.load_filters(path, max_age_days=max_age_days, fatal=fatal)

@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, Tuple
 
 
@@ -46,6 +48,17 @@ def load_specs(path: str) -> Tuple[ExchangeSpecs, Dict[str, Any]]:
             rules[str(k).upper()] = ExchangeRule.from_dict(str(k), v or {})
         except Exception:
             continue
+    ga = meta.get("generated_at")
+    if isinstance(ga, str):
+        try:
+            ts = datetime.fromisoformat(ga.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - ts).days
+            if age_days > 30:
+                warnings.warn(
+                    f"{path} is {age_days} days old (>=30d); refresh via script_fetch_exchange_specs.py"
+                )
+        except Exception:
+            pass
     return ExchangeSpecs(rules), meta
 
 
