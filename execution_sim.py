@@ -703,6 +703,41 @@ class ExecutionSimulator:
             except Exception:
                 result["latency"] = None
         return result
+
+    def dump_seasonality_multipliers(self) -> Dict[str, List[float]]:
+        """Return current liquidity and spread seasonality multipliers.
+
+        The result is a JSON-serializable mapping with two keys:
+        ``liquidity`` and ``spread``. Each contains a list of 168 floats
+        representing multipliers for each hour of week.
+        """
+
+        return {
+            "liquidity": self._liq_seasonality.tolist(),
+            "spread": self._spread_seasonality.tolist(),
+        }
+
+    def load_seasonality_multipliers(self, data: Dict[str, Sequence[float]]) -> None:
+        """Load liquidity and spread seasonality multipliers from ``data``.
+
+        ``data`` should be a mapping with optional ``liquidity`` and ``spread``
+        keys, each mapping to a sequence of 168 floats. Missing keys are
+        ignored. Raises ``ValueError`` if provided arrays have invalid length.
+        """
+
+        liq = data.get("liquidity")
+        if liq is not None:
+            arr = np.asarray(liq, dtype=float)
+            if arr.size != HOURS_IN_WEEK:
+                raise ValueError("liquidity multipliers must have length 168")
+            self._liq_seasonality = arr.copy()
+
+        spread = data.get("spread")
+        if spread is not None:
+            arr = np.asarray(spread, dtype=float)
+            if arr.size != HOURS_IN_WEEK:
+                raise ValueError("spread multipliers must have length 168")
+            self._spread_seasonality = arr.copy()
     def _build_executor(self) -> None:
         """
         Построить исполнителя согласно self._execution_cfg.
