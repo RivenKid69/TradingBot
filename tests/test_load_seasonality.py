@@ -89,3 +89,12 @@ def test_hourly_seasonality_legacy_key(tmp_path):
     p.write_text(json.dumps({"multipliers": _arr(5.0)}))
     arr = load_hourly_seasonality(str(p), "liquidity")
     assert np.allclose(arr, 5.0)
+
+
+def test_load_seasonality_daily(tmp_path):
+    p = tmp_path / "day.json"
+    p.write_text(json.dumps({"liquidity": [1.0] * 7}))
+    res = load_seasonality(str(p))
+    assert len(res["liquidity"]) == 7
+    arr = load_hourly_seasonality(str(p), "liquidity")
+    assert len(arr) == 7

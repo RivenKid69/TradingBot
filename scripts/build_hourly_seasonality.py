@@ -26,8 +26,9 @@ def load_logs(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def _fill_missing(arr: np.ndarray) -> tuple[np.ndarray, list[int]]:
-    """Replace NaNs in *arr* using neighbouring-hour averages or global mean."""
+def _fill_missing(arr: np.ndarray, period: int = 168) -> tuple[np.ndarray, list[int]]:
+    """Replace NaNs in *arr* using neighbouring-period averages or global mean."""
+
     out = arr.copy()
     imputed: list[int] = []
     for i, val in enumerate(out):
@@ -35,13 +36,13 @@ def _fill_missing(arr: np.ndarray) -> tuple[np.ndarray, list[int]]:
             continue
         imputed.append(i)
         left = right = None
-        for j in range(1, 168):
-            lval = out[(i - j) % 168]
+        for j in range(1, period):
+            lval = out[(i - j) % period]
             if not np.isnan(lval):
                 left = lval
                 break
-        for j in range(1, 168):
-            rval = out[(i + j) % 168]
+        for j in range(1, period):
+            rval = out[(i + j) % period]
             if not np.isnan(rval):
                 right = rval
                 break
@@ -74,6 +75,8 @@ def compute_multipliers(
     prior_metrics: Optional[Dict[str, np.ndarray]] = None,
     trim_bottom_pct: float = 0.0,
     trim_top_pct: float = 0.0,
+    *,
+    by_day: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict[str, list[int]]]:
     ts_col = 'ts_ms' if 'ts_ms' in df.columns else 'ts'
     if ts_col not in df.columns:
@@ -81,7 +84,11 @@ def compute_multipliers(
     # ``hour_of_week`` uses Monday 00:00 UTC as index 0
     ts_ms = df[ts_col].to_numpy(dtype=np.int64)
     how = hour_of_week(ts_ms)
-    df = df.assign(hour_of_week=how)
+    group_col = 'day_of_week' if by_day else 'hour_of_week'
+    if by_day:
+        df = df.assign(day_of_week=(how // 24))
+    else:
+        df = df.assign(hour_of_week=how)
     metrics: dict[str, np.ndarray] = {}
     imputed_hours: dict[str, list[int]] = {}
     cols_map = {
@@ -90,27 +97,33 @@ def compute_multipliers(
         # Some datasets may label spread either in absolute terms or in bps.
         'spread': ['spread', 'spread_bps'],
     }
+    period = 7 if by_day else 168
     for key, candidates in cols_map.items():
         col = next((c for c in candidates if c in df.columns), None)
         if col is None:
-            arr = np.ones(168, dtype=float)
+            arr = np.ones(period, dtype=float)
         else:
-            data = df[['hour_of_week', col]].copy()
+            data = df[[group_col, col]].copy()
             if trim_bottom_pct > 0.0 or trim_top_pct > 0.0:
                 series = data[col]
                 lower = series.quantile(trim_bottom_pct / 100.0) if trim_bottom_pct > 0.0 else series.min()
                 upper = series.quantile(1 - trim_top_pct / 100.0) if trim_top_pct > 0.0 else series.max()
                 data = data[(data[col] >= lower) & (data[col] <= upper)]
-            grouped = data.groupby('hour_of_week')[col].agg(['mean', 'count'])
+            grouped = data.groupby(group_col)[col].agg(['mean', 'count'])
             overall = data[col].mean()
             if overall:
                 mult = grouped['mean'] / overall
             else:
                 mult = grouped['mean'] * 0.0 + 1.0
             mult[grouped['count'] < min_samples] = np.nan
-            arr, imp = _fill_missing(mult.reindex(range(168)).to_numpy(dtype=float))
+            arr, imp = _fill_missing(
+                mult.reindex(range(period)).to_numpy(dtype=float), period=period
+            )
             if imp:
                 imputed_hours[key] = imp
+        if by_day:
+            from utils_time import interpolate_daily_multipliers
+            arr = interpolate_daily_multipliers(arr)
         if prior_metrics and key in prior_metrics:
             weights = np.asarray(prior_metrics[key], dtype=float)
             if weights.shape[0] != 168:
@@ -185,6 +198,11 @@ def main() -> None:
         default=0.0,
         help='Percentile of lowest values to discard before averaging (0-100)',
     )
+    parser.add_argument(
+        '--by-day',
+        action='store_true',
+        help='Aggregate by day-of-week and interpolate to 168-hour array',
+    )
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -200,6 +218,7 @@ def main() -> None:
         prior,
         trim_bottom_pct=args.trim_bottom,
         trim_top_pct=args.trim_top,
+        by_day=args.by_day,
     )
     if args.smooth_window > 1:
         for key, arr in multipliers.items():

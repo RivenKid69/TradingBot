@@ -369,6 +369,7 @@ class ExecutionSimulator:
                  seasonality_override_path: Optional[str] = None,
                  use_seasonality: bool = True,
                  seasonality_interpolate: bool = False,
+                 seasonality_day_only: bool = False,
                  run_config: Any = None):
         self.symbol = str(symbol).upper()
         self.latency_steps = int(max(0, latency_steps))
@@ -484,7 +485,11 @@ class ExecutionSimulator:
         self.seasonality_interpolate = bool(
             getattr(run_config, "seasonality_interpolate", seasonality_interpolate)
         )
-        default_seasonality = np.ones(HOURS_IN_WEEK, dtype=float)
+        self.seasonality_day_only = bool(
+            getattr(run_config, "seasonality_day_only", seasonality_day_only)
+        )
+        default_len = 7 if self.seasonality_day_only else HOURS_IN_WEEK
+        default_seasonality = np.ones(default_len, dtype=float)
         self._liq_seasonality = default_seasonality.copy()
         self._spread_seasonality = default_seasonality.copy()
         if self.use_seasonality:
@@ -500,16 +505,38 @@ class ExecutionSimulator:
                     liq_arr = load_hourly_seasonality(path, "liquidity", "multipliers")
                 if spread_arr is None:
                     spread_arr = load_hourly_seasonality(path, "spread", "latency")
-            if liq_arr is not None and len(liq_arr) == HOURS_IN_WEEK:
-                self._liq_seasonality = np.asarray(liq_arr, dtype=float)
+
+            from utils_time import interpolate_daily_multipliers, daily_from_hourly
+
+            def _prep(arr: Optional[Sequence[float]]) -> Optional[np.ndarray]:
+                if arr is None:
+                    return None
+                arr = np.asarray(arr, dtype=float)
+                if self.seasonality_day_only:
+                    if arr.size == HOURS_IN_WEEK:
+                        arr = daily_from_hourly(arr)
+                    elif arr.size != 7:
+                        return None
+                else:
+                    if arr.size == 7:
+                        arr = interpolate_daily_multipliers(arr)
+                    elif arr.size != HOURS_IN_WEEK:
+                        return None
+                return arr
+
+            liq_arr = _prep(liq_arr)
+            spread_arr = _prep(spread_arr)
+
+            if liq_arr is not None:
+                self._liq_seasonality = liq_arr
             else:
                 logger.warning(
                     "Liquidity seasonality config %s not found or invalid; using default multipliers of 1.0; "
                     "run scripts/build_hourly_seasonality.py to generate them.",
                     path,
                 )
-            if spread_arr is not None and len(spread_arr) == HOURS_IN_WEEK:
-                self._spread_seasonality = np.asarray(spread_arr, dtype=float)
+            if spread_arr is not None:
+                self._spread_seasonality = spread_arr
             else:
                 logger.warning(
                     "Spread seasonality config %s not found or invalid; using default multipliers of 1.0; "
@@ -539,14 +566,13 @@ class ExecutionSimulator:
                     spread_override = load_hourly_seasonality(
                         override_path, "spread", "latency"
                     )
-            if liq_override is not None and len(liq_override) == HOURS_IN_WEEK:
-                self._liq_seasonality *= np.asarray(liq_override, dtype=float)
-            elif liq_override is not None:
-                logger.warning("Liquidity override must have length 168; ignoring.")
-            if spread_override is not None and len(spread_override) == HOURS_IN_WEEK:
-                self._spread_seasonality *= np.asarray(spread_override, dtype=float)
-            elif spread_override is not None:
-                logger.warning("Spread override must have length 168; ignoring.")
+
+            liq_override = _prep(liq_override)
+            spread_override = _prep(spread_override)
+            if liq_override is not None:
+                self._liq_seasonality *= liq_override
+            if spread_override is not None:
+                self._spread_seasonality *= spread_override
 
         # накопители статистики по сезонности ликвидности
         self._liq_mult_sum: List[float] = [0.0] * HOURS_IN_WEEK
@@ -688,8 +714,9 @@ class ExecutionSimulator:
         """Return current liquidity and spread seasonality multipliers.
 
         The result is a JSON-serializable mapping with two keys:
-        ``liquidity`` and ``spread``. Each contains a list of 168 floats
-        representing multipliers for each hour of week.
+        ``liquidity`` and ``spread``. Each contains a list of floats representing
+        multipliers either for each hour of week (length 168) or for each day
+        of week (length 7) when ``seasonality_day_only`` is enabled.
         """
 
         return {
@@ -701,35 +728,46 @@ class ExecutionSimulator:
         """Load liquidity and spread seasonality multipliers from ``data``.
 
         ``data`` should be a mapping with optional ``liquidity`` and ``spread``
-        keys, each mapping to a sequence of 168 floats. Missing keys are
-        ignored. Raises ``ValueError`` if provided arrays have invalid length.
+        keys, each mapping to a sequence of 168 floats (or 7 if
+        ``seasonality_day_only`` is enabled). Missing keys are ignored. Raises
+        ``ValueError`` if provided arrays have invalid length.
         """
 
         liq = data.get("liquidity")
         spread = data.get("spread")
         legacy = data.get("multipliers")
 
+        expected = 7 if self.seasonality_day_only else HOURS_IN_WEEK
+
         if liq is not None:
             arr = np.asarray(liq, dtype=float)
-            if arr.size != HOURS_IN_WEEK:
-                raise ValueError("liquidity multipliers must have length 168")
+            if arr.size != expected:
+                raise ValueError(
+                    f"liquidity multipliers must have length {expected}"
+                )
             self._liq_seasonality = arr.copy()
         elif legacy is not None:
             arr = np.asarray(legacy, dtype=float)
-            if arr.size != HOURS_IN_WEEK:
-                raise ValueError("multipliers must have length 168")
+            if arr.size != expected:
+                raise ValueError(
+                    f"multipliers must have length {expected}"
+                )
             self._liq_seasonality = arr.copy()
 
         if spread is not None:
             arr = np.asarray(spread, dtype=float)
-            if arr.size != HOURS_IN_WEEK:
-                raise ValueError("spread multipliers must have length 168")
+            if arr.size != expected:
+                raise ValueError(
+                    f"spread multipliers must have length {expected}"
+                )
             self._spread_seasonality = arr.copy()
         elif legacy is not None and spread is None and liq is None:
             # Legacy single-array structure applied to both
             arr = np.asarray(legacy, dtype=float)
-            if arr.size != HOURS_IN_WEEK:
-                raise ValueError("multipliers must have length 168")
+            if arr.size != expected:
+                raise ValueError(
+                    f"multipliers must have length {expected}"
+                )
             self._spread_seasonality = arr.copy()
     def _build_executor(self) -> None:
         """
