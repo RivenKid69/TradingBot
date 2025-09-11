@@ -5,7 +5,7 @@ The hour-of-week index assumes ``0 = Monday 00:00 UTC``.
 
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence, Union, Dict
 import os
 import json
 import hashlib
@@ -76,6 +76,82 @@ def load_hourly_seasonality(
     except Exception:
         return None
     return None
+
+
+def load_seasonality(path: str) -> Dict[str, np.ndarray]:
+    """Load all available seasonality arrays from ``path``.
+
+    The JSON file is expected to contain arrays of length :data:`HOURS_IN_WEEK`
+    (168). It may either expose the arrays at the top level, or nest them under
+    an instrument symbol. Only keys with list values of the correct length are
+    returned.
+
+    Parameters
+    ----------
+    path:
+        Path to a JSON file. ``FileNotFoundError`` is raised if the path does
+        not exist.
+
+    Returns
+    -------
+    Dict[str, numpy.ndarray]
+        Mapping of keys such as ``"liquidity"``, ``"latency"`` or
+        ``"spread"`` to numpy arrays.
+
+    Raises
+    ------
+    ValueError
+        If the file cannot be parsed or does not contain any valid arrays.
+    """
+
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        digest = hashlib.sha256(raw).hexdigest()
+        logging.getLogger(__name__).info(
+            "Loaded seasonality multipliers from %s (sha256=%s)", path, digest
+        )
+        data = json.loads(raw.decode("utf-8"))
+    except FileNotFoundError:
+        raise
+    except Exception as exc:  # pragma: no cover - unexpected parse error
+        raise ValueError(f"Invalid seasonality file {path}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("Seasonality JSON must be an object")
+
+    def _extract(obj: Dict[str, object]) -> Dict[str, np.ndarray]:
+        res: Dict[str, np.ndarray] = {}
+        for key in ("liquidity", "latency", "spread", "multipliers"):
+            if key in obj:
+                arr = np.asarray(obj[key], dtype=float)
+                if arr.shape[0] != HOURS_IN_WEEK:
+                    raise ValueError(
+                        f"Seasonality array '{key}' must have length {HOURS_IN_WEEK}"
+                    )
+                res[key] = arr
+        return res
+
+    arrays = _extract(data)
+    if arrays:
+        return arrays
+
+    # Handle structure where arrays are nested under a symbol key.
+    candidates = []
+    for val in data.values():
+        if isinstance(val, dict):
+            arrs = _extract(val)
+            if arrs:
+                candidates.append(arrs)
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise ValueError("No seasonality arrays found")
+    raise ValueError("Multiple seasonality mappings found; specify symbol")
 
 
 def parse_time_to_ms(s: str) -> int:
