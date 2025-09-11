@@ -1,0 +1,1 @@
+Archived seasonality JSON snapshots.

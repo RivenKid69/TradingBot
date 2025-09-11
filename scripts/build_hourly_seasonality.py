@@ -9,6 +9,7 @@ to modulate these parameters during backtests.
 import argparse
 import hashlib
 import json
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -180,7 +181,17 @@ def main() -> None:
     if args.smooth_alpha > 0.0:
         for key, arr in multipliers.items():
             multipliers[key] = arr * (1.0 - args.smooth_alpha) + args.smooth_alpha
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        archive_dir = Path("configs/seasonality/archive")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        archived = archive_dir / f"{out_path.stem}-{timestamp}{out_path.suffix}"
+        shutil.copy2(out_path, archived)
+        print(f"Archived previous config to {archived}")
+
     meta = {
         'generated_at': datetime.utcnow().isoformat() + 'Z',
         'smoothing': {
@@ -198,7 +209,8 @@ def main() -> None:
         out_data = {k: v.tolist() for k, v in multipliers.items()}
         out_data['hour_of_week_definition'] = '0=Monday 00:00 UTC'
         out_data['metadata'] = meta
-    with open(args.out, 'w') as f:
+
+    with open(out_path, 'w') as f:
         json.dump(out_data, f, indent=2)
     if imputed:
         for key, hours in imputed.items():
