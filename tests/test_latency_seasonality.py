@@ -331,3 +331,38 @@ def test_latency_impl_caps_timeout(tmp_path, caplog):
         res = lat.sample(0)
 
     assert res["total_ms"] == 1000
+
+
+def test_latency_seasonality_day_only(tmp_path):
+    multipliers = [1.0] * 7
+    multipliers[1] = 2.0
+    multipliers[2] = 0.5
+    path = tmp_path / "latency.json"
+    path.write_text(json.dumps({"latency": multipliers}))
+
+    cfg = {
+        "base_ms": 100,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seasonality_path": str(path),
+        "seasonality_day_only": True,
+    }
+    impl = LatencyImpl.from_dict(cfg)
+
+    class Dummy:
+        pass
+
+    sim = Dummy()
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    base_dt = datetime.datetime(2024, 1, 2, 0, 0, tzinfo=datetime.timezone.utc)
+    ts_high = int(base_dt.timestamp() * 1000)
+    ts_low = int((base_dt + datetime.timedelta(days=1)).timestamp() * 1000)
+
+    d_high = lat.sample(ts_high)
+    d_low = lat.sample(ts_low)
+
+    assert d_high["total_ms"] == 200
+    assert d_low["total_ms"] == 50

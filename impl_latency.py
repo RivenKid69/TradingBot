@@ -72,6 +72,7 @@ class LatencyCfg:
     seasonality_override_path: str | None = None
     seasonality_hash: str | None = None
     seasonality_interpolate: bool = False
+    seasonality_day_only: bool = False
 
 
 class _LatencyWithSeasonality:
@@ -81,15 +82,16 @@ class _LatencyWithSeasonality:
         self, model: LatencyModel, multipliers: Sequence[float], *, interpolate: bool = False
     ):  # type: ignore[name-defined]
         self._model = model
-        self._mult = (
-            np.asarray(multipliers, dtype=float)
-            if len(multipliers) == 168
-            else np.ones(168, dtype=float)
-        )
+        arr = np.asarray(multipliers, dtype=float)
+        n = len(arr)
+        if n not in (7, 168):
+            arr = np.ones(168, dtype=float)
+            n = 168
+        self._mult = arr
         self._interpolate = bool(interpolate)
-        self._mult_sum: List[float] = [0.0] * 168
-        self._lat_sum: List[float] = [0.0] * 168
-        self._count: List[int] = [0] * 168
+        self._mult_sum: List[float] = [0.0] * n
+        self._lat_sum: List[float] = [0.0] * n
+        self._count: List[int] = [0] * n
 
     def sample(self, ts_ms: int | None = None):
         if ts_ms is None:
@@ -165,7 +167,7 @@ class LatencyImpl:
             retries=int(cfg.retries),
             seed=int(cfg.seed),
         ) if LatencyModel is not None else None
-        self.latency: List[float] = [1.0] * 168
+        self.latency: List[float] = [1.0] * (7 if cfg.seasonality_day_only else 168)
         path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
         self._has_seasonality = bool(cfg.use_seasonality and seasonality_enabled())
         if self._has_seasonality:
@@ -175,13 +177,20 @@ class LatencyImpl:
                 symbol=cfg.symbol,
                 expected_hash=cfg.seasonality_hash,
             )
-            if arr is None or len(arr) != 168:
+            from utils_time import interpolate_daily_multipliers, daily_from_hourly
+            if arr is None or len(arr) not in (7, 168):
                 logger.warning(
                     "Latency seasonality config %s not found or invalid; using default multipliers.",
                     path,
                 )
                 self._has_seasonality = False
             else:
+                if cfg.seasonality_day_only:
+                    if len(arr) == 168:
+                        arr = daily_from_hourly(arr)
+                else:
+                    if len(arr) == 7:
+                        arr = interpolate_daily_multipliers(arr)
                 self.latency = [float(x) for x in arr]
             if not self._has_seasonality:
                 logger.warning(
@@ -198,13 +207,23 @@ class LatencyImpl:
                     )
             if override is not None:
                 arr = np.asarray(override, dtype=float)
-                if len(arr) == 168:
+                if cfg.seasonality_day_only:
+                    if len(arr) == 168:
+                        arr = daily_from_hourly(arr)
+                    elif len(arr) != 7:
+                        arr = None
+                else:
+                    if len(arr) == 7:
+                        arr = interpolate_daily_multipliers(arr)
+                    elif len(arr) != 168:
+                        arr = None
+                if arr is not None:
                     self.latency = (
                         np.asarray(self.latency, dtype=float) * arr
                     ).tolist()
                 else:
                     logger.warning(
-                        "Latency override array must have length 168; ignoring."
+                        "Latency override array must have length 168 or 7; ignoring."
                     )
         self.attached_sim = None
         self._wrapper: _LatencyWithSeasonality | None = None
@@ -215,7 +234,7 @@ class LatencyImpl:
 
     def attach_to(self, sim) -> None:
         if self._model is not None:
-            mult = self.latency if self._has_seasonality else [1.0] * 168
+            mult = self.latency if self._has_seasonality else [1.0] * len(self.latency)
             self._wrapper = _LatencyWithSeasonality(
                 self._model, mult, interpolate=self.cfg.seasonality_interpolate
             )
@@ -248,17 +267,23 @@ class LatencyImpl:
     def load_multipliers(self, arr: Sequence[float]) -> None:
         """Load latency seasonality multipliers from ``arr``.
 
-        ``arr`` must contain 168 float values. Raises ``ValueError`` if the
+        ``arr`` must contain 168 float values (or 7 when
+        ``seasonality_day_only`` is enabled). Raises ``ValueError`` if the
         length is incorrect. If the implementation is already attached to a
         simulator, the underlying wrapper is updated as well.
         """
 
         arr_list = [float(x) for x in arr]
-        if len(arr_list) != 168:
-            raise ValueError("multipliers array must have length 168")
+        expected = 7 if self.cfg.seasonality_day_only else 168
+        if len(arr_list) != expected:
+            raise ValueError(f"multipliers array must have length {expected}")
         self.latency = arr_list
         if self._wrapper is not None:
             self._wrapper._mult = np.asarray(self.latency, dtype=float)
+            n = len(self.latency)
+            self._wrapper._mult_sum = [0.0] * n
+            self._wrapper._lat_sum = [0.0] * n
+            self._wrapper._count = [0] * n
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "LatencyImpl":
@@ -277,4 +302,5 @@ class LatencyImpl:
             seasonality_override_path=d.get("seasonality_override_path"),
             seasonality_hash=d.get("seasonality_hash"),
             seasonality_interpolate=bool(d.get("seasonality_interpolate", False)),
+            seasonality_day_only=bool(d.get("seasonality_day_only", False)),
         ))

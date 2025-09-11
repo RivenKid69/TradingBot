@@ -70,3 +70,11 @@ def test_compute_multipliers_trims_outliers():
     multipliers, _ = compute_multipliers(df, min_samples=1, trim_top_pct=25.0)
     assert multipliers["liquidity"][0] == pytest.approx(1.0)
     assert multipliers["liquidity"][1] == pytest.approx(1.0)
+
+
+def test_compute_multipliers_by_day():
+    df = pd.read_csv(_data_path())
+    multipliers, _ = compute_multipliers(df, min_samples=1, by_day=True)
+    arr = multipliers["liquidity"]
+    assert len(arr) == 168
+    assert np.allclose(arr, 1.0)

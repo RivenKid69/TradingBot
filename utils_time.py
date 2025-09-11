@@ -27,13 +27,38 @@ SEASONALITY_MULT_MIN = 0.1
 SEASONALITY_MULT_MAX = 10.0
 
 
+def interpolate_daily_multipliers(days: Sequence[float]) -> np.ndarray:
+    """Expand 7-element day-of-week multipliers to 168 hours.
+
+    Linear interpolation is applied between adjacent days to provide a smooth
+    transition for each hour of the week. The first value is appended to the
+    end to ensure wrap-around continuity.
+    """
+
+    arr = np.asarray(list(days), dtype=float)
+    if arr.size != 7:
+        raise ValueError("days must have length 7")
+    hours = np.arange(0, HOURS_IN_WEEK + 24, 24)
+    vals = np.concatenate([arr, arr[:1]])
+    return np.interp(np.arange(HOURS_IN_WEEK), hours, vals)
+
+
+def daily_from_hourly(hours: Sequence[float]) -> np.ndarray:
+    """Collapse 168-hour multipliers into 7 day-of-week averages."""
+
+    arr = np.asarray(list(hours), dtype=float)
+    if arr.size != HOURS_IN_WEEK:
+        raise ValueError("hours must have length 168")
+    return arr.reshape(7, 24).mean(axis=1)
+
+
 def load_hourly_seasonality(
     path: str,
     *keys: str,
     symbol: str | None = None,
     expected_hash: str | None = None,
 ) -> np.ndarray | None:
-    """Load hourly multipliers array from JSON file.
+    """Load hourly or daily multipliers array from JSON file.
 
     Parameters
     ----------
@@ -47,7 +72,7 @@ def load_hourly_seasonality(
     Returns
     -------
     numpy.ndarray | None
-        Array of length 168 if successful, otherwise ``None``.
+        Array of length 168 or 7 if successful, otherwise ``None``.
     """
     if not path or not os.path.exists(path):
         return None
@@ -78,7 +103,7 @@ def load_hourly_seasonality(
             if isinstance(data, dict) and "multipliers" in data:
                 data = data["multipliers"]
         arr = np.asarray(data, dtype=float)
-        if arr.shape[0] == HOURS_IN_WEEK:
+        if arr.shape[0] in (HOURS_IN_WEEK, 7):
             if any(k in {"liquidity", "latency"} for k in keys):
                 arr = np.clip(arr, SEASONALITY_MULT_MIN, SEASONALITY_MULT_MAX)
             return arr
@@ -91,9 +116,9 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
     """Load all available seasonality arrays from ``path``.
 
     The JSON file is expected to contain arrays of length :data:`HOURS_IN_WEEK`
-    (168). It may either expose the arrays at the top level, or nest them under
-    an instrument symbol. Only keys with list values of the correct length are
-    returned.
+    (168) or 7 (one per weekday). It may either expose the arrays at the top
+    level, or nest them under an instrument symbol. Only keys with list values
+    of an accepted length are returned.
 
     Parameters
     ----------
@@ -139,9 +164,9 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
         for key in ("liquidity", "latency", "spread", "multipliers"):
             if key in obj:
                 arr = np.asarray(obj[key], dtype=float)
-                if arr.shape[0] != HOURS_IN_WEEK:
+                if arr.shape[0] not in (HOURS_IN_WEEK, 7):
                     raise ValueError(
-                        f"Seasonality array '{key}' must have length {HOURS_IN_WEEK}"
+                        "Seasonality array '%s' must have length 168 or 7" % key
                     )
                 if key in {"liquidity", "latency"}:
                     arr = np.clip(arr, SEASONALITY_MULT_MIN, SEASONALITY_MULT_MAX)
@@ -180,7 +205,11 @@ def _hour_index(ts_ms: int, length: int) -> int:
     # ``ts_ms`` must therefore be a UTC timestamp.
     hour = hour_of_week(int(ts_ms))
     if length:
-        hour %= int(length)
+        length = int(length)
+        if length == 7:
+            hour = (hour // 24) % 7
+        else:
+            hour %= length
     return int(hour)
 
 
