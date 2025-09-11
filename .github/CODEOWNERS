@@ -1,4 +1,5 @@
 # CODEOWNERS
 # Replace example teams with actual GitHub usernames or teams.
-* @example-org/maintainers
+# Ensure PRs are reviewed by experts in market microstructure and latency.
+* @example-org/maintainers @example-org/microstructure @example-org/latency
 .github/workflows/ @example-org/devops
