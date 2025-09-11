@@ -4,7 +4,7 @@ This guide describes how the QA team should validate hourly seasonality multipli
 
 ## Running the validation script
 
-1. Prepare a CSV or Parquet file with historical trades. The file must include a timestamp column (`ts_ms` or `ts`).
+1. Prepare a CSV or Parquet file with historical trades. The file must include a timestamp column (`ts_ms` or `ts`) expressed in UTC. Feeding local-time timestamps into the validator can misalign hour-of-week multipliers due to DST, so convert any source data to UTC first.
 2. Run the validation script with paths to the historical dataset and the multipliers JSON:
 
 ```bash
