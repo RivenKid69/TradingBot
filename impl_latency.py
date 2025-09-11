@@ -15,6 +15,11 @@ import sysconfig
 from pathlib import Path
 
 import numpy as np
+try:
+    from runtime_flags import seasonality_enabled
+except Exception:  # pragma: no cover - fallback when module not found
+    def seasonality_enabled(default: bool = True) -> bool:
+        return default
 
 from utils.time import hour_of_week
 from utils.prometheus import Counter
@@ -158,7 +163,7 @@ class LatencyImpl:
         ) if LatencyModel is not None else None
         self.latency: List[float] = [1.0] * 168
         path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
-        self._has_seasonality = bool(cfg.use_seasonality)
+        self._has_seasonality = bool(cfg.use_seasonality and seasonality_enabled())
         if self._has_seasonality:
             try:
                 data = load_seasonality(path)

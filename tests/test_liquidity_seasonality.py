@@ -6,6 +6,7 @@ import pytest
 import logging
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE))
 
 spec_exec = importlib.util.spec_from_file_location("execution_sim", BASE / "execution_sim.py")
 exec_mod = importlib.util.module_from_spec(spec_exec)
@@ -42,6 +43,25 @@ def test_seasonality_toggle_off():
         liquidity_seasonality=liq_mult,
         spread_seasonality=spr_mult,
         use_seasonality=False,
+    )
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    ts_ms = int(base_dt.timestamp() * 1000 + hour_idx * 3_600_000)
+    sim.set_market_snapshot(bid=100.0, ask=101.0, liquidity=5.0, spread_bps=1.0, ts_ms=ts_ms)
+    assert sim._last_liquidity == 5.0
+    assert sim._last_spread_bps == 1.0
+
+
+def test_env_flag_disables_seasonality(monkeypatch):
+    liq_mult = [1.0] * 168
+    spr_mult = [1.0] * 168
+    hour_idx = 4
+    liq_mult[hour_idx] = 2.0
+    spr_mult[hour_idx] = 3.0
+    monkeypatch.setenv("ENABLE_SEASONALITY", "0")
+    sim = ExecutionSimulator(
+        liquidity_seasonality=liq_mult,
+        spread_seasonality=spr_mult,
+        use_seasonality=True,
     )
     base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
     ts_ms = int(base_dt.timestamp() * 1000 + hour_idx * 3_600_000)

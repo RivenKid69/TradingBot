@@ -28,3 +28,13 @@ def get_float(name: str, default: float = 0.0) -> float:
 def get_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return str(v) if v is not None else default
+
+
+def seasonality_enabled(default: bool = True) -> bool:
+    """Return whether seasonality features are enabled.
+
+    Controlled via the ``ENABLE_SEASONALITY`` environment variable which
+    accepts typical truthy values ("1", "true", "yes", "on"). Defaults to
+    ``True`` when the variable is unset.
+    """
+    return get_bool("ENABLE_SEASONALITY", default)
