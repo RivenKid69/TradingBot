@@ -16,10 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-try:
-    from utils.time import hour_of_week
-except Exception:  # pragma: no cover - fallback
-    hour_of_week = lambda ts: int((int(ts) // 3_600_000 + 72) % 168)  # type: ignore
+from utils.time import hour_of_week
 
 _logging_spec = importlib.util.spec_from_file_location(
     "py_logging", Path(sysconfig.get_path("stdlib")) / "logging/__init__.py"
