@@ -622,6 +622,9 @@ class ExecutionSimulator:
             if self.use_seasonality:
                 logger.warning("ts_ms is None; seasonality multipliers not applied")
         else:
+            # Convert UTC milliseconds to hour-of-week (0=Mon 00:00 UTC) via the
+            # shared helper: (ts_ms // HOUR_MS + 72) % 168.  This keeps hour
+            # indexing consistent across modules.
             how = hour_of_week(int(ts_ms))
             if self.use_seasonality:
                 liq_mult = get_liquidity_multiplier(

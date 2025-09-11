@@ -19,6 +19,12 @@ def hour_of_week(ts_ms: Union[int, Sequence[int], np.ndarray]) -> Union[int, np.
     arr = np.asarray(ts_ms, dtype=np.int64)
 
     def _calc(ts: int) -> int:
+        # Convert milliseconds since epoch to an hour-of-week index.  We add the
+        # epoch offset (1970‑01‑01 00:00 UTC was Thursday, hour 72 of the week)
+        # and wrap by 168 so that Monday 00:00 UTC maps to ``0``.
+        #
+        # This formula is used across the codebase via this shared helper, so it
+        # assumes ``ts`` is a UTC timestamp.
         idx = int((ts // HOUR_MS + _EPOCH_HOW) % HOURS_IN_WEEK)
         assert 0 <= idx < HOURS_IN_WEEK
         return idx
