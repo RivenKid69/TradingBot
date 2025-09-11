@@ -25,12 +25,12 @@ logging = importlib.util.module_from_spec(_logging_spec)
 _logging_spec.loader.exec_module(logging)
 
 try:
-    from utils_time import load_seasonality
+    from utils_time import load_seasonality, get_latency_multiplier
 except Exception:  # pragma: no cover - fallback
     try:
         import pathlib, sys
         sys.path.append(str(pathlib.Path(__file__).resolve().parent))
-        from utils_time import load_seasonality
+        from utils_time import load_seasonality, get_latency_multiplier
     except Exception:  # pragma: no cover
         load_seasonality = lambda *a, **k: {}  # type: ignore
 
@@ -78,7 +78,7 @@ class _LatencyWithSeasonality:
         if ts_ms is None:
             return self._model.sample()
         hour = hour_of_week(int(ts_ms)) % len(self._mult)
-        m = float(self._mult[hour])
+        m = get_latency_multiplier(int(ts_ms), self._mult)
         base, jitter, timeout = (
             self._model.base_ms,
             self._model.jitter_ms,

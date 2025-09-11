@@ -30,12 +30,20 @@ import os
 import logging
 try:
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
-    from utils_time import load_seasonality
+    from utils_time import (
+        load_seasonality,
+        get_hourly_multiplier,
+        get_liquidity_multiplier,
+    )
 except Exception:  # pragma: no cover - fallback when running as standalone file
     import pathlib, sys
     sys.path.append(str(pathlib.Path(__file__).resolve().parent))
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
-    from utils_time import load_seasonality
+    from utils_time import (
+        load_seasonality,
+        get_hourly_multiplier,
+        get_liquidity_multiplier,
+    )
 
 logger = logging.getLogger(__name__)
 seasonality_logger = logger.getChild("seasonality")
@@ -599,8 +607,8 @@ class ExecutionSimulator:
         else:
             how = hour_of_week(int(ts_ms))
             if self.use_seasonality:
-                liq_mult = float(self._liq_seasonality[how])
-                spread_mult = float(self._spread_seasonality[how])
+                liq_mult = get_liquidity_multiplier(int(ts_ms), self._liq_seasonality)
+                spread_mult = get_hourly_multiplier(int(ts_ms), self._spread_seasonality)
 
         sbps: Optional[float]
         if spread_bps is not None:
