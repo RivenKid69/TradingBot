@@ -1,8 +1,9 @@
 """Utility helpers for deriving hour-of-week multipliers.
 
 The script scans a trade/latency log and computes relative multipliers for
-liquidity, latency and bid-ask spread.  The output JSON can then be consumed by
-the simulator to modulate these parameters during backtests.
+liquidity, latency and bid-ask spread. The hour-of-week index uses
+``0 = Monday 00:00 UTC``. The output JSON can then be consumed by the simulator
+to modulate these parameters during backtests.
 """
 
 import argparse
@@ -12,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from utils.time import hour_of_week
 
 
 def load_logs(path: Path) -> pd.DataFrame:
@@ -54,8 +57,9 @@ def compute_multipliers(df: pd.DataFrame, min_samples: int = 30) -> tuple[dict[s
     ts_col = 'ts_ms' if 'ts_ms' in df.columns else 'ts'
     if ts_col not in df.columns:
         raise ValueError('ts or ts_ms column required')
-    ts = pd.to_datetime(df[ts_col], unit='ms', utc=True)
-    how = ts.dt.dayofweek * 24 + ts.dt.hour
+    # ``hour_of_week`` uses Monday 00:00 UTC as index 0
+    ts_ms = df[ts_col].to_numpy(dtype=np.int64)
+    how = hour_of_week(ts_ms)
     df = df.assign(hour_of_week=how)
     metrics: dict[str, np.ndarray] = {}
     imputed_hours: dict[str, list[int]] = {}
@@ -118,8 +122,10 @@ def main() -> None:
     df = load_logs(data_path)
     multipliers, imputed = compute_multipliers(df, args.min_samples)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    out_data = {k: v.tolist() for k, v in multipliers.items()}
+    out_data['hour_of_week_definition'] = '0=Monday 00:00 UTC'
     with open(args.out, 'w') as f:
-        json.dump({k: v.tolist() for k, v in multipliers.items()}, f, indent=2)
+        json.dump(out_data, f, indent=2)
     if imputed:
         for key, hours in imputed.items():
             print(f'Imputed {key} multipliers for hours: {sorted(hours)}')

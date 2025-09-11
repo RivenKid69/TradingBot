@@ -1,3 +1,8 @@
+"""Extract liquidity seasonality multipliers.
+
+The hour-of-week index uses ``0 = Monday 00:00 UTC``.
+"""
+
 import argparse
 import hashlib
 import json
@@ -5,6 +10,8 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
+
+from utils.time import hour_of_week
 
 
 def load_ohlcv(path: Path) -> pd.DataFrame:
@@ -19,9 +26,9 @@ def compute_multipliers(df: pd.DataFrame) -> np.ndarray:
     vol_col = next((c for c in ['quote_asset_volume', 'quote_volume', 'volume'] if c in df.columns), None)
     if vol_col is None:
         raise ValueError('volume column not found')
-    ts = pd.to_datetime(df['ts_ms'], unit='ms', utc=True)
-    how = ts.dt.dayofweek * 24 + ts.dt.hour
-    df = df.assign(hour_of_week=how)
+    # ``hour_of_week`` uses Monday 00:00 UTC as index 0
+    ts_ms = df['ts_ms'].to_numpy(dtype=np.int64)
+    df = df.assign(hour_of_week=hour_of_week(ts_ms))
     grouped = df.groupby('hour_of_week')[vol_col].mean()
     overall = df[vol_col].mean()
     mult = grouped / overall if overall else grouped * 0.0 + 1.0
@@ -51,8 +58,12 @@ def main():
     df = load_ohlcv(data_path)
     multipliers = compute_multipliers(df)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    out_data = {
+        'hour_of_week_definition': '0=Monday 00:00 UTC',
+        'liquidity': multipliers.tolist(),
+    }
     with open(args.out, 'w') as f:
-        json.dump(multipliers.tolist(), f, indent=2)
+        json.dump(out_data, f, indent=2)
     checksum_path = write_checksum(data_path)
     print(f'Saved liquidity seasonality to {args.out}')
     print(f'Input data checksum written to {checksum_path}')

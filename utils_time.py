@@ -1,4 +1,8 @@
-# data/utils_time.py
+"""Assorted time utilities.
+
+The hour-of-week index assumes ``0 = Monday 00:00 UTC``.
+"""
+
 from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional, Sequence, Union
@@ -22,7 +26,7 @@ HOURS_IN_WEEK = 168
 
 
 def hour_of_week(ts_ms: Union[int, Sequence[int], np.ndarray]) -> Union[int, np.ndarray]:
-    """Return hour-of-week (0-167) for timestamps in milliseconds.
+    """Return hour-of-week index where ``0`` is Monday 00:00 UTC.
 
     The calculation uses :func:`datetime.utcfromtimestamp` to avoid any
     dependence on the local timezone.
