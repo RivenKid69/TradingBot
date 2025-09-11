@@ -9,13 +9,15 @@ execution_params:
   ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
   tif: GTC               # e.g. IOC or FOK
 
-# Optional path to 168 hourly liquidity multipliers (indexed by UTC hour-of-week)
+# Optional path to 168 hourly liquidity multipliers (indexed by UTC hour-of-week;
+# values clamped to [0.1, 10.0])
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
 # Optional SHA256 hash of the above liquidity multipliers for integrity checking
 liquidity_seasonality_hash: null
 # Optional path to 168 hourly liquidity overrides multiplied with the above multipliers
 liquidity_seasonality_override_path: null
-# Optional path to 168 hourly latency multipliers (indexed by UTC hour-of-week)
+# Optional path to 168 hourly latency multipliers (indexed by UTC hour-of-week;
+# values clamped to [0.1, 10.0])
 latency_seasonality_path: "configs/liquidity_latency_seasonality.json"
 # Set false to ignore liquidity and latency multipliers
 use_seasonality: true

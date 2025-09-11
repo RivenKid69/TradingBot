@@ -23,6 +23,10 @@ _logging_spec.loader.exec_module(logging)
 # Re-export shared time utilities to avoid duplicate implementations.
 from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
 
+# Clamp limits applied to liquidity and latency seasonality multipliers.
+SEASONALITY_MULT_MIN = 0.1
+SEASONALITY_MULT_MAX = 10.0
+
 
 def load_hourly_seasonality(
     path: str,
@@ -72,6 +76,8 @@ def load_hourly_seasonality(
                     break
         arr = np.asarray(data, dtype=float)
         if arr.shape[0] == HOURS_IN_WEEK:
+            if any(k in {"liquidity", "latency"} for k in keys):
+                arr = np.clip(arr, SEASONALITY_MULT_MIN, SEASONALITY_MULT_MAX)
             return arr
     except Exception:
         return None
@@ -132,6 +138,8 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
                     raise ValueError(
                         f"Seasonality array '{key}' must have length {HOURS_IN_WEEK}"
                     )
+                if key in {"liquidity", "latency"}:
+                    arr = np.clip(arr, SEASONALITY_MULT_MIN, SEASONALITY_MULT_MAX)
                 res[key] = arr
         return res
 

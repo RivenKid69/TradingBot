@@ -1,8 +1,23 @@
 import json
+import importlib.util
+import pathlib
+import sys
 import numpy as np
 import pytest
 
-from utils_time import load_seasonality, HOURS_IN_WEEK
+BASE = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE))
+
+spec_utils = importlib.util.spec_from_file_location("utils_time", BASE / "utils_time.py")
+utils_time = importlib.util.module_from_spec(spec_utils)
+sys.modules["utils_time"] = utils_time
+spec_utils.loader.exec_module(utils_time)
+
+load_seasonality = utils_time.load_seasonality
+load_hourly_seasonality = utils_time.load_hourly_seasonality
+HOURS_IN_WEEK = utils_time.HOURS_IN_WEEK
+SEASONALITY_MULT_MIN = utils_time.SEASONALITY_MULT_MIN
+SEASONALITY_MULT_MAX = utils_time.SEASONALITY_MULT_MAX
 
 def _arr(v):
     return [float(v)] * HOURS_IN_WEEK
@@ -36,3 +51,27 @@ def test_load_seasonality_bad_length(tmp_path):
     p.write_text(json.dumps(data))
     with pytest.raises(ValueError):
         load_seasonality(str(p))
+
+
+def test_seasonality_clamping(tmp_path):
+    data = {
+        "liquidity": [0.01] * HOURS_IN_WEEK,
+        "latency": [20.0] * HOURS_IN_WEEK,
+    }
+    p = tmp_path / "clamp.json"
+    p.write_text(json.dumps(data))
+    res = load_seasonality(str(p))
+    assert res["liquidity"].min() == SEASONALITY_MULT_MIN
+    assert res["latency"].max() == SEASONALITY_MULT_MAX
+
+
+def test_hourly_seasonality_clamping(tmp_path):
+    p = tmp_path / "liq.json"
+    p.write_text(json.dumps({"liquidity": [0.01] * HOURS_IN_WEEK}))
+    arr = load_hourly_seasonality(str(p), "liquidity")
+    assert arr.min() == SEASONALITY_MULT_MIN
+
+    p2 = tmp_path / "lat.json"
+    p2.write_text(json.dumps({"latency": [20.0] * HOURS_IN_WEEK}))
+    arr2 = load_hourly_seasonality(str(p2), "latency")
+    assert arr2.max() == SEASONALITY_MULT_MAX
