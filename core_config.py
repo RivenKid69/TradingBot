@@ -12,6 +12,7 @@ from enum import Enum
 
 import yaml
 from pydantic import BaseModel, Field, validator
+import logging
 
 
 class ComponentSpec(BaseModel):
@@ -43,6 +44,7 @@ class CommonRunConfig(BaseModel):
     timezone: Optional[str] = None
     liquidity_seasonality_path: Optional[str] = Field(default=None)
     liquidity_seasonality_hash: Optional[str] = Field(default=None)
+    seasonality_log_level: str = Field(default="INFO", description="Logging level for seasonality namespace")
     components: Components
 
 
@@ -181,7 +183,9 @@ def load_config(path: str) -> CommonRunConfig:
     if cfg_cls is None:
         raise ValueError(f"Unknown mode: {mode}")
     # parse_obj ensures all newly added optional fields are preserved
-    return cfg_cls.parse_obj(data)
+    cfg = cfg_cls.parse_obj(data)
+    _set_seasonality_log_level(cfg)
+    return cfg
 
 
 def load_config_from_str(content: str) -> CommonRunConfig:
@@ -198,7 +202,22 @@ def load_config_from_str(content: str) -> CommonRunConfig:
     if cfg_cls is None:
         raise ValueError(f"Unknown mode: {mode}")
     # parse_obj ensures all newly added optional fields are preserved
-    return cfg_cls.parse_obj(data)
+    cfg = cfg_cls.parse_obj(data)
+    _set_seasonality_log_level(cfg)
+    return cfg
+
+
+def _set_seasonality_log_level(cfg: CommonRunConfig) -> None:
+    """Configure log level for ``seasonality`` namespace."""
+    level = getattr(cfg, "seasonality_log_level", "INFO")
+    if isinstance(level, str):
+        level_num = getattr(logging, level.upper(), logging.INFO)
+    else:
+        try:
+            level_num = int(level)
+        except Exception:
+            level_num = logging.INFO
+    logging.getLogger("seasonality").setLevel(level_num)
 
 
 __all__ = [

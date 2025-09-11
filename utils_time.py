@@ -19,6 +19,7 @@ _logging_spec = importlib.util.spec_from_file_location(
 )
 logging = importlib.util.module_from_spec(_logging_spec)
 _logging_spec.loader.exec_module(logging)
+seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
 
 # Re-export shared time utilities to avoid duplicate implementations.
 from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
@@ -56,10 +57,11 @@ def load_hourly_seasonality(
         with open(path, "rb") as f:
             raw = f.read()
         digest = hashlib.sha256(raw).hexdigest()
-        logger = logging.getLogger(__name__)
-        logger.info("Loaded seasonality multipliers from %s (sha256=%s)", path, digest)
+        seasonality_logger.info(
+            "Loaded seasonality multipliers from %s (sha256=%s)", path, digest
+        )
         if expected_hash and digest.lower() != expected_hash.lower():
-            logger.warning(
+            seasonality_logger.warning(
                 "Seasonality hash mismatch for %s: expected %s got %s",
                 path,
                 expected_hash,
@@ -117,7 +119,7 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
         with open(path, "rb") as f:
             raw = f.read()
         digest = hashlib.sha256(raw).hexdigest()
-        logging.getLogger(__name__).info(
+        seasonality_logger.info(
             "Loaded seasonality multipliers from %s (sha256=%s)", path, digest
         )
         data = json.loads(raw.decode("utf-8"))

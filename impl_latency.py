@@ -35,7 +35,7 @@ except Exception:  # pragma: no cover - fallback
         load_seasonality = lambda *a, **k: {}  # type: ignore
 
 logger = logging.getLogger(__name__)
-seasonality_logger = logger.getChild("seasonality")
+seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
 
 try:
     from latency import LatencyModel
