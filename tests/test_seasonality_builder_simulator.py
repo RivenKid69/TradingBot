@@ -58,3 +58,15 @@ def test_simulator_applies_multipliers(sample_multipliers):
     sim.set_market_snapshot(bid=100.0, ask=101.0, liquidity=5.0, spread_bps=1.0, ts_ms=ts_hour1)
     assert sim._last_liquidity == pytest.approx(5.0 * 1.77777778)
     assert sim._last_spread_bps == pytest.approx(1.0 * 1.2)
+
+
+def test_compute_multipliers_trims_outliers():
+    df = pd.DataFrame(
+        {
+            "ts_ms": [0, 0, MS, MS],
+            "liquidity": [1.0, 1000.0, 1.0, 1.0],
+        }
+    )
+    multipliers, _ = compute_multipliers(df, min_samples=1, trim_top_pct=25.0)
+    assert multipliers["liquidity"][0] == pytest.approx(1.0)
+    assert multipliers["liquidity"][1] == pytest.approx(1.0)

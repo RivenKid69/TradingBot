@@ -72,6 +72,8 @@ def compute_multipliers(
     df: pd.DataFrame,
     min_samples: int = 30,
     prior_metrics: Optional[Dict[str, np.ndarray]] = None,
+    trim_bottom_pct: float = 0.0,
+    trim_top_pct: float = 0.0,
 ) -> tuple[dict[str, np.ndarray], dict[str, list[int]]]:
     ts_col = 'ts_ms' if 'ts_ms' in df.columns else 'ts'
     if ts_col not in df.columns:
@@ -93,8 +95,14 @@ def compute_multipliers(
         if col is None:
             arr = np.ones(168, dtype=float)
         else:
-            grouped = df.groupby('hour_of_week')[col].agg(['mean', 'count'])
-            overall = df[col].mean()
+            data = df[['hour_of_week', col]].copy()
+            if trim_bottom_pct > 0.0 or trim_top_pct > 0.0:
+                series = data[col]
+                lower = series.quantile(trim_bottom_pct / 100.0) if trim_bottom_pct > 0.0 else series.min()
+                upper = series.quantile(1 - trim_top_pct / 100.0) if trim_top_pct > 0.0 else series.max()
+                data = data[(data[col] >= lower) & (data[col] <= upper)]
+            grouped = data.groupby('hour_of_week')[col].agg(['mean', 'count'])
+            overall = data[col].mean()
             if overall:
                 mult = grouped['mean'] / overall
             else:
@@ -165,6 +173,18 @@ def main() -> None:
         default=None,
         help='Optional path to JSON with per-hour validation metrics',
     )
+    parser.add_argument(
+        '--trim-top',
+        type=float,
+        default=0.0,
+        help='Percentile of highest values to discard before averaging (0-100)',
+    )
+    parser.add_argument(
+        '--trim-bottom',
+        type=float,
+        default=0.0,
+        help='Percentile of lowest values to discard before averaging (0-100)',
+    )
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -174,7 +194,13 @@ def main() -> None:
         with open(args.prior_metrics, 'r') as f:
             raw = json.load(f)
         prior = {k: np.asarray(v, dtype=float) for k, v in raw.items() if isinstance(v, list)}
-    multipliers, imputed = compute_multipliers(df, args.min_samples, prior)
+    multipliers, imputed = compute_multipliers(
+        df,
+        args.min_samples,
+        prior,
+        trim_bottom_pct=args.trim_bottom,
+        trim_top_pct=args.trim_top,
+    )
     if args.smooth_window > 1:
         for key, arr in multipliers.items():
             multipliers[key] = _rolling_mean_circular(arr, args.smooth_window)
@@ -197,6 +223,10 @@ def main() -> None:
         'smoothing': {
             'rolling_window': args.smooth_window,
             'regularization_alpha': args.smooth_alpha,
+        },
+        'trim_percentiles': {
+            'top': args.trim_top,
+            'bottom': args.trim_bottom,
         },
     }
     if args.symbol:
