@@ -92,7 +92,9 @@ class SimExecutor(TradeExecutor):
         if risk is None:
             risk = RiskBasicImpl.from_dict(rc_risk)
         if latency is None:
-            latency = LatencyImpl.from_dict(rc_latency)
+            cfg_lat = dict(rc_latency)
+            cfg_lat.setdefault("symbol", symbol)
+            latency = LatencyImpl.from_dict(cfg_lat)
         if slippage is None:
             slippage = SlippageImpl.from_dict(rc_slippage)
         if fees is None:
@@ -137,7 +139,9 @@ class SimExecutor(TradeExecutor):
         q_impl = QuantizerImpl.from_dict(getattr(run_config, "quantizer", {}) or {})
         f_impl = FeesImpl.from_dict(getattr(run_config, "fees", {}) or {})
         s_impl = SlippageImpl.from_dict(getattr(run_config, "slippage", {}) or {})
-        l_impl = LatencyImpl.from_dict(getattr(run_config, "latency", {}) or {})
+        l_cfg = dict(getattr(run_config, "latency", {}) or {})
+        l_cfg.setdefault("symbol", symbol)
+        l_impl = LatencyImpl.from_dict(l_cfg)
         r_impl = RiskBasicImpl.from_dict(getattr(run_config, "risk", {}) or {})
 
         if q_impl is not None:

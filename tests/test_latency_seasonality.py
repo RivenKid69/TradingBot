@@ -58,6 +58,43 @@ def test_latency_seasonality(tmp_path):
     assert d_low["total_ms"] == 50
 
 
+def test_latency_seasonality_symbol_specific(tmp_path):
+    multipliers = [1.0] * 168
+    hour_high = 5
+    hour_low = 10
+    multipliers[hour_high] = 2.0
+    multipliers[hour_low] = 0.5
+    path = tmp_path / "latency.json"
+    path.write_text(json.dumps({"ETHUSDT": {"latency": multipliers}}))
+
+    cfg = {
+        "base_ms": 100,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seasonality_path": str(path),
+        "symbol": "ETHUSDT",
+    }
+    impl = LatencyImpl.from_dict(cfg)
+
+    class Dummy:
+        pass
+
+    sim = Dummy()
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    ts_high = int(base_dt.timestamp() * 1000 + hour_high * 3_600_000)
+    ts_low = int(base_dt.timestamp() * 1000 + hour_low * 3_600_000)
+
+    d_high = lat.sample(ts_high)
+    d_low = lat.sample(ts_low)
+
+    assert d_high["total_ms"] == 200
+    assert d_low["total_ms"] == 50
+
+
 def test_latency_seasonality_disabled(tmp_path):
     multipliers = [1.0] * 168
     hour_high = 5

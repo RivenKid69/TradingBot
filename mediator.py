@@ -148,7 +148,12 @@ class Mediator:
         if self._use_exec:
             self.exec = ExecutionSimulator(latency_steps=latency_steps, slip_k=slip_k, seed=seed)  # type: ignore
             try:
-                l_impl = LatencyImpl.from_dict(latency_cfg or {})
+                cfg = dict(latency_cfg or {})
+                cfg.setdefault(
+                    "symbol",
+                    str(getattr(env_ref, "symbol", getattr(env_ref, "base_symbol", ""))),
+                )
+                l_impl = LatencyImpl.from_dict(cfg)
                 l_impl.attach_to(self.exec)
                 self._latency_impl = l_impl
             except Exception:
