@@ -26,3 +26,7 @@ PY
         run: |
           pip install black flake8
           make lint
+      - name: Run integration tests
+        run: |
+          pip install pytest
+          pytest tests/test_integration_seasonality_simulation.py -q
