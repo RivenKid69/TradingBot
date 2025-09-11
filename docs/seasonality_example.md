@@ -45,6 +45,7 @@ from impl_latency import LatencyImpl
 sim = ExecutionSimulator(
     liquidity_seasonality=multipliers["liquidity"],
     spread_seasonality=multipliers["spread"],
+    seasonality_interpolate=True,  # enable minute-level interpolation
 )
 
 lat_cfg = {
@@ -52,6 +53,7 @@ lat_cfg = {
     "jitter_ms": 20,
     "seasonality_path": "configs/liquidity_latency_seasonality.json",
     "seasonality_override": multipliers["latency"],
+    "seasonality_interpolate": True,  # smooth latency multipliers
 }
 lat = LatencyImpl.from_dict(lat_cfg)
 lat.attach_to(sim)

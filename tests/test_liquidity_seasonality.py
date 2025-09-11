@@ -131,3 +131,24 @@ def test_ts_ms_none_skips_multipliers_and_logs_warning(caplog):
     assert sim._last_liquidity == 5.0
     assert sim._last_spread_bps == 1.0
     assert "ts_ms is None" in caplog.text
+
+
+def test_seasonality_linear_interpolation():
+    liq_mult = [1.0] * 168
+    spr_mult = [1.0] * 168
+    hour = 5
+    liq_mult[hour] = 1.0
+    liq_mult[hour + 1] = 2.0
+    spr_mult[hour] = 1.0
+    spr_mult[hour + 1] = 3.0
+    sim = ExecutionSimulator(
+        liquidity_seasonality=liq_mult,
+        spread_seasonality=spr_mult,
+        seasonality_interpolate=True,
+    )
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    # halfway between hour and next hour
+    ts_ms = int(base_dt.timestamp() * 1000 + hour * 3_600_000 + 30 * 60_000)
+    sim.set_market_snapshot(bid=100.0, ask=101.0, liquidity=10.0, spread_bps=1.0, ts_ms=ts_ms)
+    assert sim._last_liquidity == pytest.approx(15.0)
+    assert sim._last_spread_bps == pytest.approx(2.0)
