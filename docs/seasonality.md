@@ -68,6 +68,7 @@ The script writes line charts and heatmaps for liquidity and latency multipliers
    ```bash
    python scripts/validate_seasonality.py --historical path/to/trades.parquet --multipliers configs/liquidity_latency_seasonality.json
    ```
+   See [seasonality_QA.md](seasonality_QA.md) for QA steps and acceptance thresholds.
 
 ## Enabling seasonality in configs
 
