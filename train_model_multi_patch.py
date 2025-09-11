@@ -142,6 +142,16 @@ from data_validation import DataValidator
 from utils.model_io import save_sidecar_metadata, check_model_compat
 from watchdog_vec_env import WatchdogVecEnv
 
+# --- helper to compute SHA256 of liquidity seasonality file ---
+def _file_sha256(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except FileNotFoundError:
+        return None
+
 # === КОНФИГУРАЦИЯ ИНДИКАТОРОВ (ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ) ===
 MA5_WINDOW = 5
 MA20_WINDOW = 20
@@ -694,6 +704,12 @@ def main():
 
     sim_config = {k: getattr(cfg, k) for k in ("quantizer", "slippage", "fees", "latency", "risk", "no_trade")}
     sim_config["liquidity_seasonality_path"] = args.liquidity_seasonality
+    liq_hash = _file_sha256(args.liquidity_seasonality)
+    if liq_hash:
+        sim_config["liquidity_seasonality_hash"] = liq_hash
+        print(f"Liquidity seasonality hash: {liq_hash}")
+    else:
+        print(f"Warning: could not compute hash for {args.liquidity_seasonality}; seasonality consistency not enforced")
 
     processed_data_dir = getattr(cfg.data, "processed_dir", "data/processed")
     run_id = getattr(cfg, "run_id", "default-run")

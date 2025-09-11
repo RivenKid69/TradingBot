@@ -202,6 +202,7 @@ class TradingEnv(gym.Env):
         decision_mode: DecisionTiming = DecisionTiming.CLOSE_TO_OPEN,
         decision_delay_ms: int = 0,
         liquidity_seasonality_path: str | None = None,
+        liquidity_seasonality_hash: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -238,7 +239,10 @@ class TradingEnv(gym.Env):
             "liquidity_seasonality_path", "configs/liquidity_seasonality.json"
         )
         self._liq_seasonality = load_hourly_seasonality(
-            liq_path, "liquidity", "multipliers"
+            liq_path,
+            "liquidity",
+            "multipliers",
+            expected_hash=liquidity_seasonality_hash,
         )
         if self._liq_seasonality is None:
             logger.warning(
