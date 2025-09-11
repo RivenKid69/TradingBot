@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from utils.time import hour_of_week
+from utils.prometheus import Counter
 
 _logging_spec = importlib.util.spec_from_file_location(
     "py_logging", Path(sysconfig.get_path("stdlib")) / "logging/__init__.py"
@@ -36,6 +37,12 @@ except Exception:  # pragma: no cover - fallback
 
 logger = logging.getLogger(__name__)
 seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
+
+_LATENCY_MULT_COUNTER = Counter(
+    "latency_hour_of_week_multiplier_total",
+    "Latency multiplier applications per hour of week",
+    ["hour"],
+)
 
 try:
     from latency import LatencyModel
@@ -113,6 +120,7 @@ class _LatencyWithSeasonality:
         self._mult_sum[hour] += m
         self._lat_sum[hour] += float(res.get("total_ms", 0))
         self._count[hour] += 1
+        _LATENCY_MULT_COUNTER.labels(hour=hour).inc()
         if seasonality_logger.isEnabledFor(logging.DEBUG):
             seasonality_logger.debug(
                 "latency sample h%03d mult=%.3f total_ms=%s",

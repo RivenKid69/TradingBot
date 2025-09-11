@@ -28,6 +28,7 @@ import math
 import time
 import os
 import logging
+from utils.prometheus import Counter
 try:
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
     from utils_time import (
@@ -47,6 +48,12 @@ except Exception:  # pragma: no cover - fallback when running as standalone file
 
 logger = logging.getLogger(__name__)
 seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
+
+_SIM_MULT_COUNTER = Counter(
+    "sim_hour_of_week_multiplier_total",
+    "Simulator liquidity multiplier applications per hour of week",
+    ["hour"],
+)
 
 try:
     import numpy as np
@@ -637,11 +644,12 @@ class ExecutionSimulator:
                 liq_mult,
                 self._last_liquidity,
             )
-        if how is not None and 0 <= how < HOURS_IN_WEEK:
+        if self.use_seasonality and how is not None and 0 <= how < HOURS_IN_WEEK:
             self._liq_mult_sum[how] += liq_mult
             if self._last_liquidity is not None:
                 self._liq_val_sum[how] += self._last_liquidity
             self._liq_count[how] += 1
+            _SIM_MULT_COUNTER.labels(hour=how).inc()
         if self._last_ref_price is None:
             if mid_from_quotes is not None:
                 mid = mid_from_quotes(bid=self._last_bid, ask=self._last_ask)
