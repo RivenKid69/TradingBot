@@ -16,6 +16,11 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from utils.time import hour_of_week
+except Exception:  # pragma: no cover - fallback
+    hour_of_week = lambda ts: int((int(ts) // 3_600_000 + 72) % 168)  # type: ignore
+
 _logging_spec = importlib.util.spec_from_file_location(
     "py_logging", Path(sysconfig.get_path("stdlib")) / "logging/__init__.py"
 )
@@ -25,7 +30,12 @@ _logging_spec.loader.exec_module(logging)
 try:
     from utils_time import load_hourly_seasonality
 except Exception:  # pragma: no cover - fallback
-    load_hourly_seasonality = lambda *a, **k: None  # type: ignore
+    try:
+        import pathlib, sys
+        sys.path.append(str(pathlib.Path(__file__).resolve().parent))
+        from utils_time import load_hourly_seasonality
+    except Exception:  # pragma: no cover
+        load_hourly_seasonality = lambda *a, **k: None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +78,7 @@ class _LatencyWithSeasonality:
     def sample(self, ts_ms: int | None = None):
         if ts_ms is None:
             return self._model.sample()
-        hour = ((int(ts_ms) // 3_600_000) + 72) % len(self._mult)
+        hour = hour_of_week(int(ts_ms)) % len(self._mult)
         m = float(self._mult[hour])
         base, jitter, timeout = (
             self._model.base_ms,

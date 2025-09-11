@@ -32,11 +32,8 @@ from no_trade import (
 
 logger = logging.getLogger(__name__)
 from no_trade_config import get_no_trade_config
-from utils_time import (
-    hour_of_week as _hour_of_week,
-    load_hourly_seasonality,
-    HOURS_IN_WEEK,
-)
+from utils.time import hour_of_week as _hour_of_week, HOURS_IN_WEEK
+from utils_time import load_hourly_seasonality
 
 try:  # existing dynamic-spread config (pydantic model)
     from trainingtcost import DynSpreadCfg

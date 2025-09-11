@@ -29,11 +29,13 @@ import time
 import os
 import logging
 try:
-    from utils_time import HOUR_MS, HOURS_IN_WEEK, hour_of_week, load_hourly_seasonality
+    from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
+    from utils_time import load_hourly_seasonality
 except Exception:  # pragma: no cover - fallback when running as standalone file
     import pathlib, sys
     sys.path.append(str(pathlib.Path(__file__).resolve().parent))
-    from utils_time import HOUR_MS, HOURS_IN_WEEK, hour_of_week, load_hourly_seasonality
+    from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
+    from utils_time import load_hourly_seasonality
 
 logger = logging.getLogger(__name__)
 
