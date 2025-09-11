@@ -354,6 +354,7 @@ class ExecutionSimulator:
                  spread_seasonality_override: Optional[Sequence[float]] = None,
                  seasonality_override_path: Optional[str] = None,
                  use_seasonality: bool = True,
+                 seasonality_interpolate: bool = False,
                  run_config: Any = None):
         self.symbol = str(symbol).upper()
         self.latency_steps = int(max(0, latency_steps))
@@ -464,6 +465,9 @@ class ExecutionSimulator:
         # сезонность ликвидности и спреда по часам недели
         self.use_seasonality = bool(
             getattr(run_config, "use_seasonality", use_seasonality)
+        )
+        self.seasonality_interpolate = bool(
+            getattr(run_config, "seasonality_interpolate", seasonality_interpolate)
         )
         default_seasonality = np.ones(HOURS_IN_WEEK, dtype=float)
         self._liq_seasonality = default_seasonality.copy()
@@ -607,8 +611,12 @@ class ExecutionSimulator:
         else:
             how = hour_of_week(int(ts_ms))
             if self.use_seasonality:
-                liq_mult = get_liquidity_multiplier(int(ts_ms), self._liq_seasonality)
-                spread_mult = get_hourly_multiplier(int(ts_ms), self._spread_seasonality)
+                liq_mult = get_liquidity_multiplier(
+                    int(ts_ms), self._liq_seasonality, interpolate=self.seasonality_interpolate
+                )
+                spread_mult = get_hourly_multiplier(
+                    int(ts_ms), self._spread_seasonality, interpolate=self.seasonality_interpolate
+                )
 
         sbps: Optional[float]
         if spread_bps is not None:

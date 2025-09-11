@@ -11,11 +11,12 @@ if str(ROOT) not in sys.path:
 from execution_sim import ExecutionSimulator
 
 
-def _run(use_seasonality: bool, n: int = 100_000) -> float:
+def _run(use_seasonality: bool, interpolate: bool = False, n: int = 100_000) -> float:
     sim = ExecutionSimulator(
         liquidity_seasonality=[1.0] * 168,
         spread_seasonality=[1.0] * 168,
         use_seasonality=use_seasonality,
+        seasonality_interpolate=interpolate,
     )
     ts = np.arange(n, dtype=np.int64) * 60_000  # 1-minute steps
     start = time.perf_counter()
@@ -25,9 +26,16 @@ def _run(use_seasonality: bool, n: int = 100_000) -> float:
 
 
 def main() -> None:
-    for flag in (False, True):
-        dt = _run(flag)
-        print(f"use_seasonality={flag}: {dt:.3f}s")
+    cases = [
+        (False, False),
+        (True, False),
+        (True, True),
+    ]
+    for use_seasonality, interp in cases:
+        dt = _run(use_seasonality, interpolate=interp)
+        print(
+            f"use_seasonality={use_seasonality} interpolate={interp}: {dt:.3f}s"
+        )
 
 
 if __name__ == "__main__":
