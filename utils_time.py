@@ -154,6 +154,53 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
     raise ValueError("Multiple seasonality mappings found; specify symbol")
 
 
+def _hour_index(ts_ms: int, length: int) -> int:
+    """Return hour-of-week index clamped to ``length``.
+
+    The helper mirrors :func:`utils.time.hour_of_week` but additionally
+    wraps the result by ``length`` to support arrays shorter than a full
+    week. ``length`` defaults to :data:`HOURS_IN_WEEK`.
+    """
+
+    hour = hour_of_week(int(ts_ms))
+    if length:
+        hour %= int(length)
+    return int(hour)
+
+
+def get_hourly_multiplier(ts_ms: int, multipliers: Sequence[float]) -> float:
+    """Return hourly multiplier for ``ts_ms`` from ``multipliers``.
+
+    Missing or short arrays gracefully default to ``1.0``.
+    """
+
+    if multipliers is None:
+        return 1.0
+    try:
+        length = len(multipliers)
+    except Exception:
+        return 1.0
+    if length == 0:
+        return 1.0
+    idx = _hour_index(ts_ms, length)
+    try:
+        return float(multipliers[idx])
+    except Exception:
+        return 1.0
+
+
+def get_liquidity_multiplier(ts_ms: int, liquidity: Sequence[float]) -> float:
+    """Convenience wrapper around :func:`get_hourly_multiplier` for liquidity."""
+
+    return get_hourly_multiplier(ts_ms, liquidity)
+
+
+def get_latency_multiplier(ts_ms: int, latency: Sequence[float]) -> float:
+    """Convenience wrapper around :func:`get_hourly_multiplier` for latency."""
+
+    return get_hourly_multiplier(ts_ms, latency)
+
+
 def parse_time_to_ms(s: str) -> int:
     """
     Поддерживает:

@@ -219,3 +219,19 @@ use_seasonality=True: 0.195s
 Lookup now avoids `time.gmtime` and uses precomputed NumPy arrays for the
 168 multipliers, reducing datetime conversions and keeping the cost of
 seasonality modest.
+
+## Helper functions
+
+``utils_time.py`` provides convenience helpers to fetch the appropriate
+hour-of-week multiplier for a given UTC timestamp. Modules can import
+``get_liquidity_multiplier`` or ``get_latency_multiplier`` instead of
+manually indexing arrays:
+
+```python
+from utils_time import get_liquidity_multiplier, get_latency_multiplier
+m_liq = get_liquidity_multiplier(ts_ms, liquidity_array)
+m_lat = get_latency_multiplier(ts_ms, latency_array)
+```
+
+These helpers ensure consistent hour-of-week calculations and will be
+reused across future modules.
