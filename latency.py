@@ -167,5 +167,16 @@ class SeasonalLatencyModel:
                 if state_after is not None and hasattr(self._model, "_rng"):
                     self._model._rng.setstate(state_after)
 
+    def update_multipliers(self, multipliers: Sequence[float]) -> None:
+        """Atomically replace the internal multipliers array."""
+
+        arr = [float(x) for x in multipliers]
+        if len(arr) != len(self._mult):
+            raise ValueError(
+                f"multipliers must have length {len(self._mult)}"
+            )
+        with self._lock:
+            self._mult = list(arr)
+
     def __getattr__(self, name: str):  # pragma: no cover - simple delegation
         return getattr(self._model, name)
