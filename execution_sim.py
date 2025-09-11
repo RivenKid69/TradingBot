@@ -469,12 +469,19 @@ class ExecutionSimulator:
                 path = "configs/liquidity_seasonality.json"
             if path and (liq_arr is None or spread_arr is None):
                 if os.path.exists(path):
-                    file_liq = load_hourly_seasonality(
-                        path, "liquidity", "multipliers", expected_hash=expected_hash
-                    )
-                    file_spread = load_hourly_seasonality(
-                        path, "spread", "latency", expected_hash=expected_hash
-                    )
+                    try:
+                        file_liq = load_hourly_seasonality(
+                            path, "liquidity", "multipliers", expected_hash=expected_hash
+                        )
+                        file_spread = load_hourly_seasonality(
+                            path, "spread", "latency", expected_hash=expected_hash
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Error loading seasonality multipliers from %s; using defaults.",
+                            path,
+                        )
+                        file_liq = file_spread = None
                     if liq_arr is None:
                         liq_arr = file_liq
                     if spread_arr is None:
@@ -521,12 +528,18 @@ class ExecutionSimulator:
                     ) or getattr(run_config, "seasonality_override_path", None)
             if override_path and (liq_override is None or spread_override is None):
                 if os.path.exists(override_path):
-                    file_liq = load_hourly_seasonality(
-                        override_path, "liquidity", "multipliers"
-                    )
-                    file_spread = load_hourly_seasonality(
-                        override_path, "spread", "latency"
-                    )
+                    try:
+                        file_liq = load_hourly_seasonality(
+                            override_path, "liquidity", "multipliers"
+                        )
+                        file_spread = load_hourly_seasonality(
+                            override_path, "spread", "latency"
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Error loading seasonality override %s; ignoring.", override_path
+                        )
+                        file_liq = file_spread = None
                     if liq_override is None:
                         liq_override = file_liq
                     if spread_override is None:

@@ -104,3 +104,13 @@ def test_seasonality_override_applied():
     sim.set_market_snapshot(bid=100.0, ask=101.0, liquidity=4.0, spread_bps=1.0, ts_ms=ts_ms)
     assert sim._last_liquidity == pytest.approx(4.0 * 2.0 * 0.75)
     assert sim._last_spread_bps == pytest.approx(1.0 * 3.0 * 0.5)
+
+
+def test_seasonality_file_missing(tmp_path):
+    missing = tmp_path / "missing.json"
+    sim = ExecutionSimulator(liquidity_seasonality_path=str(missing))
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    ts_ms = int(base_dt.timestamp() * 1000 + 5 * 3_600_000)
+    sim.set_market_snapshot(bid=100.0, ask=101.0, liquidity=5.0, spread_bps=1.0, ts_ms=ts_ms)
+    assert sim._last_liquidity == 5.0
+    assert sim._last_spread_bps == 1.0

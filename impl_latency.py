@@ -135,9 +135,15 @@ class LatencyImpl:
         path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
         self._has_seasonality = bool(cfg.use_seasonality)
         if self._has_seasonality:
-            arr = load_hourly_seasonality(
-                path, "latency", expected_hash=cfg.seasonality_hash
-            )
+            try:
+                arr = load_hourly_seasonality(
+                    path, "latency", expected_hash=cfg.seasonality_hash
+                )
+            except Exception:
+                logger.warning(
+                    "Error loading latency seasonality config %s; using defaults.", path
+                )
+                arr = None
             if arr is not None:
                 self.latency = [float(x) for x in arr]
             else:
@@ -154,7 +160,13 @@ class LatencyImpl:
             override = cfg.seasonality_override
             o_path = cfg.seasonality_override_path
             if override is None and o_path:
-                override = load_hourly_seasonality(o_path, "latency")
+                try:
+                    override = load_hourly_seasonality(o_path, "latency")
+                except Exception:
+                    logger.warning(
+                        "Error loading latency override %s; ignoring.", o_path
+                    )
+                    override = None
                 if override is None:
                     logger.warning(
                         "Latency override %s not found or invalid; ignoring.", o_path
