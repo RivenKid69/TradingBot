@@ -35,6 +35,22 @@ python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT
 python scripts/validate_seasonality.py --historical path/to/trades.csv --multipliers configs/liquidity_latency_seasonality.json
 ```
 
+### Обновление биржевых фильтров и спецификаций
+
+JSON‑файлы `binance_filters.json` и `exchange_specs.json` содержат поле
+`metadata.generated_at`. При запуске симулятора дата сравнивается с текущей;
+если файл старше 30 дней, выводится предупреждение. Обновить данные можно
+с помощью:
+
+```bash
+python fetch_binance_filters.py binance_filters.json
+python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
+```
+
+Для жёсткого контроля свежести установите переменную окружения
+`TB_FAIL_ON_STALE_FILTERS=1` — симулятор завершит работу при обнаружении
+устаревших файлов.
+
 Скрипт `scripts/validate_seasonality.py` воспроизводит почасовое поведение
 ликвидности, спреда и задержек и сравнивает его с историческим датасетом.
 Проверка завершится ошибкой, если максимальное относительное отклонение

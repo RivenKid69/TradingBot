@@ -374,7 +374,11 @@ class ExecutionSimulator:
         self.strict_filters = bool(strict_filters)
         try:
             if Quantizer is not None and filters_path:
-                filters, meta = load_filters(filters_path)
+                max_age = int(os.getenv("TB_FILTER_MAX_AGE_DAYS", "30"))
+                fatal = os.getenv("TB_FAIL_ON_STALE_FILTERS") not in (None, "0", "")
+                filters, meta = load_filters(
+                    filters_path, max_age_days=max_age, fatal=fatal
+                )
                 if filters:
                     self.quantizer = Quantizer(filters, strict=strict_filters)
                 if meta:
