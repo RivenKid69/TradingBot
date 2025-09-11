@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import sys
-import math
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -47,7 +46,9 @@ def _check_schema_and_order(df: pd.DataFrame) -> None:
     cols = list(df.columns)
     need = REQUIRED_PREFIX
     if len(cols) < len(need):
-        _fail(f"Columns too few: have={len(cols)}, need at least {len(need)}; cols={cols}")
+        _fail(
+            f"Columns too few: have={len(cols)}, need at least {len(need)}; cols={cols}"
+        )
     # порядок первых N должен совпадать точь-в-точь
     if cols[: len(need)] != need:
         _fail(f"Prefix/order mismatch.\nGot:   {cols[:len(need)]}\nWant:  {need}")
@@ -58,9 +59,9 @@ def _check_types_and_ranges(df: pd.DataFrame) -> None:
     if not np.issubdtype(df["timestamp"].dtype, np.integer):
         _fail(f"'timestamp' must be integer seconds, got dtype={df['timestamp'].dtype}")
     # symbol — строковый
-    if not pd.api.types.is_object_dtype(df["symbol"].dtype) and not pd.api.types.is_string_dtype(
+    if not pd.api.types.is_object_dtype(
         df["symbol"].dtype
-    ):
+    ) and not pd.api.types.is_string_dtype(df["symbol"].dtype):
         _fail(f"'symbol' must be string dtype, got dtype={df['symbol'].dtype}")
     # Числовые колонки и диапазоны
     for c in NUMERIC_KEY_COLS:
@@ -69,11 +70,21 @@ def _check_types_and_ranges(df: pd.DataFrame) -> None:
         if not pd.api.types.is_numeric_dtype(df[c].dtype):
             _fail(f"Column '{c}' must be numeric dtype, got {df[c].dtype}")
     # Положительность ключевых метрик
-    if (df["open"] <= 0).any() or (df["high"] <= 0).any() or (df["low"] <= 0).any() or (df["close"] <= 0).any():
+    if (
+        (df["open"] <= 0).any()
+        or (df["high"] <= 0).any()
+        or (df["low"] <= 0).any()
+        or (df["close"] <= 0).any()
+    ):
         _fail("OHLC must be > 0")
     # Объёмы/счётчики не отрицательны
-    for c in ("volume", "quote_asset_volume", "number_of_trades",
-              "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume"):
+    for c in (
+        "volume",
+        "quote_asset_volume",
+        "number_of_trades",
+        "taker_buy_base_asset_volume",
+        "taker_buy_quote_asset_volume",
+    ):
         if (df[c] < 0).any():
             _fail(f"'{c}' must be >= 0")
 
@@ -91,8 +102,10 @@ def _check_for_nulls(df: pd.DataFrame) -> None:
 
 
 def _check_ohlc(df: pd.DataFrame) -> None:
-    bad_high = (df["high"] < df[["open", "close", "low"]].max(axis=1))  # high ≥ {open,close,low}
-    bad_low = (df["low"] > df[["open", "close"]].min(axis=1))           # low ≤ {open,close}
+    bad_high = df["high"] < df[["open", "close", "low"]].max(
+        axis=1
+    )  # high ≥ {open,close,low}
+    bad_low = df["low"] > df[["open", "close"]].min(axis=1)  # low ≤ {open,close}
     if bad_high.any():
         idx = int(bad_high.idxmax())
         row = df.loc[idx, ["timestamp", "open", "high", "low", "close"]]
@@ -108,8 +121,10 @@ def _check_sorted_unique_ts(df: pd.DataFrame) -> None:
     if not (np.all(ts[1:] > ts[:-1])):
         # найдём первое нарушение
         bad_idx = int(np.where(~(ts[1:] > ts[:-1]))[0][0] + 1)
-        _fail(f"'timestamp' must be strictly increasing; first violation at position {bad_idx} "
-              f"(ts[{bad_idx-1}]={ts[bad_idx-1]} -> ts[{bad_idx}]={ts[bad_idx]})")
+        _fail(
+            f"'timestamp' must be strictly increasing; first violation at position "
+            f"{bad_idx} (ts[{bad_idx-1}]={ts[bad_idx-1]} -> ts[{bad_idx}]={ts[bad_idx]})"
+        )
 
 
 def _check_ts_continuity(df: pd.DataFrame, step_sec: int = 3600) -> None:
@@ -117,8 +132,10 @@ def _check_ts_continuity(df: pd.DataFrame, step_sec: int = 3600) -> None:
     diffs = ts[1:] - ts[:-1]
     if not (np.all(diffs == step_sec)):
         bad_idx = int(np.where(diffs != step_sec)[0][0] + 1)
-        _fail(f"Timestamp continuity broken at position {bad_idx}: "
-              f"delta={int(diffs[bad_idx-1])}, expected {step_sec}")
+        _fail(
+            f"Timestamp continuity broken at position {bad_idx}: "
+            f"delta={int(diffs[bad_idx-1])}, expected {step_sec}"
+        )
 
 
 def _check_utc_alignment(df: pd.DataFrame) -> None:
@@ -169,11 +186,15 @@ def _check_no_duplicates(df: pd.DataFrame) -> None:
 
 def _check_same_columns(cols: Sequence[str], ref_cols: Sequence[str]) -> None:
     if list(cols) != list(ref_cols):
-        _fail(f"Column set/order must be the same across files.\n"
-              f"Got:  {list(cols)}\nRef:  {list(ref_cols)}")
+        _fail(
+            f"Column set/order must be the same across files.\n"
+            f"Got:  {list(cols)}\nRef:  {list(ref_cols)}"
+        )
 
 
-def _validate_file(path: Path, ref_cols: List[str] | None) -> Tuple[bool, List[str], List[str]]:
+def _validate_file(
+    path: Path, ref_cols: List[str] | None
+) -> Tuple[bool, List[str], List[str]]:
     """Возвращает (ok, cols, errors)."""
     errs: List[str] = []
     try:

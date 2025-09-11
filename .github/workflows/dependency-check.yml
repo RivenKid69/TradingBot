@@ -22,3 +22,7 @@ import pandas, numpy
 print('pandas', pandas.__version__)
 print('numpy', numpy.__version__)
 PY
+      - name: Run lint checks
+        run: |
+          pip install black flake8
+          make lint

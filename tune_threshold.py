@@ -1,13 +1,13 @@
-# scripts/tune_threshold.py
-from __future__ import annotations
-
 import argparse
 import os
 
 import pandas as pd
-import yaml
 
-from training.threshold_tuner import TuneConfig, tune_threshold, load_min_signal_gap_s_from_yaml
+from training.threshold_tuner import (
+    TuneConfig,
+    tune_threshold,
+    load_min_signal_gap_s_from_yaml,
+)
 
 
 def _read_table(path: str) -> pd.DataFrame:
@@ -32,25 +32,93 @@ def _write_table(df: pd.DataFrame, path: str) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Подбор порога под целевую частоту сигналов с учётом кулдауна и no-trade.")
-    ap.add_argument("--data", required=True, help="Файл с предсказаниями и таргетом (CSV/Parquet). Должны быть колонки ts_ms,symbol,score и y или eff_ret.")
-    ap.add_argument("--score_col", default="score", help="Имя колонки со скором/вероятностью.")
-    ap.add_argument("--y_col", default="", help="Колонка бинарной метки 0/1 (для классификации).")
-    ap.add_argument("--ret_col", default="", help="Колонка эффективного ретёрна (для регрессии), например eff_ret_60.")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Подбор порога под целевую частоту сигналов "
+            "с учётом кулдауна и no-trade."
+        )
+    )
+    ap.add_argument(
+        "--data",
+        required=True,
+        help=(
+            "Файл с предсказаниями и таргетом (CSV/Parquet). "
+            "Должны быть колонки ts_ms,symbol,score и y или eff_ret."
+        ),
+    )
+    ap.add_argument(
+        "--score_col", default="score", help="Имя колонки со скором/вероятностью."
+    )
+    ap.add_argument(
+        "--y_col", default="", help="Колонка бинарной метки 0/1 (для классификации)."
+    )
+    ap.add_argument(
+        "--ret_col",
+        default="",
+        help="Колонка эффективного ретёрна (для регрессии), например eff_ret_60.",
+    )
     ap.add_argument("--ts_col", default="ts_ms", help="Колонка времени")
     ap.add_argument("--symbol_col", default="symbol", help="Колонка символа")
-    ap.add_argument("--direction", choices=["greater", "less"], default="greater", help="Правило: сигнал если score >= thr (greater) или <= thr (less)")
-    ap.add_argument("--target_signals_per_day", type=float, default=1.5, help="Желаемая частота сигналов в день.")
-    ap.add_argument("--tolerance", type=float, default=0.5, help="Допустимое отклонение частоты.")
-    ap.add_argument("--min_signal_gap_s", type=int, default=None, help="Кулдаун между сигналами (сек). Если не задан — пробуем прочитать из realtime.yaml.")
-    ap.add_argument("--realtime_config", default="configs/config_live.yaml", help="Файл для чтения min_signal_gap_s (если не задан явно).")
-    ap.add_argument("--sandbox_config", default="configs/legacy_sandbox.yaml", help="Файл с no_trade (если нужно фильтровать).")
-    ap.add_argument("--drop_no_trade", action="store_true", help="Фильтровать no-trade окна (по legacy_sandbox.yaml).")
-    ap.add_argument("--min_thr", type=float, default=0.50, help="Минимальный порог сетки.")
-    ap.add_argument("--max_thr", type=float, default=0.99, help="Максимальный порог сетки.")
+    ap.add_argument(
+        "--direction",
+        choices=["greater", "less"],
+        default="greater",
+        help="Правило: сигнал если score >= thr (greater) или <= thr (less)",
+    )
+    ap.add_argument(
+        "--target_signals_per_day",
+        type=float,
+        default=1.5,
+        help="Желаемая частота сигналов в день.",
+    )
+    ap.add_argument(
+        "--tolerance", type=float, default=0.5, help="Допустимое отклонение частоты."
+    )
+    ap.add_argument(
+        "--min_signal_gap_s",
+        type=int,
+        default=None,
+        help=(
+            "Кулдаун между сигналами (сек). Если не задан — "
+            "пробуем прочитать из realtime.yaml."
+        ),
+    )
+    ap.add_argument(
+        "--realtime_config",
+        default="configs/config_live.yaml",
+        help="Файл для чтения min_signal_gap_s (если не задан явно).",
+    )
+    ap.add_argument(
+        "--sandbox_config",
+        default="configs/legacy_sandbox.yaml",
+        help="Файл с no_trade (если нужно фильтровать).",
+    )
+    ap.add_argument(
+        "--drop_no_trade",
+        action="store_true",
+        help="Фильтровать no-trade окна (по legacy_sandbox.yaml).",
+    )
+    ap.add_argument(
+        "--min_thr", type=float, default=0.50, help="Минимальный порог сетки."
+    )
+    ap.add_argument(
+        "--max_thr", type=float, default=0.99, help="Максимальный порог сетки."
+    )
     ap.add_argument("--steps", type=int, default=50, help="Число порогов в сетке.")
-    ap.add_argument("--optimize_for", choices=["sharpe", "precision", "f1"], default="sharpe", help="Целевая метрика для выбора порога.")
-    ap.add_argument("--out_csv", default="", help="Куда сохранить таблицу результатов (если пусто — рядом, суффикс _thrscan.csv).")
+    ap.add_argument(
+        "--optimize_for",
+        choices=["sharpe", "precision", "f1"],
+        default="sharpe",
+        help="Целевая метрика для выбора порога.",
+    )
+    ap.add_argument(
+        "--out_csv",
+        default="",
+        help=(
+            "Куда сохранить таблицу результатов (если пусто — "
+            "рядом, суффикс _thrscan.csv)."
+        ),
+    )
     args = ap.parse_args()
 
     df = _read_table(args.data)

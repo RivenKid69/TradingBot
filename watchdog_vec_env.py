@@ -1,4 +1,3 @@
-# watchdog_vec_env.py
 from __future__ import annotations
 
 """
@@ -8,29 +7,39 @@ WatchdogVecEnv — обёртка вокруг SharedMemoryVecEnv c автома
 Поведение:
 - Любая ошибка в step_wait() перехватывается.
 - Текущая базовая среда закрывается, создаётся новая через сохранённые env_fns.
-- Возвращаются obs после reset() новой среды, rewards=zeros, dones=ones (эпизод завершён),
+- Возвращаются obs после reset() новой среды,
+  rewards=zeros, dones=ones (эпизод завершён),
   infos — список словарей с ключом {"watchdog_restart": True}.
 
 Совместимость:
 - Ставит тонкий фолбэк на sb3 VecEnv (если не установлен, не наследуемся жёстко).
-- Проксирует reset/step_async/step_wait/close/get_attr/set_attr/env_method/env_is_wrapped.
+- Проксирует reset/step_async/step_wait/close/get_attr/set_attr/
+  env_method/env_is_wrapped.
 """
 
-from typing import Any, Callable, List, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
 try:
     from stable_baselines3.common.vec_env import VecEnv  # type: ignore
 except Exception:
+
     class VecEnv:  # минимальный интерфейс для типовой совместимости
         pass
+
 
 from shared_memory_vec_env import SharedMemoryVecEnv
 
 
 class WatchdogVecEnv(VecEnv):
-    def __init__(self, env_fns: Sequence[Callable[[], Any]], *, verbose: bool = True, max_restarts: int = 100):
+    def __init__(
+        self,
+        env_fns: Sequence[Callable[[], Any]],
+        *,
+        verbose: bool = True,
+        max_restarts: int = 100,
+    ):
         """
         env_fns: последовательность фабрик, создающих отдельные окружения.
         verbose: печатать события рестартов.
@@ -55,7 +64,9 @@ class WatchdogVecEnv(VecEnv):
         """Закрыть текущую и создать новую базовую среду."""
         self._restarts += 1
         if self._restarts > self._max_restarts:
-            raise RuntimeError(f"WatchdogVecEnv exceeded max_restarts={self._max_restarts}")
+            raise RuntimeError(
+                f"WatchdogVecEnv exceeded max_restarts={self._max_restarts}"
+            )
         try:
             self.env.close()
         except Exception:
@@ -79,13 +90,12 @@ class WatchdogVecEnv(VecEnv):
         try:
             return self.env.step_wait()
         except Exception as e:
-            # Любая ошибка => перезапуск, возврат reset-obs и маркеров рестарта
             self._log(f"Error in step_wait: {e!r}")
             self._reinit()
             obs = self.env.reset()
             n = self.num_envs
             rewards = np.zeros((n,), dtype=np.float32)
-            dones = np.ones((n,), dtype=bool)  # сигнализируем «эпизод завершён»
+            dones = np.ones((n,), dtype=bool)
             infos = [{"watchdog_restart": True} for _ in range(n)]
             return obs, rewards, dones, infos
 
@@ -103,7 +113,9 @@ class WatchdogVecEnv(VecEnv):
         return self.env.set_attr(attr_name, value, indices=indices)
 
     def env_method(self, method_name: str, *method_args, indices=None, **method_kwargs):
-        return self.env.env_method(method_name, *method_args, indices=indices, **method_kwargs)
+        return self.env.env_method(
+            method_name, *method_args, indices=indices, **method_kwargs
+        )
 
     def env_is_wrapped(self, wrapper_class, indices=None):
         return self.env.env_is_wrapped(wrapper_class, indices=indices)
