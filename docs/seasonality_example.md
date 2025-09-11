@@ -3,6 +3,8 @@
 This example demonstrates how to derive hour-of-week multipliers,
 configure the simulator with them and validate the result.
 
+All timestamp data **must** be in UTC to avoid daylight-saving time ambiguity. Feeding local-time values into multiplier computations will misalign the hour-of-week indices, so convert any inputs to UTC before processing.
+
 ## Generate multipliers from sample data
 
 ```python

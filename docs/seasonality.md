@@ -2,6 +2,8 @@
 
 Certain hours of the week exhibit systematic patterns in market depth, bid-ask spreads and order-processing delays. To capture this behaviour, the simulator supports **hour-of-week multipliers** that scale baseline liquidity, spread and latency parameters. Multipliers are indexed from `0` (Monday 00:00 UTC) to `167` (Sunday 23:00 UTC). All hour-of-week calculations use `datetime.utcfromtimestamp`, so timestamps must be interpreted as UTC.
 
+All timestamp inputs **must** be expressed in UTC to avoid daylight-saving time (DST) ambiguity. Feeding local-time data into multiplier computations will misalign hour-of-week indices, so always convert source data to UTC before generating or applying multipliers.
+
 ## `liquidity_latency_seasonality.json` format
 
 The JSON file contains up to three arrays with 168 floating-point numbers each.
