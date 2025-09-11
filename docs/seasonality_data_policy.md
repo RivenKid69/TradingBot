@@ -16,4 +16,15 @@ The following rules apply to any data stored under `data/seasonality_source`:
 - Run `scripts/check_pii.py` before committing new snapshots to verify that no
   PII patterns exist.
 
+## Licensing and Attribution
+- Historical snapshots are typically sourced from public exchange APIs (for
+  example, Binance) and remain subject to their respective terms of use. See the
+  [Binance API Terms of Use](https://www.binance.com/en/legal/api-terms-of-use)
+  for a reference.
+- The data may be used internally for analytics and model training but must not
+  be redistributed or sold.
+- When sharing derived metrics, include attribution such as "Based on data from
+  Binance. © Binance. All rights reserved." and ensure any additional provider
+  requirements are met.
+
 Adhering to this policy helps maintain compliance and data privacy.
