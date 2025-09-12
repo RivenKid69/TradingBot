@@ -227,6 +227,10 @@ class Mediator:
             return True
         self.total_signals += 1
         allowed, status = self._rate_limiter.can_send(float(ts))
+        try:
+            eb.log_signal_metric(status)
+        except Exception:
+            pass
         if not allowed:
             if status == "delayed":
                 self.delayed_signals += 1
