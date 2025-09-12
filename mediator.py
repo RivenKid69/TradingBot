@@ -27,6 +27,7 @@ from compat_shims import sim_report_dict_to_core_exec_reports
 import event_bus as eb
 from impl_latency import LatencyImpl
 from core_constants import PRICE_SCALE
+from utils import SignalRateLimiter
 try:
     from quantizer import Quantizer, load_filters
 except Exception:  # pragma: no cover - soft dependency
@@ -100,10 +101,20 @@ class _EnvStateView:
 
 
 class Mediator:
-    def __init__(self, env_ref: Any, *, event_level: int = 0,
-                 use_exec_sim: Optional[bool] = None,
-                 latency_steps: int = 0, slip_k: float = 0.0, seed: int = 0,
-                 latency_cfg: dict | None = None):
+    def __init__(
+        self,
+        env_ref: Any,
+        *,
+        event_level: int = 0,
+        use_exec_sim: Optional[bool] = None,
+        latency_steps: int = 0,
+        slip_k: float = 0.0,
+        seed: int = 0,
+        latency_cfg: dict | None = None,
+        rate_limit: float | None = None,
+        backoff_base: float = 2.0,
+        max_backoff: float = 60.0,
+    ):
         """
         env_ref — ссылка на «среду» (должна держать .state и, опционально, .lob)
         event_level — уровень логов EventBus (0/1/2)
@@ -133,6 +144,13 @@ class Mediator:
 
         # LOB (реальный или заглушка)
         self.lob = getattr(env_ref, "lob", None) or _DummyLOB()
+
+        # Rate limiter for outbound signals
+        self._rate_limiter = (
+            SignalRateLimiter(rate_limit, backoff_base, max_backoff)
+            if rate_limit and rate_limit > 0
+            else None
+        )
 
         # ExecutionSimulator — опционально
         if use_exec_sim is None:
@@ -307,8 +325,16 @@ class Mediator:
             except Exception:
                 return 0, 0
 
-        order_id, qpos = self.lob.add_limit_order(bool(is_buy_side), int(price_ticks_q), float(volume_q), int(timestamp),
-                                                  bool(taker_is_agent))
+        if self._rate_limiter and not self._rate_limiter.can_send(float(timestamp)):
+            return 0, 0
+
+        order_id, qpos = self.lob.add_limit_order(
+            bool(is_buy_side),
+            int(price_ticks_q),
+            float(volume_q),
+            int(timestamp),
+            bool(taker_is_agent),
+        )
         if int(ttl_steps) > 0:
             ttl_set = False
             if hasattr(self.lob, "set_order_ttl"):
@@ -350,21 +376,40 @@ class Mediator:
 
         # Попробуем использовать Cython LOB сигнатуру (с буферами), если она доступна
         trades: List[Tuple[float, float, bool, bool]] = []
-        try:
-            max_len = 1024
-            prices = np.empty(max_len, dtype=np.float64)
-            vols = np.empty(max_len, dtype=np.float64)
-            is_buy_arr = np.empty(max_len, dtype=np.int32)
-            is_self_arr = np.empty(max_len, dtype=np.int32)
-            ids = np.empty(max_len, dtype=np.int64)
-            n, fee_total = self.lob.match_market_order(bool(is_buy_side), float(volume), int(timestamp),
-                                                       bool(taker_is_agent), prices, vols,
-                                                       is_buy_arr, is_self_arr, ids, int(max_len))
-            for i in range(int(n)):
-                trades.append((float(prices[i]), float(vols[i]), bool(is_buy_arr[i]), bool(is_self_arr[i])))
-        except Exception:
-            # Заглушечный путь: ничего не исполнилось
+        if self._rate_limiter and not self._rate_limiter.can_send(float(timestamp)):
             trades = []
+        else:
+            try:
+                max_len = 1024
+                prices = np.empty(max_len, dtype=np.float64)
+                vols = np.empty(max_len, dtype=np.float64)
+                is_buy_arr = np.empty(max_len, dtype=np.int32)
+                is_self_arr = np.empty(max_len, dtype=np.int32)
+                ids = np.empty(max_len, dtype=np.int64)
+                n, fee_total = self.lob.match_market_order(
+                    bool(is_buy_side),
+                    float(volume),
+                    int(timestamp),
+                    bool(taker_is_agent),
+                    prices,
+                    vols,
+                    is_buy_arr,
+                    is_self_arr,
+                    ids,
+                    int(max_len),
+                )
+                for i in range(int(n)):
+                    trades.append(
+                        (
+                            float(prices[i]),
+                            float(vols[i]),
+                            bool(is_buy_arr[i]),
+                            bool(is_self_arr[i]),
+                        )
+                    )
+            except Exception:
+                # Заглушечный путь: ничего не исполнилось
+                trades = []
 
         # применяем сделки к состоянию и логируем
         if trades:
