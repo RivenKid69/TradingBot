@@ -333,10 +333,30 @@ JSON‑файлу с допустимыми диапазонами KPI (`--kpi-t
 `--quantiles` задаёт число квантилей для построения статистики по размерам
 ордеров.
 
+Дополнительно доступны аргументы для анализа чувствительности:
+
+- `--scenario-config` — путь к JSON-файлу с определением сценариев;
+- `--scenarios` — список сценариев через запятую (по умолчанию используются все из конфигурации);
+- `--sensitivity-threshold` — относительное изменение KPI, при превышении которого сценарий помечается флагом «чрезмерная чувствительность».
+
+Файл конфигурации сценариев задаёт множители комиссий и спреда, расширяя значения по умолчанию:
+
+```json
+{
+  "Low":  {"fee_mult": 0.5, "spread_mult": 0.5},
+  "Med":  {"fee_mult": 1.0, "spread_mult": 1.0},
+  "High": {"fee_mult": 1.5, "spread_mult": 1.5}
+}
+```
+
+Сценарий `Med` используется как базовый. Для каждого другого сценария рассчитывается изменение `pnl_total` относительно базы; если абсолютное изменение превышает `--sensitivity-threshold`, в отчёт добавляется флаг `scenario.<имя>: чрезмерная чувствительность`.
+
 При запуске формируются отчёты `sim_reality_check.json` и
-`sim_reality_check.md`, а также файл `sim_reality_check_buckets.csv` и график
-среднего `spread/slippage` по квантилям. Если значения KPI выходят за
-пороговые диапазоны, список нарушений выводится в консоль и попадает в отчёт.
+`sim_reality_check.md`, файлы `sim_reality_check_buckets.*`,
+`sim_reality_check_degradation.*` и `sim_reality_check_scenarios.*`. Все они
+сохраняются в каталог, где расположен файл `--trades`. Если значения KPI или
+чувствительность выходят за пределы, список нарушений выводится в консоль и
+попадает в отчёт.
 
 ```bash
 # все KPI в пределах порогов
@@ -344,7 +364,9 @@ python scripts/sim_reality_check.py \
   --trades sim_trades.parquet \
   --historical-trades hist_trades.parquet \
   --equity sim_equity.parquet \
-  --benchmark bench_equity.parquet
+  --benchmark bench_equity.parquet \
+  --scenario-config configs/scenarios.json \
+  --scenarios Low,Med,High
 Saved reports to run/sim_reality_check.json and run/sim_reality_check.md
 Saved bucket stats to run/sim_reality_check_buckets.csv and run/sim_reality_check_buckets.png
 
@@ -354,7 +376,8 @@ python scripts/sim_reality_check.py \
   --historical-trades hist_trades.parquet \
   --equity sim_equity.parquet \
   --benchmark bench_equity.parquet \
-  --kpi-thresholds benchmarks/sim_kpi_thresholds.json
+  --kpi-thresholds benchmarks/sim_kpi_thresholds.json \
+  --sensitivity-threshold 0.25
 Saved reports to run/sim_reality_check.json and run/sim_reality_check.md
 Saved bucket stats to run/sim_reality_check_buckets.csv and run/sim_reality_check_buckets.png
 Unrealistic KPIs detected:
