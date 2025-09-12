@@ -12,6 +12,9 @@ from decimal import Decimal
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 import glob
 import os
+import random
+import time
+import logging
 
 import pandas as pd  # предполагается в зависимостях
 
@@ -19,6 +22,8 @@ from core_models import Bar, Tick
 from core_contracts import MarketDataSource
 from utils_time import parse_time_to_ms
 from config import DataDegradationConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,13 +42,20 @@ class OfflineCSVConfig:
     n_trades_col: Optional[str] = None
     vendor: Optional[str] = "offline"
     sort_by_ts: bool = True
-    data_degradation: DataDegradationConfig | None = None
 
 
 class OfflineCSVBarSource(MarketDataSource):
-    def __init__(self, cfg: OfflineCSVConfig) -> None:
+    def __init__(
+        self,
+        cfg: OfflineCSVConfig,
+        data_degradation: DataDegradationConfig | None = None,
+    ) -> None:
         self.cfg = cfg
         ensure_timeframe(self.cfg.timeframe)
+        if data_degradation is None:
+            data_degradation = getattr(cfg, "data_degradation", None)
+        self._degradation = data_degradation or DataDegradationConfig.default()
+        self._rng = random.Random(self._degradation.seed)
 
     def stream_bars(self, symbols: Sequence[str], interval_ms: int) -> Iterator[Bar]:
         interval_ms_cfg = timeframe_to_ms(self.cfg.timeframe)
@@ -54,6 +66,8 @@ class OfflineCSVBarSource(MarketDataSource):
 
         symbols_u = list(dict.fromkeys([s.upper() for s in symbols]))
         last_ts: Dict[str, int] = {}
+        prev_bar: Optional[Bar] = None
+        total = drop_cnt = stale_cnt = delay_cnt = 0
 
         files: List[str] = []
         for p in self.cfg.paths:
@@ -95,7 +109,20 @@ class OfflineCSVBarSource(MarketDataSource):
                         missing = list(range(prev + interval_ms_cfg, ts, interval_ms_cfg))
                         raise ValueError(f"Missing bars for {sym}: {missing}")
                 last_ts[sym] = ts
-                yield Bar(
+                total += 1
+                if self._rng.random() < self._degradation.drop_prob:
+                    drop_cnt += 1
+                    continue
+                if prev_bar is not None and self._rng.random() < self._degradation.stale_prob:
+                    stale_cnt += 1
+                    if self._rng.random() < self._degradation.dropout_prob:
+                        delay_ms = self._rng.randint(0, self._degradation.max_delay_ms)
+                        if delay_ms > 0:
+                            delay_cnt += 1
+                            time.sleep(delay_ms / 1000.0)
+                    yield prev_bar
+                    continue
+                bar = Bar(
                     ts=ts,
                     symbol=sym,
                     open=Decimal(str(r[self.cfg.o_col])),
@@ -110,6 +137,29 @@ class OfflineCSVBarSource(MarketDataSource):
                     ),
                     is_final=True,
                 )
+                if self._rng.random() < self._degradation.dropout_prob:
+                    delay_ms = self._rng.randint(0, self._degradation.max_delay_ms)
+                    if delay_ms > 0:
+                        delay_cnt += 1
+                        time.sleep(delay_ms / 1000.0)
+                prev_bar = bar
+                yield bar
+
+        if total:
+            logger.info(
+                "OfflineCSVBarSource degradation: drop=%0.2f%% (%d/%d), stale=%0.2f%% (%d/%d), delay=%0.2f%% (%d/%d)",
+                drop_cnt / total * 100.0,
+                drop_cnt,
+                total,
+                stale_cnt / total * 100.0,
+                stale_cnt,
+                total,
+                delay_cnt / total * 100.0,
+                delay_cnt,
+                total,
+            )
+        else:
+            logger.info("OfflineCSVBarSource degradation: no bars processed")
 
     def stream_ticks(self, symbols: Sequence[str]) -> Iterator[Tick]:
         return iter([])
