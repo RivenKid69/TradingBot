@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from typing import Awaitable, Callable, List
 
 from decimal import Decimal
@@ -13,6 +14,7 @@ import websockets
 
 from core_models import Bar
 from config import DataDegradationConfig
+from utils import SignalRateLimiter
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,9 @@ class BinanceWS:
         dropout_prob: float | None = None,
         max_delay_ms: int | None = None,
         seed: int | None = None,
+        rate_limit: float | None = None,
+        backoff_base: float = 2.0,
+        max_backoff: float = 60.0,
     ) -> None:
         self.symbols = [s.strip().upper() for s in symbols if s.strip()]
         self.interval = str(interval)
@@ -69,12 +74,39 @@ class BinanceWS:
         self._dd_stale = 0
         self._dd_delay = 0
 
+        self._rate_limiter = (
+            SignalRateLimiter(rate_limit, backoff_base, max_backoff)
+            if rate_limit and rate_limit > 0
+            else None
+        )
+        self._rl_total = 0
+        self._rl_delayed = 0
+        self._rl_dropped = 0
+
         if not self.symbols:
             raise ValueError("Не задан список symbols для подписки")
 
         streams = "/".join(f"{s.lower()}@kline_{self.interval}" for s in self.symbols)
         self.ws_url = f"{self.base_url}/stream?streams={streams}"
         self._stop = False
+
+    async def _check_rate_limit(self) -> bool:
+        if self._rate_limiter is None:
+            self._rl_total += 1
+            return True
+        self._rl_total += 1
+        allowed, status = self._rate_limiter.can_send()
+        if allowed:
+            return True
+        if status == "rejected":
+            self._rl_delayed += 1
+            wait = max(self._rate_limiter._cooldown_until - time.time(), 0.0)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            allowed, _ = self._rate_limiter.can_send()
+            return allowed
+        self._rl_dropped += 1
+        return False
 
     async def _heartbeat(self, ws: websockets.WebSocketClientProtocol) -> None:
         while not self._stop:
@@ -143,7 +175,8 @@ class BinanceWS:
                                         await asyncio.sleep(delay_ms / 1000.0)
 
                                 prev_bar = bar
-                                await self.on_bar(bar)
+                                if await self._check_rate_limit():
+                                    await self.on_bar(bar)
                         hb_task.cancel()
                 except asyncio.CancelledError:
                     return
@@ -163,6 +196,17 @@ class BinanceWS:
                     self._dd_delay / self._dd_total * 100.0,
                     self._dd_delay,
                     self._dd_total,
+                )
+
+            if self._rl_total:
+                logger.info(
+                    "BinanceWS rate limiting: delayed=%0.2f%% (%d/%d), dropped=%0.2f%% (%d/%d)",
+                    self._rl_delayed / self._rl_total * 100.0,
+                    self._rl_delayed,
+                    self._rl_total,
+                    self._rl_dropped / self._rl_total * 100.0,
+                    self._rl_dropped,
+                    self._rl_total,
                 )
 
     def stop(self) -> None:
