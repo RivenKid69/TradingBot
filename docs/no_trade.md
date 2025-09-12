@@ -54,11 +54,19 @@ Effect on a sample dataset:
 The environment also tracks the ratio of blocked steps via `info["no_trade_stats"]`.
 
 ```python
+from no_trade import compute_no_trade_mask
+from no_trade_config import get_no_trade_config
+import pandas as pd
+
 cfg = get_no_trade_config("configs/legacy_sandbox.yaml")
+df = pd.DataFrame({"ts_ms": [0]})
 mask = compute_no_trade_mask(df, sandbox_yaml_path="configs/legacy_sandbox.yaml")
-if mask[i]:
-    # no orders are sent; step is counted as blocked
-    skip_action()
+
+def skip_action():
+    pass
+
+if mask.iloc[0]:
+    skip_action()  # no orders are sent; step is counted as blocked
 ```
 
 ## Typical schedule
