@@ -152,6 +152,11 @@ class Mediator:
             else None
         )
 
+        # Counters for signal statistics
+        self.total_signals = 0
+        self.delayed_signals = 0
+        self.rejected_signals = 0
+
         # ExecutionSimulator — опционально
         if use_exec_sim is None:
             use_exec_sim = _HAVE_EXEC_SIM
@@ -210,6 +215,19 @@ class Mediator:
         self._pending_buy_volume: float = 0.0
         self._pending_sell_volume: float = 0.0
 
+    def _check_rate_limit(self, ts: float) -> bool:
+        """Apply rate limiter and update counters."""
+        if self._rate_limiter is None:
+            return True
+        self.total_signals += 1
+        allowed, status = self._rate_limiter.can_send(float(ts))
+        if not allowed:
+            if status == "delayed":
+                self.delayed_signals += 1
+            else:
+                self.rejected_signals += 1
+        return allowed
+
     # ------------------------------ Служебное ------------------------------
 
     def reset(self) -> None:
@@ -223,22 +241,40 @@ class Mediator:
         self._ttl_queue.clear()
         self._pending_buy_volume = 0.0
         self._pending_sell_volume = 0.0
+        self.total_signals = 0
+        self.delayed_signals = 0
+        self.rejected_signals = 0
 
     def on_episode_end(self) -> None:
-        """Запросить и вывести статистику латентности."""
-        if self._latency_impl is None:
-            return
-        try:
-            stats = self._latency_impl.get_stats()
-        except Exception:
-            stats = None
-        if stats:
+        """Запросить и вывести статистику латентности и ограничителя сигналов."""
+        if self._latency_impl is not None:
             try:
-                event_bus.log_risk({"etype": "LATENCY_STATS", **stats})
+                stats = self._latency_impl.get_stats()
             except Exception:
-                pass
+                stats = None
+            if stats:
+                try:
+                    event_bus.log_risk({"etype": "LATENCY_STATS", **stats})
+                except Exception:
+                    pass
+                try:
+                    self._latency_impl.reset_stats()
+                except Exception:
+                    pass
+
+        # log signal rate limiter stats
+        if self.total_signals > 0:
+            delayed_ratio = float(self.delayed_signals) / float(self.total_signals)
+            rejected_ratio = float(self.rejected_signals) / float(self.total_signals)
             try:
-                self._latency_impl.reset_stats()
+                event_bus.log_risk(
+                    {
+                        "etype": "SIGNAL_RATE_STATS",
+                        "total": int(self.total_signals),
+                        "delayed_ratio": delayed_ratio,
+                        "rejected_ratio": rejected_ratio,
+                    }
+                )
             except Exception:
                 pass
 
@@ -325,7 +361,7 @@ class Mediator:
             except Exception:
                 return 0, 0
 
-        if self._rate_limiter and not self._rate_limiter.can_send(float(timestamp)):
+        if not self._check_rate_limit(float(timestamp)):
             return 0, 0
 
         order_id, qpos = self.lob.add_limit_order(
@@ -376,9 +412,7 @@ class Mediator:
 
         # Попробуем использовать Cython LOB сигнатуру (с буферами), если она доступна
         trades: List[Tuple[float, float, bool, bool]] = []
-        if self._rate_limiter and not self._rate_limiter.can_send(float(timestamp)):
-            trades = []
-        else:
+        if self._check_rate_limit(float(timestamp)):
             try:
                 max_len = 1024
                 prices = np.empty(max_len, dtype=np.float64)
@@ -521,6 +555,10 @@ class Mediator:
 
         # если есть ExecutionSimulator — используем его
         if self._use_exec and self.exec is not None:
+            if proto.action_type != ActionType.HOLD and not self._check_rate_limit(float(timestamp)):
+                info["rate_limited"] = True
+                return {"trades": [], "cancelled_ids": [], "new_order_ids": [], "fee_total": 0.0,
+                        "new_order_pos": [], "info": info, "events": events}
             try:
                 bid = getattr(self.env, "last_bid", None)
                 ask = getattr(self.env, "last_ask", None)
