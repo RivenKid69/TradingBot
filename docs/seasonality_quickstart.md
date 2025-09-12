@@ -2,6 +2,8 @@
 
 Follow these steps to regenerate and validate hour-of-week seasonality multipliers on a fresh clone of the repository.
 
+An example file with all multipliers set to `1.0` is available at `configs/liquidity_latency_seasonality.sample.json`.
+
 1. **Install dependencies**
 
    ```bash
