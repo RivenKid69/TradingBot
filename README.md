@@ -113,6 +113,26 @@ max_backoff_s: 60.0
 BinancePublicClient rate limiting: delayed=5.00% (6/120), rejected=1.00% (1/120)
 ```
 
+## Large order execution
+
+Orders whose notional exceeds `notional_threshold` are split by a deterministic algorithm.
+Select the strategy with `large_order_algo` (`TWAP` or `POV`). POV accepts extra fields under `pov`:
+`participation`, `child_interval_s`, and `min_child_notional`.
+
+```yaml
+notional_threshold: 10000.0
+large_order_algo: POV
+pov:
+  participation: 0.2
+  child_interval_s: 1
+  min_child_notional: 1000.0
+```
+
+This configuration slices a 50k parent into 2k notional children every second, matching 20% of observed volume.
+See [docs/large_orders.md](docs/large_orders.md) for additional examples and trajectories.
+Parameters are deterministic but should be calibrated on historical data to align with market impact.
+
+
 Сезонные множители позволяют масштабировать базовые значения ликвидности и
 задержек для каждого часа недели (от понедельника 00:00 до воскресенья
 23:00 UTC). Формат файла и процесс пересчёта коэффициентов из исторических
