@@ -32,6 +32,12 @@ class TakerExecutor(BaseExecutor):
 
 
 class TWAPExecutor(BaseExecutor):
+    """Time-weighted execution with deterministic schedule.
+
+    For a given timestamp and target quantity the resulting child orders are
+    always identical.  No randomness is used in planning the schedule.
+    """
+
     def __init__(self, *, parts: int = 6, child_interval_s: int = 600):
         self.parts = max(1, int(parts))
         self.child_interval_ms = int(child_interval_s) * 1000
@@ -60,6 +66,13 @@ class TWAPExecutor(BaseExecutor):
 
 
 class POVExecutor(BaseExecutor):
+    """Participation-of-volume execution with deterministic planning.
+
+    The plan depends only on the provided timestamp, liquidity hint and target
+    quantity; repeated calls with identical inputs produce identical child
+    trajectories.
+    """
+
     def __init__(
         self,
         *,
