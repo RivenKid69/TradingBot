@@ -106,9 +106,13 @@ def load_hourly_seasonality(
             return None
         arr = np.asarray(data, dtype=float)
         if arr.shape[0] in (HOURS_IN_WEEK, 7):
+            if np.any(arr <= 0):
+                raise ValueError("Seasonality array values must be > 0")
             if any(k in {"liquidity", "latency"} for k in keys):
                 arr = np.clip(arr, SEASONALITY_MULT_MIN, SEASONALITY_MULT_MAX)
             return arr
+    except ValueError:
+        raise
     except Exception:
         return None
     return None
@@ -166,6 +170,10 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
                 if arr.shape[0] not in (HOURS_IN_WEEK, 7):
                     raise ValueError(
                         "Seasonality array '%s' must have length 168 or 7" % key
+                    )
+                if np.any(arr <= 0):
+                    raise ValueError(
+                        "Seasonality array '%s' must contain positive values" % key
                     )
                 if key in {"liquidity", "latency"}:
                     arr = np.clip(arr, SEASONALITY_MULT_MIN, SEASONALITY_MULT_MAX)
