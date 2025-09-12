@@ -4,6 +4,10 @@ symbols:
   - "BTCUSDT"
 interval: "1m"
 
+max_signals_per_sec: 5.0
+backoff_base_s: 2.0
+max_backoff_s: 60.0
+
 calibrator:
   enabled: false
   path: "models/calibrator.json"
