@@ -12,6 +12,10 @@ execution_params:
 execution_config:
   notional_threshold: 10000.0
   large_order_algo: TWAP
+  pov:
+    participation: 0.10
+    child_interval_s: 60
+    min_child_notional: 20.0
 
 # Optional path to 168 hourly liquidity multipliers (indexed by UTC hour-of-week;
 # values clamped to [0.1, 10.0])
