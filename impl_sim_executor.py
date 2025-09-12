@@ -24,6 +24,7 @@ from compat_shims import sim_report_dict_to_core_exec_reports
 from execution_sim import ExecutionSimulator, SimStepReport  # type: ignore
 from action_proto import ActionProto, ActionType
 from core_config import ExecutionProfile, ExecutionParams
+from config import DataDegradationConfig
 
 # новые компонентные имплементации
 from impl_quantizer import QuantizerImpl, QuantizerConfig
@@ -55,6 +56,7 @@ class SimExecutor(TradeExecutor):
         latency: LatencyImpl | None = None,
         slippage: SlippageImpl | None = None,
         fees: FeesImpl | None = None,
+        data_degradation: DataDegradationConfig | None = None,
         run_config: Any | None = None,
     ) -> None:
         """Создать исполнителя поверх :class:`ExecutionSimulator`.
@@ -75,6 +77,7 @@ class SimExecutor(TradeExecutor):
         rc_latency = getattr(run_config, "latency", {}) if run_config else {}
         rc_slippage = getattr(run_config, "slippage", {}) if run_config else {}
         rc_fees = getattr(run_config, "fees", {}) if run_config else {}
+        rc_degradation = getattr(run_config, "data_degradation", {}) if run_config else {}
         self._no_trade_cfg = getattr(run_config, "no_trade", {}) if run_config else {}
         self._exec_profile: ExecutionProfile = (
             getattr(run_config, "execution_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
@@ -86,6 +89,13 @@ class SimExecutor(TradeExecutor):
             if run_config is not None
             else ExecutionParams()
         )
+        if data_degradation is None:
+            data_degradation = (
+                DataDegradationConfig.from_dict(rc_degradation)
+                if rc_degradation
+                else DataDegradationConfig.default()
+            )
+        self._data_degradation = data_degradation
 
         if quantizer is None:
             quantizer = QuantizerImpl.from_dict(rc_quantizer)
@@ -143,6 +153,9 @@ class SimExecutor(TradeExecutor):
         l_cfg.setdefault("symbol", symbol)
         l_impl = LatencyImpl.from_dict(l_cfg)
         r_impl = RiskBasicImpl.from_dict(getattr(run_config, "risk", {}) or {})
+        d_impl = DataDegradationConfig.from_dict(
+            getattr(run_config, "data_degradation", {}) or {}
+        )
 
         if q_impl is not None:
             q_impl.attach_to(sim, strict=True, enforce_percent_price_by_side=True)
@@ -164,6 +177,7 @@ class SimExecutor(TradeExecutor):
             latency=l_impl,
             slippage=s_impl,
             fees=f_impl,
+            data_degradation=d_impl,
             run_config=run_config,
         )
 

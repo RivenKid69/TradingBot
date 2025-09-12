@@ -245,3 +245,38 @@ class MicroParams:
             "p_market_order": self.p_market_order,
             "p_cancel_order": self.p_cancel_order,
         }
+
+
+@dataclass
+class DataDegradationConfig:
+    """Параметры деградации данных (задержки/потери)."""
+
+    stale_prob: float = 0.0
+    drop_prob: float = 0.0
+    dropout_prob: float = 0.0
+    max_delay_ms: int = 0
+    seed: int = 0
+
+    @classmethod
+    def default(cls) -> "DataDegradationConfig":
+        """Создает DataDegradationConfig с параметрами по умолчанию."""
+        return cls()
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DataDegradationConfig":
+        """Создает DataDegradationConfig из словаря, игнорируя неизвестные ключи."""
+        cfg = cls.default()
+        for key, val in data.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, val)
+        return cfg
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Возвращает словарь с параметрами DataDegradationConfig."""
+        return {
+            "stale_prob": self.stale_prob,
+            "drop_prob": self.drop_prob,
+            "dropout_prob": self.dropout_prob,
+            "max_delay_ms": self.max_delay_ms,
+            "seed": self.seed,
+        }

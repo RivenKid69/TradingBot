@@ -18,6 +18,7 @@ import pandas as pd  # предполагается в зависимостях
 from core_models import Bar, Tick
 from core_contracts import MarketDataSource
 from utils_time import parse_time_to_ms
+from config import DataDegradationConfig
 
 
 @dataclass
@@ -36,6 +37,7 @@ class OfflineCSVConfig:
     n_trades_col: Optional[str] = None
     vendor: Optional[str] = "offline"
     sort_by_ts: bool = True
+    data_degradation: DataDegradationConfig | None = None
 
 
 class OfflineCSVBarSource(MarketDataSource):
