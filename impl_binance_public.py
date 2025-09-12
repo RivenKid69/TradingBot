@@ -23,6 +23,7 @@ except Exception:
 
 from core_models import Bar, Tick
 from core_contracts import MarketDataSource
+from config import DataDegradationConfig
 
 
 _BINANCE_WS = "wss://stream.binance.com:9443/stream"
@@ -34,6 +35,7 @@ class BinanceWSConfig:
     reconnect_backoff_max_s: float = 30.0
     ping_interval_s: float = 10.0
     vendor: str = "binance"
+    data_degradation: DataDegradationConfig | None = None
 
 
 class BinancePublicBarSource(MarketDataSource):

@@ -10,6 +10,7 @@ from decimal import Decimal
 import websockets
 
 from core_models import Bar
+from config import DataDegradationConfig
 
 
 class BinanceWS:
@@ -28,6 +29,7 @@ class BinanceWS:
         reconnect_initial_delay_s: float = 1.0,
         reconnect_max_delay_s: float = 60.0,
         heartbeat_interval_s: float = 15.0,
+        data_degradation: DataDegradationConfig | None = None,
     ) -> None:
         self.symbols = [s.strip().upper() for s in symbols if s.strip()]
         self.interval = str(interval)
@@ -36,6 +38,7 @@ class BinanceWS:
         self.reconnect_initial_delay_s = float(reconnect_initial_delay_s)
         self.reconnect_max_delay_s = float(reconnect_max_delay_s)
         self.heartbeat_interval_s = float(heartbeat_interval_s)
+        self.data_degradation = data_degradation or DataDegradationConfig.default()
 
         if not self.symbols:
             raise ValueError("Не задан список symbols для подписки")
