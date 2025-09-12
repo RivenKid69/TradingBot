@@ -6,8 +6,14 @@ import json
 import math
 import urllib.parse
 import urllib.request
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+from utils import SignalRateLimiter
+
+
+logger = logging.getLogger(__name__)
 
 
 def _http_get(url: str, params: Dict[str, Any], *, timeout: int = 20) -> Dict[str, Any] | List[Any]:
@@ -52,9 +58,54 @@ class BinancePublicClient:
     Пагинация — по startTime/endTime + limit.
     Времена — миллисекунды Unix.
     """
-    def __init__(self, endpoints: Optional[PublicEndpoints] = None, timeout: int = 20) -> None:
+
+    def __init__(
+        self,
+        endpoints: Optional[PublicEndpoints] = None,
+        timeout: int = 20,
+        rate_limit: float | None = None,
+        backoff_base: float = 2.0,
+        max_backoff: float = 60.0,
+    ) -> None:
         self.e = endpoints or PublicEndpoints()
         self.timeout = int(timeout)
+        self._rate_limiter = (
+            SignalRateLimiter(rate_limit, backoff_base, max_backoff)
+            if rate_limit and rate_limit > 0
+            else None
+        )
+        self._rl_total = 0
+        self._rl_delayed = 0
+        self._rl_rejected = 0
+
+    def _throttle(self) -> None:
+        """Apply rate limiter with blocking backoff."""
+        if self._rate_limiter is None:
+            return
+        self._rl_total += 1
+        while True:
+            allowed, status = self._rate_limiter.can_send()
+            if allowed:
+                return
+            if status == "rejected":
+                self._rl_rejected += 1
+            else:
+                self._rl_delayed += 1
+            wait = max(self._rate_limiter._cooldown_until - time.time(), 0.0)
+            if wait > 0:
+                time.sleep(wait)
+
+    def __del__(self) -> None:  # pragma: no cover - best effort logging
+        if getattr(self, "_rl_total", 0):
+            logger.info(
+                "BinancePublicClient rate limiting: delayed=%0.2f%% (%d/%d), rejected=%0.2f%% (%d/%d)",
+                self._rl_delayed / self._rl_total * 100.0,
+                self._rl_delayed,
+                self._rl_total,
+                self._rl_rejected / self._rl_total * 100.0,
+                self._rl_rejected,
+                self._rl_total,
+            )
 
     # -------- KLINES --------
 
@@ -78,6 +129,7 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
+        self._throttle()
         data = _retrying_get(url, params, timeout=self.timeout)
         if isinstance(data, list):
             return data  # type: ignore
@@ -98,6 +150,7 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
+        self._throttle()
         data = _retrying_get(url, params, timeout=self.timeout)
         if isinstance(data, list):
             return data  # type: ignore
@@ -117,6 +170,7 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
+        self._throttle()
         data = _retrying_get(url, params, timeout=self.timeout)
         if isinstance(data, list):
             return data  # type: ignore
@@ -138,6 +192,7 @@ class BinancePublicClient:
         params: Dict[str, Any] = {}
         if symbols:
             params["symbols"] = json.dumps([s.upper() for s in symbols])
+        self._throttle()
         data = _retrying_get(url, params, timeout=self.timeout)
         out: Dict[str, Dict[str, Any]] = {}
         if isinstance(data, dict):
