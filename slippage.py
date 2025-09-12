@@ -1,9 +1,10 @@
 # sim/slippage.py
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Sequence
 
 
 @dataclass
@@ -31,6 +32,15 @@ class SlippageConfig:
             default_spread_bps=float(d.get("default_spread_bps", 2.0)),
             eps=float(d.get("eps", 1e-12)),
         )
+
+    @classmethod
+    def from_file(cls, path: str) -> "SlippageConfig":
+        """Load configuration from a JSON file."""
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):  # pragma: no cover - sanity check
+            raise ValueError("slippage config file must contain a JSON object")
+        return cls.from_dict(data)
 
 
 def estimate_slippage_bps(
@@ -91,3 +101,29 @@ def mid_from_quotes(*, bid: Optional[float], ask: Optional[float]) -> Optional[f
     if not (math.isfinite(b) and math.isfinite(a)):
         return None
     return float((a + b) / 2.0)
+
+
+def model_curve(
+    participations: Sequence[float],
+    *,
+    cfg: SlippageConfig,
+    spread_bps: float,
+    vol_factor: float = 1.0,
+) -> list[float]:
+    """Return expected slippage for a range of participation rates.
+
+    ``participations`` are interpreted as size/liquidity ratios.  The model is
+    evaluated with ``liquidity=1`` and ``size=participation`` for each value.
+    """
+
+    out = []
+    for p in participations:
+        s = estimate_slippage_bps(
+            spread_bps=spread_bps,
+            size=float(p),
+            liquidity=1.0,
+            vol_factor=vol_factor,
+            cfg=cfg,
+        )
+        out.append(float(s))
+    return out

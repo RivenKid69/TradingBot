@@ -135,6 +135,37 @@ class BinancePublicClient:
             return data  # type: ignore
         raise RuntimeError(f"Unexpected klines response: {data}")
 
+    # -------- AGGREGATED TRADES --------
+
+    def get_agg_trades(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Fetch aggregated trades from Binance public API."""
+        if market not in ("spot", "futures"):
+            raise ValueError("market must be 'spot' or 'futures'")
+        base = self.e.spot_base if market == "spot" else self.e.futures_base
+        path = "/api/v3/aggTrades" if market == "spot" else "/fapi/v1/aggTrades"
+        url = f"{base}{path}"
+        params: Dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "limit": int(limit),
+        }
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+        self._throttle()
+        data = _retrying_get(url, params, timeout=self.timeout)
+        if isinstance(data, list):
+            return data  # type: ignore[return-value]
+        raise RuntimeError(f"Unexpected aggTrades response: {data}")
+
     # -------- MARK PRICE KLINES (futures only) --------
 
     def get_mark_klines(self, *, symbol: str, interval: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None, limit: int = 1500) -> List[List[Any]]:
