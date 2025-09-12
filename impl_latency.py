@@ -14,6 +14,7 @@ import importlib.util
 import sysconfig
 from pathlib import Path
 import threading
+import warnings
 
 import numpy as np
 try:
@@ -317,6 +318,22 @@ class LatencyImpl:
                     self._wrapper._mult_sum = [0.0] * n
                     self._wrapper._lat_sum = [0.0] * n
                     self._wrapper._count = [0] * n
+
+    def dump_latency_multipliers(self) -> List[float]:
+        warnings.warn(
+            "dump_latency_multipliers() is deprecated; use dump_multipliers() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.dump_multipliers()
+
+    def load_latency_multipliers(self, arr: Sequence[float]) -> None:
+        warnings.warn(
+            "load_latency_multipliers() is deprecated; use load_multipliers() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.load_multipliers(arr)
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "LatencyImpl":
