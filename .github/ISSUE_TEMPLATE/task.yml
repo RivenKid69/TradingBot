@@ -1,0 +1,33 @@
+name: Task
+description: Track project tasks with explicit completion criteria, code review, and test evidence.
+title: "[Task]: "
+labels: [task]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Task Description
+      description: Summary of the work to be done.
+    validations:
+      required: true
+  - type: textarea
+    id: completion-criteria
+    attributes:
+      label: Completion Criteria
+      description: Explicit conditions required to consider this task complete.
+    validations:
+      required: true
+  - type: textarea
+    id: code-review
+    attributes:
+      label: Code Review Evidence
+      description: Link to pull request reviews or other review artifacts.
+    validations:
+      required: true
+  - type: textarea
+    id: test-evidence
+    attributes:
+      label: Test Evidence
+      description: Relevant logs or outputs from test runs.
+    validations:
+      required: true
