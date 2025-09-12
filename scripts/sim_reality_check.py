@@ -254,10 +254,16 @@ def main() -> None:
         rel_change = (
             (kpi - baseline_kpi) / baseline_kpi if baseline_kpi else float("nan")
         )
+        flag = name != "Med" and abs(rel_change) > args.sensitivity_threshold
         degradation_rows.append(
-            {"scenario": name, "kpi": kpi, "relative_change": rel_change}
+            {
+                "scenario": name,
+                "kpi": kpi,
+                "relative_change": rel_change,
+                "flag": flag,
+            }
         )
-        if name != "Med" and abs(rel_change) > args.sensitivity_threshold:
+        if flag:
             flags[f"scenario.{name}"] = "чрезмерная чувствительность"
 
     degradation_ranking = pd.DataFrame(degradation_rows).sort_values(
@@ -327,6 +333,22 @@ def main() -> None:
     degradation_ranking.to_csv(degr_csv, index=False)
     degradation_ranking.to_json(degr_json, orient="records", indent=2)
 
+    scen_base = out_dir / "sim_reality_check_scenarios"
+    scen_csv = scen_base.with_suffix(".csv")
+    scen_json = scen_base.with_suffix(".json")
+    scen_df = pd.json_normalize(
+        [
+            {
+                "scenario": name,
+                **{f"equity.{k}": v for k, v in m.get("equity", {}).items()},
+                **{f"trades.{k}": v for k, v in m.get("trades", {}).items()},
+            }
+            for name, m in scenario_metrics.items()
+        ]
+    )
+    scen_df.to_csv(scen_csv, index=False)
+    scen_df.to_json(scen_json, orient="records", indent=2)
+
     try:
         import matplotlib.pyplot as plt
 
@@ -372,14 +394,19 @@ def main() -> None:
             for k, v in flags.items():
                 f.write(f"- {k}: {v}\n")
             f.write("\n")
-        f.write("## Degradation Ranking\n")
+        f.write("## Sensitivity Analysis\n")
         try:
             f.write(degradation_ranking.to_markdown(index=False))
             f.write("\n\n")
         except Exception:
             for row in degradation_ranking.to_dict(orient="records"):
                 f.write(
-                    f"- {row['scenario']}: kpi={row['kpi']}, change={row['relative_change']:.2%}\n"
+                    "- {scenario}: kpi={kpi}, change={change:.2%}, flag={flag}\n".format(
+                        scenario=row["scenario"],
+                        kpi=row["kpi"],
+                        change=row["relative_change"],
+                        flag=row.get("flag", False),
+                    )
                 )
             f.write("\n")
         f.write("## Simulation Metrics\n")
@@ -414,7 +441,8 @@ def main() -> None:
 
     print(f"Saved reports to {json_path} and {md_path}")
     print(f"Saved bucket stats to {bucket_csv} and {bucket_png}")
-    print(f"Saved degradation ranking to {degr_csv}")
+    print(f"Saved sensitivity analysis to {degr_csv}")
+    print(f"Saved scenario metrics to {scen_csv}")
     if flags:
         print("Unrealistic KPIs detected:")
         for k, v in flags.items():
