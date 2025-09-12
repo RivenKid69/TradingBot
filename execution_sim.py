@@ -29,12 +29,14 @@ import time
 import os
 import logging
 import threading
+import random
 try:
     from runtime_flags import seasonality_enabled  # type: ignore
 except Exception:  # pragma: no cover - fallback if module not found
     def seasonality_enabled(default: bool = True) -> bool:
         return default
 from utils.prometheus import Counter
+from config import DataDegradationConfig
 try:
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
     from utils_time import (
@@ -309,12 +311,28 @@ class Pending:
     lat_ms: int = 0
     timeout: bool = False
     spike: bool = False
+    delayed: bool = False
 
 
 class _LatencyQueue:
-    def __init__(self, latency_steps: int = 0):
+    def __init__(
+        self,
+        latency_steps: int = 0,
+        *,
+        rng: Optional[random.Random] = None,
+        drop_prob: float = 0.0,
+        dropout_prob: float = 0.0,
+        max_delay_steps: int = 0,
+    ):
         self.latency_steps = max(0, int(latency_steps))
         self._q: List[Pending] = []
+        self._rng = rng
+        self.drop_prob = float(drop_prob)
+        self.dropout_prob = float(dropout_prob)
+        self.max_delay_steps = max(0, int(max_delay_steps))
+        self.total_cnt = 0
+        self.drop_cnt = 0
+        self.delay_cnt = 0
 
     def push(self, p: Pending) -> None:
         self._q.append(p)
@@ -324,6 +342,18 @@ class _LatencyQueue:
         cancelled: List[Pending] = []
         rest: List[Pending] = []
         for p in self._q:
+            self.total_cnt += 1
+            if self._rng is not None:
+                if self._rng.random() < self.drop_prob:
+                    self.drop_cnt += 1
+                    continue
+                if self._rng.random() < self.dropout_prob:
+                    delay_steps = self._rng.randint(0, self.max_delay_steps)
+                    if delay_steps > 0:
+                        p.remaining_lat += delay_steps
+                        if not p.delayed:
+                            self.delay_cnt += 1
+                            p.delayed = True
             if p.remaining_lat <= 0:
                 if p.timeout:
                     cancelled.append(p)
@@ -374,6 +404,7 @@ class ExecutionSimulator:
                  seasonality_interpolate: bool = False,
                  seasonality_day_only: bool = False,
                  seasonality_auto_reload: bool = False,
+                 data_degradation: Optional[DataDegradationConfig] = None,
                  run_config: Any = None):
         self.symbol = str(symbol).upper()
         self.latency_steps = int(max(0, latency_steps))
@@ -385,7 +416,6 @@ class ExecutionSimulator:
                 self._rng = np.RandomState(seed)  # type: ignore
             except Exception:
                 self._rng = None  # type: ignore
-        self._q = _LatencyQueue(self.latency_steps)
         self._next_cli_id = 1
         self.lob = lob
         self._last_ref_price: Optional[float] = None
@@ -394,6 +424,21 @@ class ExecutionSimulator:
         self.step_ms: int = int(getattr(run_config, "step_ms", 1000)) if run_config is not None else 1000
         if self.step_ms <= 0:
             self.step_ms = 1
+        if data_degradation is None:
+            data_degradation = DataDegradationConfig.default()
+        self.data_degradation = data_degradation
+        self._rng_dd = random.Random(self.data_degradation.seed or self.seed)
+        max_delay_steps = 0
+        if self.step_ms > 0:
+            max_delay_steps = self.data_degradation.max_delay_ms // self.step_ms
+        self._q = _LatencyQueue(
+            self.latency_steps,
+            rng=self._rng_dd,
+            drop_prob=self.data_degradation.drop_prob,
+            dropout_prob=self.data_degradation.dropout_prob,
+            max_delay_steps=max_delay_steps,
+        )
+        self._stopped = False
         self._cancelled_on_submit: List[int] = []
         self._ttl_orders: List[Tuple[int, int]] = []
 
@@ -1860,3 +1905,27 @@ class ExecutionSimulator:
             liquidity=self._last_liquidity,
             execution_profile=str(getattr(self, "execution_profile", "")),
         )
+
+    def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        total = getattr(self._q, "total_cnt", 0)
+        if total:
+            logger.info(
+                "LatencyQueue degradation: drop=%0.2f%% (%d/%d), delay=%0.2f%% (%d/%d)",
+                self._q.drop_cnt / total * 100.0,
+                self._q.drop_cnt,
+                total,
+                self._q.delay_cnt / total * 100.0,
+                self._q.delay_cnt,
+                total,
+            )
+        else:
+            logger.info("LatencyQueue degradation: no events processed")
+
+    def __del__(self) -> None:
+        try:
+            self.stop()
+        except Exception:
+            pass
