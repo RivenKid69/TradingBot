@@ -245,10 +245,22 @@ if make_executor is None:
 
     def make_executor(algo: str, cfg: Dict[str, Any] | None = None):  # type: ignore[override]
         a = str(algo).upper()
+        cfg = dict(cfg or {})
         if a == "TWAP" and TWAPExecutor is not None:
-            return TWAPExecutor()
+            tw = dict(cfg.get("twap", {}))
+            parts = int(tw.get("parts", 6))
+            interval = int(tw.get("child_interval_s", 600))
+            return TWAPExecutor(parts=parts, child_interval_s=interval)
         if a == "POV" and POVExecutor is not None:
-            return POVExecutor()
+            pv = dict(cfg.get("pov", {}))
+            part = float(pv.get("participation", 0.10))
+            interval = int(pv.get("child_interval_s", 60))
+            min_not = float(pv.get("min_child_notional", 20.0))
+            return POVExecutor(
+                participation=part,
+                child_interval_s=interval,
+                min_child_notional=min_not,
+            )
         if a == "VWAP" and VWAPExecutor is not None:
             return VWAPExecutor()
         return TakerExecutor()
