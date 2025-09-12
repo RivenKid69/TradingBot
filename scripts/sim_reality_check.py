@@ -14,6 +14,13 @@ from services.metrics import (
 )
 
 
+DEFAULT_SCENARIOS = {
+    "Low": {"fee_mult": 0.5, "spread_mult": 0.5},
+    "Base": {"fee_mult": 1.0, "spread_mult": 1.0},
+    "High": {"fee_mult": 1.5, "spread_mult": 1.5},
+}
+
+
 def _bucket_stats(df: pd.DataFrame, quantiles: int) -> pd.DataFrame:
     """Return per-order-size bucket spread/slippage statistics."""
     required = {"order_size", "spread_bps", "slippage_bps"}
@@ -141,7 +148,30 @@ def main() -> None:
         default=10,
         help="Number of order size quantiles for bucket stats",
     )
+    parser.add_argument(
+        "--scenario-config",
+        default=None,
+        help="Path to JSON file with scenario configuration",
+    )
+    parser.add_argument(
+        "--scenarios",
+        default=None,
+        help="Comma-separated list of scenarios to include",
+    )
     args = parser.parse_args()
+
+    scenarios = DEFAULT_SCENARIOS.copy()
+    if args.scenario_config:
+        try:
+            with open(Path(args.scenario_config)) as f:
+                scenarios.update(json.load(f))
+        except Exception:
+            pass
+    scenario_names = (
+        [s.strip() for s in args.scenarios.split(",") if s.strip()]
+        if args.scenarios
+        else list(scenarios.keys())
+    )
 
     trades_path = Path(args.trades)
     trades_df = read_any(trades_path.as_posix())
