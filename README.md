@@ -95,6 +95,28 @@ latency:
   mean_ms: 50
 ```
 
+### Деградация данных
+
+`DataDegradationConfig` позволяет смоделировать пропуски и задержки в
+потоке маркет‑данных. Полный список полей описан в
+[docs/data_degradation.md](docs/data_degradation.md).
+
+Пример настройки в YAML‑конфиге:
+
+```yaml
+data_degradation:
+  stale_prob: 0.1      # вероятность повторить предыдущий бар
+  drop_prob: 0.05      # вероятность пропустить бар
+  dropout_prob: 0.2    # вероятность добавить задержку
+  max_delay_ms: 50     # верхняя граница задержки
+  seed: 42
+```
+
+Во время работы сервисы выводят сводку вида
+`OfflineCSVBarSource degradation: ...`, `BinanceWS degradation: ...` или
+`LatencyQueue degradation: ...` — по этим сообщениям можно контролировать
+доли пропусков и задержек.
+
 Обработка окон **no‑trade** описывается в конфигурации; подробности
 см. [docs/no_trade.md](docs/no_trade.md).
 
