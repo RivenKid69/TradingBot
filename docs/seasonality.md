@@ -7,6 +7,7 @@ All timestamp inputs **must** be expressed in UTC to avoid daylight-saving time 
 ## `liquidity_latency_seasonality.json` format
 
 The JSON file contains up to three arrays with 168 floating-point numbers each.
+A template with all multipliers set to `1.0` is available at `configs/liquidity_latency_seasonality.sample.json`.
 It can either be a flat mapping or nested under instrument symbols:
 
 ```json

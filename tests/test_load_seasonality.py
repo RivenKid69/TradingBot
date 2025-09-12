@@ -23,6 +23,14 @@ def _arr(v):
     return [float(v)] * HOURS_IN_WEEK
 
 
+def test_load_seasonality_sample_file():
+    path = BASE / "configs" / "liquidity_latency_seasonality.sample.json"
+    res = load_seasonality(str(path))
+    assert np.allclose(res["liquidity"], 1.0)
+    assert np.allclose(res["latency"], 1.0)
+    assert np.allclose(res["spread"], 1.0)
+
+
 def test_load_seasonality_basic(tmp_path):
     data = {"liquidity": _arr(1.0), "latency": _arr(2.0)}
     p = tmp_path / "s.json"

@@ -76,6 +76,8 @@ python train_model_multi_patch.py --config configs/config_train.yaml --slippage.
 `liquidity_latency_seasonality.json` содержит массивы `liquidity` и
 `latency` для 168 часов недели. Файл может быть как плоским, так и
 вложенным по символам, например `{ "BTCUSDT": {"liquidity": [...], "latency": [...] }}`.
+В качестве шаблона можно использовать `configs/liquidity_latency_seasonality.sample.json`,
+в котором все множители равны `1.0`.
 
 Сезонные множители позволяют масштабировать базовые значения ликвидности и
 задержек для каждого часа недели (от понедельника 00:00 до воскресенья
