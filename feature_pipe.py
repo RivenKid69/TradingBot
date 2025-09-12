@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, TYPE_CHECKING
 
 from transformers import FeatureSpec, OnlineFeatureTransformer
 
 if TYPE_CHECKING:
     from core_contracts import FeaturePipe as FeaturePipeProtocol
+    from core_models import Bar
 
 @dataclass
 class FeatureConfig:
@@ -24,18 +25,27 @@ class FeatureConfig:
 
 
 class FeaturePipe:
+    """Потоковый адаптер для онлайнового трансформера.
+
+    На вход принимает :class:`core_models.Bar` и возвращает словарь фичей,
+    совместимый с :class:`service_signal_runner.FeaturePipe`.
     """
-    Потоковый адаптер, делегирующий в общий онлайновый трансформер.
-    На вход: закрытая 1m kline (dict из binance_ws).
-    На выход: features dict, без утечек во время.
-    """
+
     def __init__(self, cfg: FeatureConfig) -> None:
-        spec = FeatureSpec(lookbacks_prices=list(cfg.lookbacks_prices or [5, 15, 60]), rsi_period=int(cfg.rsi_period))
+        spec = FeatureSpec(
+            lookbacks_prices=list(cfg.lookbacks_prices or [5, 15, 60]),
+            rsi_period=int(cfg.rsi_period),
+        )
         self._tr = OnlineFeatureTransformer(spec)
 
-    def on_kline(self, kline: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        sym = str(kline["symbol"]).upper()
-        close = float(kline["close"])
-        ts_ms = int(kline["close_time"])
-        feats = self._tr.update(symbol=sym, ts_ms=ts_ms, close=close)
-        return feats
+    def warmup(self) -> None:  # pragma: no cover - нет инициализации
+        """Нет тёплого старта для онлайновых фичей."""
+
+    def on_bar(self, bar: "Bar") -> Dict[str, Any]:
+        """Обрабатывает закрытую свечу и возвращает фичи."""
+        feats = self._tr.update(
+            symbol=str(bar.symbol).upper(),
+            ts_ms=int(bar.ts),
+            close=float(bar.close),
+        )
+        return feats or {}
