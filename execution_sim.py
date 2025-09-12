@@ -45,19 +45,18 @@ from config import DataDegradationConfig
 try:
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
     from utils_time import (
-        load_seasonality,
         get_hourly_multiplier,
         get_liquidity_multiplier,
         load_hourly_seasonality,
         watch_seasonality_file,
     )
 except Exception:  # pragma: no cover - fallback when running as standalone file
-    import pathlib, sys
+    import pathlib
+    import sys
 
     sys.path.append(str(pathlib.Path(__file__).resolve().parent))
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
     from utils_time import (
-        load_seasonality,
         get_hourly_multiplier,
         get_liquidity_multiplier,
         load_hourly_seasonality,
@@ -89,7 +88,8 @@ except Exception:  # минимальная замена на случай от�
         def random(seed=None):
             return _R(seed)
 
-        class randomState: ...
+        class randomState:
+            pass
 
         class RandomState:
             def __init__(self, seed=0):
@@ -398,7 +398,16 @@ class _LatencyQueue:
     ):
         self.latency_steps = max(0, int(latency_steps))
         self._q: List[Pending] = []
-        self._rng = rng
+        # Any randomness in the queue (drops / delays) is driven by a dedicated
+        # ``random.Random`` instance so that executions are reproducible when a
+        # seed is provided.  If no RNG is supplied but probabilistic features are
+        # enabled, fall back to a deterministic RNG seeded with ``0``.
+        if rng is not None:
+            self._rng = rng
+        elif drop_prob > 0.0 or dropout_prob > 0.0 or max_delay_steps > 0:
+            self._rng = random.Random(0)
+        else:
+            self._rng = None
         self.drop_prob = float(drop_prob)
         self.dropout_prob = float(dropout_prob)
         self.max_delay_steps = max(0, int(max_delay_steps))
@@ -442,9 +451,11 @@ class _LatencyQueue:
 
 
 class ExecutionSimulator:
-    """
-    Очередь действий + простое исполнение.
-    Поддерживает квантизацию Binance-фильтрами.
+    """Simple order queue with deterministic execution.
+
+    All pseudo-random behaviour inside the simulator (latency dropouts,
+    delays, etc.) is driven by RNGs that are explicitly seeded.  Providing the
+    same seed and inputs therefore yields identical child order trajectories.
     """
 
     def __init__(
@@ -484,6 +495,12 @@ class ExecutionSimulator:
         self.symbol = str(symbol).upper()
         self.latency_steps = int(max(0, latency_steps))
         self.seed = int(seed)
+        # Seed global RNGs for reproducibility of any downstream randomness.
+        random.seed(self.seed)
+        try:
+            np.random.seed(self.seed)
+        except Exception:
+            pass
         try:
             self._rng = np.random.RandomState(seed)  # type: ignore
         except Exception:
@@ -1257,6 +1274,13 @@ class ExecutionSimulator:
     def pop_ready(
         self, now_ts: Optional[int] = None, ref_price: Optional[float] = None
     ) -> ExecReport:
+        """Execute all actions whose latency has elapsed.
+
+        The execution path is completely deterministic: child order timing and
+        quantity depend solely on the provided timestamps, the latency queue and
+        the seeded RNGs.  No new randomness is introduced here, making repeated
+        runs with identical inputs reproducible.
+        """
         ready, timed_out = self._q.pop_ready()
         trades: List[ExecTrade] = []
         cancelled_ids: List[int] = list(self._cancelled_on_submit)
@@ -1377,7 +1401,7 @@ class ExecutionSimulator:
                     continue
 
                 lat_ms = int(p.lat_ms)
-                lat_spike = bool(p.spike)
+                _ = bool(p.spike)  # spike flag unused, kept for diagnostics
 
                 for child in plan:
                     ts_fill = int(ts + int(child.ts_offset_ms) + lat_ms)
