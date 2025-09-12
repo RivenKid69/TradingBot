@@ -13,3 +13,9 @@
     - [Process checklist](docs/seasonality_checklist.md)
     - [Example notebook](docs/seasonality_example.md)
     - [Migration guide](docs/seasonality_migration.md)
+
+### Deprecated
+- `LatencyImpl.dump_latency_multipliers` and
+  `LatencyImpl.load_latency_multipliers` have been replaced by
+  `dump_multipliers` and `load_multipliers`. The old names continue to work but
+  emit `DeprecationWarning`. See the migration guide for details.

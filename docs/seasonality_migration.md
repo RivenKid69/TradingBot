@@ -21,3 +21,10 @@ under a different name, for example `--key latency`.
 The helper functions in `utils_time.py` (`load_hourly_seasonality` and
 `load_seasonality`) no longer support legacy structures. Convert old files with
 the script above before loading them to avoid errors.
+
+## API changes
+
+`LatencyImpl.dump_latency_multipliers` and `LatencyImpl.load_latency_multipliers`
+have been renamed to `dump_multipliers` and `load_multipliers`. The previous
+methods remain available for backward compatibility but emit a
+`DeprecationWarning`. Update any custom code to use the new method names.
