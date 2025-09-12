@@ -21,6 +21,43 @@ DEFAULT_SCENARIOS = {
 }
 
 
+def apply_fee_spread(
+    trades_df: pd.DataFrame, fee_mult: float, spread_mult: float
+) -> pd.DataFrame:
+    """Return a copy of ``trades_df`` with fee and spread adjustments applied.
+
+    Parameters
+    ----------
+    trades_df:
+        DataFrame containing trade information with ``fees`` and ``spread_bps``
+        columns.
+    fee_mult:
+        Multiplier applied to the ``fees`` column.
+    spread_mult:
+        Multiplier applied to the ``spread_bps`` column.
+
+    Raises
+    ------
+    ValueError
+        If either ``fees`` or ``spread_bps`` column is missing.
+
+    Returns
+    -------
+    pd.DataFrame
+        The modified DataFrame with adjusted ``fees`` and ``spread_bps``.
+    """
+
+    required = {"fees", "spread_bps"}
+    missing = required - set(trades_df.columns)
+    if missing:
+        raise ValueError(f"missing required columns: {sorted(missing)}")
+
+    df = trades_df.copy()
+    df["fees"] *= fee_mult
+    df["spread_bps"] *= spread_mult
+    return df
+
+
 def _bucket_stats(df: pd.DataFrame, quantiles: int) -> pd.DataFrame:
     """Return per-order-size bucket spread/slippage statistics."""
     required = {"order_size", "spread_bps", "slippage_bps"}
