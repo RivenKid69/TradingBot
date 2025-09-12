@@ -214,6 +214,18 @@ def main() -> None:
     trades_df = read_any(trades_path.as_posix())
     hist_trades_df = read_any(args.historical_trades)
 
+    scenario_metrics: dict[str, dict] = {}
+    for name in scenario_names:
+        params = scenarios.get(name, {})
+        df = trades_df.copy()
+        df = apply_fee_spread(
+            df,
+            params.get("fee_mult", 1.0),
+            params.get("spread_mult", 1.0),
+        )
+        eq_df = equity_from_trades(df)
+        scenario_metrics[name] = calculate_metrics(df, eq_df)
+
     equity_df = read_any(args.equity) if args.equity else equity_from_trades(trades_df)
     benchmark_df = read_any(args.benchmark)
 
@@ -301,6 +313,7 @@ def main() -> None:
         "latency_ms": latency_summary,
         "order_fill": fill_summary,
         "cancellations": cancel_summary,
+        "scenario_metrics": scenario_metrics,
         "flags": flags,
     }
 
