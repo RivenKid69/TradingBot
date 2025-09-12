@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Any, List, Sequence
-import json
-import os
 import importlib.util
 import sysconfig
 from pathlib import Path
@@ -198,19 +196,17 @@ class LatencyImpl:
                 expected_hash=cfg.seasonality_hash,
             )
             from utils_time import interpolate_daily_multipliers, daily_from_hourly
-            if arr is None or len(arr) not in (7, 168):
+            if arr is None:
                 logger.warning(
-                    "Latency seasonality config %s not found or invalid; using default multipliers.",
+                    "Seasonality helper returned no multipliers for %s; using default multipliers.",
                     path,
                 )
                 self._has_seasonality = False
             else:
-                if cfg.seasonality_day_only:
-                    if len(arr) == 168:
-                        arr = daily_from_hourly(arr)
-                else:
-                    if len(arr) == 7:
-                        arr = interpolate_daily_multipliers(arr)
+                if cfg.seasonality_day_only and arr.size == 168:
+                    arr = daily_from_hourly(arr)
+                elif not cfg.seasonality_day_only and arr.size == 7:
+                    arr = interpolate_daily_multipliers(arr)
                 self.latency = [float(x) for x in arr]
             if not self._has_seasonality:
                 logger.warning(
@@ -223,28 +219,25 @@ class LatencyImpl:
                 override = load_hourly_seasonality(o_path, "latency", symbol=cfg.symbol)
                 if override is None:
                     logger.warning(
-                        "Latency override %s not found or invalid; ignoring.", o_path
+                        "Seasonality helper returned no multipliers for override %s; ignoring.",
+                        o_path,
                     )
             if override is not None:
                 arr = np.asarray(override, dtype=float)
-                if cfg.seasonality_day_only:
-                    if len(arr) == 168:
-                        arr = daily_from_hourly(arr)
-                    elif len(arr) != 7:
-                        arr = None
+                if cfg.seasonality_day_only and arr.size == 168:
+                    arr = daily_from_hourly(arr)
+                elif not cfg.seasonality_day_only and arr.size == 7:
+                    arr = interpolate_daily_multipliers(arr)
+                if arr.size != len(self.latency):
+                    logger.warning(
+                        "Latency override array length %s does not match expected %s; ignoring.",
+                        arr.size,
+                        len(self.latency),
+                    )
                 else:
-                    if len(arr) == 7:
-                        arr = interpolate_daily_multipliers(arr)
-                    elif len(arr) != 168:
-                        arr = None
-                if arr is not None:
                     self.latency = (
                         np.asarray(self.latency, dtype=float) * arr
                     ).tolist()
-                else:
-                    logger.warning(
-                        "Latency override array must have length 168 or 7; ignoring."
-                    )
         self.latency = validate_multipliers(self.latency, expected_len=len(self.latency))
         self.attached_sim = None
         self._wrapper: _LatencyWithSeasonality | None = None
