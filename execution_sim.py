@@ -510,7 +510,9 @@ class ExecutionSimulator:
                 if liq_arr is None:
                     liq_arr = load_hourly_seasonality(path, "liquidity")
                 if spread_arr is None:
-                    spread_arr = load_hourly_seasonality(path, "spread", "latency")
+                    # Prefer the dedicated "spread" field, falling back to generic
+                    # "multipliers" for backwards compatibility with older configs.
+                    spread_arr = load_hourly_seasonality(path, "spread", "multipliers")
 
             from utils_time import interpolate_daily_multipliers, daily_from_hourly
 
@@ -570,7 +572,7 @@ class ExecutionSimulator:
                     )
                 if spread_override is None:
                     spread_override = load_hourly_seasonality(
-                        override_path, "spread", "latency"
+                        override_path, "spread", "multipliers"
                     )
 
             liq_override = _prep(liq_override)
