@@ -16,7 +16,7 @@ from services.metrics import (
 
 DEFAULT_SCENARIOS = {
     "Low": {"fee_mult": 0.5, "spread_mult": 0.5},
-    "Base": {"fee_mult": 1.0, "spread_mult": 1.0},
+    "Med": {"fee_mult": 1.0, "spread_mult": 1.0},
     "High": {"fee_mult": 1.5, "spread_mult": 1.5},
 }
 
@@ -141,6 +141,7 @@ def _cancel_stats(df: pd.DataFrame) -> dict:
             except Exception:
                 try:
                     import ast
+
                     return ast.literal_eval(m)
                 except Exception:
                     return {}
@@ -157,7 +158,9 @@ def main() -> None:
         description="Generate reality check report for simulated vs benchmark logs",
     )
     parser.add_argument(
-        "--trades", required=True, help="Path to simulated trade log (CSV or Parquet)",
+        "--trades",
+        required=True,
+        help="Path to simulated trade log (CSV or Parquet)",
     )
     parser.add_argument(
         "--historical-trades",
@@ -195,6 +198,12 @@ def main() -> None:
         default=None,
         help="Comma-separated list of scenarios to include",
     )
+    parser.add_argument(
+        "--sensitivity-threshold",
+        type=float,
+        default=0.2,
+        help="Relative KPI change threshold triggering sensitivity flag",
+    )
     args = parser.parse_args()
 
     scenarios = DEFAULT_SCENARIOS.copy()
@@ -214,8 +223,19 @@ def main() -> None:
     trades_df = read_any(trades_path.as_posix())
     hist_trades_df = read_any(args.historical_trades)
 
-    scenario_metrics: dict[str, dict] = {}
+    baseline_params = scenarios.get("Med", {})
+    base_df = apply_fee_spread(
+        trades_df.copy(),
+        baseline_params.get("fee_mult", 1.0),
+        baseline_params.get("spread_mult", 1.0),
+    )
+    base_eq = equity_from_trades(base_df)
+    baseline_metrics = calculate_metrics(base_df, base_eq)
+
+    scenario_metrics: dict[str, dict] = {"Med": baseline_metrics}
     for name in scenario_names:
+        if name == "Med":
+            continue
         params = scenarios.get(name, {})
         df = trades_df.copy()
         df = apply_fee_spread(
@@ -225,6 +245,24 @@ def main() -> None:
         )
         eq_df = equity_from_trades(df)
         scenario_metrics[name] = calculate_metrics(df, eq_df)
+
+    baseline_kpi = baseline_metrics["equity"].get("pnl_total", 0.0)
+    degradation_rows = []
+    flags: dict[str, str] = {}
+    for name, metrics in scenario_metrics.items():
+        kpi = metrics.get("equity", {}).get("pnl_total", float("nan"))
+        rel_change = (
+            (kpi - baseline_kpi) / baseline_kpi if baseline_kpi else float("nan")
+        )
+        degradation_rows.append(
+            {"scenario": name, "kpi": kpi, "relative_change": rel_change}
+        )
+        if name != "Med" and abs(rel_change) > args.sensitivity_threshold:
+            flags[f"scenario.{name}"] = "чрезмерная чувствительность"
+
+    degradation_ranking = pd.DataFrame(degradation_rows).sort_values(
+        "kpi", ascending=False
+    )
 
     equity_df = read_any(args.equity) if args.equity else equity_from_trades(trades_df)
     benchmark_df = read_any(args.benchmark)
@@ -253,8 +291,6 @@ def main() -> None:
         "order_fill": sim_fill,
         "cancellations": sim_cancel,
     }
-
-    flags: dict[str, str] = {}
 
     def _check(values: dict, specs: dict, prefix: str = "") -> None:
         for key, spec in specs.items():
@@ -285,6 +321,12 @@ def main() -> None:
     bucket_df.to_csv(bucket_csv, index=False)
     bucket_df.to_json(bucket_json, orient="records", indent=2)
 
+    degr_base = out_dir / "sim_reality_check_degradation"
+    degr_csv = degr_base.with_suffix(".csv")
+    degr_json = degr_base.with_suffix(".json")
+    degradation_ranking.to_csv(degr_csv, index=False)
+    degradation_ranking.to_json(degr_json, orient="records", indent=2)
+
     try:
         import matplotlib.pyplot as plt
 
@@ -314,6 +356,7 @@ def main() -> None:
         "order_fill": fill_summary,
         "cancellations": cancel_summary,
         "scenario_metrics": scenario_metrics,
+        "degradation_ranking": degradation_ranking.to_dict(orient="records"),
         "flags": flags,
     }
 
@@ -328,6 +371,16 @@ def main() -> None:
             f.write("## KPI Flags\n")
             for k, v in flags.items():
                 f.write(f"- {k}: {v}\n")
+            f.write("\n")
+        f.write("## Degradation Ranking\n")
+        try:
+            f.write(degradation_ranking.to_markdown(index=False))
+            f.write("\n\n")
+        except Exception:
+            for row in degradation_ranking.to_dict(orient="records"):
+                f.write(
+                    f"- {row['scenario']}: kpi={row['kpi']}, change={row['relative_change']:.2%}\n"
+                )
             f.write("\n")
         f.write("## Simulation Metrics\n")
         for section, metrics in sim_metrics.items():
@@ -361,6 +414,7 @@ def main() -> None:
 
     print(f"Saved reports to {json_path} and {md_path}")
     print(f"Saved bucket stats to {bucket_csv} and {bucket_png}")
+    print(f"Saved degradation ranking to {degr_csv}")
     if flags:
         print("Unrealistic KPIs detected:")
         for k, v in flags.items():
@@ -369,4 +423,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
