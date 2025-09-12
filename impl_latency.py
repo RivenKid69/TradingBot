@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - fallback when module not found
     def seasonality_enabled(default: bool = True) -> bool:
         return default
 
-from utils.time import hour_of_week
+from utils_time import hour_of_week
 from utils.prometheus import Counter
 
 _logging_spec = importlib.util.spec_from_file_location(
@@ -109,9 +109,9 @@ class _LatencyWithSeasonality:
     def sample(self, ts_ms: int | None = None):
         if ts_ms is None:
             return self._model.sample()
-        # Use the shared hour_of_week helper: (ts_ms // HOUR_MS + 72) % 168
-        # yields an index where Monday 00:00 UTC == 0. ts_ms must therefore be
-        # a UTC timestamp.  Wrap the result to the multiplier array length.
+        # Convert milliseconds since epoch to hour-of-week (0=Mon 00:00 UTC)
+        # using the shared helper.  Wrap the result to the multiplier array
+        # length for day-only configurations.
         hour = hour_of_week(int(ts_ms)) % len(self._mult)
         m = get_latency_multiplier(int(ts_ms), self._mult, interpolate=self._interpolate)
         with self._lock:
