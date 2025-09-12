@@ -568,11 +568,15 @@ class ExecutionSimulator:
         )
 
         # слиппедж
-        self.slippage_cfg = (
-            SlippageConfig.from_dict(slippage_config)
-            if (SlippageConfig is not None and slippage_config is not None)
-            else None
-        )
+        self.slippage_cfg = None
+        if SlippageConfig is not None and slippage_config is not None:
+            if isinstance(slippage_config, str):
+                try:
+                    self.slippage_cfg = SlippageConfig.from_file(slippage_config)
+                except Exception:
+                    logger.exception("failed to load slippage config from %s", slippage_config)
+            elif isinstance(slippage_config, dict):
+                self.slippage_cfg = SlippageConfig.from_dict(slippage_config)
 
         # исполнители
         self._execution_cfg = dict(execution_config or {})
