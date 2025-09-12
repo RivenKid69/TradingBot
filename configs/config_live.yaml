@@ -3,6 +3,9 @@ run_id: live-run
 logs_dir: logs
 artifacts_dir: artifacts
 seasonality_log_level: INFO
+execution_config:
+  notional_threshold: 10000.0
+  large_order_algo: TWAP
 max_signals_per_sec: 5.0
 backoff_base_s: 2.0
 max_backoff_s: 60.0
