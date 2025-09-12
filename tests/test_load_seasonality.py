@@ -61,6 +61,15 @@ def test_load_seasonality_bad_length(tmp_path):
         load_seasonality(str(p))
 
 
+def test_seasonality_negative_values(tmp_path):
+    p = tmp_path / "neg.json"
+    p.write_text(json.dumps({"liquidity": [-1.0] * HOURS_IN_WEEK}))
+    with pytest.raises(ValueError):
+        load_seasonality(str(p))
+    with pytest.raises(ValueError):
+        load_hourly_seasonality(str(p), "liquidity")
+
+
 def test_seasonality_clamping(tmp_path):
     data = {
         "liquidity": [0.01] * HOURS_IN_WEEK,
