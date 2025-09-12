@@ -4,6 +4,11 @@ run_id: default-run
 logs_dir: logs
 artifacts_dir: artifacts
 seasonality_log_level: INFO
+# Rate limiter configuration for outbound signals
+# max_signals_per_sec: 0 disables limiting
+max_signals_per_sec: 0.0
+backoff_base_s: 2.0
+max_backoff_s: 60.0
 execution_profile: MKT_OPEN_NEXT_H1
 execution_params:
   slippage_bps: 0.0

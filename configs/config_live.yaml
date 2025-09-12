@@ -3,6 +3,9 @@ run_id: live-run
 logs_dir: logs
 artifacts_dir: artifacts
 seasonality_log_level: INFO
+max_signals_per_sec: 5.0
+backoff_base_s: 2.0
+max_backoff_s: 60.0
 api:
   api_key: null
   api_secret: null

@@ -112,8 +112,8 @@ class Mediator:
         seed: int = 0,
         latency_cfg: dict | None = None,
         rate_limit: float | None = None,
-        backoff_base: float = 2.0,
-        max_backoff: float = 60.0,
+        backoff_base: float | None = None,
+        max_backoff: float | None = None,
     ):
         """
         env_ref — ссылка на «среду» (должна держать .state и, опционально, .lob)
@@ -123,6 +123,14 @@ class Mediator:
         latency_cfg — параметры модели латентности для ExecutionSimulator
         """
         self.env = env_ref
+        rc = getattr(env_ref, "run_config", None)
+
+        if rate_limit is None and rc is not None:
+            rate_limit = getattr(rc, "max_signals_per_sec", None)
+        if backoff_base is None:
+            backoff_base = getattr(rc, "backoff_base_s", 2.0) if rc is not None else 2.0
+        if max_backoff is None:
+            max_backoff = getattr(rc, "max_backoff_s", 60.0) if rc is not None else 60.0
 
         # EventBus
         try:
@@ -163,7 +171,6 @@ class Mediator:
         self._use_exec = bool(use_exec_sim and _HAVE_EXEC_SIM)
 
         if latency_cfg is None:
-            rc = getattr(env_ref, "run_config", None)
             if rc is not None:
                 latency_cfg = getattr(rc, "latency", None)
 
@@ -188,7 +195,6 @@ class Mediator:
         # Quantizer (shared with ExecutionSimulator)
         self.quantizer = None
         self.enforce_ppbs = True
-        rc = getattr(env_ref, "run_config", None)
         qcfg = getattr(rc, "quantizer", {}) if rc is not None else {}
         filters_path = qcfg.get("path", "")
         strict = bool(qcfg.get("strict", True))

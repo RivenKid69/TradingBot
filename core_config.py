@@ -45,6 +45,12 @@ class CommonRunConfig(BaseModel):
     liquidity_seasonality_path: Optional[str] = Field(default=None)
     liquidity_seasonality_hash: Optional[str] = Field(default=None)
     seasonality_log_level: str = Field(default="INFO", description="Logging level for seasonality namespace")
+    max_signals_per_sec: Optional[float] = Field(
+        default=None,
+        description="Maximum outbound signals per second; non-positive disables limiting.",
+    )
+    backoff_base_s: float = Field(default=2.0, description="Initial backoff in seconds for rate limiter")
+    max_backoff_s: float = Field(default=60.0, description="Maximum backoff in seconds for rate limiter")
     components: Components
 
 
