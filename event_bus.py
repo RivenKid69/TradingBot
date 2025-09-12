@@ -12,6 +12,7 @@ import os
 import time
 from dataclasses import asdict, is_dataclass
 from multiprocessing import Lock
+from utils.prometheus import Counter
 
 # Уровень событий: NONE=0, SUMMARY=1, FULL=2
 class EventLevel(int):
@@ -51,6 +52,40 @@ class _BusState:
         self.initialized = False
 
 _STATE = _BusState()
+
+# Prometheus counters for signal rate limiting
+_SIGNALS_TOTAL = Counter(
+    "signals_total",
+    "Total number of outbound trading signals",
+)
+_SIGNALS_DELAYED = Counter(
+    "signals_delayed",
+    "Signals delayed due to rate limiting",
+)
+_SIGNALS_REJECTED = Counter(
+    "signals_rejected",
+    "Signals rejected due to rate limiting",
+)
+
+
+def log_signal_metric(status: str) -> None:
+    """Emit signal rate limiter metrics and optional risk events."""
+    try:
+        _SIGNALS_TOTAL.inc()
+        if status == "delayed":
+            _SIGNALS_DELAYED.inc()
+            try:
+                log_risk({"etype": "SIGNAL_DELAYED"})
+            except Exception:
+                pass
+        elif status == "rejected":
+            _SIGNALS_REJECTED.inc()
+            try:
+                log_risk({"etype": "SIGNAL_REJECTED"})
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def _ensure_open():
     """Открывает файлы, если ещё не открыты. Потокобезопасно."""
