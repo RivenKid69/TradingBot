@@ -27,6 +27,8 @@ slippage:
 
 execution:
   algo: "TWAP"
+  notional_threshold: 10000.0
+  large_order_algo: TWAP
   twap:
     parts: 6
     child_interval_s: 600
