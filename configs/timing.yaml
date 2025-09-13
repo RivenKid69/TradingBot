@@ -1,0 +1,3 @@
+enforce_closed_bars: true
+timeframe_ms: 60000
+close_lag_ms: 2000
