@@ -13,6 +13,12 @@ execution_config:
 max_signals_per_sec: 5.0
 backoff_base_s: 2.0
 max_backoff_s: 60.0
+clock_sync:
+  refresh_sec: 300        # How often to resync clocks in seconds
+  warn_threshold_ms: 500  # Log warning if drift exceeds this many milliseconds
+  kill_threshold_ms: 2000 # Terminate if drift exceeds this many milliseconds
+  max_step_ms: 1000       # Max single adjustment step in milliseconds
+  attempts: 5             # Number of sync attempts before giving up
 api:
   api_key: null
   api_secret: null
