@@ -5,8 +5,8 @@ import asyncio
 import json
 import logging
 import random
-import time
 from typing import Awaitable, Callable, List
+from clock import now_ms
 
 from decimal import Decimal
 
@@ -95,15 +95,15 @@ class BinanceWS:
             self._rl_total += 1
             return True
         self._rl_total += 1
-        allowed, status = self._rate_limiter.can_send()
+        allowed, status = self._rate_limiter.can_send(now_ms() / 1000.0)
         if allowed:
             return True
         if status == "rejected":
             self._rl_delayed += 1
-            wait = max(self._rate_limiter._cooldown_until - time.time(), 0.0)
+            wait = max(self._rate_limiter._cooldown_until - now_ms() / 1000.0, 0.0)
             if wait > 0:
                 await asyncio.sleep(wait)
-            allowed, _ = self._rate_limiter.can_send()
+            allowed, _ = self._rate_limiter.can_send(now_ms() / 1000.0)
             return allowed
         self._rl_dropped += 1
         return False
