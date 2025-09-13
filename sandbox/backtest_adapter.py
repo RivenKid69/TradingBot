@@ -7,6 +7,8 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
+import clock
+from utils_time import floor_to_timeframe, is_bar_closed
 
 from core_contracts import SignalPolicy, PolicyCtx
 from core_models import Order, Side
@@ -71,6 +73,21 @@ class NoTradeConfig:
         )
 
 
+@dataclass
+class TimingConfig:
+    enforce_closed_bars: bool = True
+    timeframe_ms: int = 60_000
+    close_lag_ms: int = 2000
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TimingConfig":
+        return cls(
+            enforce_closed_bars=bool(d.get("enforce_closed_bars", True)),
+            timeframe_ms=int(d.get("timeframe_ms", 60_000)),
+            close_lag_ms=int(d.get("close_lag_ms", 2000)),
+        )
+
+
 class BacktestAdapter:
     """
     Простой бэктестер по уже собранной таблице (например, data/train.parquet):
@@ -96,12 +113,14 @@ class BacktestAdapter:
         guards_config: Optional[Dict[str, Any]] = None,
         signal_cooldown_s: int = 0,
         no_trade_config: Optional[Dict[str, Any]] = None,
+        timing_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.policy = policy
         self.sim = sim_bridge
         self._dyn = DynSpreadConfig.from_dict(dynamic_spread_config or {})
         self._guards = GuardsConfig.from_dict(guards_config or {})
         self._no_trade = NoTradeConfig.from_dict(no_trade_config or {})
+        self._timing = TimingConfig.from_dict(timing_config or {})
         self._last_ref_by_symbol: Dict[str, float] = {}
 
         # спецификации биржи
@@ -318,10 +337,32 @@ class BacktestAdapter:
         out_reports: List[Dict[str, Any]] = []
         has_hl = ("high" in df.columns) and ("low" in df.columns)
 
+        logger = logging.getLogger(__name__)
+        skip_cnt = 0
+        try:
+            from service_signal_runner import skipped_incomplete_bars  # type: ignore
+        except Exception:  # pragma: no cover - optional metric
+            skipped_incomplete_bars = None
+
         for _, row in df.iterrows():
             ts = int(row[ts_col])
             sym = str(row[symbol_col]).upper()
             ref = float(row[price_col])
+
+            if self._timing.enforce_closed_bars:
+                close_ts = floor_to_timeframe(ts, self._timing.timeframe_ms) + self._timing.timeframe_ms
+                if not is_bar_closed(close_ts, clock.now_ms(), self._timing.close_lag_ms):
+                    skip_cnt += 1
+                    try:
+                        logger.info("SKIP_INCOMPLETE_BAR")
+                    except Exception:
+                        pass
+                    if skipped_incomplete_bars is not None:
+                        try:
+                            skipped_incomplete_bars.labels(sym).inc()
+                        except Exception:
+                            pass
+                    continue
 
             feats: Dict[str, Any] = {}
             for c in df.columns:
@@ -378,5 +419,10 @@ class BacktestAdapter:
                 orders=orders,
             )
             out_reports.append({**rep, "symbol": sym, "ts_ms": ts, "core_order_intents": core_order_intents})
+        if skip_cnt:
+            try:
+                logger.info("Skipped %d incomplete bars", skip_cnt)
+            except Exception:
+                pass
 
         return out_reports
