@@ -11,6 +11,7 @@ from compat_shims import sim_report_dict_to_core_exec_reports
 from event_bus import log_trade_exec as _bus_log_trade_exec
 from core_contracts import MarketDataSource
 from core_config import CommonRunConfig
+from services.monitoring import skipped_incomplete_bars
 
 _TF_MS = {
     "1s": 1_000,
@@ -129,21 +130,16 @@ class SimAdapter:
           - возвращаем отчёт симулятора, расширенный служебными полями
         """
         prev_close: Optional[float] = None
-        try:
-            from service_signal_runner import skipped_incomplete_bars  # type: ignore
-        except Exception:
-            skipped_incomplete_bars = None
 
         try:
             for bar in self.source.stream_bars([self.symbol], self.interval_ms):
                 if bar.symbol != self.symbol:
                     continue
                 if self.enforce_closed_bars and not getattr(bar, "is_final", True):
-                    if skipped_incomplete_bars is not None:
-                        try:
-                            skipped_incomplete_bars.labels(bar.symbol).inc()
-                        except Exception:
-                            pass
+                    try:
+                        skipped_incomplete_bars.labels(bar.symbol).inc()
+                    except Exception:
+                        pass
                     continue
 
                 orders: Sequence[Order] = list(provider.on_bar(bar) or [])

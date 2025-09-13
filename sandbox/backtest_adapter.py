@@ -14,6 +14,7 @@ from core_contracts import SignalPolicy, PolicyCtx
 from core_models import Order, Side
 from sandbox.sim_adapter import SimAdapter
 from exchange.specs import load_specs, round_price_to_tick
+from services.monitoring import skipped_incomplete_bars
 
 
 @dataclass
@@ -339,10 +340,6 @@ class BacktestAdapter:
 
         logger = logging.getLogger(__name__)
         skip_cnt = 0
-        try:
-            from service_signal_runner import skipped_incomplete_bars  # type: ignore
-        except Exception:  # pragma: no cover - optional metric
-            skipped_incomplete_bars = None
 
         for _, row in df.iterrows():
             ts = int(row[ts_col])
@@ -357,11 +354,10 @@ class BacktestAdapter:
                         logger.info("SKIP_INCOMPLETE_BAR")
                     except Exception:
                         pass
-                    if skipped_incomplete_bars is not None:
-                        try:
-                            skipped_incomplete_bars.labels(sym).inc()
-                        except Exception:
-                            pass
+                    try:
+                        skipped_incomplete_bars.labels(sym).inc()
+                    except Exception:
+                        pass
                     continue
 
             feats: Dict[str, Any] = {}
