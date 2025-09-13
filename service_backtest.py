@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+import logging
 import os
 import pandas as pd
 
@@ -139,6 +140,8 @@ def from_config(
         run_id=bt_kwargs.get("run_id") or cfg.run_id,
         timing_config=bt_kwargs.get("timing_config") or cfg.timing.dict(),
     )
+
+    logging.getLogger(__name__).info("timing settings: %s", svc_cfg.timing_config)
 
     data_path = getattr(cfg.data, "prices_path", None)
     if data_path is None:

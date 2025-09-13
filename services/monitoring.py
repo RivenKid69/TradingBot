@@ -45,6 +45,13 @@ clock_sync_fail = Counter(
     "Total number of failed clock synchronization attempts",
 )
 
+# Bars dropped because they were not fully closed
+skipped_incomplete_bars = Counter(
+    "skipped_incomplete_bars",
+    "Bars dropped because not closed",
+    ["symbol"],
+)
+
 _last_sync_ts_ms: float = 0.0
 
 
@@ -95,6 +102,7 @@ def clock_sync_age_seconds() -> float:
 
 
 __all__ = [
+    "skipped_incomplete_bars",
     "clock_sync_fail",
     "clock_sync_success",
     "report_clock_sync",

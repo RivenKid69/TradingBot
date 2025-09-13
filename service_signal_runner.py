@@ -26,20 +26,14 @@ import threading
 
 import clock
 from services import monitoring
+from services.monitoring import skipped_incomplete_bars
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig, ClockSyncConfig
-from utils.prometheus import Counter
 import di_registry
-
-skipped_incomplete_bars = Counter(
-    "skipped_incomplete_bars_total",
-    "Total number of skipped incomplete bars",
-    ["symbol"],
-)
 
 
 class RiskGuards(Protocol):
@@ -251,6 +245,8 @@ def from_config(
     snapshot_config_path: str | None = None,
 ) -> Iterator[Dict[str, Any]]:
     """Build dependencies from ``cfg`` and run :class:`ServiceSignalRunner`."""
+
+    logging.getLogger(__name__).info("timing settings: %s", cfg.timing.dict())
 
     svc_cfg = SignalRunnerConfig(
         snapshot_config_path=snapshot_config_path,
