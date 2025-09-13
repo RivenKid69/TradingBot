@@ -20,7 +20,10 @@ class ComponentSpec(BaseModel):
     Описание компонента для DI. target — dotted path "module:Class",
     params — аргументы конструктора.
     """
-    target: str = Field(..., description='Например: "impl_offline_data:OfflineBarSource"')
+
+    target: str = Field(
+        ..., description='Например: "impl_offline_data:OfflineBarSource"'
+    )
     params: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -28,6 +31,7 @@ class Components(BaseModel):
     """
     Карта используемых компонентов запуском.
     """
+
     market_data: ComponentSpec
     executor: ComponentSpec
     feature_pipe: ComponentSpec
@@ -39,29 +43,56 @@ class Components(BaseModel):
 class ClockSyncConfig(BaseModel):
     """Настройки синхронизации часов между процессами."""
 
-    refresh_sec: float = Field(default=60.0, description="How often to refresh clock sync in seconds")
-    warn_threshold_ms: float = Field(default=500.0, description="Log warning if drift exceeds this many ms")
-    kill_threshold_ms: float = Field(default=2000.0, description="Enter safe mode if drift exceeds this many ms")
+    refresh_sec: float = Field(
+        default=60.0, description="How often to refresh clock sync in seconds"
+    )
+    warn_threshold_ms: float = Field(
+        default=500.0, description="Log warning if drift exceeds this many ms"
+    )
+    kill_threshold_ms: float = Field(
+        default=2000.0, description="Enter safe mode if drift exceeds this many ms"
+    )
     attempts: int = Field(default=5, description="Number of samples per sync attempt")
-    ema_alpha: float = Field(default=0.1, description="EMA coefficient for skew updates")
-    max_step_ms: float = Field(default=1000.0, description="Maximum skew adjustment per sync in ms")
+    ema_alpha: float = Field(
+        default=0.1, description="EMA coefficient for skew updates"
+    )
+    max_step_ms: float = Field(
+        default=1000.0, description="Maximum skew adjustment per sync in ms"
+    )
+
+
+class TimingConfig(BaseModel):
+    """Настройки тайминга обработки баров и задержек закрытия."""
+
+    enforce_closed_bars: bool = Field(default=True)
+    timeframe_ms: int = Field(default=60_000)
+    close_lag_ms: int = Field(default=2000)
 
 
 class CommonRunConfig(BaseModel):
-    run_id: Optional[str] = Field(default=None, description="Идентификатор запуска; если None — генерируется.")
+    run_id: Optional[str] = Field(
+        default=None, description="Идентификатор запуска; если None — генерируется."
+    )
     seed: Optional[int] = Field(default=None)
     logs_dir: str = Field(default="logs")
     artifacts_dir: str = Field(default="artifacts")
     timezone: Optional[str] = None
     liquidity_seasonality_path: Optional[str] = Field(default=None)
     liquidity_seasonality_hash: Optional[str] = Field(default=None)
-    seasonality_log_level: str = Field(default="INFO", description="Logging level for seasonality namespace")
+    seasonality_log_level: str = Field(
+        default="INFO", description="Logging level for seasonality namespace"
+    )
     max_signals_per_sec: Optional[float] = Field(
         default=None,
         description="Maximum outbound signals per second; non-positive disables limiting.",
     )
-    backoff_base_s: float = Field(default=2.0, description="Initial backoff in seconds for rate limiter")
-    max_backoff_s: float = Field(default=60.0, description="Maximum backoff in seconds for rate limiter")
+    backoff_base_s: float = Field(
+        default=2.0, description="Initial backoff in seconds for rate limiter"
+    )
+    max_backoff_s: float = Field(
+        default=60.0, description="Maximum backoff in seconds for rate limiter"
+    )
+    timing: TimingConfig = Field(default_factory=TimingConfig)
     clock_sync: ClockSyncConfig = Field(default_factory=ClockSyncConfig)
     components: Components
 
@@ -86,11 +117,14 @@ class SimulationDataConfig(BaseModel):
     timeframe: str = Field(..., description="Например: '1m', '5m'")
     start_ts: Optional[int] = None
     end_ts: Optional[int] = None
-    prices_path: Optional[str] = Field(default=None, description="Путь к parquet/csv с историческими данными.")
+    prices_path: Optional[str] = Field(
+        default=None, description="Путь к parquet/csv с историческими данными."
+    )
 
 
 class SimulationConfig(CommonRunConfig):
     mode: str = Field(default="sim")
+    timing: TimingConfig = Field(default_factory=TimingConfig)
     market: Literal["spot", "futures"] = Field(default="spot")
     symbols: List[str] = Field(default_factory=list)
     quantizer: Dict[str, Any] = Field(default_factory=dict)
@@ -101,7 +135,9 @@ class SimulationConfig(CommonRunConfig):
     no_trade: Dict[str, Any] = Field(default_factory=dict)
     data: SimulationDataConfig
     limits: Dict[str, Any] = Field(default_factory=dict)
-    execution_profile: ExecutionProfile = Field(default=ExecutionProfile.MKT_OPEN_NEXT_H1)
+    execution_profile: ExecutionProfile = Field(
+        default=ExecutionProfile.MKT_OPEN_NEXT_H1
+    )
     execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
 
     @validator("symbols", always=True)
@@ -161,7 +197,9 @@ class TrainConfig(CommonRunConfig):
     no_trade: Dict[str, Any] = Field(default_factory=dict)
     data: TrainDataConfig
     model: ModelConfig
-    execution_profile: ExecutionProfile = Field(default=ExecutionProfile.MKT_OPEN_NEXT_H1)
+    execution_profile: ExecutionProfile = Field(
+        default=ExecutionProfile.MKT_OPEN_NEXT_H1
+    )
     execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
 
     @validator("symbols", always=True)
@@ -179,8 +217,12 @@ class EvalInputConfig(BaseModel):
 class EvalConfig(CommonRunConfig):
     mode: str = Field(default="eval")
     input: EvalInputConfig
-    metrics: List[str] = Field(default_factory=lambda: ["sharpe", "sortino", "mdd", "pnl"])
-    execution_profile: ExecutionProfile = Field(default=ExecutionProfile.MKT_OPEN_NEXT_H1)
+    metrics: List[str] = Field(
+        default_factory=lambda: ["sharpe", "sortino", "mdd", "pnl"]
+    )
+    execution_profile: ExecutionProfile = Field(
+        default=ExecutionProfile.MKT_OPEN_NEXT_H1
+    )
     execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
     all_profiles: bool = Field(default=False)
 
@@ -242,6 +284,7 @@ __all__ = [
     "ComponentSpec",
     "Components",
     "ClockSyncConfig",
+    "TimingConfig",
     "CommonRunConfig",
     "SimulationDataConfig",
     "SimulationConfig",
