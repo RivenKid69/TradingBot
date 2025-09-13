@@ -36,6 +36,13 @@ class Components(BaseModel):
     backtest_engine: Optional[ComponentSpec] = None
 
 
+class ClockSyncConfig(BaseModel):
+    """Настройки синхронизации часов между процессами."""
+
+    refresh: float = Field(default=60.0, description="How often to refresh clock sync in seconds")
+    threshold: float = Field(default=1.0, description="Threshold in seconds to trigger resync")
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(default=None, description="Идентификатор запуска; если None — генерируется.")
     seed: Optional[int] = Field(default=None)
@@ -51,6 +58,7 @@ class CommonRunConfig(BaseModel):
     )
     backoff_base_s: float = Field(default=2.0, description="Initial backoff in seconds for rate limiter")
     max_backoff_s: float = Field(default=60.0, description="Maximum backoff in seconds for rate limiter")
+    clock_sync: ClockSyncConfig = Field(default_factory=ClockSyncConfig)
     components: Components
 
 
@@ -229,6 +237,7 @@ def _set_seasonality_log_level(cfg: CommonRunConfig) -> None:
 __all__ = [
     "ComponentSpec",
     "Components",
+    "ClockSyncConfig",
     "CommonRunConfig",
     "SimulationDataConfig",
     "SimulationConfig",
