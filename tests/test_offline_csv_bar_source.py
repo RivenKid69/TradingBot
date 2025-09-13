@@ -5,6 +5,8 @@ import pytest
 from datetime import datetime, timedelta, timezone
 
 sys.path.append(os.getcwd())
+import clock
+from utils_time import floor_to_timeframe
 from impl_offline_data import OfflineCSVConfig, OfflineCSVBarSource, to_ms
 
 
@@ -98,3 +100,28 @@ def test_timezone_bar_passes(tmp_path):
     src = OfflineCSVBarSource(cfg)
     bars = list(src.stream_bars(["BTC"], 60_000))
     assert bars[0].ts == 0
+
+
+def test_enforce_closed_bar(tmp_path, monkeypatch):
+    now = clock.now_ms()
+    start = floor_to_timeframe(now, 60_000)
+    path = _write_csv(
+        tmp_path,
+        [
+            {
+                "ts": start,
+                "symbol": "BTC",
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "volume": 1,
+            }
+        ],
+    )
+    cfg = OfflineCSVConfig(paths=[path], timeframe="1m")
+    monkeypatch.setattr(clock, "now_ms", lambda: start + 30_000)
+    src = OfflineCSVBarSource(cfg)
+    bars = list(src.stream_bars(["BTC"], 60_000))
+    assert len(bars) == 1
+    assert bars[0].is_final is False
