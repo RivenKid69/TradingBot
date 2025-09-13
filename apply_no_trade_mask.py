@@ -9,6 +9,10 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 
+import clock
+from utils_time import is_bar_closed
+from impl_offline_data import timeframe_to_ms
+
 from no_trade import compute_no_trade_mask, estimate_block_ratio
 from no_trade_config import get_no_trade_config
 
@@ -62,6 +66,13 @@ def main():
     ap.add_argument("--ts_col", default="ts_ms", help="Колонка метки времени в мс UTC.")
     ap.add_argument("--mode", choices=["drop", "weight"], default="drop", help="drop — удалить строки; weight — оставить и добавить train_weight=0.")
     ap.add_argument("--mask-only", action="store_true", help="Сохранить только колонку no_trade_block для всех строк.")
+    ap.add_argument("--timeframe", required=True, help="Баровый таймфрейм, например 1m или 1h.")
+    ap.add_argument(
+        "--close-lag-ms",
+        type=int,
+        default=0,
+        help="Допустимое запаздывание закрытия бара в миллисекундах.",
+    )
     ap.add_argument(
         "--histogram",
         nargs="?",
@@ -74,16 +85,27 @@ def main():
     df = _read_table(args.data)
 
     cfg = get_no_trade_config(args.sandbox_config)
-    mask_block = compute_no_trade_mask(
+    mask_nt = compute_no_trade_mask(
         df, sandbox_yaml_path=args.sandbox_config, ts_col=args.ts_col
     )
     est_ratio = estimate_block_ratio(df, cfg, ts_col=args.ts_col)
-    actual_ratio = float(mask_block.mean())
-    if abs(actual_ratio - est_ratio) > 0.01:
+    actual_nt_ratio = float(mask_nt.mean())
+    if abs(actual_nt_ratio - est_ratio) > 0.01:
         print(
-            f"Blocked ratio {actual_ratio:.4f} differs from expected {est_ratio:.4f}",
+            f"Blocked ratio {actual_nt_ratio:.4f} differs from expected {est_ratio:.4f}",
             file=sys.stderr,
         )
+
+    tf_ms = timeframe_to_ms(args.timeframe)
+    ts = pd.to_numeric(df[args.ts_col], errors="coerce").to_numpy(dtype=np.int64)
+    close_ts = (ts // tf_ms) * tf_ms + tf_ms
+    now_ms = clock.now_ms()
+    closed = np.array(
+        [is_bar_closed(int(ct), now_ms, args.close_lag_ms) for ct in close_ts],
+        dtype=bool,
+    )
+    mask_block = mask_nt | ~pd.Series(closed, index=df.index)
+    actual_ratio = float(mask_block.mean())
     if args.mask_only:
         base, ext = os.path.splitext(args.data)
         out_path = args.out.strip() or f"{base}_mask{ext if ext.lower() in ('.csv', '.parquet', '.pq', '.txt') else '.parquet'}"
