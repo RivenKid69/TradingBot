@@ -107,6 +107,22 @@ class BinancePublicClient:
                 self._rl_total,
             )
 
+    # -------- SERVER TIME --------
+
+    def get_server_time(self) -> Tuple[int, float]:
+        """Fetch Binance server time and measure round-trip time."""
+        base = self.e.spot_base
+        path = "/api/v3/time"
+        url = f"{base}{path}"
+        params: Dict[str, Any] = {}
+        self._throttle()
+        t0 = time.time()
+        data = _retrying_get(url, params, timeout=self.timeout)
+        t1 = time.time()
+        if isinstance(data, dict) and "serverTime" in data:
+            return int(data["serverTime"]), (t1 - t0) * 1000.0
+        raise RuntimeError(f"Unexpected server time response: {data}")
+
     # -------- KLINES --------
 
     def get_klines(self, *, market: str, symbol: str, interval: str, start_ms: Optional[int] = None, end_ms: Optional[int] = None, limit: int = 1500) -> List[List[Any]]:
