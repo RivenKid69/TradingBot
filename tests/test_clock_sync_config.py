@@ -40,10 +40,12 @@ def test_clock_sync_config_loading():
           symbols: ["BTCUSDT"]
           timeframe: "1m"
         clock_sync:
-          refresh: 123
-          threshold: 456
+          refresh_sec: 123
+          warn_threshold_ms: 456
+          kill_threshold_ms: 789
         """
     )
     cfg = load_config_from_str(yaml_cfg)
-    assert cfg.clock_sync.refresh == 123
-    assert cfg.clock_sync.threshold == 456
+    assert cfg.clock_sync.refresh_sec == 123
+    assert cfg.clock_sync.warn_threshold_ms == 456
+    assert cfg.clock_sync.kill_threshold_ms == 789

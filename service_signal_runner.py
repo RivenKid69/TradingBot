@@ -19,15 +19,19 @@ for report in from_config(cfg):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Iterator, Protocol
+from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable
 import os
 import logging
+import threading
+
+import clock
+from services import monitoring
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
-from core_config import CommonRunConfig
+from core_config import CommonRunConfig, ClockSyncConfig
 import di_registry
 
 
@@ -55,14 +59,18 @@ class _Provider:
         logger: logging.Logger,
         executor: Any,
         guards: Optional[RiskGuards] = None,
+        safe_mode_fn: Callable[[], bool] | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
         self._logger = logger
         self._executor = executor
         self._guards = guards
+        self._safe_mode_fn = safe_mode_fn or (lambda: False)
 
     def on_bar(self, bar: Bar):
+        if self._safe_mode_fn():
+            return []
         feats = self._fp.update(bar)
         ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
         orders = list(self._policy.decide({**feats}, ctx) or [])
@@ -90,6 +98,7 @@ class ServiceSignalRunner:
         policy: SignalPolicy,
         risk_guards: Optional[RiskGuards] = None,
         cfg: Optional[SignalRunnerConfig] = None,
+        clock_sync_cfg: ClockSyncConfig | None = None,
     ) -> None:
         self.adapter = adapter
         self.feature_pipe = feature_pipe
@@ -97,6 +106,10 @@ class ServiceSignalRunner:
         self.risk_guards = risk_guards
         self.cfg = cfg or SignalRunnerConfig()
         self.logger = logging.getLogger(__name__)
+        self.clock_sync_cfg = clock_sync_cfg
+        self._clock_safe_mode = False
+        self._clock_stop = threading.Event()
+        self._clock_thread: Optional[threading.Thread] = None
 
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
@@ -119,11 +132,86 @@ class ServiceSignalRunner:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
 
         self.feature_pipe.warmup()
-        provider = _Provider(self.feature_pipe, self.policy, self.logger, self.adapter, self.risk_guards)
+        provider = _Provider(
+            self.feature_pipe,
+            self.policy,
+            self.logger,
+            self.adapter,
+            self.risk_guards,
+            lambda: self._clock_safe_mode,
+        )
+
+        client = getattr(self.adapter, "client", None)
+        if client is not None and self.clock_sync_cfg is not None:
+            drift = clock.sync_clock(client, self.clock_sync_cfg, monitoring)
+            try:
+                monitoring.report_clock_sync(drift, 0.0, True, clock.system_utc_ms())
+            except Exception:
+                pass
+            self.logger.info(
+                "clock drift %.2fms (warn=%dms kill=%dms)",
+                drift,
+                int(self.clock_sync_cfg.warn_threshold_ms),
+                int(self.clock_sync_cfg.kill_threshold_ms),
+            )
+
+            def _sync_loop() -> None:
+                backoff = self.clock_sync_cfg.refresh_sec
+                while not self._clock_stop.wait(backoff):
+                    before = clock.last_sync_at
+                    drift_local = clock.sync_clock(client, self.clock_sync_cfg, monitoring)
+                    success = clock.last_sync_at != before
+                    try:
+                        monitoring.report_clock_sync(
+                            drift_local, 0.0, success, clock.system_utc_ms()
+                        )
+                    except Exception:
+                        pass
+                    if not success:
+                        try:
+                            monitoring.clock_sync_fail.inc()
+                        except Exception:
+                            pass
+                        backoff = min(backoff * 2.0, self.clock_sync_cfg.refresh_sec * 10.0)
+                        continue
+                    backoff = self.clock_sync_cfg.refresh_sec
+                    if drift_local > self.clock_sync_cfg.kill_threshold_ms:
+                        self._clock_safe_mode = True
+                        try:
+                            monitoring.clock_sync_fail.inc()
+                        except Exception:
+                            pass
+                        self.logger.error(
+                            "clock drift %.2fms exceeds kill threshold %.2fms; entering safe mode",
+                            drift_local,
+                            self.clock_sync_cfg.kill_threshold_ms,
+                        )
+                    else:
+                        self._clock_safe_mode = False
+                        if drift_local > self.clock_sync_cfg.warn_threshold_ms:
+                            self.logger.warning(
+                                "clock drift %.2fms exceeds warn threshold %.2fms",
+                                drift_local,
+                                self.clock_sync_cfg.warn_threshold_ms,
+                            )
+                            try:
+                                monitoring.clock_sync_fail.inc()
+                            except Exception:
+                                pass
+
+            self._clock_thread = threading.Thread(target=_sync_loop, daemon=True)
+            self._clock_thread.start()
+
         try:
             for rep in self.adapter.run_events(provider):
                 yield rep
         finally:
+            self._clock_stop.set()
+            if self._clock_thread is not None:
+                try:
+                    self._clock_thread.join(timeout=self.clock_sync_cfg.refresh_sec if self.clock_sync_cfg else 1.0)
+                except Exception:
+                    pass
             sim = getattr(self.adapter, "sim", None) or getattr(self.adapter, "_sim", None)
             logger = getattr(sim, "_logger", None) if sim is not None else None
             try:
@@ -154,7 +242,7 @@ def from_config(
     fp: FeaturePipe = container["feature_pipe"]
     policy: SignalPolicy = container["policy"]
     guards: RiskGuards | None = container.get("risk_guards")
-    service = ServiceSignalRunner(adapter, fp, policy, guards, svc_cfg)
+    service = ServiceSignalRunner(adapter, fp, policy, guards, svc_cfg, cfg.clock_sync)
     return service.run()
 
 
