@@ -45,6 +45,7 @@ class BacktestConfig:
     artifacts_dir: Optional[str] = None
     logs_dir: Optional[str] = None
     run_id: Optional[str] = None
+    timing_config: Optional[Dict[str, Any]] = None
 
 
 class ServiceBacktest:
@@ -94,6 +95,7 @@ class ServiceBacktest:
             guards_config=self.cfg.guards_config,
             signal_cooldown_s=self.cfg.signal_cooldown_s,
             no_trade_config=self.cfg.no_trade_config,
+            timing_config=self.cfg.timing_config,
         )
 
     def run(self, df: pd.DataFrame, *, ts_col: str = "ts_ms", symbol_col: str = "symbol", price_col: str = "ref_price") -> List[Dict[str, Any]]:
@@ -135,6 +137,7 @@ def from_config(
         artifacts_dir=cfg.artifacts_dir,
         logs_dir=bt_kwargs.get("logs_dir") or cfg.logs_dir,
         run_id=bt_kwargs.get("run_id") or cfg.run_id,
+        timing_config=bt_kwargs.get("timing_config") or cfg.timing.dict(),
     )
 
     data_path = getattr(cfg.data, "prices_path", None)
