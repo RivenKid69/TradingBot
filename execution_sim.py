@@ -25,11 +25,11 @@ ExecutionSimulator v2
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any, Dict, Sequence
 import math
-import time
 import os
 import logging
 import threading
 import random
+from clock import now_ms
 
 try:
     from runtime_flags import seasonality_enabled  # type: ignore
@@ -1190,7 +1190,7 @@ class ExecutionSimulator:
                 proto=proto,
                 client_order_id=cid,
                 remaining_lat=remaining,
-                timestamp=int(now_ts or int(time.time() * 1000)),
+                timestamp=int(now_ts or now_ms()),
                 lat_ms=int(lat_ms),
                 timeout=bool(timeout),
                 spike=bool(spike),
@@ -1323,7 +1323,7 @@ class ExecutionSimulator:
         new_order_pos: List[int] = []
         fee_total: float = 0.0
 
-        ts = int(now_ts or int(time.time() * 1000))
+        ts = int(now_ts or now_ms())
         ref = self._ref(ref_price)
         self._vwap_on_tick(ts, ref, self._last_liquidity)
 

@@ -28,6 +28,7 @@ import event_bus as eb
 from impl_latency import LatencyImpl
 from core_constants import PRICE_SCALE
 from utils import SignalRateLimiter
+from clock import now_ms
 try:
     from quantizer import Quantizer, load_filters
 except Exception:  # pragma: no cover - soft dependency
@@ -221,12 +222,13 @@ class Mediator:
         self._pending_buy_volume: float = 0.0
         self._pending_sell_volume: float = 0.0
 
-    def _check_rate_limit(self, ts: float) -> bool:
-        """Apply rate limiter and update counters."""
+    def _check_rate_limit(self) -> bool:
+        """Apply rate limiter using wall-clock milliseconds."""
         if self._rate_limiter is None:
             return True
         self.total_signals += 1
-        allowed, status = self._rate_limiter.can_send(float(ts))
+        ts_s = now_ms() / 1000.0
+        allowed, status = self._rate_limiter.can_send(ts_s)
         try:
             eb.log_signal_metric(status)
         except Exception:
@@ -371,7 +373,7 @@ class Mediator:
             except Exception:
                 return 0, 0
 
-        if not self._check_rate_limit(float(timestamp)):
+        if not self._check_rate_limit():
             return 0, 0
 
         order_id, qpos = self.lob.add_limit_order(
@@ -422,7 +424,7 @@ class Mediator:
 
         # Попробуем использовать Cython LOB сигнатуру (с буферами), если она доступна
         trades: List[Tuple[float, float, bool, bool]] = []
-        if self._check_rate_limit(float(timestamp)):
+        if self._check_rate_limit():
             try:
                 max_len = 1024
                 prices = np.empty(max_len, dtype=np.float64)
@@ -565,7 +567,7 @@ class Mediator:
 
         # если есть ExecutionSimulator — используем его
         if self._use_exec and self.exec is not None:
-            if proto.action_type != ActionType.HOLD and not self._check_rate_limit(float(timestamp)):
+            if proto.action_type != ActionType.HOLD and not self._check_rate_limit():
                 info["rate_limited"] = True
                 return {"trades": [], "cancelled_ids": [], "new_order_ids": [], "fee_total": 0.0,
                         "new_order_pos": [], "info": info, "events": events}

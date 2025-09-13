@@ -1,11 +1,11 @@
 # risk_guard.py
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, asdict
 from enum import IntEnum
 from typing import Optional, Deque, Tuple, Dict, Any, TYPE_CHECKING
 from collections import deque
+from clock import now_ms
 
 if TYPE_CHECKING:
     from core_contracts import RiskGuards
@@ -47,7 +47,7 @@ class RiskConfig:
     bankruptcy_cash_th: float = -1e12     # порог банкротства по кэшу
 
     # Технические опции
-    ts_provider: callable = lambda: int(time.time_ns())  # нано-время
+    ts_provider: callable = lambda: now_ms()
 
 
 class RiskGuard:
