@@ -10,6 +10,7 @@ from core_models import Bar, Order, Side, as_dict
 from compat_shims import sim_report_dict_to_core_exec_reports
 from event_bus import log_trade_exec as _bus_log_trade_exec
 from core_contracts import MarketDataSource
+from core_config import CommonRunConfig
 
 _TF_MS = {
     "1s": 1_000,
@@ -51,12 +52,23 @@ class SimAdapter:
     Тонкий мост: превращает решения стратегии в список экшенов симулятора.
     Требуется ExecutionSimulator с публичным методом run_step(...) (ниже добавим в execution_sim.py).
     """
-    def __init__(self, sim: ExecutionSimulator, *, symbol: str, timeframe: str, source: MarketDataSource):
+    def __init__(
+        self,
+        sim: ExecutionSimulator,
+        *,
+        symbol: str,
+        timeframe: str,
+        source: MarketDataSource,
+        run_config: CommonRunConfig | None = None,
+    ):
         self.sim = sim
         self.symbol = str(symbol).upper()
         self.timeframe = _ensure_timeframe(timeframe)
         self.interval_ms = _timeframe_to_ms(self.timeframe)
         self.source = source
+        self.enforce_closed_bars = (
+            run_config.timing.enforce_closed_bars if run_config is not None else True
+        )
 
 
     def _to_actions(self, orders: Sequence[Order]) -> List[Tuple[ActionType, ActionProto]]:
@@ -118,8 +130,20 @@ class SimAdapter:
         """
         prev_close: Optional[float] = None
         try:
+            from service_signal_runner import skipped_incomplete_bars  # type: ignore
+        except Exception:
+            skipped_incomplete_bars = None
+
+        try:
             for bar in self.source.stream_bars([self.symbol], self.interval_ms):
                 if bar.symbol != self.symbol:
+                    continue
+                if self.enforce_closed_bars and not getattr(bar, "is_final", True):
+                    if skipped_incomplete_bars is not None:
+                        try:
+                            skipped_incomplete_bars.labels(bar.symbol).inc()
+                        except Exception:
+                            pass
                     continue
 
                 orders: Sequence[Order] = list(provider.on_bar(bar) or [])

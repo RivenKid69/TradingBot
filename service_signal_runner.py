@@ -32,11 +32,8 @@ from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig, ClockSyncConfig
-from runtime_flags import get_bool
 from utils.prometheus import Counter
 import di_registry
-
-_ENFORCE_CLOSED_BARS = get_bool("ENFORCE_CLOSED_BARS", True)
 
 skipped_incomplete_bars = Counter(
     "skipped_incomplete_bars_total",
@@ -70,6 +67,8 @@ class _Provider:
         executor: Any,
         guards: Optional[RiskGuards] = None,
         safe_mode_fn: Callable[[], bool] | None = None,
+        *,
+        enforce_closed_bars: bool,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -77,11 +76,12 @@ class _Provider:
         self._executor = executor
         self._guards = guards
         self._safe_mode_fn = safe_mode_fn or (lambda: False)
+        self._enforce_closed_bars = enforce_closed_bars
 
     def on_bar(self, bar: Bar):
         if self._safe_mode_fn():
             return []
-        if _ENFORCE_CLOSED_BARS and not bar.is_final:
+        if self._enforce_closed_bars and not bar.is_final:
             try:
                 self._logger.info("SKIP_INCOMPLETE_BAR")
             except Exception:
@@ -119,6 +119,8 @@ class ServiceSignalRunner:
         risk_guards: Optional[RiskGuards] = None,
         cfg: Optional[SignalRunnerConfig] = None,
         clock_sync_cfg: ClockSyncConfig | None = None,
+        *,
+        enforce_closed_bars: bool = True,
     ) -> None:
         self.adapter = adapter
         self.feature_pipe = feature_pipe
@@ -130,6 +132,7 @@ class ServiceSignalRunner:
         self._clock_safe_mode = False
         self._clock_stop = threading.Event()
         self._clock_thread: Optional[threading.Thread] = None
+        self.enforce_closed_bars = enforce_closed_bars
 
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
@@ -159,6 +162,7 @@ class ServiceSignalRunner:
             self.adapter,
             self.risk_guards,
             lambda: self._clock_safe_mode,
+            enforce_closed_bars=self.enforce_closed_bars,
         )
 
         client = getattr(self.adapter, "client", None)
@@ -262,7 +266,15 @@ def from_config(
     fp: FeaturePipe = container["feature_pipe"]
     policy: SignalPolicy = container["policy"]
     guards: RiskGuards | None = container.get("risk_guards")
-    service = ServiceSignalRunner(adapter, fp, policy, guards, svc_cfg, cfg.clock_sync)
+    service = ServiceSignalRunner(
+        adapter,
+        fp,
+        policy,
+        guards,
+        svc_cfg,
+        cfg.clock_sync,
+        enforce_closed_bars=cfg.timing.enforce_closed_bars,
+    )
     return service.run()
 
 
