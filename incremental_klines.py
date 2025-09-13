@@ -9,7 +9,7 @@ Incrementally append the last CLOSED 1h Binance candles per symbol.
 Output CSV per symbol at data/candles/{SYMBOL}.csv with Binance 12 fields + 'symbol'.
 
 CLI:
-  python incremental_klines.py --symbols BTCUSDT,ETHUSDT
+  python incremental_klines.py --symbols BTCUSDT,ETHUSDT [--close-lag-ms 2000]
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ import time
 import argparse
 from typing import List, Optional
 import requests
+import clock
+from utils_time import is_bar_closed
 
 BASE = "https://api.binance.com/api/v3/klines"
 OUT_DIR = os.path.join("data", "candles")
@@ -82,13 +84,32 @@ def fetch_last_closed(symbol: str) -> Optional[list]:
     return closed
 
 
-def append_closed(symbol: str) -> bool:
+def append_closed(symbol: str, close_lag_ms: int) -> bool:
     """Append the latest CLOSED candle for symbol if it advances the timeline.
-    Returns True if appended, False otherwise.
+
+    Parameters
+    ----------
+    symbol : str
+        Trading pair symbol, e.g. ``BTCUSDT``.
+    close_lag_ms : int
+        Allowed lag in milliseconds when verifying bar close time.
+
+    Returns
+    -------
+    bool
+        ``True`` if the bar was appended, ``False`` otherwise.
     """
     path = os.path.join(OUT_DIR, f"{symbol.upper()}.csv")
     row = fetch_last_closed(symbol)
     if row is None:
+        return False
+
+    close_ts = int(row[0]) + 3_600_000  # open time + 1h in ms
+    now_ms = clock.now_ms()
+    if not is_bar_closed(close_ts, now_ms, close_lag_ms):
+        print(
+            f"[WARN] {symbol}: bar not closed yet (close_ts={close_ts} now={now_ms} lag={close_lag_ms})"
+        )
         return False
 
     open_time = int(row[0])
@@ -113,11 +134,11 @@ def append_closed(symbol: str) -> bool:
     return True
 
 
-def run_many(symbols: List[str]) -> int:
+def run_many(symbols: List[str], close_lag_ms: int) -> int:
     appended = 0
     for sym in symbols:
         try:
-            if append_closed(sym):
+            if append_closed(sym, close_lag_ms):
                 appended += 1
         except Exception as e:
             print(f"[WARN] {sym}: {e}")
@@ -133,9 +154,15 @@ def main():
     parser = argparse.ArgumentParser(description="Incrementally append last CLOSED 1h candles from Binance.")
     parser.add_argument("--symbols", type=str, default="BTCUSDT,ETHUSDT",
                         help="Comma-separated symbols, e.g. BTCUSDT,ETHUSDT")
+    parser.add_argument(
+        "--close-lag-ms",
+        type=int,
+        default=2000,
+        help="Allowed lag in ms when verifying if the fetched bar is closed",
+    )
     args = parser.parse_args()
     symbols = _parse_symbols(args.symbols)
-    run_many(symbols)
+    run_many(symbols, args.close_lag_ms)
 
 
 if __name__ == "__main__":
