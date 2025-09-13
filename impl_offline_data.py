@@ -18,9 +18,10 @@ import logging
 
 import pandas as pd  # предполагается в зависимостях
 
+import clock
 from core_models import Bar, Tick
 from core_contracts import MarketDataSource
-from utils_time import parse_time_to_ms
+from utils_time import parse_time_to_ms, floor_to_timeframe, is_bar_closed
 from config import DataDegradationConfig
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ class OfflineCSVConfig:
     n_trades_col: Optional[str] = None
     vendor: Optional[str] = "offline"
     sort_by_ts: bool = True
+    enforce_closed_bars: bool = True
+    close_lag_ms: int = 2000
 
 
 class OfflineCSVBarSource(MarketDataSource):
@@ -64,10 +67,16 @@ class OfflineCSVBarSource(MarketDataSource):
                 f"Timeframe mismatch. Source={self.cfg.timeframe}, requested={interval_ms}ms"
             )
 
+        logger.info(
+            "OfflineCSVBarSource closed bar enforcement: enforce=%s close_lag_ms=%d",
+            self.cfg.enforce_closed_bars,
+            self.cfg.close_lag_ms,
+        )
+
         symbols_u = list(dict.fromkeys([s.upper() for s in symbols]))
         last_ts: Dict[str, int] = {}
         prev_bar: Optional[Bar] = None
-        total = drop_cnt = stale_cnt = delay_cnt = 0
+        total = drop_cnt = stale_cnt = delay_cnt = skip_cnt = 0
 
         files: List[str] = []
         for p in self.cfg.paths:
@@ -122,6 +131,13 @@ class OfflineCSVBarSource(MarketDataSource):
                             time.sleep(delay_ms / 1000.0)
                     yield prev_bar
                     continue
+                close_ts = floor_to_timeframe(ts, interval_ms_cfg) + interval_ms_cfg
+                is_final = True
+                if self.cfg.enforce_closed_bars and not is_bar_closed(
+                    close_ts, clock.now_ms(), self.cfg.close_lag_ms
+                ):
+                    is_final = False
+                    skip_cnt += 1
                 bar = Bar(
                     ts=ts,
                     symbol=sym,
@@ -135,8 +151,12 @@ class OfflineCSVBarSource(MarketDataSource):
                         if not self.cfg.n_trades_col
                         else int(r[self.cfg.n_trades_col])
                     ),
-                    is_final=True,
+                    is_final=is_final,
                 )
+                if not is_final:
+                    prev_bar = bar
+                    yield bar
+                    continue
                 if self._rng.random() < self._degradation.dropout_prob:
                     delay_ms = self._rng.randint(0, self._degradation.max_delay_ms)
                     if delay_ms > 0:
@@ -147,7 +167,7 @@ class OfflineCSVBarSource(MarketDataSource):
 
         if total:
             logger.info(
-                "OfflineCSVBarSource degradation: drop=%0.2f%% (%d/%d), stale=%0.2f%% (%d/%d), delay=%0.2f%% (%d/%d)",
+                "OfflineCSVBarSource degradation: drop=%0.2f%% (%d/%d), stale=%0.2f%% (%d/%d), delay=%0.2f%% (%d/%d), skip=%0.2f%% (%d/%d)",
                 drop_cnt / total * 100.0,
                 drop_cnt,
                 total,
@@ -156,6 +176,9 @@ class OfflineCSVBarSource(MarketDataSource):
                 total,
                 delay_cnt / total * 100.0,
                 delay_cnt,
+                total,
+                skip_cnt / total * 100.0,
+                skip_cnt,
                 total,
             )
         else:
