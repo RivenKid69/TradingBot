@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
 
+__all__ = ["floor_to_timeframe", "is_bar_closed"]
+
 _logging_spec = importlib.util.spec_from_file_location(
     "py_logging", Path(sysconfig.get_path("stdlib")) / "logging/__init__.py"
 )
@@ -27,6 +29,18 @@ seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
 # Clamp limits applied to liquidity and latency seasonality multipliers.
 SEASONALITY_MULT_MIN = 0.1
 SEASONALITY_MULT_MAX = 10.0
+
+
+def floor_to_timeframe(ts_ms: int, timeframe_ms: int) -> int:
+    """Floor ``ts_ms`` down to the nearest multiple of ``timeframe_ms``."""
+
+    return (ts_ms // timeframe_ms) * timeframe_ms
+
+
+def is_bar_closed(ts_close_ms: int, now_utc_ms: int, lag_ms: int = 0) -> bool:
+    """Return ``True`` if current time exceeds ``ts_close_ms`` plus ``lag_ms``."""
+
+    return now_utc_ms >= ts_close_ms + lag_ms
 
 
 def interpolate_daily_multipliers(days: Sequence[float]) -> np.ndarray:
