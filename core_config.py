@@ -39,8 +39,9 @@ class Components(BaseModel):
 class ClockSyncConfig(BaseModel):
     """Настройки синхронизации часов между процессами."""
 
-    refresh: float = Field(default=60.0, description="How often to refresh clock sync in seconds")
-    threshold: float = Field(default=1.0, description="Threshold in seconds to trigger resync")
+    refresh_sec: float = Field(default=60.0, description="How often to refresh clock sync in seconds")
+    warn_threshold_ms: float = Field(default=500.0, description="Log warning if drift exceeds this many ms")
+    kill_threshold_ms: float = Field(default=2000.0, description="Enter safe mode if drift exceeds this many ms")
     attempts: int = Field(default=5, description="Number of samples per sync attempt")
     ema_alpha: float = Field(default=0.1, description="EMA coefficient for skew updates")
     max_step_ms: float = Field(default=1000.0, description="Maximum skew adjustment per sync in ms")
