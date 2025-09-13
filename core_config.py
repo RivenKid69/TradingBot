@@ -41,6 +41,9 @@ class ClockSyncConfig(BaseModel):
 
     refresh: float = Field(default=60.0, description="How often to refresh clock sync in seconds")
     threshold: float = Field(default=1.0, description="Threshold in seconds to trigger resync")
+    attempts: int = Field(default=5, description="Number of samples per sync attempt")
+    ema_alpha: float = Field(default=0.1, description="EMA coefficient for skew updates")
+    max_step_ms: float = Field(default=1000.0, description="Maximum skew adjustment per sync in ms")
 
 
 class CommonRunConfig(BaseModel):
