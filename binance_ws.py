@@ -148,7 +148,7 @@ class BinanceWS:
                                         close=Decimal(k.get("c", 0.0)),
                                         volume_base=Decimal(k.get("v", 0.0)),
                                         trades=int(k.get("n", 0)),
-                                        is_final=True,
+                                        is_final=bool(k.get("x", False)),
                                     )
                                 except Exception:
                                     continue
