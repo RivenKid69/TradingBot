@@ -32,7 +32,17 @@ from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig, ClockSyncConfig
+from runtime_flags import get_bool
+from utils.prometheus import Counter
 import di_registry
+
+_ENFORCE_CLOSED_BARS = get_bool("ENFORCE_CLOSED_BARS", True)
+
+skipped_incomplete_bars = Counter(
+    "skipped_incomplete_bars_total",
+    "Total number of skipped incomplete bars",
+    ["symbol"],
+)
 
 
 class RiskGuards(Protocol):
@@ -70,6 +80,16 @@ class _Provider:
 
     def on_bar(self, bar: Bar):
         if self._safe_mode_fn():
+            return []
+        if _ENFORCE_CLOSED_BARS and not bar.is_final:
+            try:
+                self._logger.info("SKIP_INCOMPLETE_BAR")
+            except Exception:
+                pass
+            try:
+                skipped_incomplete_bars.labels(bar.symbol).inc()
+            except Exception:
+                pass
             return []
         feats = self._fp.update(bar)
         ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
