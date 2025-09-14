@@ -79,6 +79,13 @@ ws_dup_skipped_count = Counter(
     ["symbol"],
 )
 
+# Websocket bars dropped due to event bus backpressure
+ws_backpressure_drop_count = Counter(
+    "ws_backpressure_drop_count",
+    "WS bars dropped due to event bus backpressure",
+    ["symbol"],
+)
+
 # Orders dropped because their originating bar exceeded TTL boundary
 ttl_expired_boundary_count = Counter(
     "ttl_expired_boundary_count",
@@ -162,6 +169,7 @@ def clock_sync_age_seconds() -> float:
 __all__ = [
     "skipped_incomplete_bars",
     "ws_dup_skipped_count",
+    "ws_backpressure_drop_count",
     "ttl_expired_boundary_count",
     "signal_boundary_count",
     "signal_absolute_count",

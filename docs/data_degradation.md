@@ -39,12 +39,13 @@ python script_backtest.py --config config_sim.yaml
 
 ```python
 from binance_ws import BinanceWS
+from services.event_bus import EventBus
 from config import DataDegradationConfig
 
 cfg = DataDegradationConfig(stale_prob=0.05, drop_prob=0.02,
                             dropout_prob=0.1, max_delay_ms=50, seed=7)
-ws = BinanceWS(symbols=["BTCUSDT"], on_bar=handle_bar,
-               data_degradation=cfg)
+bus = EventBus(queue_size=1000, drop_policy="newest")
+ws = BinanceWS(symbols=["BTCUSDT"], bus=bus, data_degradation=cfg)
 ws.run()
 ```
 
