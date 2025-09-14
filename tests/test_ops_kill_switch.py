@@ -48,3 +48,42 @@ def test_reset_duplicates(tmp_path):
     assert json.loads(state.read_text())["counters"]["duplicates"] == 1
     ops_kill_switch.reset_duplicates()
     assert json.loads(state.read_text())["counters"]["duplicates"] == 0
+
+
+def test_alert_command_runs_once(tmp_path):
+    flag = tmp_path / "flag"
+    state = tmp_path / "state.json"
+    out = tmp_path / "out.txt"
+    cmd = ["bash", "-c", f'echo run >> "{out}"']
+    cfg = {
+        "flag_path": str(flag),
+        "state_path": str(state),
+        "alert_command": cmd,
+        "rest_limit": 1,
+    }
+    ops_kill_switch.init(cfg)
+    ops_kill_switch.record_error("rest")
+    assert out.read_text().strip() == "run"
+    ops_kill_switch.record_error("rest")
+    assert out.read_text().strip() == "run"
+    ops_kill_switch.manual_reset()
+    ops_kill_switch.record_error("rest")
+    assert out.read_text().splitlines() == ["run", "run"]
+    ops_kill_switch.manual_reset()
+
+
+def test_alert_command_failure_does_not_raise(tmp_path, caplog):
+    flag = tmp_path / "flag"
+    state = tmp_path / "state.json"
+    cfg = {
+        "flag_path": str(flag),
+        "state_path": str(state),
+        "alert_command": ["nonexistent_cmd"],
+        "rest_limit": 1,
+    }
+    ops_kill_switch.init(cfg)
+    with caplog.at_level(std_logging.ERROR):
+        ops_kill_switch.record_error("rest")
+    assert ops_kill_switch.tripped()
+    assert any("alert_command" in r.message for r in caplog.records)
+    ops_kill_switch.manual_reset()

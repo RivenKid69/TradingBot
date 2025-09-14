@@ -7,6 +7,7 @@ The switch can be manually reset by deleting the flag file or by calling
 """
 
 import json
+import logging
 import subprocess
 import threading
 import time
@@ -19,7 +20,7 @@ from .utils_app import atomic_write_with_retry
 # Persistent state and configuration
 _state_path = Path("state/ops_state.json")
 _flag_path = Path("state/ops_kill_switch.flag")
-_alert_cmd: Optional[Sequence[str]] = None
+_alert_command: Optional[Sequence[str]] = None
 _reset_cooldown_sec = 60.0
 _limits: Dict[str, int] = {"rest": 0, "ws": 0, "duplicates": 0, "stale": 0}
 
@@ -76,9 +77,9 @@ def init(cfg: Dict[str, Any]) -> None:
         reset_cooldown_sec
         flag_path
         state_path
-        alert_cmd
+        alert_command
     """
-    global _reset_cooldown_sec, _flag_path, _alert_cmd, _limits, _state_path
+    global _reset_cooldown_sec, _flag_path, _alert_command, _limits, _state_path
 
     _limits = {
         "rest": int(
@@ -99,7 +100,7 @@ def init(cfg: Dict[str, Any]) -> None:
     _reset_cooldown_sec = float(cfg.get("reset_cooldown_sec", _reset_cooldown_sec))
     _flag_path = Path(cfg.get("flag_path", _flag_path))
     _state_path = Path(cfg.get("state_path", _state_path))
-    _alert_cmd = cfg.get("alert_cmd")
+    _alert_command = cfg.get("alert_command")
     _load_state()
 
 
@@ -129,11 +130,6 @@ def _trip() -> None:
         atomic_write_with_retry(_flag_path, "1", retries=3, backoff=0.1)
     except Exception:
         pass
-    if _alert_cmd:
-        try:
-            subprocess.Popen(list(_alert_cmd))
-        except Exception:
-            pass
     _save_state()
 
 
@@ -145,22 +141,46 @@ def record_error(kind: str) -> None:
     if kind not in ("rest", "ws"):
         raise ValueError("kind must be 'rest' or 'ws'")
     now = time.time()
+    tripped_now = False
     with _lock:
         _maybe_reset_all(now)
         _counters[kind] += 1
         _last_ts[kind] = now
         _save_state()
+        was_tripped = _tripped
         _trip_if_needed(kind)
+        tripped_now = _tripped and not was_tripped
+    if tripped_now and _alert_command:
+        try:
+            proc = subprocess.run(list(_alert_command))
+            if proc.returncode != 0:
+                logging.getLogger(__name__).warning(
+                    "alert_command exited with code %s", proc.returncode
+                )
+        except Exception:
+            logging.getLogger(__name__).exception("alert_command execution failed")
 
 
 def _record_generic(kind: str) -> None:
     now = time.time()
+    tripped_now = False
     with _lock:
         _maybe_reset_all(now)
         _counters[kind] += 1
         _last_ts[kind] = now
         _save_state()
+        was_tripped = _tripped
         _trip_if_needed(kind)
+        tripped_now = _tripped and not was_tripped
+    if tripped_now and _alert_command:
+        try:
+            proc = subprocess.run(list(_alert_command))
+            if proc.returncode != 0:
+                logging.getLogger(__name__).warning(
+                    "alert_command exited with code %s", proc.returncode
+                )
+        except Exception:
+            logging.getLogger(__name__).exception("alert_command execution failed")
 
 
 def record_duplicate() -> None:

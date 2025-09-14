@@ -680,7 +680,9 @@ class ServiceSignalRunner:
         if self.cfg.kill_switch_ops.flag_path:
             ops_cfg["flag_path"] = self.cfg.kill_switch_ops.flag_path
         if self.cfg.kill_switch_ops.alert_command:
-            ops_cfg["alert_cmd"] = shlex.split(self.cfg.kill_switch_ops.alert_command)
+            ops_cfg["alert_command"] = shlex.split(
+                self.cfg.kill_switch_ops.alert_command
+            )
         ops_kill_switch.init(ops_cfg)
 
         ops_flush_stop = threading.Event()
