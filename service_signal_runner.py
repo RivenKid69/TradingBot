@@ -29,6 +29,7 @@ import yaml
 import clock
 from services import monitoring
 from services.monitoring import skipped_incomplete_bars
+from services.utils_app import append_row_csv
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
@@ -113,7 +114,42 @@ class _Provider:
         orders = list(self._policy.decide({**feats}, ctx) or [])
         if self._guards:
             orders = list(self._guards.apply(int(bar.ts), bar.symbol, orders) or [])
+
+        out_csv = getattr(signal_bus, "OUT_CSV", None)
+        header = [
+            "ts_ms",
+            "symbol",
+            "side",
+            "volume_frac",
+            "score",
+            "features_hash",
+        ]
+        score = float(feats.get("score", 0) or 0)
+        fh = str(feats.get("features_hash", "") or "")
+
         for o in orders:
+            if out_csv:
+                side = getattr(o, "side", "")
+                side = side.value if hasattr(side, "value") else str(side)
+                vol = getattr(o, "volume_frac", None)
+                if vol is None:
+                    vol = getattr(o, "quantity", 0)
+                try:
+                    vol_val = float(vol)
+                except Exception:
+                    vol_val = 0.0
+                row = [
+                    int(bar.ts),
+                    bar.symbol,
+                    side,
+                    vol_val,
+                    score,
+                    fh,
+                ]
+                try:
+                    append_row_csv(out_csv, header, row)
+                except Exception:
+                    pass
             try:
                 self._logger.info("order %s", o)
             except Exception:
