@@ -25,6 +25,14 @@ clock_sync:
   kill_threshold_ms: 2000 # Terminate if drift exceeds this many milliseconds
   max_step_ms: 1000       # Max single adjustment step in milliseconds
   attempts: 5             # Number of sync attempts before giving up
+
+shutdown:
+  grace_period: 5.0           # Seconds to wait between stop and flush phases
+  drain_policy: graceful      # How to drain outstanding work
+  timeouts:
+    stop: 10.0                # Seconds to wait for stop callbacks
+    flush: 10.0               # Seconds to wait for flush callbacks
+    finalize: 5.0             # Seconds to wait for finalize callbacks
 ttl:
   enabled: false
   ttl_seconds: 60

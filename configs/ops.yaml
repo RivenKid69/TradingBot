@@ -16,6 +16,14 @@ kill_switch:
   ws_failures: 100         # Enter safe mode if WS failures exceed this count; 0 disables
   error_rate: 0.2          # Enter safe mode if signal error rate exceeds this fraction; 0 disables
 
+shutdown:
+  grace_period: 5.0           # Seconds to wait between stop and flush phases
+  drain_policy: graceful      # How to drain outstanding work
+  timeouts:
+    stop: 10.0                # Seconds to wait for stop callbacks
+    flush: 10.0               # Seconds to wait for flush callbacks
+    finalize: 5.0             # Seconds to wait for finalize callbacks
+
 ttl:
   enabled: false
   ttl_seconds: 60

@@ -951,29 +951,38 @@ def from_config(
         return PipelineConfig(enabled=enabled, stages=stages)
 
     base_pipeline = PipelineConfig()
+    base_shutdown: Dict[str, Any] = {}
     if snapshot_config_path:
         try:
             with open(snapshot_config_path, "r", encoding="utf-8") as f:
                 base_data = yaml.safe_load(f) or {}
             base_pipeline = _parse_pipeline(base_data.get("pipeline", {}))
+            base_shutdown = base_data.get("shutdown", {}) or {}
         except Exception:
             base_pipeline = PipelineConfig()
+            base_shutdown = {}
 
     ops_pipeline = PipelineConfig()
+    ops_shutdown: Dict[str, Any] = {}
     ops_path = Path("configs/ops.yaml")
     if ops_path.exists():
         try:
             with ops_path.open("r", encoding="utf-8") as f:
                 ops_data = yaml.safe_load(f) or {}
             ops_pipeline = _parse_pipeline(ops_data.get("pipeline", {}))
+            ops_shutdown = ops_data.get("shutdown", {}) or {}
         except Exception:
             ops_pipeline = PipelineConfig()
+            ops_shutdown = {}
     elif rt_cfg.get("pipeline"):
         ops_pipeline = _parse_pipeline(rt_cfg.get("pipeline", {}))
 
     pipeline_cfg = base_pipeline.merge(ops_pipeline)
 
-    shutdown_cfg = rt_cfg.get("shutdown", {})
+    shutdown_cfg: Dict[str, Any] = {}
+    shutdown_cfg.update(base_shutdown)
+    shutdown_cfg.update(ops_shutdown)
+    shutdown_cfg.update(rt_cfg.get("shutdown", {}))
 
     # Ensure components receive the bus if they accept it
     try:
