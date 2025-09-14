@@ -116,20 +116,31 @@ def test_binance_ws_degradation_logging(monkeypatch, caplog):
         class MockWS:
             def __init__(self, msgs):
                 self.msgs = list(msgs)
+
             async def __aenter__(self):
                 return self
+
             async def __aexit__(self, exc_type, exc, tb):
-                client.stop()
+                await client.stop()
+
             def __aiter__(self):
                 return self
+
             async def __anext__(self):
                 if not self.msgs:
                     raise StopAsyncIteration
                 return self.msgs.pop(0)
+
             async def ping(self):
                 fut = asyncio.Future()
                 fut.set_result(None)
                 return fut
+
+            async def send(self, _msg):
+                return None
+
+            async def close(self):
+                return None
 
         async def dummy_sleep(_):
             pass

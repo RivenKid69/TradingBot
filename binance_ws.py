@@ -110,8 +110,11 @@ class BinanceWS:
         if not self.symbols:
             raise ValueError("Не задан список symbols для подписки")
 
-        streams = "/".join(f"{s.lower()}@kline_{self.interval}" for s in self.symbols)
+        self._streams = [f"{s.lower()}@kline_{self.interval}" for s in self.symbols]
+        streams = "/".join(self._streams)
         self.ws_url = f"{self.base_url}/stream?streams={streams}"
+
+        self._ws: websockets.WebSocketClientProtocol | None = None
         self._stop = False
 
     async def _check_rate_limit(self) -> bool:
@@ -181,9 +184,12 @@ class BinanceWS:
             while not self._stop:
                 try:
                     async with websockets.connect(self.ws_url, ping_interval=None, close_timeout=5) as ws:
+                        self._ws = ws
                         hb_task = asyncio.create_task(self._heartbeat(ws))
                         delay = self.reconnect_initial_delay_s  # сбросим backoff при успешном коннекте
                         async for msg in ws:
+                            if self._stop:
+                                break
                             try:
                                 payload = json.loads(msg)
                             except Exception:
@@ -253,12 +259,18 @@ class BinanceWS:
                                 if await self._check_rate_limit():
                                     await self._emit(bar, bar_close_ms)
                         hb_task.cancel()
+                        try:
+                            await hb_task
+                        except Exception:
+                            pass
+                        self._ws = None
                 except asyncio.CancelledError:
                     return
                 except Exception:
                     await asyncio.sleep(delay)
                     delay = min(self.reconnect_max_delay_s, delay * 2.0)
         finally:
+            self._ws = None
             if self._ws_dedup_enabled:
                 try:
                     signal_bus.shutdown()
@@ -289,5 +301,24 @@ class BinanceWS:
                     self._rl_total,
                 )
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         self._stop = True
+        ws = self._ws
+        if ws is not None:
+            try:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "method": "UNSUBSCRIBE",
+                            "params": self._streams,
+                            "id": 1,
+                        }
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            self._ws = None
