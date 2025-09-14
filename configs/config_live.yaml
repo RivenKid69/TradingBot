@@ -28,6 +28,19 @@ ttl:
   ttl_seconds: 60
   out_csv: null
   dedup_persist: null
+throttle:
+  enabled: false              # disable throttling
+  global:
+    rps: 0.0                  # requests per second; 0 disables
+    burst: 0                  # burst capacity
+  symbol:
+    rps: 0.0                  # per-symbol RPS limit
+    burst: 0
+  mode: drop                  # drop or queue
+  queue:
+    max_items: 0              # queue size when mode=queue
+    ttl_ms: 0                 # item lifetime in ms
+  time_source: "monotonic"
 api:
   api_key: null
   api_secret: null
