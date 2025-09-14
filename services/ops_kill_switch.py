@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""Operational kill switch with persistent counters and flag file support.
+
+The switch can be manually reset by deleting the flag file or by calling
+``ops_kill_switch.manual_reset()``.
+"""
+
 import json
 import subprocess
 import threading
@@ -29,13 +35,13 @@ _lock = threading.Lock()
 def _load_state() -> None:
     """Load counters and timestamps from :data:`_state_path`."""
     global _tripped
+    data: Dict[str, Any] = {}
     p = _state_path
-    if not p.exists():
-        return
-    try:
-        data = json.loads(p.read_text())
-    except Exception:
-        return
+    if p.exists():
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            data = {}
     with _lock:
         cnt = data.get("counters", {}) or {}
         ts = data.get("last_ts", {}) or {}
@@ -43,6 +49,11 @@ def _load_state() -> None:
             _counters[k] = int(cnt.get(k, 0))
             _last_ts[k] = float(ts.get(k, 0.0))
         _tripped = bool(data.get("tripped", False))
+        try:
+            if _flag_path.exists():
+                _tripped = True
+        except Exception:
+            pass
 
 
 def _save_state() -> None:
@@ -179,4 +190,12 @@ def manual_reset() -> None:
             _flag_path.unlink(missing_ok=True)  # type: ignore[arg-type]
         except Exception:
             pass
+        _save_state()
+
+
+def tick() -> None:
+    """Persist counters periodically and apply cooldown resets."""
+    now = time.time()
+    with _lock:
+        _maybe_reset_all(now)
         _save_state()

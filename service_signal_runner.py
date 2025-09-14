@@ -27,10 +27,11 @@ import signal
 from pathlib import Path
 from collections import deque, defaultdict
 import time
+import shlex
 
 import yaml
 import clock
-from services import monitoring
+from services import monitoring, ops_kill_switch
 from services.monitoring import skipped_incomplete_bars, pipeline_stage_drop_count
 from pipeline import (
     check_ttl,
@@ -668,13 +669,44 @@ class ServiceSignalRunner:
 
         self.feature_pipe.warmup()
         monitoring.configure_kill_switch(self.cfg.kill_switch)
+
+        ops_cfg = {
+            "rest_limit": self.cfg.kill_switch_ops.error_limit,
+            "ws_limit": self.cfg.kill_switch_ops.error_limit,
+            "duplicate_limit": self.cfg.kill_switch_ops.duplicate_limit,
+            "stale_limit": self.cfg.kill_switch_ops.stale_intervals_limit,
+            "reset_cooldown_sec": self.cfg.kill_switch_ops.reset_cooldown_sec,
+        }
+        if self.cfg.kill_switch_ops.flag_path:
+            ops_cfg["flag_path"] = self.cfg.kill_switch_ops.flag_path
+        if self.cfg.kill_switch_ops.alert_command:
+            ops_cfg["alert_cmd"] = shlex.split(self.cfg.kill_switch_ops.alert_command)
+        ops_kill_switch.init(ops_cfg)
+
+        ops_flush_stop = threading.Event()
+
+        def _ops_flush_loop() -> None:
+            while not ops_flush_stop.wait(1.0):
+                try:
+                    ops_kill_switch.tick()
+                except Exception:
+                    pass
+
+        ops_flush_thread = threading.Thread(target=_ops_flush_loop, daemon=True)
+        ops_flush_thread.start()
+        shutdown.on_flush(ops_kill_switch.tick)
+        shutdown.on_finalize(ops_flush_stop.set)
+        shutdown.on_finalize(lambda: ops_flush_thread.join(timeout=1.0))
+
         worker = _Worker(
             self.feature_pipe,
             self.policy,
             self.logger,
             self.adapter,
             self.risk_guards,
-            lambda: self._clock_safe_mode or monitoring.kill_switch_triggered(),
+            lambda: self._clock_safe_mode
+            or monitoring.kill_switch_triggered()
+            or ops_kill_switch.tripped(),
             enforce_closed_bars=self.enforce_closed_bars,
             ws_dedup_enabled=self.ws_dedup_enabled,
             ws_dedup_log_skips=self.ws_dedup_log_skips,
