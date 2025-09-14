@@ -308,6 +308,19 @@ def kill_switch_info() -> Dict[str, Any]:
     return dict(_kill_reason)
 
 
+def reset_kill_switch_counters() -> None:
+    """Reset kill switch metrics and internal state."""
+    ws_failure_count._metrics.clear()
+    signal_boundary_count._metrics.clear()
+    signal_absolute_count._metrics.clear()
+    signal_published_count._metrics.clear()
+    _feed_lag_max.clear()
+    global _kill_triggered, _kill_reason
+    _kill_triggered = False
+    _kill_reason = {}
+    _check_kill_switch()
+
+
 def _check_kill_switch() -> None:
     """Evaluate metrics against thresholds and update kill switch state."""
     global _kill_triggered, _kill_reason
@@ -486,5 +499,6 @@ __all__ = [
     "inc_reason",
     "kill_switch_triggered",
     "kill_switch_info",
+    "reset_kill_switch_counters",
     "snapshot_metrics",
 ]
