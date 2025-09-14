@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 from dataclasses import dataclass
 
+import utils_time
+from .utils_app import append_row_csv
+
 # Путь к файлу состояния
 _STATE_PATH = Path("state/seen_signals.json")
 
@@ -16,6 +19,10 @@ _STATE_PATH = Path("state/seen_signals.json")
 _SEEN: Dict[str, int] = {}
 _lock = threading.Lock()
 _loaded = False
+
+# Optional CSV output paths
+OUT_CSV: str | None = None
+DROPS_CSV: str | None = None
 
 
 @dataclass
@@ -129,10 +136,10 @@ def publish_signal(
     payload: Any,
     send_fn: Callable[[Any], None],
     *,
-    ttl_ms: int,
+    expires_at_ms: int,
     now_ms: int | None = None,
 ) -> bool:
-    """Опубликовать сигнал, если он ещё не публиковался.
+    """Опубликовать сигнал, если он ещё не публиковался и не истёк TTL.
 
     Возвращает True, если сигнал был отправлен, иначе False.
     """
@@ -140,12 +147,27 @@ def publish_signal(
         return False
     _ensure_loaded()
     sid = signal_id(symbol, bar_close_ms)
-    if already_emitted(sid, now_ms=now_ms):
+    now = now_ms if now_ms is not None else utils_time.now_ms()
+    if now >= int(expires_at_ms):
+        if DROPS_CSV:
+            try:
+                header = ["symbol", "bar_close_ms", "payload", "expires_at_ms"]
+                row = [symbol, int(bar_close_ms), json.dumps(payload), int(expires_at_ms)]
+                append_row_csv(DROPS_CSV, header, row)
+            except Exception:
+                pass
+        return False
+    if already_emitted(sid, now_ms=now):
         return False
     send_fn(payload)
-    now = now_ms or int(time.time() * 1000)
-    expires_at = now + int(ttl_ms)
-    mark_emitted(sid, expires_at_ms=expires_at, now_ms=now_ms)
+    mark_emitted(sid, expires_at_ms=int(expires_at_ms), now_ms=now)
+    if OUT_CSV:
+        try:
+            header = ["symbol", "bar_close_ms", "payload", "expires_at_ms"]
+            row = [symbol, int(bar_close_ms), json.dumps(payload), int(expires_at_ms)]
+            append_row_csv(OUT_CSV, header, row)
+        except Exception:
+            pass
     return True
 
 
