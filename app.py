@@ -95,6 +95,21 @@ def refresh_seasonality(
     return {k: v.tolist() for k, v in sdata.items()}
 
 
+@api.get("/monitoring/snapshot")
+def monitoring_snapshot(
+    path: str = "logs/snapshot_metrics.json",
+    _: None = Depends(_check_auth),
+) -> Dict[str, Any]:
+    """Return monitoring metrics snapshot from JSON file."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Snapshot file not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 # --------------------------- Utility ---------------------------
 
 def build_all_pipeline(
@@ -250,6 +265,12 @@ with st.sidebar:
     trades_path = st.text_input("Путь к трейдам (для evaluate)", value=os.path.join(logs_dir, "log_trades_*.csv"))
     reports_path = st.text_input("Путь к отчётам (для evaluate)", value=os.path.join(logs_dir, "reports.csv"))
     metrics_json = st.text_input("Выход метрик JSON", value=os.path.join(logs_dir, "metrics.json"))
+    snapshot_json = st.text_input(
+        "Snapshot metrics JSON", value=os.path.join(logs_dir, "snapshot_metrics.json")
+    )
+    snapshot_csv = st.text_input(
+        "Snapshot metrics CSV", value=os.path.join(logs_dir, "snapshot_metrics.csv")
+    )
     equity_png = st.text_input("PNG с equity", value=os.path.join(logs_dir, "equity.png"))
     signals_csv = st.text_input("Файл сигналов (realtime)", value=os.path.join(logs_dir, "signals.csv"))
     realtime_log = st.text_input("Лог realtime", value=os.path.join(logs_dir, "realtime.log"))
@@ -309,6 +330,17 @@ with tabs[0]:
         st.image(equity_png, caption="Equity curve")
     else:
         st.info("Файл equity.png пока не найден. Сгенерируйте через раздел Evaluate.")
+
+    st.divider()
+    st.subheader("Monitoring snapshot")
+    snap = read_json(snapshot_json)
+    if snap:
+        st.json(snap)
+    else:
+        st.info("Snapshot metrics JSON не найден.")
+    snap_df = read_csv(snapshot_csv)
+    if not snap_df.empty:
+        st.dataframe(snap_df)
 
 # --------------------------- Tab: Ingest ---------------------------
 

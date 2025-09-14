@@ -57,6 +57,9 @@ class SignalRunnerConfig:
     artifacts_dir: Optional[str] = None
     logs_dir: Optional[str] = None
     run_id: Optional[str] = None
+    snapshot_metrics_json: Optional[str] = None
+    snapshot_metrics_csv: Optional[str] = None
+    snapshot_metrics_sec: int = 60
 
 
 # обратная совместимость
@@ -466,6 +469,26 @@ class ServiceSignalRunner:
             throttle_cfg=self.throttle_cfg,
         )
 
+        logs_dir = self.cfg.logs_dir or "logs"
+        json_path = self.cfg.snapshot_metrics_json or os.path.join(logs_dir, "snapshot_metrics.json")
+        csv_path = self.cfg.snapshot_metrics_csv or os.path.join(logs_dir, "snapshot_metrics.csv")
+        snapshot_stop = threading.Event()
+        snapshot_thread: threading.Thread | None = None
+        if self.cfg.snapshot_metrics_sec > 0:
+            def _snapshot_loop() -> None:
+                while not snapshot_stop.wait(self.cfg.snapshot_metrics_sec):
+                    try:
+                        monitoring.snapshot_metrics(json_path, csv_path)
+                    except Exception:
+                        pass
+
+            try:
+                monitoring.snapshot_metrics(json_path, csv_path)
+            except Exception:
+                pass
+            snapshot_thread = threading.Thread(target=_snapshot_loop, daemon=True)
+            snapshot_thread.start()
+
         # Optional asynchronous event bus processing
         bus = getattr(self.adapter, "bus", None)
         loop_thread: threading.Thread | None = None
@@ -605,6 +628,12 @@ class ServiceSignalRunner:
                     loop_thread.join()
                 except Exception:
                     pass
+            snapshot_stop.set()
+            if snapshot_thread is not None:
+                try:
+                    snapshot_thread.join(timeout=1.0)
+                except Exception:
+                    pass
             self._clock_stop.set()
             if self._clock_thread is not None:
                 try:
@@ -619,7 +648,7 @@ class ServiceSignalRunner:
             except Exception:
                 pass
             try:
-                summary_json, _ = monitoring.snapshot_metrics()
+                summary_json, _ = monitoring.snapshot_metrics(json_path, csv_path)
                 self.logger.info("SUMMARY %s", summary_json)
             except Exception:
                 pass
@@ -728,11 +757,14 @@ def from_config(
     svc_cfg = SignalRunnerConfig(
         snapshot_config_path=snapshot_config_path,
         artifacts_dir=cfg.artifacts_dir,
+        logs_dir=cfg.logs_dir,
+        run_id=cfg.run_id,
+        snapshot_metrics_json=os.path.join(cfg.logs_dir, "snapshot_metrics.json"),
+        snapshot_metrics_csv=os.path.join(cfg.logs_dir, "snapshot_metrics.csv"),
     )
-    if svc_cfg.logs_dir is None:
-        svc_cfg.logs_dir = cfg.logs_dir
-    if svc_cfg.run_id is None:
-        svc_cfg.run_id = cfg.run_id
+    sec = rt_cfg.get("ops", {}).get("snapshot_metrics_sec")
+    if isinstance(sec, (int, float)) and sec > 0:
+        svc_cfg.snapshot_metrics_sec = int(sec)
 
     container = di_registry.build_graph(cfg.components, cfg)
     adapter: SimAdapter = container["executor"]
