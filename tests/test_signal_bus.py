@@ -33,3 +33,17 @@ def test_publish_signal_dedup(tmp_path):
     assert sb.publish_signal("BTCUSDT", 1, {"p": 3}, send_fn, ttl_ms=100, now_ms=now + 200)
     assert sent == [{"p": 1}, {"p": 3}]
     assert sb._SEEN[sid] == now + 200 + 100
+
+
+def test_publish_signal_payload_fields(tmp_path):
+    sb._STATE_PATH = tmp_path / "seen.json"
+    sb._SEEN.clear()
+
+    captured = []
+
+    def send_fn(payload):
+        captured.append(payload)
+
+    payload = {"score": 1.23, "features_hash": "abc"}
+    assert sb.publish_signal("ETHUSDT", 2, payload, send_fn, ttl_ms=100, now_ms=1000)
+    assert captured == [payload]

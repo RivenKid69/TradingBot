@@ -124,10 +124,9 @@ class _Provider:
             "score",
             "features_hash",
         ]
-        score = float(feats.get("score", 0) or 0)
-        fh = str(feats.get("features_hash", "") or "")
-
         for o in orders:
+            score = float(getattr(o, "score", 0) or 0)
+            fh = str(getattr(o, "features_hash", "") or "")
             side = getattr(o, "side", "")
             side = side.value if hasattr(side, "value") else str(side)
             side = str(side).upper()
@@ -161,6 +160,8 @@ class _Provider:
                         ts_ms=int(bar.ts),
                         symbol=bar.symbol,
                         side=side,
+                        score=score,
+                        features_hash=fh,
                         bar_close_ms=int(bar.ts),
                     )
                 except Exception:
