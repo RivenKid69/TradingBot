@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable
 import os
 import logging
 import threading
+from pathlib import Path
 
 import clock
 from services import monitoring
@@ -34,6 +35,7 @@ from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig, ClockSyncConfig
 import di_registry
+import ws_dedup_state as signal_bus
 
 
 class RiskGuards(Protocol):
@@ -63,6 +65,9 @@ class _Provider:
         safe_mode_fn: Callable[[], bool] | None = None,
         *,
         enforce_closed_bars: bool,
+        ws_dedup_enabled: bool = False,
+        ws_dedup_log_skips: bool = False,
+        ws_dedup_timeframe_ms: int = 0,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -71,9 +76,20 @@ class _Provider:
         self._guards = guards
         self._safe_mode_fn = safe_mode_fn or (lambda: False)
         self._enforce_closed_bars = enforce_closed_bars
+        self._ws_dedup_enabled = ws_dedup_enabled
+        self._ws_dedup_log_skips = ws_dedup_log_skips
+        self._ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
 
     def on_bar(self, bar: Bar):
         if self._safe_mode_fn():
+            return []
+        close_ms = int(bar.ts) + self._ws_dedup_timeframe_ms
+        if self._ws_dedup_enabled and signal_bus.should_skip(bar.symbol, close_ms):
+            if self._ws_dedup_log_skips:
+                try:
+                    self._logger.info("SKIP_DUPLICATE_BAR")
+                except Exception:
+                    pass
             return []
         if self._enforce_closed_bars and not bar.is_final:
             try:
@@ -101,6 +117,11 @@ class _Provider:
                     submit(o)
                 except Exception:
                     pass
+        if self._ws_dedup_enabled:
+            try:
+                signal_bus.update(bar.symbol, close_ms)
+            except Exception:
+                pass
         return orders
 
 
@@ -115,6 +136,9 @@ class ServiceSignalRunner:
         clock_sync_cfg: ClockSyncConfig | None = None,
         *,
         enforce_closed_bars: bool = True,
+        ws_dedup_enabled: bool = False,
+        ws_dedup_log_skips: bool = False,
+        ws_dedup_timeframe_ms: int = 0,
     ) -> None:
         self.adapter = adapter
         self.feature_pipe = feature_pipe
@@ -127,6 +151,9 @@ class ServiceSignalRunner:
         self._clock_stop = threading.Event()
         self._clock_thread: Optional[threading.Thread] = None
         self.enforce_closed_bars = enforce_closed_bars
+        self.ws_dedup_enabled = ws_dedup_enabled
+        self.ws_dedup_log_skips = ws_dedup_log_skips
+        self.ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
 
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
@@ -157,6 +184,9 @@ class ServiceSignalRunner:
             self.risk_guards,
             lambda: self._clock_safe_mode,
             enforce_closed_bars=self.enforce_closed_bars,
+            ws_dedup_enabled=self.ws_dedup_enabled,
+            ws_dedup_log_skips=self.ws_dedup_log_skips,
+            ws_dedup_timeframe_ms=self.ws_dedup_timeframe_ms,
         )
 
         client = getattr(self.adapter, "client", None)
@@ -257,6 +287,10 @@ def from_config(
     if svc_cfg.run_id is None:
         svc_cfg.run_id = cfg.run_id
 
+    if cfg.ws_dedup.enabled:
+        signal_bus.PERSIST_PATH = Path(cfg.ws_dedup.persist_path)
+        signal_bus.load_state(cfg.ws_dedup.persist_path)
+
     container = di_registry.build_graph(cfg.components, cfg)
     adapter: SimAdapter = container["executor"]
     fp: FeaturePipe = container["feature_pipe"]
@@ -270,6 +304,9 @@ def from_config(
         svc_cfg,
         cfg.clock_sync,
         enforce_closed_bars=cfg.timing.enforce_closed_bars,
+        ws_dedup_enabled=cfg.ws_dedup.enabled,
+        ws_dedup_log_skips=cfg.ws_dedup.log_skips,
+        ws_dedup_timeframe_ms=cfg.timing.timeframe_ms,
     )
     return service.run()
 
