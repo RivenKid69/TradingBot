@@ -52,6 +52,13 @@ skipped_incomplete_bars = Counter(
     ["symbol"],
 )
 
+# Websocket duplicates skipped
+ws_dup_skipped_count = Counter(
+    "ws_dup_skipped_count",
+    "WS duplicates skipped",
+    ["symbol"],
+)
+
 _last_sync_ts_ms: float = 0.0
 
 
@@ -103,6 +110,7 @@ def clock_sync_age_seconds() -> float:
 
 __all__ = [
     "skipped_incomplete_bars",
+    "ws_dup_skipped_count",
     "clock_sync_fail",
     "clock_sync_success",
     "report_clock_sync",
