@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable
 import os
 import logging
 import threading
+import signal
 from pathlib import Path
 from collections import deque, defaultdict
 import time
@@ -491,6 +492,40 @@ class ServiceSignalRunner:
             loop_thread = threading.Thread(target=_loop_runner, daemon=True)
             loop_thread.start()
 
+        # --- signal handling for graceful shutdown ---
+        stop_event = threading.Event()
+        ws_client = getattr(self.adapter, "ws", None) or getattr(self.adapter, "source", None)
+
+        def _shutdown() -> None:
+            if ws_client is not None and hasattr(ws_client, "stop"):
+                try:
+                    ws_client.stop()
+                except Exception:
+                    pass
+            if bus is not None:
+                try:
+                    bus.close()
+                except Exception:
+                    pass
+
+        prev_handlers: Dict[int, Any] = {}
+        for _sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                prev_handlers[_sig] = signal.getsignal(_sig)
+
+                def _handler(signum, frame, _prev=prev_handlers[_sig]):
+                    try:
+                        if not stop_event.is_set():
+                            stop_event.set()
+                            _shutdown()
+                    finally:
+                        if callable(_prev):
+                            _prev(signum, frame)
+
+                signal.signal(_sig, _handler)
+            except Exception:
+                pass
+
         client = getattr(self.adapter, "client", None)
         if client is not None and self.clock_sync_cfg is not None:
             drift = clock.sync_clock(client, self.clock_sync_cfg, monitoring)
@@ -554,14 +589,22 @@ class ServiceSignalRunner:
 
         try:
             for rep in self.adapter.run_events(worker):
+                if stop_event.is_set():
+                    break
                 yield rep
         finally:
-            if bus is not None:
+            # restore previous signal handlers
+            for _sig, _prev in prev_handlers.items():
                 try:
-                    bus.close()
-                finally:
-                    if loop_thread is not None:
-                        loop_thread.join()
+                    signal.signal(_sig, _prev)
+                except Exception:
+                    pass
+            _shutdown()
+            if loop_thread is not None:
+                try:
+                    loop_thread.join()
+                except Exception:
+                    pass
             self._clock_stop.set()
             if self._clock_thread is not None:
                 try:
@@ -573,6 +616,11 @@ class ServiceSignalRunner:
             try:
                 if logger:
                     logger.flush()
+            except Exception:
+                pass
+            try:
+                summary_json, _ = monitoring.snapshot_metrics()
+                self.logger.info("SUMMARY %s", summary_json)
             except Exception:
                 pass
             if signal_bus.ENABLED:
