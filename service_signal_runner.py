@@ -32,7 +32,7 @@ import yaml
 import clock
 from services import monitoring
 from services.monitoring import skipped_incomplete_bars
-from pipeline import check_ttl
+from pipeline import check_ttl, closed_bar_guard
 from services.utils_app import append_row_csv
 from services.signal_bus import log_drop
 from services.event_bus import EventBus
@@ -266,7 +266,13 @@ class _Worker:
                 except Exception:
                     pass
                 return emitted
-        if self._enforce_closed_bars and not bar.is_final:
+        guard_res = closed_bar_guard(
+            bar=bar,
+            now_ms=clock.now_ms(),
+            enforce=self._enforce_closed_bars,
+            lag_ms=0,
+        )
+        if guard_res.action == "drop":
             try:
                 self._logger.info("SKIP_INCOMPLETE_BAR")
             except Exception:

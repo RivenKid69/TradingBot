@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Tuple
 
-from utils_time import next_bar_open_ms
+from core_models import Bar
+from utils_time import next_bar_open_ms, is_bar_closed
 
 
 class Stage(Enum):
@@ -42,6 +43,48 @@ class PipelineResult:
     stage: Stage
     reason: Reason | None = None
     decision: Any | None = None
+
+
+def closed_bar_guard(
+    bar: Bar, now_ms: int, enforce: bool, lag_ms: int
+) -> PipelineResult:
+    """Ensure that incoming bars are fully closed before processing.
+
+    Parameters
+    ----------
+    bar : Bar
+        The bar under consideration.
+    now_ms : int
+        Current timestamp in milliseconds.
+    enforce : bool
+        Whether the guard is active.
+    lag_ms : int
+        Allowed closing lag in milliseconds. ``0`` implies websocket bars
+        where ``bar.is_final`` should be used.
+
+    Returns
+    -------
+    PipelineResult
+        Result with action ``"pass"`` if the bar is closed, otherwise
+        ``"drop"`` with reason :class:`Reason.INCOMPLETE_BAR`.
+    """
+
+    if not enforce:
+        return PipelineResult(action="pass", stage=Stage.CLOSED_BAR)
+
+    if lag_ms <= 0:
+        if not getattr(bar, "is_final", True):
+            return PipelineResult(
+                action="drop", stage=Stage.CLOSED_BAR, reason=Reason.INCOMPLETE_BAR
+            )
+        return PipelineResult(action="pass", stage=Stage.CLOSED_BAR)
+
+    if not is_bar_closed(int(bar.ts), now_ms, lag_ms):
+        return PipelineResult(
+            action="drop", stage=Stage.CLOSED_BAR, reason=Reason.INCOMPLETE_BAR
+        )
+
+    return PipelineResult(action="pass", stage=Stage.CLOSED_BAR)
 
 
 def compute_expires_at(bar_close_ms: int, timeframe_ms: int) -> int:
@@ -98,6 +141,7 @@ __all__ = [
     "Stage",
     "Reason",
     "PipelineResult",
+    "closed_bar_guard",
     "compute_expires_at",
     "check_ttl",
 ]
