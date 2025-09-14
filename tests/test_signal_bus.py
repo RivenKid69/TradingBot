@@ -24,17 +24,17 @@ def test_publish_signal_dedup(tmp_path):
     sid = sb.signal_id("BTCUSDT", 1)
 
     # first call should send and mark emitted
-    assert sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, ttl_ms=100, now_ms=now)
+    assert sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, expires_at_ms=now + 100, now_ms=now)
     assert sent == [{"p": 1}]
     assert sb._SEEN[sid] == now + 100
 
     # duplicate before expiry should be skipped
-    assert not sb.publish_signal("BTCUSDT", 1, {"p": 2}, send_fn, ttl_ms=100, now_ms=now + 50)
+    assert not sb.publish_signal("BTCUSDT", 1, {"p": 2}, send_fn, expires_at_ms=now + 150, now_ms=now + 50)
     assert sent == [{"p": 1}]
     assert sb._SEEN[sid] == now + 100
 
     # after expiration it should send again
-    assert sb.publish_signal("BTCUSDT", 1, {"p": 3}, send_fn, ttl_ms=100, now_ms=now + 200)
+    assert sb.publish_signal("BTCUSDT", 1, {"p": 3}, send_fn, expires_at_ms=now + 200 + 100, now_ms=now + 200)
     assert sent == [{"p": 1}, {"p": 3}]
     assert sb._SEEN[sid] == now + 200 + 100
 
@@ -51,7 +51,7 @@ def test_publish_signal_payload_fields(tmp_path):
         captured.append(payload)
 
     payload = {"score": 1.23, "features_hash": "abc"}
-    assert sb.publish_signal("ETHUSDT", 2, payload, send_fn, ttl_ms=100, now_ms=1000)
+    assert sb.publish_signal("ETHUSDT", 2, payload, send_fn, expires_at_ms=1100, now_ms=1000)
     assert captured == [payload]
 
 
@@ -68,7 +68,7 @@ def test_publish_signal_disabled(tmp_path):
 
     sb.config.enabled = False
     try:
-        assert not sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, ttl_ms=100, now_ms=0)
+        assert not sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, expires_at_ms=100, now_ms=0)
         assert sent == []
         assert sb._SEEN == {}
     finally:
@@ -108,3 +108,37 @@ def test_load_and_flush_state(tmp_path):
     sb.load_state()
     assert sb._SEEN == {valid_sid: future_exp}
     assert json.loads(sb._STATE_PATH.read_text()) == {valid_sid: future_exp}
+
+
+def test_publish_signal_csv_logging(tmp_path):
+    sb._STATE_PATH = tmp_path / "seen.json"
+    sb._SEEN.clear()
+    sb._loaded = False
+    sb.load_state()
+
+    sb.OUT_CSV = str(tmp_path / "out.csv")
+    sb.DROPS_CSV = str(tmp_path / "drop.csv")
+
+    sent = []
+
+    def send_fn(payload):
+        sent.append(payload)
+
+    now = 1000
+    ok = sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, expires_at_ms=now + 100, now_ms=now)
+    assert ok
+    assert sent == [{"p": 1}]
+    out_path = Path(sb.OUT_CSV)
+    assert out_path.exists()
+    assert len(out_path.read_text().strip().splitlines()) == 2
+
+    # expired signal should be logged to drops CSV and not sent
+    ok = sb.publish_signal("BTCUSDT", 2, {"p": 2}, send_fn, expires_at_ms=now - 1, now_ms=now)
+    assert not ok
+    assert sent == [{"p": 1}]
+    drop_path = Path(sb.DROPS_CSV)
+    assert drop_path.exists()
+    assert len(drop_path.read_text().strip().splitlines()) == 2
+
+    sb.OUT_CSV = None
+    sb.DROPS_CSV = None
