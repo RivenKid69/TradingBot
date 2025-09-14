@@ -41,6 +41,20 @@ queue_len = Gauge(
     "Current number of queued signals awaiting tokens",
 )
 
+# Event bus metrics
+queue_depth = Gauge(
+    "event_bus_queue_depth",
+    "Current depth of the event bus queue",
+)
+events_in = Counter(
+    "event_bus_events_in_total",
+    "Total number of events enqueued to the event bus",
+)
+dropped_bp = Counter(
+    "event_bus_dropped_backpressure_total",
+    "Events dropped due to backpressure in the event bus",
+)
+
 # Counters for sync attempts
 clock_sync_success = Counter(
     "clock_sync_success_total",
@@ -159,6 +173,9 @@ __all__ = [
     "clock_sync_rtt_ms",
     "clock_sync_last_sync_ts",
     "queue_len",
+    "queue_depth",
+    "events_in",
+    "dropped_bp",
     "report_clock_sync",
     "clock_sync_age_seconds",
 ]
