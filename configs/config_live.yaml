@@ -23,6 +23,11 @@ clock_sync:
   kill_threshold_ms: 2000 # Terminate if drift exceeds this many milliseconds
   max_step_ms: 1000       # Max single adjustment step in milliseconds
   attempts: 5             # Number of sync attempts before giving up
+ttl:
+  enabled: false
+  ttl_seconds: 60
+  out_csv: null
+  dedup_persist: null
 api:
   api_key: null
   api_secret: null

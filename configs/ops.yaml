@@ -11,3 +11,9 @@ ws_dedup:
   persist_path: state/last_bar_seen.json
   log_skips: true
 
+ttl:
+  enabled: false
+  ttl_seconds: 60
+  out_csv: null
+  dedup_persist: null
+
