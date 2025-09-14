@@ -336,7 +336,7 @@ class _Provider:
 
         if self._ws_dedup_enabled and close_ms is not None:
             try:
-                signal_bus.update(bar.symbol, close_ms)
+                signal_bus.update(bar.symbol, close_ms, auto_flush=False)
             except Exception:
                 pass
         return emitted
@@ -498,6 +498,11 @@ class ServiceSignalRunner:
                     logger.flush()
             except Exception:
                 pass
+            if signal_bus.ENABLED:
+                try:
+                    signal_bus.shutdown()
+                except Exception:
+                    pass
 
 
 def from_config(

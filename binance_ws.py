@@ -100,8 +100,9 @@ class BinanceWS:
         )
         if self._ws_dedup_enabled:
             try:
-                signal_bus.PERSIST_PATH = self._ws_dedup_persist_path
-                signal_bus.load_state(self._ws_dedup_persist_path)
+                signal_bus.init(
+                    enabled=True, persist_path=self._ws_dedup_persist_path
+                )
                 logger.info("WS_DEDUP_INIT size=%d", len(signal_bus.STATE))
             except Exception:
                 pass
@@ -160,7 +161,7 @@ class BinanceWS:
             except Exception:
                 pass
         try:
-            signal_bus.update(bar.symbol, close_ms)
+            signal_bus.update(bar.symbol, close_ms, auto_flush=False)
         except Exception:
             pass
 
@@ -249,6 +250,11 @@ class BinanceWS:
                     await asyncio.sleep(delay)
                     delay = min(self.reconnect_max_delay_s, delay * 2.0)
         finally:
+            if self._ws_dedup_enabled:
+                try:
+                    signal_bus.shutdown()
+                except Exception:
+                    pass
             if self._dd_total:
                 logger.info(
                     "BinanceWS degradation: drop=%0.2f%% (%d/%d), stale=%0.2f%% (%d/%d), delay=%0.2f%% (%d/%d)",
