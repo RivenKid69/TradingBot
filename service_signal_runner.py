@@ -948,6 +948,31 @@ def from_config(
         cfg.kill_switch.error_rate = float(
             kill_cfg.get("error_rate", cfg.kill_switch.error_rate)
         )
+        cfg.kill_switch_ops.enabled = bool(
+            kill_cfg.get("enabled", cfg.kill_switch_ops.enabled)
+        )
+        cfg.kill_switch_ops.error_limit = int(
+            kill_cfg.get("error_limit", cfg.kill_switch_ops.error_limit)
+        )
+        cfg.kill_switch_ops.duplicate_limit = int(
+            kill_cfg.get("duplicate_limit", cfg.kill_switch_ops.duplicate_limit)
+        )
+        cfg.kill_switch_ops.stale_intervals_limit = int(
+            kill_cfg.get(
+                "stale_intervals_limit", cfg.kill_switch_ops.stale_intervals_limit
+            )
+        )
+        cfg.kill_switch_ops.reset_cooldown_sec = int(
+            kill_cfg.get(
+                "reset_cooldown_sec", cfg.kill_switch_ops.reset_cooldown_sec
+            )
+        )
+        cfg.kill_switch_ops.flag_path = kill_cfg.get(
+            "flag_path", cfg.kill_switch_ops.flag_path
+        )
+        cfg.kill_switch_ops.alert_command = kill_cfg.get(
+            "alert_command", cfg.kill_switch_ops.alert_command
+        )
 
     # Pipeline configuration
     def _parse_pipeline(data: Dict[str, Any]) -> PipelineConfig:

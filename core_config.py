@@ -131,6 +131,18 @@ class KillSwitchConfig(BaseModel):
     )
 
 
+class OpsKillSwitchConfig(BaseModel):
+    """Operational kill switch settings."""
+
+    enabled: bool = False
+    error_limit: int = 0
+    duplicate_limit: int = 0
+    stale_intervals_limit: int = 0
+    reset_cooldown_sec: int = 60
+    flag_path: Optional[str] = None
+    alert_command: Optional[str] = None
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
         default=None, description="Идентификатор запуска; если None — генерируется."
@@ -160,6 +172,7 @@ class CommonRunConfig(BaseModel):
     ttl: TTLConfig = Field(default_factory=TTLConfig)
     throttle: ThrottleConfig = Field(default_factory=ThrottleConfig)
     kill_switch: KillSwitchConfig = Field(default_factory=KillSwitchConfig)
+    kill_switch_ops: OpsKillSwitchConfig = Field(default_factory=OpsKillSwitchConfig)
     components: Components
 
 
@@ -355,6 +368,7 @@ __all__ = [
     "TTLConfig",
     "ThrottleConfig",
     "KillSwitchConfig",
+    "OpsKillSwitchConfig",
     "CommonRunConfig",
     "SimulationDataConfig",
     "SimulationConfig",
