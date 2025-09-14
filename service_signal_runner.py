@@ -153,7 +153,10 @@ class _Worker:
             checked, reason = self._guards.apply(bar_close_ms, symbol, [o])
             if reason or not checked:
                 try:
-                    self._logger.info(f"DROP_{Stage.PUBLISH.name}_{reason or ''}")
+                    self._logger.info(
+                        "DROP %s",
+                        {"stage": Stage.PUBLISH.name, "reason": reason or ""},
+                    )
                 except Exception:
                     pass
                 try:
@@ -348,7 +351,13 @@ class _Worker:
         )
         if guard_res.action == "drop":
             try:
-                self._logger.info(f"DROP_{guard_res.stage.name}_{getattr(guard_res.reason, 'name', '')}")
+                self._logger.info(
+                    "DROP %s",
+                    {
+                        "stage": guard_res.stage.name,
+                        "reason": getattr(guard_res.reason, "name", ""),
+                    },
+                )
             except Exception:
                 pass
             try:
@@ -378,7 +387,13 @@ class _Worker:
             )
             if win_res.action == "drop":
                 try:
-                    self._logger.info(f"DROP_{win_res.stage.name}_{getattr(win_res.reason, 'name', '')}")
+                    self._logger.info(
+                        "DROP %s",
+                        {
+                            "stage": win_res.stage.name,
+                            "reason": getattr(win_res.reason, "name", ""),
+                        },
+                    )
                 except Exception:
                     pass
                 try:
@@ -399,7 +414,13 @@ class _Worker:
         )
         if pol_res.action == "drop":
             try:
-                self._logger.info(f"DROP_{pol_res.stage.name}_{getattr(pol_res.reason, 'name', '')}")
+                self._logger.info(
+                    "DROP %s",
+                    {
+                        "stage": pol_res.stage.name,
+                        "reason": getattr(pol_res.reason, "name", ""),
+                    },
+                )
             except Exception:
                 pass
             try:
@@ -422,7 +443,13 @@ class _Worker:
         )
         if risk_res.action == "drop":
             try:
-                self._logger.info(f"DROP_{risk_res.stage.name}_{getattr(risk_res.reason, 'name', '')}")
+                self._logger.info(
+                    "DROP %s",
+                    {
+                        "stage": risk_res.stage.name,
+                        "reason": getattr(risk_res.reason, "name", ""),
+                    },
+                )
             except Exception:
                 pass
             try:
@@ -479,7 +506,11 @@ class _Worker:
             elif res.action == "drop":
                 try:
                     self._logger.info(
-                        f"DROP_{res.stage.name}_{getattr(res.reason, 'name', '')}"
+                        "DROP %s",
+                        {
+                            "stage": res.stage.name,
+                            "reason": getattr(res.reason, "name", ""),
+                        },
                     )
                 except Exception:
                     pass

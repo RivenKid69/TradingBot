@@ -6,6 +6,7 @@
 сервисов.
 
 Документация по утилите скользящего среднего доступна в [docs/moving_average.md](docs/moving_average.md) (English/Russian).
+Обзор конвейера принятия решений описан в [docs/pipeline.md](docs/pipeline.md).
 
 ## File Ownership and Permissions
 
