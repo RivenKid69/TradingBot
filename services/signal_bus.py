@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict
 from dataclasses import dataclass
 from collections import defaultdict
+import os
 
 import utils_time
 from .utils_app import append_row_csv
@@ -43,8 +44,22 @@ def signal_id(symbol: str, bar_close_ms: int) -> str:
 
 def _atomic_write(path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(_SEEN, separators=(",", ":")))
+    # ensure data is flushed to disk before replace
+    with tmp.open("w") as f:
+        f.write(json.dumps(_SEEN, separators=(",", ":")))
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
     tmp.replace(path)
+    # attempt to fsync directory for durability
+    try:
+        dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
+        os.fsync(dir_fd)
+        os.close(dir_fd)
+    except Exception:
+        pass
 
 
 def _purge(now_ms: int | None = None) -> None:
@@ -161,16 +176,23 @@ def publish_signal(
     *,
     expires_at_ms: int,
     now_ms: int | None = None,
+    dedup_key: str | None = None,
 ) -> bool:
     """Опубликовать сигнал, если он ещё не публиковался и не истёк TTL.
 
-    Возвращает True, если сигнал был отправлен, иначе False.
+    Parameters
+    ----------
+    dedup_key:
+        Optional explicit deduplication key.  If provided, it overrides
+        :func:`signal_id`.
+
+    Возвращает ``True``, если сигнал был отправлен, иначе ``False``.
     """
     if not config.enabled:
         log_drop(symbol, bar_close_ms, payload, "disabled")
         return False
     _ensure_loaded()
-    sid = signal_id(symbol, bar_close_ms)
+    sid = dedup_key or signal_id(symbol, bar_close_ms)
     now = now_ms if now_ms is not None else utils_time.now_ms()
     if now >= int(expires_at_ms):
         log_drop(symbol, bar_close_ms, payload, "expired")

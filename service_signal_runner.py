@@ -40,6 +40,7 @@ from pipeline import (
     apply_risk,
     Stage,
     Reason,
+    PipelineResult,
 )
 from services.utils_app import append_row_csv
 from services.signal_bus import log_drop
@@ -247,6 +248,30 @@ class _Worker:
                 pass
         return True
 
+    def publish_decision(self, o: Any, symbol: str, bar_close_ms: int) -> PipelineResult:
+        """Final pipeline stage: throttle and emit order."""
+        if self._throttle_cfg and self._throttle_cfg.enabled:
+            ok, reason = self._acquire_tokens(symbol)
+            if not ok:
+                if self._throttle_cfg.mode == "queue" and self._queue is not None:
+                    exp = time.monotonic() + self._throttle_cfg.queue.ttl_ms / 1000.0
+                    self._queue.append((exp, symbol, bar_close_ms, o))
+                    try:
+                        monitoring.throttle_enqueued_count.labels(symbol, reason or "").inc()
+                    except Exception:
+                        pass
+                    return PipelineResult(action="queue", stage=Stage.PUBLISH)
+                try:
+                    log_drop(symbol, bar_close_ms, o, reason or "")
+                    monitoring.throttle_dropped_count.labels(symbol, reason or "").inc()
+                except Exception:
+                    pass
+                return PipelineResult(action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER)
+        if not self._emit(o, symbol, bar_close_ms):
+            self._refund_tokens(symbol)
+            return PipelineResult(action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER)
+        return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
+
     def _drain_queue(self) -> list[Any]:
         emitted: list[Any] = []
         if self._queue is None:
@@ -411,27 +436,24 @@ class _Worker:
             checked_orders.append(o)
 
         for o in checked_orders:
-            if self._throttle_cfg and self._throttle_cfg.enabled:
-                ok, reason = self._acquire_tokens(bar.symbol)
-                if not ok:
-                    if self._throttle_cfg.mode == "drop":
-                        try:
-                            log_drop(bar.symbol, int(bar.ts), o, reason or "")
-                            monitoring.throttle_dropped_count.labels(bar.symbol, reason or "").inc()
-                        except Exception:
-                            pass
-                    elif self._throttle_cfg.mode == "queue" and self._queue is not None:
-                        exp = time.monotonic() + self._throttle_cfg.queue.ttl_ms / 1000.0
-                        self._queue.append((exp, bar.symbol, int(bar.ts), o))
-                        try:
-                            monitoring.throttle_enqueued_count.labels(bar.symbol, reason or "").inc()
-                        except Exception:
-                            pass
-                    continue
-            if not self._emit(o, bar.symbol, int(bar.ts)):
-                self._refund_tokens(bar.symbol)
-            else:
+            res = self.publish_decision(o, bar.symbol, int(bar.ts))
+            if res.action == "pass":
                 emitted.append(o)
+            elif res.action == "drop":
+                try:
+                    self._logger.info(
+                        f"DROP_{res.stage.name}_{getattr(res.reason, 'name', '')}"
+                    )
+                except Exception:
+                    pass
+                try:
+                    pipeline_stage_drop_count.labels(
+                        bar.symbol,
+                        res.stage.name,
+                        res.reason.name if res.reason else "",
+                    ).inc()
+                except Exception:
+                    pass
 
         try:
             monitoring.queue_len.set(len(self._queue) if self._queue else 0)
