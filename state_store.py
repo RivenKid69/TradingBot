@@ -12,6 +12,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict
 
+from services.utils_app import atomic_write_with_retry
+
 # Path used when no explicit destination is provided
 DEFAULT_PATH = Path("state/state_store.json")
 
@@ -55,8 +57,6 @@ def load(path: str | Path | None = None) -> None:
 def save(path: str | Path | None = None) -> None:
     """Persist current state to *path* using an atomic replace."""
     p = Path(path or DEFAULT_PATH)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(p.suffix + ".tmp")
     with _lock:
         data = {
             "last_seen_close_ms": last_seen_close_ms,
@@ -65,5 +65,5 @@ def save(path: str | Path | None = None) -> None:
             "kill_switch_counters": kill_switch_counters,
             "throttle_last_refill": throttle_last_refill,
         }
-        tmp.write_text(json.dumps(data, separators=(",", ":")))
-    tmp.replace(p)
+        data_str = json.dumps(data, separators=(",", ":"))
+    atomic_write_with_retry(p, data_str, retries=3, backoff=0.1)

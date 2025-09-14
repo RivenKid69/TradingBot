@@ -5,6 +5,8 @@ import os
 from datetime import datetime, date
 from typing import Dict, Sequence, Any
 
+from .utils_app import atomic_write_with_retry
+
 
 class SignalCSVWriter:
     """Write signal rows to a CSV file with daily rotation.
@@ -109,7 +111,7 @@ class SignalCSVWriter:
             return
         try:
             self._file.flush()
-            os.fsync(self._file.fileno())
+            atomic_write_with_retry(self.path, None, retries=3, backoff=0.1)
         except Exception:
             pass
 

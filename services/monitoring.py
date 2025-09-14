@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import time
 from typing import Dict, Tuple, Union, Optional, Any
 
 from enum import Enum
 from utils.prometheus import Counter, Histogram
+from .utils_app import atomic_write_with_retry
 
 from core_config import KillSwitchConfig
 
@@ -436,27 +436,12 @@ def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[Dict[str, Any], str
     csv_lines.append(f"worst_error_rate,{worst_err[0] or ''},{worst_err[1]}")
     csv_str = "\n".join(csv_lines)
 
-    def _atomic_write(path: str, data: str, *, newline: Optional[str] = None) -> None:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, path)
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-
     try:
-        _atomic_write(json_path, json_str)
+        atomic_write_with_retry(json_path, json_str, retries=3, backoff=0.1)
     except Exception:
         pass
     try:
-        _atomic_write(csv_path, csv_str, newline="")
+        atomic_write_with_retry(csv_path, csv_str, retries=3, backoff=0.1)
     except Exception:
         pass
 

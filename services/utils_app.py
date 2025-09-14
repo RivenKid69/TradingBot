@@ -5,6 +5,10 @@ import platform
 import signal
 import subprocess
 import json
+import logging
+import tempfile
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -14,6 +18,71 @@ def ensure_dir(path: str) -> None:
     d = os.path.dirname(path) if os.path.splitext(path)[1] else path
     if d:
         os.makedirs(d, exist_ok=True)
+
+
+# ------------------------------------------------------------------
+# Atomic file writing with retries
+ALERT_LEVEL = logging.CRITICAL + 10
+logging.addLevelName(ALERT_LEVEL, "ALERT")
+
+
+def atomic_write_with_retry(
+    path: str | Path,
+    data: str | bytes | None,
+    retries: int = 3,
+    backoff: float = 0.1,
+) -> None:
+    """Atomically write *data* to *path* with retry logic.
+
+    If ``data`` is ``None`` the function will simply ``fsync`` the existing
+    file at ``path``.  When ``data`` is provided it is written to a temporary
+    file which is then ``os.replace``'d into place.  In both cases the
+    directory containing ``path`` is created if necessary and ``fsync`` is
+    attempted for durability.  After all retry attempts are exhausted the
+    failure is logged at ALERT level and the exception is re-raised.
+    """
+
+    p = Path(path)
+    for attempt in range(retries + 1):
+        try:
+            if data is None:
+                fd = os.open(str(p), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            else:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp_path = tempfile.mkstemp(dir=str(p.parent))
+                try:
+                    if isinstance(data, (bytes, bytearray)):
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(data)
+                            f.flush()
+                            os.fsync(f.fileno())
+                    else:
+                        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                            f.write(str(data))
+                            f.flush()
+                            os.fsync(f.fileno())
+                    os.replace(tmp_path, str(p))
+                    try:
+                        dir_fd = os.open(str(p.parent), os.O_DIRECTORY)
+                        os.fsync(dir_fd)
+                        os.close(dir_fd)
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+            return
+        except Exception:
+            if attempt >= retries:
+                logging.getLogger(__name__).log(ALERT_LEVEL, "Failed to write %s", path, exc_info=True)
+                raise
+            time.sleep(backoff)
 
 
 def run_cmd(cmd: List[str], cwd: Optional[str] = None, log_path: Optional[str] = None) -> int:
