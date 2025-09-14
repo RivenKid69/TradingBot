@@ -729,7 +729,10 @@ class ServiceSignalRunner:
 
         ws_client = getattr(self.adapter, "ws", None) or getattr(self.adapter, "source", None)
         if ws_client is not None and hasattr(ws_client, "stop"):
-            shutdown.on_stop(lambda: ws_client.stop())
+            async def _stop_ws_client() -> None:
+                await ws_client.stop()
+
+            shutdown.on_stop(_stop_ws_client)
 
         shutdown.on_stop(worker._drain_queue)
 
