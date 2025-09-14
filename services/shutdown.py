@@ -95,7 +95,13 @@ class ShutdownManager:
         if self._shutdown_requested:
             return
         self._shutdown_requested = True
-        self._shutdown_task = asyncio.create_task(self._run_sequence(), name="shutdown")
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._run_sequence())
+            self._shutdown_task = None
+        else:
+            self._shutdown_task = loop.create_task(self._run_sequence(), name="shutdown")
 
     # ------------------------------------------------------------------
     async def _run_callbacks(self, cbs: Iterable[Callback], timeout: float | None) -> None:

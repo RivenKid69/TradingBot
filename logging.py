@@ -165,6 +165,19 @@ class LogWriter:
         else:
             self._flush_parquet()
 
+    def flush_fsync(self) -> None:
+        """Flush buffers and fsync output files to disk."""
+        self.flush()
+        if not self.cfg.enabled:
+            return
+        for path in (self.cfg.trades_path, self.cfg.reports_path):
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                os.fsync(fd)
+                os.close(fd)
+            except Exception:
+                pass
+
     def _flush_csv(self) -> None:
         if self._trades_buf:
             df_t = pd.DataFrame(self._trades_buf)
