@@ -1,8 +1,16 @@
-"""Prometheus-backed monitoring helpers."""
+"""Prometheus-backed monitoring helpers.
+
+This module defines lightweight wrappers around Prometheus metrics so that
+basic statistics remain available even if the ``prometheus_client`` package is
+missing.  In addition to individual counters and gauges, a helper
+``snapshot_metrics`` function summarises the most problematic trading symbols
+based on feed lag, websocket failures and signal error rates.
+"""
 from __future__ import annotations
 
+import json
 import time
-from typing import Union
+from typing import Dict, Tuple, Union
 
 from utils.prometheus import Counter, Histogram
 
@@ -103,6 +111,23 @@ ws_backpressure_drop_count = Counter(
     ["symbol"],
 )
 
+# Additional per-symbol metrics
+feed_lag_max_ms = Gauge(
+    "feed_lag_max_ms",
+    "Maximum observed feed lag for each symbol in milliseconds",
+    ["symbol"],
+)
+ws_failure_count = Counter(
+    "ws_failure_count",
+    "Websocket message failures per symbol",
+    ["symbol"],
+)
+signal_error_rate = Gauge(
+    "signal_error_rate",
+    "Fraction of dropped signals per symbol",
+    ["symbol"],
+)
+
 # Orders dropped because their originating bar exceeded TTL boundary
 ttl_expired_boundary_count = Counter(
     "ttl_expired_boundary_count",
@@ -135,6 +160,7 @@ age_at_publish_ms = Histogram(
 )
 
 _last_sync_ts_ms: float = 0.0
+_feed_lag_max: Dict[str, float] = {}
 
 
 def report_clock_sync(
@@ -183,6 +209,76 @@ def clock_sync_age_seconds() -> float:
     return max(0.0, time.time() - _last_sync_ts_ms / 1000.0)
 
 
+def report_feed_lag(symbol: str, lag_ms: Union[int, float]) -> None:
+    """Record feed lag for ``symbol`` and update maximum observed value."""
+    try:
+        lag = float(lag_ms)
+    except Exception:
+        return
+    try:
+        feed_lag_max_ms.labels(symbol).set(max(_feed_lag_max.get(symbol, 0.0), lag))
+    except Exception:
+        pass
+    prev = _feed_lag_max.get(symbol, 0.0)
+    if lag > prev:
+        _feed_lag_max[symbol] = lag
+        try:
+            feed_lag_max_ms.labels(symbol).set(lag)
+        except Exception:
+            pass
+
+
+def _collect(counter: Union[Counter, Gauge]) -> Dict[str, float]:
+    """Collect labeled metric values as a mapping of symbol to value."""
+    try:
+        metric = counter.collect()[0]
+        out: Dict[str, float] = {}
+        for sample in metric.samples:
+            if "symbol" in sample.labels and not sample.name.endswith("_created"):
+                out[sample.labels["symbol"]] = float(sample.value)
+        return out
+    except Exception:
+        return {}
+
+
+def snapshot_metrics() -> Tuple[str, str]:
+    """Return current metrics snapshot as ``(json, csv)`` strings."""
+    feed_lag = _feed_lag_max.copy()
+    ws_fail = _collect(ws_failure_count)
+    boundary = _collect(signal_boundary_count)
+    absolute = _collect(signal_absolute_count)
+    published = _collect(signal_published_count)
+
+    error_rates: Dict[str, float] = {}
+    for sym in set(boundary) | set(absolute) | set(published):
+        errors = boundary.get(sym, 0.0) + absolute.get(sym, 0.0)
+        total = errors + published.get(sym, 0.0)
+        rate = errors / total if total > 0 else 0.0
+        error_rates[sym] = rate
+        try:
+            signal_error_rate.labels(sym).set(rate)
+        except Exception:
+            pass
+
+    worst_feed = max(feed_lag.items(), key=lambda x: x[1], default=(None, 0.0))
+    worst_ws = max(ws_fail.items(), key=lambda x: x[1], default=(None, 0.0))
+    worst_err = max(error_rates.items(), key=lambda x: x[1], default=(None, 0.0))
+
+    summary = {
+        "worst_feed_lag": {"symbol": worst_feed[0], "feed_lag_ms": worst_feed[1]},
+        "worst_ws_failures": {"symbol": worst_ws[0], "failures": worst_ws[1]},
+        "worst_error_rate": {"symbol": worst_err[0], "error_rate": worst_err[1]},
+    }
+
+    json_str = json.dumps(summary, sort_keys=True)
+    csv_lines = ["metric,symbol,value"]
+    csv_lines.append(f"worst_feed_lag,{worst_feed[0] or ''},{worst_feed[1]}")
+    csv_lines.append(f"worst_ws_failures,{worst_ws[0] or ''},{worst_ws[1]}")
+    csv_lines.append(f"worst_error_rate,{worst_err[0] or ''},{worst_err[1]}")
+    csv_str = "\n".join(csv_lines)
+    return json_str, csv_str
+
+
 __all__ = [
     "skipped_incomplete_bars",
     "ws_dup_skipped_count",
@@ -206,4 +302,9 @@ __all__ = [
     "dropped_bp",
     "report_clock_sync",
     "clock_sync_age_seconds",
+    "feed_lag_max_ms",
+    "ws_failure_count",
+    "signal_error_rate",
+    "report_feed_lag",
+    "snapshot_metrics",
 ]
