@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import random
+from pathlib import Path
 from typing import Awaitable, Callable, List
 from clock import now_ms
 
@@ -15,6 +16,8 @@ import websockets
 from core_models import Bar
 from config import DataDegradationConfig
 from utils import SignalRateLimiter
+from services import monitoring
+import ws_dedup_state as signal_bus
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,9 @@ class BinanceWS:
         rate_limit: float | None = None,
         backoff_base: float = 2.0,
         max_backoff: float = 60.0,
+        ws_dedup_enabled: bool = False,
+        ws_dedup_log_skips: bool = False,
+        ws_dedup_persist_path: str | Path | None = None,
     ) -> None:
         self.symbols = [s.strip().upper() for s in symbols if s.strip()]
         self.interval = str(interval)
@@ -82,6 +88,21 @@ class BinanceWS:
         self._rl_total = 0
         self._rl_delayed = 0
         self._rl_dropped = 0
+
+        self._ws_dedup_enabled = ws_dedup_enabled
+        self._ws_dedup_log_skips = ws_dedup_log_skips
+        self._ws_dedup_persist_path = (
+            Path(ws_dedup_persist_path)
+            if ws_dedup_persist_path is not None
+            else signal_bus.PERSIST_PATH
+        )
+        if self._ws_dedup_enabled:
+            try:
+                signal_bus.PERSIST_PATH = self._ws_dedup_persist_path
+                signal_bus.load_state(self._ws_dedup_persist_path)
+                logger.info("WS_DEDUP_INIT size=%d", len(signal_bus.STATE))
+            except Exception:
+                pass
 
         if not self.symbols:
             raise ValueError("Не задан список symbols для подписки")
@@ -173,6 +194,23 @@ class BinanceWS:
                                     if delay_ms > 0:
                                         self._dd_delay += 1
                                         await asyncio.sleep(delay_ms / 1000.0)
+                                bar_close_ms = int(k.get("T", 0))
+                                if self._ws_dedup_enabled:
+                                    try:
+                                        if signal_bus.should_skip(bar.symbol, bar_close_ms):
+                                            if self._ws_dedup_log_skips:
+                                                try:
+                                                    logger.info("WS_DUP_BAR_SKIP")
+                                                except Exception:
+                                                    pass
+                                            try:
+                                                monitoring.ws_dup_skipped_count.labels(bar.symbol).inc()
+                                            except Exception:
+                                                pass
+                                            continue
+                                        signal_bus.update(bar.symbol, bar_close_ms)
+                                    except Exception:
+                                        pass
 
                                 prev_bar = bar
                                 if await self._check_rate_limit():
