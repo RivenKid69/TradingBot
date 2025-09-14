@@ -34,6 +34,7 @@ from services.monitoring import skipped_incomplete_bars
 from pipeline import check_ttl
 from services.utils_app import append_row_csv
 from services.signal_bus import log_drop
+from services.event_bus import EventBus
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
@@ -614,6 +615,31 @@ def from_config(
     cfg.ws_dedup.enabled = bus_enabled
     cfg.ws_dedup.persist_path = str(dedup_persist)
 
+    # Load runtime queue configuration for the asynchronous event bus
+    ops_cfg: Dict[str, Any] = {}
+    ops_cfg_path = Path("configs/ops.yaml")
+    if ops_cfg_path.exists():
+        try:
+            with ops_cfg_path.open("r", encoding="utf-8") as f:
+                ops_cfg = yaml.safe_load(f) or {}
+        except Exception:
+            ops_cfg = {}
+    runtime_cfg = ops_cfg.get("runtime", {})
+    queue_cfg = runtime_cfg.get("queue", {})
+    queue_capacity = int(queue_cfg.get("capacity", 0))
+    drop_policy = str(queue_cfg.get("drop_policy", "newest"))
+    bus = EventBus(queue_size=queue_capacity, drop_policy=drop_policy)
+
+    # Ensure components receive the bus if they accept it
+    try:
+        cfg.components.market_data.params.setdefault("bus", bus)
+    except Exception:
+        pass
+    try:
+        cfg.components.executor.params.setdefault("bus", bus)
+    except Exception:
+        pass
+
     svc_cfg = SignalRunnerConfig(
         snapshot_config_path=snapshot_config_path,
         artifacts_dir=cfg.artifacts_dir,
@@ -625,6 +651,11 @@ def from_config(
 
     container = di_registry.build_graph(cfg.components, cfg)
     adapter: SimAdapter = container["executor"]
+    if not hasattr(adapter, "bus"):
+        try:
+            adapter.bus = bus
+        except Exception:
+            pass
     fp: FeaturePipe = container["feature_pipe"]
     policy: SignalPolicy = container["policy"]
     guards: RiskGuards | None = container.get("risk_guards")
