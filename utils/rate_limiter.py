@@ -6,6 +6,25 @@ from typing import Literal, Tuple
 
 
 @dataclass
+class TokenBucket:
+    """Simple token bucket rate limiter."""
+
+    rps: float
+    burst: float
+    tokens: float = 0.0
+    last_ts: float = field(default_factory=time.monotonic)
+
+    def consume(self, tokens: float = 1, now: float | None = None) -> bool:
+        ts = time.monotonic() if now is None else now
+        self.tokens = min(self.burst, self.tokens + (ts - self.last_ts) * self.rps)
+        self.last_ts = ts
+        if self.tokens >= tokens:
+            self.tokens -= tokens
+            return True
+        return False
+
+
+@dataclass
 class SignalRateLimiter:
     """Simple rate limiter with exponential backoff.
 

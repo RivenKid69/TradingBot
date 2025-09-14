@@ -22,7 +22,7 @@ import logging
 from unittest.mock import MagicMock
 import pytest
 
-from utils import SignalRateLimiter
+from utils import SignalRateLimiter, TokenBucket
 
 # provide dummy websockets module for importing binance_ws without dependency
 class _DummyWS:
@@ -31,6 +31,17 @@ sys.modules.setdefault("websockets", _DummyWS())
 
 import binance_public
 import binance_ws
+
+
+# --- TokenBucket tests ---
+
+def test_token_bucket_basic():
+    tb = TokenBucket(rps=2.0, burst=4.0, tokens=4.0, last_ts=0.0)
+    assert tb.consume(tokens=1, now=0.0)
+    assert tb.tokens == pytest.approx(3.0)
+    assert tb.consume(tokens=4, now=0.5)
+    assert tb.tokens == pytest.approx(0.0)
+    assert not tb.consume(tokens=1, now=0.5)
 
 
 # --- SignalRateLimiter tests ---
