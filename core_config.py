@@ -111,6 +111,26 @@ class ThrottleConfig(BaseModel):
     time_source: str = "monotonic"
 
 
+class KillSwitchConfig(BaseModel):
+    """Thresholds for entering safe mode based on runtime metrics."""
+
+    feed_lag_ms: float = Field(
+        default=0.0,
+        description=
+        "Enter safe mode if worst feed lag exceeds this many milliseconds; non-positive disables",
+    )
+    ws_failures: float = Field(
+        default=0.0,
+        description=
+        "Enter safe mode if websocket failures for any symbol exceed this count; non-positive disables",
+    )
+    error_rate: float = Field(
+        default=0.0,
+        description=
+        "Enter safe mode if signal error rate for any symbol exceeds this fraction; non-positive disables",
+    )
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
         default=None, description="Идентификатор запуска; если None — генерируется."
@@ -139,6 +159,7 @@ class CommonRunConfig(BaseModel):
     ws_dedup: WSDedupConfig = Field(default_factory=WSDedupConfig)
     ttl: TTLConfig = Field(default_factory=TTLConfig)
     throttle: ThrottleConfig = Field(default_factory=ThrottleConfig)
+    kill_switch: KillSwitchConfig = Field(default_factory=KillSwitchConfig)
     components: Components
 
 
@@ -332,6 +353,8 @@ __all__ = [
     "TimingConfig",
     "WSDedupConfig",
     "TTLConfig",
+    "ThrottleConfig",
+    "KillSwitchConfig",
     "CommonRunConfig",
     "SimulationDataConfig",
     "SimulationConfig",

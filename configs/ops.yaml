@@ -11,6 +11,11 @@ ws_dedup:
   persist_path: state/last_bar_seen.json
   log_skips: true
 
+kill_switch:
+  feed_lag_ms: 60000       # Enter safe mode if worst feed lag exceeds this; 0 disables
+  ws_failures: 100         # Enter safe mode if WS failures exceed this count; 0 disables
+  error_rate: 0.2          # Enter safe mode if signal error rate exceeds this fraction; 0 disables
+
 ttl:
   enabled: false
   ttl_seconds: 60
