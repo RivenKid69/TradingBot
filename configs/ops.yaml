@@ -6,3 +6,8 @@ clock_sync:
   max_step_ms: 1000       # Max single adjustment step in milliseconds
   attempts: 5             # Number of sync attempts before giving up
 
+ws_dedup:
+  enabled: true
+  persist_path: state/last_bar_seen.json
+  log_skips: true
+
