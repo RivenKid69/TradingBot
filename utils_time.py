@@ -15,9 +15,10 @@ import threading
 import time
 from pathlib import Path
 import numpy as np
+import clock
 from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
 
-__all__ = ["floor_to_timeframe", "is_bar_closed"]
+__all__ = ["floor_to_timeframe", "is_bar_closed", "now_ms", "next_bar_open_ms"]
 
 _logging_spec = importlib.util.spec_from_file_location(
     "py_logging", Path(sysconfig.get_path("stdlib")) / "logging/__init__.py"
@@ -41,6 +42,18 @@ def is_bar_closed(ts_close_ms: int, now_utc_ms: int, lag_ms: int = 0) -> bool:
     """Return ``True`` if current time exceeds ``ts_close_ms`` plus ``lag_ms``."""
 
     return now_utc_ms >= ts_close_ms + lag_ms
+
+
+def now_ms() -> int:
+    """Return current corrected time accounting for clock skew."""
+
+    return int(clock.system_utc_ms() + clock.clock_skew())
+
+
+def next_bar_open_ms(close_ms: int, timeframe_ms: int) -> int:
+    """Return the open timestamp of the bar following ``close_ms``."""
+
+    return floor_to_timeframe(close_ms, timeframe_ms) + timeframe_ms
 
 
 def interpolate_daily_multipliers(days: Sequence[float]) -> np.ndarray:
