@@ -161,6 +161,47 @@ def test_load_and_flush_state(tmp_path):
     assert json.loads(sb._STATE_PATH.read_text()) == {valid_sid: future_exp}
 
 
+def test_publish_signal_loads_once_and_flushes(tmp_path):
+    sb._STATE_PATH = tmp_path / "seen.json"
+    sb._SEEN.clear()
+    sb.dropped_by_reason.clear()
+    sb._loaded = False
+
+    calls: list[int] = []
+    orig_load = sb.load_state
+
+    def _load(*a, **k):
+        calls.append(1)
+        return orig_load(*a, **k)
+
+    sb.load_state = _load  # type: ignore
+    try:
+        sent: list[dict[str, int]] = []
+
+        def send_fn(payload):
+            sent.append(payload)
+
+        now = 1000
+        sid = sb.signal_id("BTCUSDT", 1)
+        ok = sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, expires_at_ms=now + 100, now_ms=now)
+        assert ok
+        assert calls == [1]
+        assert json.loads(sb._STATE_PATH.read_text()) == {sid: now + 100}
+    finally:
+        sb.load_state = orig_load  # type: ignore
+
+
+def test_load_state_reinit_on_corruption(tmp_path):
+    sb._STATE_PATH = tmp_path / "seen.json"
+    sb._SEEN.clear()
+    sb.dropped_by_reason.clear()
+    sb._loaded = False
+    sb._STATE_PATH.write_text("not-json")
+    sb.load_state()
+    assert sb._SEEN == {}
+    assert json.loads(sb._STATE_PATH.read_text()) == {}
+
+
 def test_publish_signal_csv_logging(tmp_path):
     sb._STATE_PATH = tmp_path / "seen.json"
     sb._SEEN.clear()

@@ -84,9 +84,13 @@ def load_state(path: str | Path | None = None) -> None:
     try:
         data = json.loads(p.read_text()) if p.exists() else {}
     except Exception:
-        # В случае ошибки стартуем с пустым состоянием
+        # В случае ошибки стартуем с пустым состоянием и перезаписываем файл
         _SEEN.clear()
         _loaded = True
+        try:
+            flush_state(p)
+        except Exception:
+            pass
         return
 
     now = int(time.time() * 1000)
@@ -191,17 +195,26 @@ def publish_signal(
     if not config.enabled:
         log_drop(symbol, bar_close_ms, payload, "disabled")
         return False
+
     _ensure_loaded()
     sid = dedup_key or signal_id(symbol, bar_close_ms)
     now = now_ms if now_ms is not None else utils_time.now_ms()
     if now >= int(expires_at_ms):
         log_drop(symbol, bar_close_ms, payload, "expired")
         return False
-    if already_emitted(sid, now_ms=now):
-        log_drop(symbol, bar_close_ms, payload, "duplicate")
-        return False
+
+    with _lock:
+        _purge(now)
+        if sid in _SEEN:
+            log_drop(symbol, bar_close_ms, payload, "duplicate")
+            return False
+
     send_fn(payload)
-    mark_emitted(sid, expires_at_ms=int(expires_at_ms), now_ms=now)
+
+    with _lock:
+        _SEEN[sid] = int(expires_at_ms)
+        _flush()
+
     if OUT_CSV:
         try:
             header = ["symbol", "bar_close_ms", "payload", "expires_at_ms"]
