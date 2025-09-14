@@ -9,6 +9,7 @@ based on feed lag, websocket failures and signal error rates.
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Dict, Tuple, Union, Optional, Any
 
@@ -329,8 +330,21 @@ def _collect(counter: Union[Counter, Gauge]) -> Dict[str, float]:
         return {}
 
 
-def snapshot_metrics() -> Tuple[str, str]:
-    """Return current metrics snapshot as ``(json, csv)`` strings."""
+def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[str, str]:
+    """Persist current metrics snapshot to ``json_path`` and ``csv_path``.
+
+    Parameters
+    ----------
+    json_path : str
+        Destination for JSON summary.
+    csv_path : str
+        Destination for CSV summary.
+
+    Returns
+    -------
+    Tuple[str, str]
+        The JSON and CSV representation of the snapshot.
+    """
     feed_lag = _feed_lag_max.copy()
     ws_fail = _collect(ws_failure_count)
     boundary = _collect(signal_boundary_count)
@@ -364,6 +378,20 @@ def snapshot_metrics() -> Tuple[str, str]:
     csv_lines.append(f"worst_ws_failures,{worst_ws[0] or ''},{worst_ws[1]}")
     csv_lines.append(f"worst_error_rate,{worst_err[0] or ''},{worst_err[1]}")
     csv_str = "\n".join(csv_lines)
+
+    try:
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
+            f.write(json_str)
+    except Exception:
+        pass
+    try:
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            f.write(csv_str)
+    except Exception:
+        pass
+
     return json_str, csv_str
 
 
