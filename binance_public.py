@@ -6,11 +6,14 @@ import json
 import math
 import urllib.parse
 import urllib.request
+import urllib.error
+import socket
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from utils import SignalRateLimiter
+from services import ops_kill_switch
 
 
 logger = logging.getLogger(__name__)
@@ -30,11 +33,40 @@ def _http_get(url: str, params: Dict[str, Any], *, timeout: int = 20) -> Dict[st
         return {"raw": data.decode("utf-8", errors="ignore")}
 
 
-def _retrying_get(url: str, params: Dict[str, Any], *, timeout: int = 20, retries: int = 5, backoff_base: float = 0.5) -> Dict[str, Any] | List[Any]:
+def _retrying_get(
+    url: str,
+    params: Dict[str, Any],
+    *,
+    timeout: int = 20,
+    retries: int = 5,
+    backoff_base: float = 0.5,
+) -> Dict[str, Any] | List[Any]:
+    had_error = False
     for i in range(max(1, retries)):
         try:
-            return _http_get(url, params, timeout=timeout)
+            data = _http_get(url, params, timeout=timeout)
+            if had_error:
+                ops_kill_switch.manual_reset()
+            return data
         except Exception as e:
+            record = False
+            if isinstance(e, urllib.error.HTTPError):
+                code = getattr(e, "code", 0)
+                if code == 429 or 500 <= code < 600:
+                    record = True
+            elif isinstance(e, urllib.error.URLError):
+                reason = getattr(e, "reason", None)
+                if isinstance(reason, (TimeoutError, socket.timeout)):
+                    record = True
+                else:
+                    msg = str(reason).lower()
+                    if "timed out" in msg or "timeout" in msg:
+                        record = True
+            elif isinstance(e, (TimeoutError, socket.timeout)):
+                record = True
+            if record:
+                ops_kill_switch.record_error("rest")
+                had_error = True
             if i == retries - 1:
                 raise
             sleep_s = backoff_base * (2 ** i) + (0.1 * i)
@@ -89,6 +121,7 @@ class BinancePublicClient:
                 return
             if status == "rejected":
                 self._rl_rejected += 1
+                ops_kill_switch.record_error("rest")
             else:
                 self._rl_delayed += 1
             wait = max(self._rate_limiter._cooldown_until - time.time(), 0.0)
