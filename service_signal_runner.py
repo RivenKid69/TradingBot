@@ -664,20 +664,56 @@ def from_config(
     cfg.ws_dedup.enabled = bus_enabled
     cfg.ws_dedup.persist_path = str(dedup_persist)
 
-    # Load runtime queue configuration for the asynchronous event bus
-    ops_cfg: Dict[str, Any] = {}
-    ops_cfg_path = Path("configs/ops.yaml")
-    if ops_cfg_path.exists():
+    # Load runtime parameters
+    rt_cfg: Dict[str, Any] = {}
+    rt_cfg_path = Path("configs/runtime.yaml")
+    if rt_cfg_path.exists():
         try:
-            with ops_cfg_path.open("r", encoding="utf-8") as f:
-                ops_cfg = yaml.safe_load(f) or {}
+            with rt_cfg_path.open("r", encoding="utf-8") as f:
+                rt_cfg = yaml.safe_load(f) or {}
         except Exception:
-            ops_cfg = {}
-    runtime_cfg = ops_cfg.get("runtime", {})
-    queue_cfg = runtime_cfg.get("queue", {})
+            rt_cfg = {}
+
+    # Queue configuration for the asynchronous event bus
+    queue_cfg = rt_cfg.get("queue", {})
     queue_capacity = int(queue_cfg.get("capacity", 0))
     drop_policy = str(queue_cfg.get("drop_policy", "newest"))
     bus = EventBus(queue_size=queue_capacity, drop_policy=drop_policy)
+
+    # WS deduplication overrides
+    ws_cfg = rt_cfg.get("ws", {})
+    cfg.ws_dedup.enabled = bool(ws_cfg.get("enabled", cfg.ws_dedup.enabled))
+    cfg.ws_dedup.persist_path = str(ws_cfg.get("persist_path", cfg.ws_dedup.persist_path))
+    cfg.ws_dedup.log_skips = bool(ws_cfg.get("log_skips", cfg.ws_dedup.log_skips))
+
+    # Throttle configuration overrides
+    throttle_cfg = rt_cfg.get("throttle", {})
+    if throttle_cfg:
+        cfg.throttle.enabled = bool(throttle_cfg.get("enabled", cfg.throttle.enabled))
+        global_cfg = throttle_cfg.get("global", {})
+        cfg.throttle.global_.rps = float(global_cfg.get("rps", cfg.throttle.global_.rps))
+        cfg.throttle.global_.burst = int(global_cfg.get("burst", cfg.throttle.global_.burst))
+        sym_cfg = throttle_cfg.get("symbol", {})
+        cfg.throttle.symbol.rps = float(sym_cfg.get("rps", cfg.throttle.symbol.rps))
+        cfg.throttle.symbol.burst = int(sym_cfg.get("burst", cfg.throttle.symbol.burst))
+        cfg.throttle.mode = str(throttle_cfg.get("mode", cfg.throttle.mode))
+        q_cfg = throttle_cfg.get("queue", {})
+        cfg.throttle.queue.max_items = int(q_cfg.get("max_items", cfg.throttle.queue.max_items))
+        cfg.throttle.queue.ttl_ms = int(q_cfg.get("ttl_ms", cfg.throttle.queue.ttl_ms))
+        cfg.throttle.time_source = str(throttle_cfg.get("time_source", cfg.throttle.time_source))
+
+    # Kill switch overrides
+    kill_cfg = rt_cfg.get("ops", {}).get("kill_switch", {})
+    if kill_cfg:
+        cfg.kill_switch.feed_lag_ms = float(
+            kill_cfg.get("feed_lag_ms", cfg.kill_switch.feed_lag_ms)
+        )
+        cfg.kill_switch.ws_failures = float(
+            kill_cfg.get("ws_failures", cfg.kill_switch.ws_failures)
+        )
+        cfg.kill_switch.error_rate = float(
+            kill_cfg.get("error_rate", cfg.kill_switch.error_rate)
+        )
 
     # Ensure components receive the bus if they accept it
     try:

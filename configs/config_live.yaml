@@ -3,6 +3,8 @@ run_id: live-run
 logs_dir: logs
 artifacts_dir: artifacts
 seasonality_log_level: INFO
+# Runtime settings are defined in runtime.yaml
+runtime_config: runtime.yaml
 execution_config:
   notional_threshold: 10000.0
   large_order_algo: TWAP
@@ -23,29 +25,11 @@ clock_sync:
   kill_threshold_ms: 2000 # Terminate if drift exceeds this many milliseconds
   max_step_ms: 1000       # Max single adjustment step in milliseconds
   attempts: 5             # Number of sync attempts before giving up
-
-kill_switch:
-  feed_lag_ms: 60000       # Enter safe mode if worst feed lag exceeds this; 0 disables
-  ws_failures: 100         # Enter safe mode if WS failures exceed this count; 0 disables
-  error_rate: 0.2          # Enter safe mode if signal error rate exceeds this fraction; 0 disables
 ttl:
   enabled: false
   ttl_seconds: 60
   out_csv: null
   dedup_persist: null
-throttle:
-  enabled: false              # disable throttling
-  global:
-    rps: 0.0                  # requests per second; 0 disables
-    burst: 0                  # burst capacity
-  symbol:
-    rps: 0.0                  # per-symbol RPS limit
-    burst: 0
-  mode: drop                  # drop or queue
-  queue:
-    max_items: 0              # queue size when mode=queue
-    ttl_ms: 0                 # item lifetime in ms
-  time_source: "monotonic"
 api:
   api_key: null
   api_secret: null
