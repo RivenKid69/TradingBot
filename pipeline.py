@@ -5,8 +5,17 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Tuple
 
+import numpy as np
+
 from core_models import Bar
 from utils_time import next_bar_open_ms, is_bar_closed
+from no_trade import (
+    _parse_daily_windows_min,
+    _in_daily_window,
+    _in_funding_buffer,
+    _in_custom_window,
+)
+from no_trade_config import NoTradeConfig
 
 
 class Stage(Enum):
@@ -87,6 +96,50 @@ def closed_bar_guard(
     return PipelineResult(action="pass", stage=Stage.CLOSED_BAR)
 
 
+_NO_TRADE_CACHE: dict[str, tuple[list[tuple[int, int]], int, list[dict[str, int]]]] = {}
+
+
+def apply_no_trade_windows(
+    ts_ms: int, symbol: str, cfg: NoTradeConfig
+) -> PipelineResult:
+    """Check whether ``ts_ms`` falls into any no-trade window.
+
+    Parameters
+    ----------
+    ts_ms:
+        Timestamp in milliseconds since epoch.
+    symbol:
+        Trading symbol used for cache key.
+    cfg:
+        No-trade configuration.
+
+    Returns
+    -------
+    PipelineResult
+        ``"drop"`` with reason :class:`Reason.WINDOW` if the timestamp is
+        blocked, otherwise ``"pass"``.
+    """
+
+    cached = _NO_TRADE_CACHE.get(symbol)
+    if cached is None:
+        daily_min = _parse_daily_windows_min(cfg.daily_utc or [])
+        buf_min = int(cfg.funding_buffer_min or 0)
+        custom = cfg.custom_ms or []
+        cached = (daily_min, buf_min, custom)
+        _NO_TRADE_CACHE[symbol] = cached
+    daily_min, buf_min, custom = cached
+
+    ts_arr = np.asarray([ts_ms], dtype=np.int64)
+    blocked = (
+        _in_daily_window(ts_arr, daily_min)[0]
+        or _in_funding_buffer(ts_arr, buf_min)[0]
+        or _in_custom_window(ts_arr, custom)[0]
+    )
+    if blocked:
+        return PipelineResult(action="drop", stage=Stage.WINDOWS, reason=Reason.WINDOW)
+    return PipelineResult(action="pass", stage=Stage.WINDOWS)
+
+
 def compute_expires_at(bar_close_ms: int, timeframe_ms: int) -> int:
     """Compute expiration timestamp for a bar.
 
@@ -142,6 +195,7 @@ __all__ = [
     "Reason",
     "PipelineResult",
     "closed_bar_guard",
+    "apply_no_trade_windows",
     "compute_expires_at",
     "check_ttl",
 ]
