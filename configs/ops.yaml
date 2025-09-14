@@ -22,6 +22,7 @@ kill_switch:
   reset_cooldown_sec: 60   # Cooldown period before counters reset in seconds
   flag_path: null          # File path acting as external kill flag
   alert_command: null      # Command to execute when kill switch triggers
+  # Manual reset: delete the flag file or call ops_kill_switch.manual_reset()
 
 shutdown:
   grace_period: 5.0           # Seconds to wait between stop and flush phases
