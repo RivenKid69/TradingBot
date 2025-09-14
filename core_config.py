@@ -69,6 +69,14 @@ class TimingConfig(BaseModel):
     close_lag_ms: int = Field(default=2000)
 
 
+class WSDedupConfig(BaseModel):
+    """Конфигурация дедупликации данных вебсокета."""
+
+    enabled: bool = Field(default=False)
+    persist_path: str = Field(default="state/last_bar_seen.json")
+    log_skips: bool = Field(default=False)
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
         default=None, description="Идентификатор запуска; если None — генерируется."
@@ -94,6 +102,7 @@ class CommonRunConfig(BaseModel):
     )
     timing: TimingConfig = Field(default_factory=TimingConfig)
     clock_sync: ClockSyncConfig = Field(default_factory=ClockSyncConfig)
+    ws_dedup: WSDedupConfig = Field(default_factory=WSDedupConfig)
     components: Components
 
 
@@ -285,6 +294,7 @@ __all__ = [
     "Components",
     "ClockSyncConfig",
     "TimingConfig",
+    "WSDedupConfig",
     "CommonRunConfig",
     "SimulationDataConfig",
     "SimulationConfig",
