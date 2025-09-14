@@ -31,3 +31,8 @@ throttle:
     ttl_ms: 0                 # item lifetime in ms
   time_source: "monotonic"
 
+runtime:
+  queue:
+    capacity: 1000            # event bus capacity; 0 for unbounded
+    drop_policy: newest       # "newest" drops incoming, "oldest" drops oldest
+

@@ -26,7 +26,21 @@ from . import monitoring
 class EventBus:
     """Lightweight asynchronous event bus with drop policies."""
 
-    def __init__(self, queue_size: int, drop_policy: str) -> None:
+    def __init__(self, queue_size: int, drop_policy: str = "newest") -> None:
+        """Create a new bus.
+
+        Parameters
+        ----------
+        queue_size:
+            Maximum number of enqueued events. Non-positive values create an
+            unbounded queue.
+        drop_policy:
+            ``"newest"`` drops the incoming event when the queue is full while
+            ``"oldest"`` discards the oldest queued item and enqueues the new
+            one. Historical aliases ``"drop_newest"`` and ``"drop_oldest"`` are
+            also accepted.
+        """
+
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=max(0, int(queue_size)))
         if drop_policy not in {"oldest", "newest", "drop_oldest", "drop_newest"}:
             raise ValueError("drop_policy must be 'oldest' or 'newest'")
@@ -97,6 +111,12 @@ class EventBus:
             await self._queue.put(self._sentinel)
             return None
         return item
+
+    @property
+    def depth(self) -> int:
+        """Current number of queued events."""
+
+        return self._queue.qsize()
 
     # ------------------------------------------------------------------
     def close(self) -> None:

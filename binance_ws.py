@@ -153,7 +153,10 @@ class BinanceWS:
         accepted = await self._bus.put(event)
         if not accepted:
             try:
-                logger.info("BACKPRESSURE_DROP")
+                logger.info(
+                    "BACKPRESSURE_DROP %s",
+                    {"symbol": bar.symbol, "depth": self._bus.depth},
+                )
             except Exception:
                 pass
             try:
