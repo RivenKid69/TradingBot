@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict
+from dataclasses import dataclass
 
 # Путь к файлу состояния
 _STATE_PATH = Path("state/seen_signals.json")
@@ -15,6 +16,14 @@ _STATE_PATH = Path("state/seen_signals.json")
 _SEEN: Dict[str, int] = {}
 _lock = threading.Lock()
 _loaded = False
+
+
+@dataclass
+class _Config:
+    enabled: bool = True
+
+
+config = _Config()
 
 
 def signal_id(symbol: str, bar_close_ms: int) -> str:
@@ -127,6 +136,8 @@ def publish_signal(
 
     Возвращает True, если сигнал был отправлен, иначе False.
     """
+    if not config.enabled:
+        return False
     _ensure_loaded()
     sid = signal_id(symbol, bar_close_ms)
     if already_emitted(sid, now_ms=now_ms):

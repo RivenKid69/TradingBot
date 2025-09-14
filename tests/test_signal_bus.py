@@ -55,6 +55,26 @@ def test_publish_signal_payload_fields(tmp_path):
     assert captured == [payload]
 
 
+def test_publish_signal_disabled(tmp_path):
+    sb._STATE_PATH = tmp_path / "seen.json"
+    sb._SEEN.clear()
+    sb._loaded = False
+    sb.load_state()
+
+    sent = []
+
+    def send_fn(payload):
+        sent.append(payload)
+
+    sb.config.enabled = False
+    try:
+        assert not sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, ttl_ms=100, now_ms=0)
+        assert sent == []
+        assert sb._SEEN == {}
+    finally:
+        sb.config.enabled = True
+
+
 def test_load_and_flush_state(tmp_path):
     sb._STATE_PATH = tmp_path / "seen.json"
     sb._SEEN.clear()
