@@ -86,14 +86,30 @@ def load_state(path: str | Path | None = None) -> None:
         return
 
     try:
-        data = json.loads(p.read_text())
+        raw = p.read_text()
+        data = json.loads(raw)
     except Exception:
         logger.exception("Failed reading state file %s", p)
+        with _lock:
+            STATE.clear()
+        try:
+            _atomic_write(p)
+        except Exception:
+            pass
         return
 
     with _lock:
         STATE.clear()
-        STATE.update({str(k): int(v) for k, v in data.items()})
+        for k, v in data.items():
+            try:
+                STATE[str(k)] = int(v)
+            except Exception:
+                continue
+    if len(STATE) != len(data):
+        try:
+            _atomic_write(p)
+        except Exception:
+            pass
     logger.info("Loaded %d symbols from %s", len(STATE), p)
 
 def should_skip(symbol: str, close_ms: int) -> bool:

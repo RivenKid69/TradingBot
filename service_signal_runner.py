@@ -499,7 +499,7 @@ class _Worker:
 
         if self._ws_dedup_enabled and close_ms is not None:
             try:
-                signal_bus.update(bar.symbol, close_ms, auto_flush=False)
+                signal_bus.update(bar.symbol, close_ms)
             except Exception:
                 pass
         return emitted
