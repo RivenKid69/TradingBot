@@ -158,6 +158,35 @@ class _Provider:
             "features_hash",
         ]
         for o in orders:
+            created_ts = int(getattr(o, "created_ts_ms", 0) or 0)
+            now_ms = clock.now_ms()
+            ok, expires_at_ms, _ = check_ttl(
+                bar_close_ms=created_ts,
+                now_ms=now_ms,
+                timeframe_ms=self._ws_dedup_timeframe_ms,
+            )
+            if not ok:
+                try:
+                    self._logger.info(
+                        "TTL_EXPIRED_PUBLISH %s",
+                        {
+                            "symbol": bar.symbol,
+                            "created_ts_ms": created_ts,
+                            "now_ms": now_ms,
+                            "expires_at_ms": expires_at_ms,
+                        },
+                    )
+                except Exception:
+                    pass
+                continue
+
+            try:
+                age_ms = now_ms - created_ts
+                monitoring.signal_publish_age_ms.labels(bar.symbol).observe(age_ms)
+                monitoring.signal_publish_count.labels(bar.symbol).inc()
+            except Exception:
+                pass
+
             score = float(getattr(o, "score", 0) or 0)
             fh = str(getattr(o, "features_hash", "") or "")
             side = getattr(o, "side", "")

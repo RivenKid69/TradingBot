@@ -7,7 +7,7 @@ from typing import Union
 from utils.prometheus import Counter
 
 try:  # pragma: no cover - optional dependency
-    from prometheus_client import Gauge
+    from prometheus_client import Gauge, Histogram
 except Exception:  # pragma: no cover - fallback when prometheus_client is missing
     class _DummyGauge:
         def __init__(self, *args, **kwargs) -> None:
@@ -19,7 +19,18 @@ except Exception:  # pragma: no cover - fallback when prometheus_client is missi
         def set(self, *args, **kwargs) -> None:
             pass
 
+    class _DummyHistogram:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def labels(self, *args, **kwargs) -> "_DummyHistogram":
+            return self
+
+        def observe(self, *args, **kwargs) -> None:
+            pass
+
     Gauge = _DummyGauge  # type: ignore
+    Histogram = _DummyHistogram  # type: ignore
 
 # Gauges for latest clock sync measurements
 _CLOCK_SYNC_DRIFT_MS = Gauge(
@@ -63,6 +74,18 @@ ws_dup_skipped_count = Counter(
 ttl_expired_boundary_count = Counter(
     "ttl_expired_boundary_count",
     "Orders dropped due to bar TTL expiration before processing",
+    ["symbol"],
+)
+
+# Age of signals at publish time and publish counts
+signal_publish_age_ms = Histogram(
+    "signal_publish_age_ms",
+    "Age of signals when published in milliseconds",
+    ["symbol"],
+)
+signal_publish_count = Counter(
+    "signal_publish_count",
+    "Signals published",
     ["symbol"],
 )
 
@@ -119,6 +142,8 @@ __all__ = [
     "skipped_incomplete_bars",
     "ws_dup_skipped_count",
     "ttl_expired_boundary_count",
+    "signal_publish_age_ms",
+    "signal_publish_count",
     "clock_sync_fail",
     "clock_sync_success",
     "report_clock_sync",
