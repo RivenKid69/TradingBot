@@ -41,6 +41,23 @@ queue_len = Gauge(
     "Current number of queued signals awaiting tokens",
 )
 
+# Throttling outcomes
+throttle_dropped_count = Counter(
+    "throttle_dropped_count",
+    "Signals dropped due to throttling",
+    ["symbol", "reason"],
+)
+throttle_enqueued_count = Counter(
+    "throttle_enqueued_count",
+    "Signals enqueued due to throttling",
+    ["symbol", "reason"],
+)
+throttle_queue_expired_count = Counter(
+    "throttle_queue_expired_count",
+    "Queued signals expired before tokens became available",
+    ["symbol"],
+)
+
 # Event bus metrics
 queue_depth = Gauge(
     "event_bus_queue_depth",
@@ -181,6 +198,9 @@ __all__ = [
     "clock_sync_rtt_ms",
     "clock_sync_last_sync_ts",
     "queue_len",
+    "throttle_dropped_count",
+    "throttle_enqueued_count",
+    "throttle_queue_expired_count",
     "queue_depth",
     "events_in",
     "dropped_bp",

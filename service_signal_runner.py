@@ -220,6 +220,8 @@ class _Worker:
                 self._queue.popleft()
                 try:
                     log_drop(symbol, bar_close_ms, order, "QUEUE_EXPIRED")
+                    monitoring.throttle_queue_expired_count.labels(symbol).inc()
+                    monitoring.throttle_dropped_count.labels(symbol, "QUEUE_EXPIRED").inc()
                 except Exception:
                     pass
                 continue
@@ -318,11 +320,16 @@ class _Worker:
                     if self._throttle_cfg.mode == "drop":
                         try:
                             log_drop(bar.symbol, int(bar.ts), o, reason or "")
+                            monitoring.throttle_dropped_count.labels(bar.symbol, reason or "").inc()
                         except Exception:
                             pass
                     elif self._throttle_cfg.mode == "queue" and self._queue is not None:
                         exp = time.monotonic() + self._throttle_cfg.queue.ttl_ms / 1000.0
                         self._queue.append((exp, bar.symbol, int(bar.ts), o))
+                        try:
+                            monitoring.throttle_enqueued_count.labels(bar.symbol, reason or "").inc()
+                        except Exception:
+                            pass
                     continue
             if not self._emit(o, bar.symbol, int(bar.ts)):
                 self._refund_tokens(bar.symbol)
