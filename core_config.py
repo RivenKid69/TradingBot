@@ -86,6 +86,31 @@ class TTLConfig(BaseModel):
     dedup_persist: Optional[str] = Field(default=None)
 
 
+class TokenBucketConfig(BaseModel):
+    """Token bucket limiter settings."""
+
+    rps: float = 0.0
+    burst: int = 0
+
+
+class ThrottleQueueConfig(BaseModel):
+    """Settings for queued throttle mode."""
+
+    max_items: int = 0
+    ttl_ms: int = 0
+
+
+class ThrottleConfig(BaseModel):
+    """Global throttling configuration."""
+
+    enabled: bool = False
+    global_: TokenBucketConfig = Field(default_factory=TokenBucketConfig, alias="global")
+    symbol: TokenBucketConfig = Field(default_factory=TokenBucketConfig)
+    mode: str = "drop"
+    queue: ThrottleQueueConfig = Field(default_factory=ThrottleQueueConfig)
+    time_source: str = "monotonic"
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
         default=None, description="Идентификатор запуска; если None — генерируется."
@@ -113,6 +138,7 @@ class CommonRunConfig(BaseModel):
     clock_sync: ClockSyncConfig = Field(default_factory=ClockSyncConfig)
     ws_dedup: WSDedupConfig = Field(default_factory=WSDedupConfig)
     ttl: TTLConfig = Field(default_factory=TTLConfig)
+    throttle: ThrottleConfig = Field(default_factory=ThrottleConfig)
     components: Components
 
 
