@@ -47,6 +47,7 @@ from pipeline import (
 from services.utils_app import append_row_csv
 from services.signal_bus import log_drop
 from services.event_bus import EventBus
+from services.shutdown import ShutdownManager
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
@@ -584,6 +585,7 @@ class ServiceSignalRunner:
         throttle_cfg: ThrottleConfig | None = None,
         no_trade_cfg: NoTradeConfig | None = None,
         pipeline_cfg: PipelineConfig | None = None,
+        shutdown_cfg: Dict[str, Any] | None = None,
         *,
         enforce_closed_bars: bool = True,
         ws_dedup_enabled: bool = False,
@@ -600,6 +602,7 @@ class ServiceSignalRunner:
         self.throttle_cfg = throttle_cfg
         self.no_trade_cfg = no_trade_cfg
         self.pipeline_cfg = pipeline_cfg
+        self.shutdown_cfg = shutdown_cfg or {}
         self._clock_safe_mode = False
         self._clock_stop = threading.Event()
         self._clock_thread: Optional[threading.Thread] = None
@@ -638,6 +641,9 @@ class ServiceSignalRunner:
         # снапшот конфига, если задан
         if self.cfg.snapshot_config_path and self.cfg.artifacts_dir:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
+        shutdown = ShutdownManager(self.shutdown_cfg)
+        stop_event = threading.Event()
+        shutdown.on_stop(stop_event.set)
 
         self.feature_pipe.warmup()
         monitoring.configure_kill_switch(self.cfg.kill_switch)
@@ -676,6 +682,7 @@ class ServiceSignalRunner:
                 pass
             snapshot_thread = threading.Thread(target=_snapshot_loop, daemon=True)
             snapshot_thread.start()
+            shutdown.on_stop(snapshot_stop.set)
 
         # Optional asynchronous event bus processing
         bus = getattr(self.adapter, "bus", None)
@@ -702,40 +709,48 @@ class ServiceSignalRunner:
 
             loop_thread = threading.Thread(target=_loop_runner, daemon=True)
             loop_thread.start()
+            shutdown.on_stop(bus.close)
+            shutdown.on_finalize(lambda: loop_thread.join(timeout=1.0) if loop_thread else None)
 
-        # --- signal handling for graceful shutdown ---
-        stop_event = threading.Event()
         ws_client = getattr(self.adapter, "ws", None) or getattr(self.adapter, "source", None)
+        if ws_client is not None and hasattr(ws_client, "stop"):
+            shutdown.on_stop(lambda: ws_client.stop())
 
-        def _shutdown() -> None:
-            if ws_client is not None and hasattr(ws_client, "stop"):
-                try:
-                    ws_client.stop()
-                except Exception:
-                    pass
-            if bus is not None:
-                try:
-                    bus.close()
-                except Exception:
-                    pass
+        shutdown.on_stop(worker._drain_queue)
 
-        prev_handlers: Dict[int, Any] = {}
-        for _sig in (signal.SIGINT, signal.SIGTERM):
+        sim = getattr(self.adapter, "sim", None) or getattr(self.adapter, "_sim", None)
+        signal_log = getattr(sim, "_logger", None) if sim is not None else None
+        if signal_log is not None:
+            if hasattr(signal_log, "flush_fsync"):
+                shutdown.on_flush(signal_log.flush_fsync)
+            elif hasattr(signal_log, "flush"):
+                shutdown.on_flush(signal_log.flush)
+        if hasattr(signal_bus, "flush"):
+            shutdown.on_flush(signal_bus.flush)
+        shutdown.on_flush(lambda: monitoring.snapshot_metrics(json_path, csv_path))
+
+        def _write_marker() -> None:
             try:
-                prev_handlers[_sig] = signal.getsignal(_sig)
-
-                def _handler(signum, frame, _prev=prev_handlers[_sig]):
-                    try:
-                        if not stop_event.is_set():
-                            stop_event.set()
-                            _shutdown()
-                    finally:
-                        if callable(_prev):
-                            _prev(signum, frame)
-
-                signal.signal(_sig, _handler)
+                Path(os.path.join(logs_dir, "shutdown.marker")).touch()
             except Exception:
                 pass
+
+        def _final_summary() -> None:
+            try:
+                summary_json, _ = monitoring.snapshot_metrics(json_path, csv_path)
+                self.logger.info("SUMMARY %s", summary_json)
+            except Exception:
+                pass
+
+        shutdown.on_finalize(_write_marker)
+        if snapshot_thread is not None:
+            shutdown.on_finalize(lambda: snapshot_thread.join(timeout=1.0))
+        shutdown.on_finalize(lambda: self._clock_stop.set())
+        shutdown.on_finalize(lambda: self._clock_thread.join(timeout=self.clock_sync_cfg.refresh_sec if self.clock_sync_cfg else 1.0) if self._clock_thread is not None else None)
+        shutdown.on_finalize(lambda: signal_bus.shutdown() if signal_bus.ENABLED else None)
+        shutdown.on_finalize(_final_summary)
+
+        shutdown.register(signal.SIGINT, signal.SIGTERM)
 
         client = getattr(self.adapter, "client", None)
         if client is not None and self.clock_sync_cfg is not None:
@@ -804,47 +819,8 @@ class ServiceSignalRunner:
                     break
                 yield rep
         finally:
-            # restore previous signal handlers
-            for _sig, _prev in prev_handlers.items():
-                try:
-                    signal.signal(_sig, _prev)
-                except Exception:
-                    pass
-            _shutdown()
-            if loop_thread is not None:
-                try:
-                    loop_thread.join()
-                except Exception:
-                    pass
-            snapshot_stop.set()
-            if snapshot_thread is not None:
-                try:
-                    snapshot_thread.join(timeout=1.0)
-                except Exception:
-                    pass
-            self._clock_stop.set()
-            if self._clock_thread is not None:
-                try:
-                    self._clock_thread.join(timeout=self.clock_sync_cfg.refresh_sec if self.clock_sync_cfg else 1.0)
-                except Exception:
-                    pass
-            sim = getattr(self.adapter, "sim", None) or getattr(self.adapter, "_sim", None)
-            logger = getattr(sim, "_logger", None) if sim is not None else None
-            try:
-                if logger:
-                    logger.flush()
-            except Exception:
-                pass
-            try:
-                summary_json, _ = monitoring.snapshot_metrics(json_path, csv_path)
-                self.logger.info("SUMMARY %s", summary_json)
-            except Exception:
-                pass
-            if signal_bus.ENABLED:
-                try:
-                    signal_bus.shutdown()
-                except Exception:
-                    pass
+            shutdown.unregister(signal.SIGINT, signal.SIGTERM)
+            shutdown.request_shutdown()
 
 
 def from_config(
@@ -970,6 +946,8 @@ def from_config(
 
     pipeline_cfg = base_pipeline.merge(ops_pipeline)
 
+    shutdown_cfg = rt_cfg.get("shutdown", {})
+
     # Ensure components receive the bus if they accept it
     try:
         cfg.components.market_data.params.setdefault("bus", bus)
@@ -1012,6 +990,7 @@ def from_config(
         cfg.throttle,
         NoTradeConfig(**(cfg.no_trade or {})),
         pipeline_cfg=pipeline_cfg,
+        shutdown_cfg=shutdown_cfg,
         enforce_closed_bars=cfg.timing.enforce_closed_bars,
         ws_dedup_enabled=cfg.ws_dedup.enabled,
         ws_dedup_log_skips=cfg.ws_dedup.log_skips,
