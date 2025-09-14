@@ -128,9 +128,10 @@ class _Provider:
         fh = str(feats.get("features_hash", "") or "")
 
         for o in orders:
+            side = getattr(o, "side", "")
+            side = side.value if hasattr(side, "value") else str(side)
+            side = str(side).upper()
             if out_csv:
-                side = getattr(o, "side", "")
-                side = side.value if hasattr(side, "value") else str(side)
                 vol = getattr(o, "volume_frac", None)
                 if vol is None:
                     vol = getattr(o, "quantity", 0)
@@ -154,6 +155,16 @@ class _Provider:
                 self._logger.info("order %s", o)
             except Exception:
                 pass
+            if getattr(signal_bus, "ENABLED", False):
+                try:
+                    signal_bus.publish_signal(
+                        ts_ms=int(bar.ts),
+                        symbol=bar.symbol,
+                        side=side,
+                        bar_close_ms=int(bar.ts),
+                    )
+                except Exception:
+                    pass
             submit = getattr(self._executor, "submit", None)
             if callable(submit):
                 try:
