@@ -35,6 +35,12 @@ clock_sync_last_sync_ts = Gauge(
     "Timestamp of last successful clock sync in milliseconds since epoch",
 )
 
+# Length of throttling queue
+queue_len = Gauge(
+    "throttle_queue_len",
+    "Current number of queued signals awaiting tokens",
+)
+
 # Counters for sync attempts
 clock_sync_success = Counter(
     "clock_sync_success_total",
@@ -152,6 +158,7 @@ __all__ = [
     "clock_sync_drift_ms",
     "clock_sync_rtt_ms",
     "clock_sync_last_sync_ts",
+    "queue_len",
     "report_clock_sync",
     "clock_sync_age_seconds",
 ]
