@@ -18,11 +18,19 @@ from core_events import EventType, MarketEvent
 from services.event_bus import EventBus
 from config import DataDegradationConfig
 from utils import SignalRateLimiter
-from services import monitoring
+from services import monitoring, ops_kill_switch
 import ws_dedup_state as signal_bus
 
 
 logger = logging.getLogger(__name__)
+
+
+def _interval_to_ms(iv: str) -> int:
+    iv = str(iv).strip().lower()
+    mult = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    if iv[-1] not in mult:
+        raise ValueError(f"Unsupported interval: {iv}")
+    return int(iv[:-1]) * mult[iv[-1]]
 
 
 class BinanceWS:
@@ -116,6 +124,8 @@ class BinanceWS:
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._stop = False
+        self._last_close_ms = 0
+        self._interval_ms = _interval_to_ms(self.interval)
 
     async def _check_rate_limit(self) -> bool:
         if self._rate_limiter is None:
@@ -180,15 +190,35 @@ class BinanceWS:
         delay = self.reconnect_initial_delay_s
         prev_bar: Bar | None = None
         prev_close_ms: int | None = None
+        had_ws_error = False
+        self._last_close_ms = now_ms()
+
+        async def _stale_monitor() -> None:
+            while not self._stop and not ops_kill_switch.tripped():
+                await asyncio.sleep(self._interval_ms / 1000.0)
+                last = self._last_close_ms
+                if last and now_ms() - last > self._interval_ms * 2:
+                    try:
+                        ops_kill_switch.record_stale()
+                    except Exception:
+                        pass
+
+        stale_task = asyncio.create_task(_stale_monitor())
         try:
-            while not self._stop:
+            while not self._stop and not ops_kill_switch.tripped():
                 try:
                     async with websockets.connect(self.ws_url, ping_interval=None, close_timeout=5) as ws:
                         self._ws = ws
+                        if had_ws_error:
+                            try:
+                                ops_kill_switch.manual_reset()
+                            except Exception:
+                                pass
+                            had_ws_error = False
                         hb_task = asyncio.create_task(self._heartbeat(ws))
                         delay = self.reconnect_initial_delay_s  # сбросим backoff при успешном коннекте
                         async for msg in ws:
-                            if self._stop:
+                            if self._stop or ops_kill_switch.tripped():
                                 break
                             try:
                                 payload = json.loads(msg)
@@ -256,6 +286,7 @@ class BinanceWS:
 
                                 prev_bar = bar
                                 prev_close_ms = bar_close_ms
+                                self._last_close_ms = bar_close_ms
                                 if await self._check_rate_limit():
                                     await self._emit(bar, bar_close_ms)
                         hb_task.cancel()
@@ -267,10 +298,20 @@ class BinanceWS:
                 except asyncio.CancelledError:
                     return
                 except Exception:
+                    try:
+                        ops_kill_switch.record_error("ws")
+                    except Exception:
+                        pass
+                    had_ws_error = True
                     await asyncio.sleep(delay)
                     delay = min(self.reconnect_max_delay_s, delay * 2.0)
         finally:
             self._ws = None
+            stale_task.cancel()
+            try:
+                await stale_task
+            except Exception:
+                pass
             if self._ws_dedup_enabled:
                 try:
                     signal_bus.shutdown()
