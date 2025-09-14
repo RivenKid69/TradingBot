@@ -13,6 +13,7 @@ import os
 
 import utils_time
 from .utils_app import append_row_csv
+from . import ops_kill_switch
 
 # Путь к файлу состояния
 _STATE_PATH = Path("state/seen_signals.json")
@@ -159,6 +160,11 @@ def log_drop(symbol: str, bar_close_ms: int, payload: Any, reason: str) -> None:
     ``bar_close_ms``, ``payload`` and ``reason``.  Any exceptions during
     logging are silenced just like in other helpers.
     """
+    if reason == "duplicate":
+        try:
+            ops_kill_switch.record_duplicate()
+        except Exception:
+            pass
     if not DROPS_CSV:
         dropped_by_reason[str(reason)] += 1
         return
@@ -214,6 +220,11 @@ def publish_signal(
     with _lock:
         _SEEN[sid] = int(expires_at_ms)
         _flush()
+
+    try:
+        ops_kill_switch.reset_duplicates()
+    except Exception:
+        pass
 
     if OUT_CSV:
         try:

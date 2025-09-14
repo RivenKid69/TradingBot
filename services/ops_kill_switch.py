@@ -168,6 +168,16 @@ def record_duplicate() -> None:
     _record_generic("duplicates")
 
 
+def reset_duplicates() -> None:
+    """Reset duplicate message counter."""
+    now = time.time()
+    with _lock:
+        _maybe_reset_all(now)
+        _counters["duplicates"] = 0
+        _last_ts["duplicates"] = now
+        _save_state()
+
+
 def record_stale() -> None:
     """Record a stale interval event."""
     _record_generic("stale")

@@ -37,3 +37,14 @@ def test_tick_persists_state(tmp_path):
     data = json.loads(state.read_text())
     assert data["counters"]["rest"] == 1
     ops_kill_switch.manual_reset()
+
+
+def test_reset_duplicates(tmp_path):
+    flag = tmp_path / "flag"
+    state = tmp_path / "state.json"
+    cfg = {"flag_path": str(flag), "state_path": str(state)}
+    ops_kill_switch.init(cfg)
+    ops_kill_switch.record_duplicate()
+    assert json.loads(state.read_text())["counters"]["duplicates"] == 1
+    ops_kill_switch.reset_duplicates()
+    assert json.loads(state.read_text())["counters"]["duplicates"] == 0
