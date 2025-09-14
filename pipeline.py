@@ -18,6 +18,7 @@ from no_trade import (
     _in_custom_window,
 )
 from no_trade_config import NoTradeConfig
+from services.monitoring import inc_stage, inc_reason
 
 
 class Stage(Enum):
@@ -80,17 +81,20 @@ def closed_bar_guard(
         ``"drop"`` with reason :class:`Reason.INCOMPLETE_BAR`.
     """
 
+    inc_stage(Stage.CLOSED_BAR)
     if not enforce:
         return PipelineResult(action="pass", stage=Stage.CLOSED_BAR)
 
     if lag_ms <= 0:
         if not getattr(bar, "is_final", True):
+            inc_reason(Reason.INCOMPLETE_BAR)
             return PipelineResult(
                 action="drop", stage=Stage.CLOSED_BAR, reason=Reason.INCOMPLETE_BAR
             )
         return PipelineResult(action="pass", stage=Stage.CLOSED_BAR)
 
     if not is_bar_closed(int(bar.ts), now_ms, lag_ms):
+        inc_reason(Reason.INCOMPLETE_BAR)
         return PipelineResult(
             action="drop", stage=Stage.CLOSED_BAR, reason=Reason.INCOMPLETE_BAR
         )
@@ -122,6 +126,7 @@ def apply_no_trade_windows(
         blocked, otherwise ``"pass"``.
     """
 
+    inc_stage(Stage.WINDOWS)
     cached = _NO_TRADE_CACHE.get(symbol)
     if cached is None:
         daily_min = _parse_daily_windows_min(cfg.daily_utc or [])
@@ -138,6 +143,7 @@ def apply_no_trade_windows(
         or _in_custom_window(ts_arr, custom)[0]
     )
     if blocked:
+        inc_reason(Reason.WINDOW)
         return PipelineResult(action="drop", stage=Stage.WINDOWS, reason=Reason.WINDOW)
     return PipelineResult(action="pass", stage=Stage.WINDOWS)
 
@@ -149,6 +155,7 @@ class RiskGuards(Protocol):
 
 
 def policy_decide(fp: FeaturePipe, policy: SignalPolicy, bar: Bar) -> PipelineResult:
+    inc_stage(Stage.POLICY)
     feats = fp.update(bar)
     ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
     decisions = list(policy.decide({**feats}, ctx) or [])
@@ -158,11 +165,13 @@ def policy_decide(fp: FeaturePipe, policy: SignalPolicy, bar: Bar) -> PipelineRe
 def apply_risk(
     ts_ms: int, symbol: str, guards: RiskGuards | None, decisions: Sequence[Any]
 ) -> PipelineResult:
+    inc_stage(Stage.RISK)
     if guards is None:
         return PipelineResult(action="pass", stage=Stage.RISK, decision=list(decisions))
     checked, reason = guards.apply(ts_ms, symbol, decisions)
     checked = list(checked or [])
     if reason:
+        inc_reason(Reason.RISK_POSITION)
         return PipelineResult(
             action="drop", stage=Stage.RISK, reason=Reason.RISK_POSITION, decision=checked
         )
@@ -203,6 +212,7 @@ class AnomalyDetector:
             Bid/ask spread of the latest bar in the same units as history.
         """
 
+        inc_stage(Stage.ANOMALY)
         self._rets.append(float(ret))
         self._spreads.append(float(spread))
 
@@ -211,6 +221,8 @@ class AnomalyDetector:
 
         if self._cooldown_left > 0:
             self._cooldown_left -= 1
+            if self._last_reason is not None:
+                inc_reason(self._last_reason)
             return PipelineResult(
                 action="drop", stage=Stage.ANOMALY, reason=self._last_reason
             )
@@ -221,6 +233,7 @@ class AnomalyDetector:
         if sigma > 0 and abs(cur_ret) > float(self.sigma_mult) * sigma:
             self._cooldown_left = int(self.cooldown_bars)
             self._last_reason = Reason.ANOMALY_RET
+            inc_reason(Reason.ANOMALY_RET)
             return PipelineResult(
                 action="drop", stage=Stage.ANOMALY, reason=Reason.ANOMALY_RET
             )
@@ -231,6 +244,7 @@ class AnomalyDetector:
         if cur_spread > thr:
             self._cooldown_left = int(self.cooldown_bars)
             self._last_reason = Reason.ANOMALY_SPREAD
+            inc_reason(Reason.ANOMALY_SPREAD)
             return PipelineResult(
                 action="drop", stage=Stage.ANOMALY, reason=Reason.ANOMALY_SPREAD
             )
@@ -286,6 +300,7 @@ class MetricKillSwitch:
             Observed metric value.
         """
 
+        inc_stage(Stage.POLICY)
         st = self._get_state(symbol)
         st.last_metric = float(metric)
 
@@ -295,6 +310,7 @@ class MetricKillSwitch:
             if st.cooldown_left <= 0 and st.last_metric <= self.lower:
                 st.active = False
                 return PipelineResult(action="pass", stage=Stage.POLICY)
+            inc_reason(Reason.MAINTENANCE)
             return PipelineResult(
                 action="drop", stage=Stage.POLICY, reason=Reason.MAINTENANCE
             )
@@ -302,6 +318,7 @@ class MetricKillSwitch:
         if st.last_metric >= self.upper:
             st.active = True
             st.cooldown_left = int(self.cooldown_bars)
+            inc_reason(Reason.MAINTENANCE)
             return PipelineResult(
                 action="drop", stage=Stage.POLICY, reason=Reason.MAINTENANCE
             )

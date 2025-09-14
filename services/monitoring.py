@@ -13,6 +13,7 @@ import os
 import time
 from typing import Dict, Tuple, Union, Optional, Any
 
+from enum import Enum
 from utils.prometheus import Counter, Histogram
 
 from core_config import KillSwitchConfig
@@ -121,6 +122,18 @@ pipeline_stage_drop_count = Counter(
     ["symbol", "stage", "reason"],
 )
 
+# Global pipeline stage and reason counters
+pipeline_stage_count = Counter(
+    "pipeline_stage_count",
+    "Total number of processed pipeline stages",
+    ["stage"],
+)
+pipeline_reason_count = Counter(
+    "pipeline_reason_count",
+    "Total number of pipeline drop reasons",
+    ["reason"],
+)
+
 # Additional per-symbol metrics
 feed_lag_max_ms = Gauge(
     "feed_lag_max_ms",
@@ -168,6 +181,29 @@ age_at_publish_ms = Histogram(
     "Age of signals when published in milliseconds",
     ["symbol"],
 )
+
+def _label(value: Enum | str) -> str:
+    """Return the name of an Enum member or cast value to string."""
+    try:
+        return value.name  # type: ignore[attr-defined]
+    except Exception:
+        return str(value)
+
+
+def inc_stage(stage: Enum | str) -> None:
+    """Increment processed pipeline stage counter."""
+    try:
+        pipeline_stage_count.labels(_label(stage)).inc()
+    except Exception:
+        pass
+
+
+def inc_reason(reason: Enum | str) -> None:
+    """Increment pipeline drop reason counter."""
+    try:
+        pipeline_reason_count.labels(_label(reason)).inc()
+    except Exception:
+        pass
 
 _last_sync_ts_ms: float = 0.0
 _feed_lag_max: Dict[str, float] = {}
@@ -407,6 +443,8 @@ __all__ = [
     "ws_dup_skipped_count",
     "ws_backpressure_drop_count",
     "pipeline_stage_drop_count",
+    "pipeline_stage_count",
+    "pipeline_reason_count",
     "ttl_expired_boundary_count",
     "signal_boundary_count",
     "signal_absolute_count",
@@ -432,6 +470,8 @@ __all__ = [
     "report_feed_lag",
     "report_ws_failure",
     "configure_kill_switch",
+    "inc_stage",
+    "inc_reason",
     "kill_switch_triggered",
     "kill_switch_info",
     "snapshot_metrics",
