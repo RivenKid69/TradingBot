@@ -114,6 +114,18 @@ max_backoff_s: 60.0
 BinancePublicClient rate limiting: delayed=5.00% (6/120), rejected=1.00% (1/120)
 ```
 
+## Operational kill switch reset
+
+The operational kill switch persists its counters in `state/ops_state.json` and
+sets a flag file at `state/ops_kill_switch.flag` when tripped. To recover
+manually, remove the flag and reset the counters:
+
+```bash
+python scripts/reset_kill_switch.py
+```
+
+The script deletes the flag file and calls `ops_kill_switch.manual_reset()`.
+
 ## Large order execution
 
 Orders whose notional exceeds `notional_threshold` are split by a deterministic algorithm.
