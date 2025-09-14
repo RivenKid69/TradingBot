@@ -83,14 +83,20 @@ class _Provider:
     def on_bar(self, bar: Bar):
         if self._safe_mode_fn():
             return []
-        close_ms = int(bar.ts) + self._ws_dedup_timeframe_ms
-        if self._ws_dedup_enabled and signal_bus.should_skip(bar.symbol, close_ms):
-            if self._ws_dedup_log_skips:
+        close_ms: int | None = None
+        if self._ws_dedup_enabled:
+            close_ms = int(bar.ts) + self._ws_dedup_timeframe_ms
+            if signal_bus.should_skip(bar.symbol, close_ms):
+                if self._ws_dedup_log_skips:
+                    try:
+                        self._logger.info("SKIP_DUPLICATE_BAR")
+                    except Exception:
+                        pass
                 try:
-                    self._logger.info("SKIP_DUPLICATE_BAR")
+                    monitoring.ws_dup_skipped_count.labels(bar.symbol).inc()
                 except Exception:
                     pass
-            return []
+                return []
         if self._enforce_closed_bars and not bar.is_final:
             try:
                 self._logger.info("SKIP_INCOMPLETE_BAR")
@@ -117,7 +123,7 @@ class _Provider:
                     submit(o)
                 except Exception:
                     pass
-        if self._ws_dedup_enabled:
+        if self._ws_dedup_enabled and close_ms is not None:
             try:
                 signal_bus.update(bar.symbol, close_ms)
             except Exception:
