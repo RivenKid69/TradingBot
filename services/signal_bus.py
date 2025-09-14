@@ -39,9 +39,8 @@ def _flush() -> None:
     _atomic_write(_STATE_PATH)
 
 
-def already_emitted(symbol: str, bar_close_ms: int, *, now_ms: int | None = None) -> bool:
-    """Проверить, публиковался ли сигнал ранее и не истёк ли его срок."""
-    sid = signal_id(symbol, bar_close_ms)
+def already_emitted(sid: str, *, now_ms: int | None = None) -> bool:
+    """Проверить, публиковался ли сигнал ``sid`` ранее и не истёк ли его срок."""
     now = now_ms or int(time.time() * 1000)
     with _lock:
         exp = _SEEN.get(sid)
@@ -55,19 +54,16 @@ def already_emitted(symbol: str, bar_close_ms: int, *, now_ms: int | None = None
 
 
 def mark_emitted(
-    symbol: str,
-    bar_close_ms: int,
+    sid: str,
+    expires_at_ms: int,
     *,
-    ttl_ms: int,
     now_ms: int | None = None,
 ) -> None:
-    """Отметить сигнал как опубликованный на ``ttl_ms`` миллисекунд."""
-    sid = signal_id(symbol, bar_close_ms)
+    """Отметить сигнал как опубликованный до ``expires_at_ms`` (ms since epoch)."""
     now = now_ms or int(time.time() * 1000)
-    exp = now + int(ttl_ms)
     with _lock:
         _purge(now)
-        _SEEN[sid] = exp
+        _SEEN[sid] = int(expires_at_ms)
         _flush()
 
 
@@ -84,10 +80,13 @@ def publish_signal(
 
     Возвращает True, если сигнал был отправлен, иначе False.
     """
-    if already_emitted(symbol, bar_close_ms, now_ms=now_ms):
+    sid = signal_id(symbol, bar_close_ms)
+    if already_emitted(sid, now_ms=now_ms):
         return False
     send_fn(payload)
-    mark_emitted(symbol, bar_close_ms, ttl_ms=ttl_ms, now_ms=now_ms)
+    now = now_ms or int(time.time() * 1000)
+    expires_at = now + int(ttl_ms)
+    mark_emitted(sid, expires_at_ms=expires_at, now_ms=now_ms)
     return True
 
 
