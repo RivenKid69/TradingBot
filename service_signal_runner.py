@@ -61,7 +61,7 @@ class SignalRunnerConfig:
 RunnerConfig = SignalRunnerConfig
 
 
-class _Provider:
+class _Worker:
     def __init__(
         self,
         fp: FeaturePipe,
@@ -233,7 +233,7 @@ class _Provider:
                 emitted.append(order)
         return emitted
 
-    def on_bar(self, bar: Bar):
+    def process(self, bar: Bar):
         if self._safe_mode_fn():
             return []
 
@@ -341,6 +341,42 @@ class _Provider:
                 pass
         return emitted
 
+    # Backwards compatibility: legacy callers may still use ``on_bar``.
+    on_bar = process
+
+
+async def worker_loop(bus: "EventBus", worker: _Worker) -> None:
+    """Consume bars from ``bus`` and pass them to ``worker``.
+
+    The function exits when :meth:`EventBus.close` is called and all
+    remaining events are processed.  On cancellation, it drains any queued
+    events before re-raising :class:`asyncio.CancelledError`.
+    """
+    import asyncio
+
+    try:
+        while True:
+            event = await bus.get()
+            if event is None:
+                break
+            bar = getattr(event, "bar", None)
+            if bar is None:
+                continue
+            worker.process(bar)
+    except asyncio.CancelledError:
+        # Drain remaining events best-effort before shutting down
+        try:
+            while True:
+                ev = bus._queue.get_nowait()  # type: ignore[attr-defined]
+                if ev is None:
+                    break
+                bar = getattr(ev, "bar", None)
+                if bar is not None:
+                    worker.process(bar)
+        except Exception:
+            pass
+        raise
+
 
 class ServiceSignalRunner:
     def __init__(
@@ -406,7 +442,7 @@ class ServiceSignalRunner:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
 
         self.feature_pipe.warmup()
-        provider = _Provider(
+        worker = _Worker(
             self.feature_pipe,
             self.policy,
             self.logger,
@@ -419,6 +455,32 @@ class ServiceSignalRunner:
             ws_dedup_timeframe_ms=self.ws_dedup_timeframe_ms,
             throttle_cfg=self.throttle_cfg,
         )
+
+        # Optional asynchronous event bus processing
+        bus = getattr(self.adapter, "bus", None)
+        loop_thread: threading.Thread | None = None
+        if bus is not None:
+            import asyncio
+
+            n_workers = max(1, int(getattr(self.adapter, "n_workers", 1)))
+            loop = asyncio.new_event_loop()
+
+            async def _run_workers() -> None:
+                tasks = [asyncio.create_task(worker_loop(bus, worker)) for _ in range(n_workers)]
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            def _loop_runner() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(_run_workers())
+
+            loop_thread = threading.Thread(target=_loop_runner, daemon=True)
+            loop_thread.start()
 
         client = getattr(self.adapter, "client", None)
         if client is not None and self.clock_sync_cfg is not None:
@@ -482,9 +544,15 @@ class ServiceSignalRunner:
             self._clock_thread.start()
 
         try:
-            for rep in self.adapter.run_events(provider):
+            for rep in self.adapter.run_events(worker):
                 yield rep
         finally:
+            if bus is not None:
+                try:
+                    bus.close()
+                finally:
+                    if loop_thread is not None:
+                        loop_thread.join()
             self._clock_stop.set()
             if self._clock_thread is not None:
                 try:
