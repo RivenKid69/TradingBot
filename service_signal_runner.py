@@ -36,7 +36,7 @@ from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-по�
 from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
-from core_config import CommonRunConfig, ClockSyncConfig
+from core_config import CommonRunConfig, ClockSyncConfig, ThrottleConfig
 import di_registry
 import ws_dedup_state as signal_bus
 
@@ -256,6 +256,7 @@ class ServiceSignalRunner:
         risk_guards: Optional[RiskGuards] = None,
         cfg: Optional[SignalRunnerConfig] = None,
         clock_sync_cfg: ClockSyncConfig | None = None,
+        throttle_cfg: ThrottleConfig | None = None,
         *,
         enforce_closed_bars: bool = True,
         ws_dedup_enabled: bool = False,
@@ -269,6 +270,7 @@ class ServiceSignalRunner:
         self.cfg = cfg or SignalRunnerConfig()
         self.logger = logging.getLogger(__name__)
         self.clock_sync_cfg = clock_sync_cfg
+        self.throttle_cfg = throttle_cfg
         self._clock_safe_mode = False
         self._clock_stop = threading.Event()
         self._clock_thread: Optional[threading.Thread] = None
@@ -276,6 +278,17 @@ class ServiceSignalRunner:
         self.ws_dedup_enabled = ws_dedup_enabled
         self.ws_dedup_log_skips = ws_dedup_log_skips
         self.ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
+
+        if self.throttle_cfg is not None:
+            self.logger.info(
+                "throttle limits: enabled=%s global_rps=%s global_burst=%s symbol_rps=%s symbol_burst=%s mode=%s",
+                self.throttle_cfg.enabled,
+                self.throttle_cfg.global_.rps,
+                self.throttle_cfg.global_.burst,
+                self.throttle_cfg.symbol.rps,
+                self.throttle_cfg.symbol.burst,
+                self.throttle_cfg.mode,
+            )
 
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
@@ -446,6 +459,7 @@ def from_config(
         guards,
         svc_cfg,
         cfg.clock_sync,
+        cfg.throttle,
         enforce_closed_bars=cfg.timing.enforce_closed_bars,
         ws_dedup_enabled=cfg.ws_dedup.enabled,
         ws_dedup_log_skips=cfg.ws_dedup.log_skips,
