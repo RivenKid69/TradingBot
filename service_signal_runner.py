@@ -29,6 +29,7 @@ import yaml
 import clock
 from services import monitoring
 from services.monitoring import skipped_incomplete_bars
+from pipeline import check_ttl
 from services.utils_app import append_row_csv
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
@@ -114,6 +115,38 @@ class _Provider:
         orders = list(self._policy.decide({**feats}, ctx) or [])
         if self._guards:
             orders = list(self._guards.apply(int(bar.ts), bar.symbol, orders) or [])
+
+        created_ts_ms = clock.now_ms()
+        checked_orders = []
+        for o in orders:
+            ok, expires_at_ms, _ = check_ttl(
+                bar_close_ms=int(bar.ts),
+                now_ms=created_ts_ms,
+                timeframe_ms=self._ws_dedup_timeframe_ms,
+            )
+            if not ok:
+                try:
+                    self._logger.info(
+                        "TTL_EXPIRED_BOUNDARY %s",
+                        {
+                            "symbol": bar.symbol,
+                            "bar_close_ms": int(bar.ts),
+                            "now_ms": created_ts_ms,
+                            "expires_at_ms": expires_at_ms,
+                        },
+                    )
+                except Exception:
+                    pass
+                try:
+                    monitoring.ttl_expired_boundary_count.labels(bar.symbol).inc()
+                except Exception:
+                    pass
+                continue
+                
+            setattr(o, "created_ts_ms", created_ts_ms)
+            checked_orders.append(o)
+
+        orders = checked_orders
 
         out_csv = getattr(signal_bus, "OUT_CSV", None)
         header = [
