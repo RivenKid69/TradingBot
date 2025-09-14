@@ -72,6 +72,7 @@ class SignalRunnerConfig:
     snapshot_config_path: Optional[str] = None
     artifacts_dir: Optional[str] = None
     logs_dir: Optional[str] = None
+    marker_path: Optional[str] = None
     run_id: Optional[str] = None
     snapshot_metrics_json: Optional[str] = None
     snapshot_metrics_csv: Optional[str] = None
@@ -641,15 +642,29 @@ class ServiceSignalRunner:
         # снапшот конфига, если задан
         if self.cfg.snapshot_config_path and self.cfg.artifacts_dir:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
+
+        logs_dir = self.cfg.logs_dir or "logs"
+        marker_path = Path(self.cfg.marker_path or os.path.join(logs_dir, "shutdown.marker"))
+        dirty_restart = True
+        try:
+            if marker_path.exists():
+                dirty_restart = False
+            marker_path.unlink()
+        except Exception:
+            dirty_restart = True
+        if dirty_restart:
+            try:
+                state_store.load()
+            except Exception:
+                pass
+            try:
+                monitoring.reset_kill_switch_counters()
+            except Exception:
+                pass
+
         shutdown = ShutdownManager(self.shutdown_cfg)
         stop_event = threading.Event()
         shutdown.on_stop(stop_event.set)
-
-        # Restore persisted runtime state if available
-        try:
-            state_store.load()
-        except Exception:
-            pass
 
         self.feature_pipe.warmup()
         monitoring.configure_kill_switch(self.cfg.kill_switch)
@@ -678,7 +693,6 @@ class ServiceSignalRunner:
             except Exception:
                 signal_bus.OUT_WRITER = None
 
-        logs_dir = self.cfg.logs_dir or "logs"
         json_path = self.cfg.snapshot_metrics_json or os.path.join(logs_dir, "snapshot_metrics.json")
         csv_path = self.cfg.snapshot_metrics_csv or os.path.join(logs_dir, "snapshot_metrics.csv")
         snapshot_stop = threading.Event()
@@ -758,7 +772,7 @@ class ServiceSignalRunner:
 
         def _write_marker() -> None:
             try:
-                Path(os.path.join(logs_dir, "shutdown.marker")).touch()
+                marker_path.touch()
             except Exception:
                 pass
 
@@ -998,6 +1012,7 @@ def from_config(
         snapshot_config_path=snapshot_config_path,
         artifacts_dir=cfg.artifacts_dir,
         logs_dir=cfg.logs_dir,
+        marker_path=os.path.join(cfg.logs_dir, "shutdown.marker"),
         run_id=cfg.run_id,
         snapshot_metrics_json=os.path.join(cfg.logs_dir, "snapshot_metrics.json"),
         snapshot_metrics_csv=os.path.join(cfg.logs_dir, "snapshot_metrics.csv"),
