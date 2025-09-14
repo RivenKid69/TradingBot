@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Dict, Tuple, Union
+from typing import Dict, Tuple, Union, Optional, Any
 
 from utils.prometheus import Counter, Histogram
+
+from core_config import KillSwitchConfig
 
 try:  # pragma: no cover - optional dependency
     from prometheus_client import Gauge
@@ -161,6 +163,9 @@ age_at_publish_ms = Histogram(
 
 _last_sync_ts_ms: float = 0.0
 _feed_lag_max: Dict[str, float] = {}
+_kill_cfg: Optional[KillSwitchConfig] = None
+_kill_triggered: bool = False
+_kill_reason: Dict[str, Any] = {}
 
 
 def report_clock_sync(
@@ -226,6 +231,89 @@ def report_feed_lag(symbol: str, lag_ms: Union[int, float]) -> None:
             feed_lag_max_ms.labels(symbol).set(lag)
         except Exception:
             pass
+    _check_kill_switch()
+
+
+def report_ws_failure(symbol: str) -> None:
+    """Record a websocket failure for ``symbol``."""
+    try:
+        ws_failure_count.labels(symbol).inc()
+    except Exception:
+        pass
+    _check_kill_switch()
+
+
+def configure_kill_switch(cfg: Optional[KillSwitchConfig]) -> None:
+    """Configure kill switch thresholds."""
+    global _kill_cfg, _kill_triggered, _kill_reason
+    _kill_cfg = cfg
+    _kill_triggered = False
+    _kill_reason = {}
+    _feed_lag_max.clear()
+    _check_kill_switch()
+
+
+def kill_switch_triggered() -> bool:
+    """Return whether the kill switch has been triggered."""
+    return _kill_triggered
+
+
+def kill_switch_info() -> Dict[str, Any]:
+    """Return details about the kill switch trigger."""
+    return dict(_kill_reason)
+
+
+def _check_kill_switch() -> None:
+    """Evaluate metrics against thresholds and update kill switch state."""
+    global _kill_triggered, _kill_reason
+    cfg = _kill_cfg
+    if cfg is None:
+        return
+
+    feed_lag = _feed_lag_max.copy()
+    ws_fail = _collect(ws_failure_count)
+    boundary = _collect(signal_boundary_count)
+    absolute = _collect(signal_absolute_count)
+    published = _collect(signal_published_count)
+
+    error_rates: Dict[str, float] = {}
+    for sym in set(boundary) | set(absolute) | set(published):
+        errors = boundary.get(sym, 0.0) + absolute.get(sym, 0.0)
+        total = errors + published.get(sym, 0.0)
+        rate = errors / total if total > 0 else 0.0
+        error_rates[sym] = rate
+
+    worst_feed = max(feed_lag.items(), key=lambda x: x[1], default=(None, 0.0))
+    worst_ws = max(ws_fail.items(), key=lambda x: x[1], default=(None, 0.0))
+    worst_err = max(error_rates.items(), key=lambda x: x[1], default=(None, 0.0))
+
+    if cfg.feed_lag_ms > 0 and worst_feed[1] > cfg.feed_lag_ms:
+        _kill_triggered = True
+        _kill_reason = {
+            "metric": "feed_lag_ms",
+            "symbol": worst_feed[0],
+            "value": worst_feed[1],
+        }
+        return
+    if cfg.ws_failures > 0 and worst_ws[1] > cfg.ws_failures:
+        _kill_triggered = True
+        _kill_reason = {
+            "metric": "ws_failures",
+            "symbol": worst_ws[0],
+            "value": worst_ws[1],
+        }
+        return
+    if cfg.error_rate > 0 and worst_err[1] > cfg.error_rate:
+        _kill_triggered = True
+        _kill_reason = {
+            "metric": "error_rate",
+            "symbol": worst_err[0],
+            "value": worst_err[1],
+        }
+        return
+
+    _kill_triggered = False
+    _kill_reason = {}
 
 
 def _collect(counter: Union[Counter, Gauge]) -> Dict[str, float]:
@@ -306,5 +394,9 @@ __all__ = [
     "ws_failure_count",
     "signal_error_rate",
     "report_feed_lag",
+    "report_ws_failure",
+    "configure_kill_switch",
+    "kill_switch_triggered",
+    "kill_switch_info",
     "snapshot_metrics",
 ]

@@ -165,7 +165,7 @@ class BinanceWS:
                 pass
             try:
                 monitoring.ws_backpressure_drop_count.labels(bar.symbol).inc()
-                monitoring.ws_failure_count.labels(bar.symbol).inc()
+                monitoring.report_ws_failure(bar.symbol)
             except Exception:
                 pass
         try:
@@ -241,7 +241,7 @@ class BinanceWS:
                                                     pass
                                             try:
                                                 monitoring.ws_dup_skipped_count.labels(bar.symbol).inc()
-                                                monitoring.ws_failure_count.labels(bar.symbol).inc()
+                                                monitoring.report_ws_failure(bar.symbol)
                                             except Exception:
                                                 pass
                                             continue

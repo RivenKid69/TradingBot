@@ -450,13 +450,14 @@ class ServiceSignalRunner:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
 
         self.feature_pipe.warmup()
+        monitoring.configure_kill_switch(self.cfg.kill_switch)
         worker = _Worker(
             self.feature_pipe,
             self.policy,
             self.logger,
             self.adapter,
             self.risk_guards,
-            lambda: self._clock_safe_mode,
+            lambda: self._clock_safe_mode or monitoring.kill_switch_triggered(),
             enforce_closed_bars=self.enforce_closed_bars,
             ws_dedup_enabled=self.ws_dedup_enabled,
             ws_dedup_log_skips=self.ws_dedup_log_skips,

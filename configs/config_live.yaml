@@ -23,6 +23,11 @@ clock_sync:
   kill_threshold_ms: 2000 # Terminate if drift exceeds this many milliseconds
   max_step_ms: 1000       # Max single adjustment step in milliseconds
   attempts: 5             # Number of sync attempts before giving up
+
+kill_switch:
+  feed_lag_ms: 60000       # Enter safe mode if worst feed lag exceeds this; 0 disables
+  ws_failures: 100         # Enter safe mode if WS failures exceed this count; 0 disables
+  error_rate: 0.2          # Enter safe mode if signal error rate exceeds this fraction; 0 disables
 ttl:
   enabled: false
   ttl_seconds: 60
