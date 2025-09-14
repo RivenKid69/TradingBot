@@ -210,6 +210,87 @@ class AnomalyDetector:
         return PipelineResult(action="pass", stage=Stage.ANOMALY)
 
 
+@dataclass
+class _SymbolState:
+    """Internal per-symbol state for :class:`MetricKillSwitch`."""
+
+    active: bool = False
+    last_metric: float = 0.0
+    cooldown_left: int = 0
+
+
+@dataclass
+class MetricKillSwitch:
+    """Guard trading based on a metric with hysteresis and cooldown.
+
+    The switch tracks state separately for each symbol.  Trading is disabled
+    when the observed ``metric`` exceeds ``upper`` and re-enabled once it
+    falls below ``lower`` after ``cooldown_bars`` updates.
+
+    Parameters
+    ----------
+    upper:
+        Threshold that triggers the kill switch.
+    lower:
+        Threshold for leaving the kill state once cooldown has elapsed.
+    cooldown_bars:
+        Number of updates to wait after triggering before re-evaluating the
+        exit condition.
+    """
+
+    upper: float
+    lower: float
+    cooldown_bars: int = 0
+
+    _states: dict[str, _SymbolState] = field(default_factory=dict, init=False)
+
+    def _get_state(self, symbol: str) -> _SymbolState:
+        return self._states.setdefault(symbol, _SymbolState())
+
+    def update(self, symbol: str, metric: float) -> PipelineResult:
+        """Update state for ``symbol`` and return pipeline decision.
+
+        Parameters
+        ----------
+        symbol:
+            Trading symbol to update.
+        metric:
+            Observed metric value.
+        """
+
+        st = self._get_state(symbol)
+        st.last_metric = float(metric)
+
+        if st.active:
+            if st.cooldown_left > 0:
+                st.cooldown_left -= 1
+            if st.cooldown_left <= 0 and st.last_metric <= self.lower:
+                st.active = False
+                return PipelineResult(action="pass", stage=Stage.POLICY)
+            return PipelineResult(
+                action="drop", stage=Stage.POLICY, reason=Reason.MAINTENANCE
+            )
+
+        if st.last_metric >= self.upper:
+            st.active = True
+            st.cooldown_left = int(self.cooldown_bars)
+            return PipelineResult(
+                action="drop", stage=Stage.POLICY, reason=Reason.MAINTENANCE
+            )
+
+        return PipelineResult(action="pass", stage=Stage.POLICY)
+
+    def is_active(self, symbol: str) -> bool:
+        """Return whether trading is currently disabled for ``symbol``."""
+
+        return self._get_state(symbol).active
+
+    def last_metric_value(self, symbol: str) -> float:
+        """Return last observed metric value for ``symbol``."""
+
+        return self._get_state(symbol).last_metric
+
+
 def compute_expires_at(bar_close_ms: int, timeframe_ms: int) -> int:
     """Compute expiration timestamp for a bar.
 
@@ -267,6 +348,7 @@ __all__ = [
     "closed_bar_guard",
     "apply_no_trade_windows",
     "AnomalyDetector",
+    "MetricKillSwitch",
     "compute_expires_at",
     "check_ttl",
 ]
