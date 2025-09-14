@@ -41,6 +41,8 @@ from pipeline import (
     Stage,
     Reason,
     PipelineResult,
+    PipelineConfig,
+    PipelineStageConfig,
 )
 from services.utils_app import append_row_csv
 from services.signal_bus import log_drop
@@ -94,6 +96,7 @@ class _Worker:
         ws_dedup_timeframe_ms: int = 0,
         throttle_cfg: ThrottleConfig | None = None,
         no_trade_cfg: NoTradeConfig | None = None,
+        pipeline_cfg: PipelineConfig | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -107,6 +110,7 @@ class _Worker:
         self._ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
         self._throttle_cfg = throttle_cfg
         self._no_trade_cfg = no_trade_cfg
+        self._pipeline_cfg = pipeline_cfg
         self._global_bucket = None
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
@@ -248,8 +252,17 @@ class _Worker:
                 pass
         return True
 
-    def publish_decision(self, o: Any, symbol: str, bar_close_ms: int) -> PipelineResult:
+    def publish_decision(
+        self,
+        o: Any,
+        symbol: str,
+        bar_close_ms: int,
+        *,
+        stage_cfg: PipelineStageConfig | None = None,
+    ) -> PipelineResult:
         """Final pipeline stage: throttle and emit order."""
+        if stage_cfg is not None and not stage_cfg.enabled:
+            return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
         if self._throttle_cfg and self._throttle_cfg.enabled:
             ok, reason = self._acquire_tokens(symbol)
             if not ok:
@@ -299,6 +312,8 @@ class _Worker:
         return emitted
 
     def process(self, bar: Bar):
+        if self._pipeline_cfg is not None and not self._pipeline_cfg.enabled:
+            return []
         if self._safe_mode_fn():
             return []
 
@@ -329,6 +344,7 @@ class _Worker:
             now_ms=clock.now_ms(),
             enforce=self._enforce_closed_bars,
             lag_ms=0,
+            stage_cfg=self._pipeline_cfg.get("closed_bar") if self._pipeline_cfg else None,
         )
         if guard_res.action == "drop":
             try:
@@ -354,7 +370,12 @@ class _Worker:
             return emitted
 
         if self._no_trade_cfg is not None:
-            win_res = apply_no_trade_windows(int(bar.ts), bar.symbol, self._no_trade_cfg)
+            win_res = apply_no_trade_windows(
+                int(bar.ts),
+                bar.symbol,
+                self._no_trade_cfg,
+                stage_cfg=self._pipeline_cfg.get("windows") if self._pipeline_cfg else None,
+            )
             if win_res.action == "drop":
                 try:
                     self._logger.info(f"DROP_{win_res.stage.name}_{getattr(win_res.reason, 'name', '')}")
@@ -370,7 +391,12 @@ class _Worker:
                     pass
                 return emitted
 
-        pol_res = policy_decide(self._fp, self._policy, bar)
+        pol_res = policy_decide(
+            self._fp,
+            self._policy,
+            bar,
+            stage_cfg=self._pipeline_cfg.get("policy") if self._pipeline_cfg else None,
+        )
         if pol_res.action == "drop":
             try:
                 self._logger.info(f"DROP_{pol_res.stage.name}_{getattr(pol_res.reason, 'name', '')}")
@@ -387,7 +413,13 @@ class _Worker:
             return emitted
         orders = list(pol_res.decision or [])
 
-        risk_res = apply_risk(int(bar.ts), bar.symbol, self._guards, orders)
+        risk_res = apply_risk(
+            int(bar.ts),
+            bar.symbol,
+            self._guards,
+            orders,
+            stage_cfg=self._pipeline_cfg.get("risk") if self._pipeline_cfg else None,
+        )
         if risk_res.action == "drop":
             try:
                 self._logger.info(f"DROP_{risk_res.stage.name}_{getattr(risk_res.reason, 'name', '')}")
@@ -436,7 +468,12 @@ class _Worker:
             checked_orders.append(o)
 
         for o in checked_orders:
-            res = self.publish_decision(o, bar.symbol, int(bar.ts))
+            res = self.publish_decision(
+                o,
+                bar.symbol,
+                int(bar.ts),
+                stage_cfg=self._pipeline_cfg.get("publish") if self._pipeline_cfg else None,
+            )
             if res.action == "pass":
                 emitted.append(o)
             elif res.action == "drop":
@@ -515,6 +552,7 @@ class ServiceSignalRunner:
         clock_sync_cfg: ClockSyncConfig | None = None,
         throttle_cfg: ThrottleConfig | None = None,
         no_trade_cfg: NoTradeConfig | None = None,
+        pipeline_cfg: PipelineConfig | None = None,
         *,
         enforce_closed_bars: bool = True,
         ws_dedup_enabled: bool = False,
@@ -530,6 +568,7 @@ class ServiceSignalRunner:
         self.clock_sync_cfg = clock_sync_cfg
         self.throttle_cfg = throttle_cfg
         self.no_trade_cfg = no_trade_cfg
+        self.pipeline_cfg = pipeline_cfg
         self._clock_safe_mode = False
         self._clock_stop = threading.Event()
         self._clock_thread: Optional[threading.Thread] = None
@@ -584,6 +623,7 @@ class ServiceSignalRunner:
             ws_dedup_timeframe_ms=self.ws_dedup_timeframe_ms,
             throttle_cfg=self.throttle_cfg,
             no_trade_cfg=self.no_trade_cfg,
+            pipeline_cfg=self.pipeline_cfg,
         )
 
         logs_dir = self.cfg.logs_dir or "logs"
@@ -861,6 +901,44 @@ def from_config(
             kill_cfg.get("error_rate", cfg.kill_switch.error_rate)
         )
 
+    # Pipeline configuration
+    def _parse_pipeline(data: Dict[str, Any]) -> PipelineConfig:
+        enabled = bool(data.get("enabled", True))
+        stages_cfg = data.get("stages", {}) or {}
+        stages: Dict[str, PipelineStageConfig] = {}
+        for name, st in stages_cfg.items():
+            if isinstance(st, dict):
+                st_enabled = bool(st.get("enabled", True))
+                params = {k: v for k, v in st.items() if k != "enabled"}
+            else:
+                st_enabled = bool(st)
+                params = {}
+            stages[name] = PipelineStageConfig(enabled=st_enabled, params=params)
+        return PipelineConfig(enabled=enabled, stages=stages)
+
+    base_pipeline = PipelineConfig()
+    if snapshot_config_path:
+        try:
+            with open(snapshot_config_path, "r", encoding="utf-8") as f:
+                base_data = yaml.safe_load(f) or {}
+            base_pipeline = _parse_pipeline(base_data.get("pipeline", {}))
+        except Exception:
+            base_pipeline = PipelineConfig()
+
+    ops_pipeline = PipelineConfig()
+    ops_path = Path("configs/ops.yaml")
+    if ops_path.exists():
+        try:
+            with ops_path.open("r", encoding="utf-8") as f:
+                ops_data = yaml.safe_load(f) or {}
+            ops_pipeline = _parse_pipeline(ops_data.get("pipeline", {}))
+        except Exception:
+            ops_pipeline = PipelineConfig()
+    elif rt_cfg.get("pipeline"):
+        ops_pipeline = _parse_pipeline(rt_cfg.get("pipeline", {}))
+
+    pipeline_cfg = base_pipeline.merge(ops_pipeline)
+
     # Ensure components receive the bus if they accept it
     try:
         cfg.components.market_data.params.setdefault("bus", bus)
@@ -902,6 +980,7 @@ def from_config(
         cfg.clock_sync,
         cfg.throttle,
         NoTradeConfig(**(cfg.no_trade or {})),
+        pipeline_cfg=pipeline_cfg,
         enforce_closed_bars=cfg.timing.enforce_closed_bars,
         ws_dedup_enabled=cfg.ws_dedup.enabled,
         ws_dedup_log_skips=cfg.ws_dedup.log_skips,

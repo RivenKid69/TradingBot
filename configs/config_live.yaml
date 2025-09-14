@@ -56,6 +56,23 @@ latency:
   timeout_ms: 2500
   retries: 1
   seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
+pipeline:
+  enabled: true
+  stages:
+    closed_bar:
+      enabled: true
+    windows:
+      enabled: true
+    anomaly:
+      enabled: true
+    extreme:
+      enabled: true
+    policy:
+      enabled: true
+    risk:
+      enabled: true
+    publish:
+      enabled: true
 components:
   market_data:
     target: impl_binance_public:BinancePublicBarSource

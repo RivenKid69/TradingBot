@@ -41,3 +41,21 @@ runtime:
     capacity: 1000            # event bus capacity; 0 for unbounded
     drop_policy: newest       # "newest" drops incoming, "oldest" drops oldest
 
+pipeline:
+  enabled: true
+  stages:
+    closed_bar:
+      enabled: true
+    windows:
+      enabled: true
+    anomaly:
+      enabled: true
+    extreme:
+      enabled: true
+    policy:
+      enabled: true
+    risk:
+      enabled: true
+    publish:
+      enabled: true
+

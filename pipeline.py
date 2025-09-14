@@ -3,7 +3,7 @@ from __future__ import annotations
 """Utilities for basic pipeline time-to-live checks."""
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Tuple, Sequence, Protocol
+from typing import Any, Tuple, Sequence, Protocol, Dict
 
 import numpy as np
 from collections import deque
@@ -57,8 +57,44 @@ class PipelineResult:
     decision: Any | None = None
 
 
+@dataclass
+class PipelineStageConfig:
+    """Configuration for a single pipeline stage."""
+
+    enabled: bool = True
+    params: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PipelineConfig:
+    """Top-level pipeline configuration."""
+
+    enabled: bool = True
+    stages: Dict[str, PipelineStageConfig] = field(default_factory=dict)
+
+    def get(self, name: str) -> PipelineStageConfig | None:
+        return self.stages.get(name)
+
+    def merge(self, other: "PipelineConfig") -> "PipelineConfig":
+        """Merge two configs, with ``other`` taking precedence."""
+
+        enabled = other.enabled if other is not None else self.enabled
+        stages: Dict[str, PipelineStageConfig] = {
+            k: PipelineStageConfig(v.enabled, dict(v.params))
+            for k, v in self.stages.items()
+        }
+        if other is not None:
+            for name, cfg in other.stages.items():
+                if name in stages:
+                    stages[name].enabled = cfg.enabled
+                    stages[name].params.update(cfg.params)
+                else:
+                    stages[name] = PipelineStageConfig(cfg.enabled, dict(cfg.params))
+        return PipelineConfig(enabled=enabled, stages=stages)
+
+
 def closed_bar_guard(
-    bar: Bar, now_ms: int, enforce: bool, lag_ms: int
+    bar: Bar, now_ms: int, enforce: bool, lag_ms: int, *, stage_cfg: PipelineStageConfig | None = None
 ) -> PipelineResult:
     """Ensure that incoming bars are fully closed before processing.
 
@@ -82,6 +118,9 @@ def closed_bar_guard(
     """
 
     inc_stage(Stage.CLOSED_BAR)
+    if stage_cfg is not None and not stage_cfg.enabled:
+        return PipelineResult(action="pass", stage=Stage.CLOSED_BAR)
+
     if not enforce:
         return PipelineResult(action="pass", stage=Stage.CLOSED_BAR)
 
@@ -106,7 +145,11 @@ _NO_TRADE_CACHE: dict[str, tuple[list[tuple[int, int]], int, list[dict[str, int]
 
 
 def apply_no_trade_windows(
-    ts_ms: int, symbol: str, cfg: NoTradeConfig
+    ts_ms: int,
+    symbol: str,
+    nt_cfg: NoTradeConfig,
+    *,
+    stage_cfg: PipelineStageConfig | None = None,
 ) -> PipelineResult:
     """Check whether ``ts_ms`` falls into any no-trade window.
 
@@ -116,7 +159,7 @@ def apply_no_trade_windows(
         Timestamp in milliseconds since epoch.
     symbol:
         Trading symbol used for cache key.
-    cfg:
+    nt_cfg:
         No-trade configuration.
 
     Returns
@@ -127,11 +170,14 @@ def apply_no_trade_windows(
     """
 
     inc_stage(Stage.WINDOWS)
+    if stage_cfg is not None and not stage_cfg.enabled:
+        return PipelineResult(action="pass", stage=Stage.WINDOWS)
+
     cached = _NO_TRADE_CACHE.get(symbol)
     if cached is None:
-        daily_min = _parse_daily_windows_min(cfg.daily_utc or [])
-        buf_min = int(cfg.funding_buffer_min or 0)
-        custom = cfg.custom_ms or []
+        daily_min = _parse_daily_windows_min(nt_cfg.daily_utc or [])
+        buf_min = int(nt_cfg.funding_buffer_min or 0)
+        custom = nt_cfg.custom_ms or []
         cached = (daily_min, buf_min, custom)
         _NO_TRADE_CACHE[symbol] = cached
     daily_min, buf_min, custom = cached
@@ -154,8 +200,16 @@ class RiskGuards(Protocol):
     ) -> Tuple[Sequence[Any], str | None]: ...
 
 
-def policy_decide(fp: FeaturePipe, policy: SignalPolicy, bar: Bar) -> PipelineResult:
+def policy_decide(
+    fp: FeaturePipe,
+    policy: SignalPolicy,
+    bar: Bar,
+    *,
+    stage_cfg: PipelineStageConfig | None = None,
+) -> PipelineResult:
     inc_stage(Stage.POLICY)
+    if stage_cfg is not None and not stage_cfg.enabled:
+        return PipelineResult(action="pass", stage=Stage.POLICY, decision=[])
     feats = fp.update(bar)
     ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
     decisions = list(policy.decide({**feats}, ctx) or [])
@@ -163,9 +217,16 @@ def policy_decide(fp: FeaturePipe, policy: SignalPolicy, bar: Bar) -> PipelineRe
 
 
 def apply_risk(
-    ts_ms: int, symbol: str, guards: RiskGuards | None, decisions: Sequence[Any]
+    ts_ms: int,
+    symbol: str,
+    guards: RiskGuards | None,
+    decisions: Sequence[Any],
+    *,
+    stage_cfg: PipelineStageConfig | None = None,
 ) -> PipelineResult:
     inc_stage(Stage.RISK)
+    if stage_cfg is not None and not stage_cfg.enabled:
+        return PipelineResult(action="pass", stage=Stage.RISK, decision=list(decisions))
     if guards is None:
         return PipelineResult(action="pass", stage=Stage.RISK, decision=list(decisions))
     checked, reason = guards.apply(ts_ms, symbol, decisions)
