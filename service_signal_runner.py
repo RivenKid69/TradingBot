@@ -25,6 +25,7 @@ import logging
 import threading
 from pathlib import Path
 
+import yaml
 import clock
 from services import monitoring
 from services.monitoring import skipped_incomplete_bars
@@ -284,6 +285,31 @@ def from_config(
 
     logging.getLogger(__name__).info("timing settings: %s", cfg.timing.dict())
 
+    # Load signal bus configuration
+    signals_cfg: Dict[str, Any] = {}
+    sig_cfg_path = Path("configs/signals.yaml")
+    if sig_cfg_path.exists():
+        try:
+            with sig_cfg_path.open("r", encoding="utf-8") as f:
+                signals_cfg = yaml.safe_load(f) or {}
+        except Exception:
+            signals_cfg = {}
+
+    bus_enabled = bool(signals_cfg.get("enabled", False))
+    ttl = int(signals_cfg.get("ttl_seconds", 0))
+    out_csv = signals_cfg.get("out_csv")
+    dedup_persist = signals_cfg.get("dedup_persist") or cfg.ws_dedup.persist_path
+
+    signal_bus.init(
+        enabled=bus_enabled,
+        ttl_seconds=ttl,
+        persist_path=dedup_persist,
+        out_csv=out_csv,
+    )
+
+    cfg.ws_dedup.enabled = bus_enabled
+    cfg.ws_dedup.persist_path = str(dedup_persist)
+
     svc_cfg = SignalRunnerConfig(
         snapshot_config_path=snapshot_config_path,
         artifacts_dir=cfg.artifacts_dir,
@@ -292,10 +318,6 @@ def from_config(
         svc_cfg.logs_dir = cfg.logs_dir
     if svc_cfg.run_id is None:
         svc_cfg.run_id = cfg.run_id
-
-    if cfg.ws_dedup.enabled:
-        signal_bus.PERSIST_PATH = Path(cfg.ws_dedup.persist_path)
-        signal_bus.load_state(cfg.ws_dedup.persist_path)
 
     container = di_registry.build_graph(cfg.components, cfg)
     adapter: SimAdapter = container["executor"]

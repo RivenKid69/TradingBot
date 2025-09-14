@@ -21,8 +21,33 @@ logger = _std_logging.getLogger(__name__)
 STATE: Dict[str, int] = {}
 _lock = threading.Lock()
 
+# Runtime configuration
+ENABLED: bool = True
+TTL_SECONDS: int = 0
+OUT_CSV: str | None = None
+
 # Default persistence location
 PERSIST_PATH = Path("state/close_state.json")
+
+def init(
+    *,
+    enabled: bool = False,
+    ttl_seconds: int = 0,
+    persist_path: str | Path | None = None,
+    out_csv: str | None = None,
+) -> None:
+    """Configure signal bus runtime parameters."""
+    global ENABLED, TTL_SECONDS, PERSIST_PATH, OUT_CSV
+    ENABLED = bool(enabled)
+    TTL_SECONDS = int(ttl_seconds)
+    OUT_CSV = out_csv
+    if persist_path is not None:
+        PERSIST_PATH = Path(persist_path)
+    if ENABLED:
+        try:
+            load_state(PERSIST_PATH)
+        except Exception:
+            logger.exception("Failed loading state file %s", PERSIST_PATH)
 
 def load_state(path: str | Path = PERSIST_PATH) -> None:
     """Load state dictionary from JSON file if it exists.
@@ -50,6 +75,8 @@ def load_state(path: str | Path = PERSIST_PATH) -> None:
 
 def should_skip(symbol: str, close_ms: int) -> bool:
     """Return True if ``close_ms`` is not newer than stored value for ``symbol``."""
+    if not ENABLED:
+        return False
     with _lock:
         prev = STATE.get(symbol)
     return prev is not None and close_ms <= prev
@@ -75,6 +102,8 @@ def update(
     auto_flush: bool = True,
 ) -> None:
     """Update state for symbol and optionally flush to disk."""
+    if not ENABLED:
+        return
     with _lock:
         STATE[symbol] = close_ms
         if auto_flush:
