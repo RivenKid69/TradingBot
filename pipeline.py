@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 """Utilities for basic pipeline time-to-live checks."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Tuple
 
 import numpy as np
+from collections import deque
 
 from core_models import Bar
 from utils_time import next_bar_open_ms, is_bar_closed
@@ -140,6 +141,75 @@ def apply_no_trade_windows(
     return PipelineResult(action="pass", stage=Stage.WINDOWS)
 
 
+@dataclass
+class AnomalyDetector:
+    """Stateful anomaly detector for returns and spread.
+
+    Maintains rolling statistics over ``window`` bars and drops bars when
+    extreme moves are observed. After triggering, the detector enforces a
+    cooldown for ``cooldown_bars`` bars.
+    """
+
+    window: int = 100
+    cooldown_bars: int = 0
+    sigma_mult: float = 5.0
+    spread_pct: float = 99.0
+
+    _rets: deque[float] = field(default_factory=deque, init=False)
+    _spreads: deque[float] = field(default_factory=deque, init=False)
+    _cooldown_left: int = 0
+    _last_reason: Reason | None = None
+
+    def __post_init__(self) -> None:
+        self._rets = deque(maxlen=int(self.window))
+        self._spreads = deque(maxlen=int(self.window))
+
+    def update(self, ret: float, spread: float) -> PipelineResult:
+        """Update detector with new return and spread values.
+
+        Parameters
+        ----------
+        ret:
+            Return of the latest bar.
+        spread:
+            Bid/ask spread of the latest bar in the same units as history.
+        """
+
+        self._rets.append(float(ret))
+        self._spreads.append(float(spread))
+
+        if len(self._rets) < self._rets.maxlen:
+            return PipelineResult(action="pass", stage=Stage.ANOMALY)
+
+        if self._cooldown_left > 0:
+            self._cooldown_left -= 1
+            return PipelineResult(
+                action="drop", stage=Stage.ANOMALY, reason=self._last_reason
+            )
+
+        rets_arr = np.asarray(self._rets, dtype=np.float64)
+        cur_ret = rets_arr[-1]
+        sigma = np.std(rets_arr[:-1]) if len(rets_arr) > 1 else 0.0
+        if sigma > 0 and abs(cur_ret) > float(self.sigma_mult) * sigma:
+            self._cooldown_left = int(self.cooldown_bars)
+            self._last_reason = Reason.ANOMALY_RET
+            return PipelineResult(
+                action="drop", stage=Stage.ANOMALY, reason=Reason.ANOMALY_RET
+            )
+
+        sp_arr = np.asarray(self._spreads, dtype=np.float64)
+        cur_spread = sp_arr[-1]
+        thr = np.percentile(sp_arr[:-1], self.spread_pct) if len(sp_arr) > 1 else 0.0
+        if cur_spread > thr:
+            self._cooldown_left = int(self.cooldown_bars)
+            self._last_reason = Reason.ANOMALY_SPREAD
+            return PipelineResult(
+                action="drop", stage=Stage.ANOMALY, reason=Reason.ANOMALY_SPREAD
+            )
+
+        return PipelineResult(action="pass", stage=Stage.ANOMALY)
+
+
 def compute_expires_at(bar_close_ms: int, timeframe_ms: int) -> int:
     """Compute expiration timestamp for a bar.
 
@@ -196,6 +266,7 @@ __all__ = [
     "PipelineResult",
     "closed_bar_guard",
     "apply_no_trade_windows",
+    "AnomalyDetector",
     "compute_expires_at",
     "check_ttl",
 ]
