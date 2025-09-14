@@ -24,7 +24,7 @@ class DummyPolicy(SignalPolicy):
 
 class DummyGuards:
     def apply(self, ts_ms, symbol, decisions):
-        return decisions[:1]
+        return decisions[:1], None
 
 
 def test_decision_flow():

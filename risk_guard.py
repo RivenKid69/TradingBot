@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from enum import IntEnum
-from typing import Optional, Deque, Tuple, Dict, Any, TYPE_CHECKING
+from typing import Optional, Deque, Tuple, Dict, Any, TYPE_CHECKING, Sequence
 from collections import deque
 from clock import now_ms
 
@@ -237,3 +237,53 @@ class RiskGuard:
             "last_event": int(self._last_event),
             "nw_window_len": len(self._nw_hist),
         }
+
+
+# ----------- PIPELINE SUPPORT -----------
+
+
+@dataclass
+class _SymbolState:
+    """Internal per-symbol bookkeeping for lightweight risk checks."""
+
+    last_ts: int = 0
+    exposure: float = 0.0
+
+
+class SimpleRiskGuard:
+    """Minimal per-symbol risk guard used by the pipeline.
+
+    The guard tracks the last processed timestamp and cumulative exposure for
+    each symbol.  ``apply`` returns filtered decisions and an optional reason
+    string beginning with ``"RISK_"`` if all decisions should be dropped.
+    """
+
+    def __init__(self) -> None:
+        self._states: Dict[str, _SymbolState] = {}
+
+    def _state(self, symbol: str) -> _SymbolState:
+        return self._states.setdefault(symbol, _SymbolState())
+
+    def apply(
+        self, ts_ms: int, symbol: str, decisions: Sequence[Any]
+    ) -> tuple[Sequence[Any], str | None]:
+        st = self._state(symbol)
+        if ts_ms <= st.last_ts:
+            # Reject stale timestamps outright
+            return [], "RISK_STALE_TS"
+
+        exp = 0.0
+        checked: list[Any] = []
+        for d in decisions:
+            vol = getattr(d, "volume_frac", getattr(d, "quantity", 0.0)) or 0.0
+            try:
+                exp += abs(float(vol))
+            except Exception:
+                continue
+            checked.append(d)
+
+        st.last_ts = int(ts_ms)
+        st.exposure += exp
+        return checked, None
+
+

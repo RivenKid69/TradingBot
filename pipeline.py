@@ -143,7 +143,9 @@ def apply_no_trade_windows(
 
 
 class RiskGuards(Protocol):
-    def apply(self, ts_ms: int, symbol: str, decisions: Sequence[Any]) -> Sequence[Any]: ...
+    def apply(
+        self, ts_ms: int, symbol: str, decisions: Sequence[Any]
+    ) -> Tuple[Sequence[Any], str | None]: ...
 
 
 def policy_decide(fp: FeaturePipe, policy: SignalPolicy, bar: Bar) -> PipelineResult:
@@ -158,7 +160,12 @@ def apply_risk(
 ) -> PipelineResult:
     if guards is None:
         return PipelineResult(action="pass", stage=Stage.RISK, decision=list(decisions))
-    checked = list(guards.apply(ts_ms, symbol, decisions) or [])
+    checked, reason = guards.apply(ts_ms, symbol, decisions)
+    checked = list(checked or [])
+    if reason:
+        return PipelineResult(
+            action="drop", stage=Stage.RISK, reason=Reason.RISK_POSITION, decision=checked
+        )
     return PipelineResult(action="pass", stage=Stage.RISK, decision=checked)
 
 

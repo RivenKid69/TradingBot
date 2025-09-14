@@ -38,6 +38,8 @@ from pipeline import (
     apply_no_trade_windows,
     policy_decide,
     apply_risk,
+    Stage,
+    Reason,
 )
 from services.utils_app import append_row_csv
 from services.signal_bus import log_drop
@@ -55,7 +57,9 @@ import ws_dedup_state as signal_bus
 
 
 class RiskGuards(Protocol):
-    def apply(self, ts_ms: int, symbol: str, decisions: Sequence[Any]) -> Sequence[Any]: ...
+    def apply(
+        self, ts_ms: int, symbol: str, decisions: Sequence[Any]
+    ) -> tuple[Sequence[Any], str | None]: ...
 
 
 @dataclass
@@ -140,6 +144,26 @@ class _Worker:
             sb.tokens = min(sb.tokens + 1.0, sb.burst)
 
     def _emit(self, o: Any, symbol: str, bar_close_ms: int) -> bool:
+        if self._guards is not None:
+            checked, reason = self._guards.apply(bar_close_ms, symbol, [o])
+            if reason or not checked:
+                try:
+                    self._logger.info(f"DROP_{Stage.PUBLISH.name}_{reason or ''}")
+                except Exception:
+                    pass
+                try:
+                    pipeline_stage_drop_count.labels(
+                        symbol, Stage.PUBLISH.name, Reason.RISK_POSITION.name
+                    ).inc()
+                except Exception:
+                    pass
+                try:
+                    log_drop(symbol, bar_close_ms, o, reason or "RISK")
+                except Exception:
+                    pass
+                return False
+            o = list(checked)[0]
+
         created_ts = int(getattr(o, "created_ts_ms", 0) or 0)
         now_ms = clock.now_ms()
         ok, expires_at_ms, _ = check_ttl(
