@@ -30,3 +30,10 @@ ops:
     feed_lag_ms: 60000       # Enter safe mode if worst feed lag exceeds this; 0 disables
     ws_failures: 100         # Enter safe mode if WS failures exceed this count; 0 disables
     error_rate: 0.2          # Enter safe mode if signal error rate exceeds this fraction; 0 disables
+    enabled: false           # Enable or disable the ops kill switch
+    error_limit: 0           # Maximum allowed consecutive errors; 0 disables
+    duplicate_limit: 0       # Maximum allowed duplicate signals; 0 disables
+    stale_intervals_limit: 0 # Maximum allowed stale intervals; 0 disables
+    reset_cooldown_sec: 60   # Cooldown period before counters reset in seconds
+    flag_path: null          # File path acting as external kill flag
+    alert_command: null      # Command to execute when kill switch triggers
