@@ -31,15 +31,21 @@ import time
 import yaml
 import clock
 from services import monitoring
-from services.monitoring import skipped_incomplete_bars
-from pipeline import check_ttl, closed_bar_guard, apply_no_trade_windows
+from services.monitoring import skipped_incomplete_bars, pipeline_stage_drop_count
+from pipeline import (
+    check_ttl,
+    closed_bar_guard,
+    apply_no_trade_windows,
+    policy_decide,
+    apply_risk,
+)
 from services.utils_app import append_row_csv
 from services.signal_bus import log_drop
 from services.event_bus import EventBus
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
-from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
+from core_contracts import FeaturePipe, SignalPolicy
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig, ClockSyncConfig, ThrottleConfig
 from no_trade_config import NoTradeConfig
@@ -277,11 +283,19 @@ class _Worker:
         )
         if guard_res.action == "drop":
             try:
-                self._logger.info("SKIP_INCOMPLETE_BAR")
+                self._logger.info(f"DROP_{guard_res.stage.name}_{getattr(guard_res.reason, 'name', '')}")
             except Exception:
                 pass
             try:
                 skipped_incomplete_bars.labels(bar.symbol).inc()
+            except Exception:
+                pass
+            try:
+                pipeline_stage_drop_count.labels(
+                    bar.symbol,
+                    guard_res.stage.name,
+                    guard_res.reason.name if guard_res.reason else "",
+                ).inc()
             except Exception:
                 pass
             try:
@@ -294,16 +308,52 @@ class _Worker:
             win_res = apply_no_trade_windows(int(bar.ts), bar.symbol, self._no_trade_cfg)
             if win_res.action == "drop":
                 try:
-                    self._logger.info("SKIP_NO_TRADE_WINDOW")
+                    self._logger.info(f"DROP_{win_res.stage.name}_{getattr(win_res.reason, 'name', '')}")
+                except Exception:
+                    pass
+                try:
+                    pipeline_stage_drop_count.labels(
+                        bar.symbol,
+                        win_res.stage.name,
+                        win_res.reason.name if win_res.reason else "",
+                    ).inc()
                 except Exception:
                     pass
                 return emitted
 
-        feats = self._fp.update(bar)
-        ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
-        orders = list(self._policy.decide({**feats}, ctx) or [])
-        if self._guards:
-            orders = list(self._guards.apply(int(bar.ts), bar.symbol, orders) or [])
+        pol_res = policy_decide(self._fp, self._policy, bar)
+        if pol_res.action == "drop":
+            try:
+                self._logger.info(f"DROP_{pol_res.stage.name}_{getattr(pol_res.reason, 'name', '')}")
+            except Exception:
+                pass
+            try:
+                pipeline_stage_drop_count.labels(
+                    bar.symbol,
+                    pol_res.stage.name,
+                    pol_res.reason.name if pol_res.reason else "",
+                ).inc()
+            except Exception:
+                pass
+            return emitted
+        orders = list(pol_res.decision or [])
+
+        risk_res = apply_risk(int(bar.ts), bar.symbol, self._guards, orders)
+        if risk_res.action == "drop":
+            try:
+                self._logger.info(f"DROP_{risk_res.stage.name}_{getattr(risk_res.reason, 'name', '')}")
+            except Exception:
+                pass
+            try:
+                pipeline_stage_drop_count.labels(
+                    bar.symbol,
+                    risk_res.stage.name,
+                    risk_res.reason.name if risk_res.reason else "",
+                ).inc()
+            except Exception:
+                pass
+            return emitted
+        orders = list(risk_res.decision or [])
 
         created_ts_ms = clock.now_ms()
         checked_orders = []

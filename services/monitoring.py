@@ -114,6 +114,13 @@ ws_backpressure_drop_count = Counter(
     ["symbol"],
 )
 
+# Pipeline stage drops
+pipeline_stage_drop_count = Counter(
+    "pipeline_stage_drop_count",
+    "Pipeline drops per stage and reason",
+    ["symbol", "stage", "reason"],
+)
+
 # Additional per-symbol metrics
 feed_lag_max_ms = Gauge(
     "feed_lag_max_ms",
@@ -399,6 +406,7 @@ __all__ = [
     "skipped_incomplete_bars",
     "ws_dup_skipped_count",
     "ws_backpressure_drop_count",
+    "pipeline_stage_drop_count",
     "ttl_expired_boundary_count",
     "signal_boundary_count",
     "signal_absolute_count",

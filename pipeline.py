@@ -3,12 +3,13 @@ from __future__ import annotations
 """Utilities for basic pipeline time-to-live checks."""
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Tuple
+from typing import Any, Tuple, Sequence, Protocol
 
 import numpy as np
 from collections import deque
 
 from core_models import Bar
+from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from utils_time import next_bar_open_ms, is_bar_closed
 from no_trade import (
     _parse_daily_windows_min,
@@ -139,6 +140,26 @@ def apply_no_trade_windows(
     if blocked:
         return PipelineResult(action="drop", stage=Stage.WINDOWS, reason=Reason.WINDOW)
     return PipelineResult(action="pass", stage=Stage.WINDOWS)
+
+
+class RiskGuards(Protocol):
+    def apply(self, ts_ms: int, symbol: str, decisions: Sequence[Any]) -> Sequence[Any]: ...
+
+
+def policy_decide(fp: FeaturePipe, policy: SignalPolicy, bar: Bar) -> PipelineResult:
+    feats = fp.update(bar)
+    ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
+    decisions = list(policy.decide({**feats}, ctx) or [])
+    return PipelineResult(action="pass", stage=Stage.POLICY, decision=decisions)
+
+
+def apply_risk(
+    ts_ms: int, symbol: str, guards: RiskGuards | None, decisions: Sequence[Any]
+) -> PipelineResult:
+    if guards is None:
+        return PipelineResult(action="pass", stage=Stage.RISK, decision=list(decisions))
+    checked = list(guards.apply(ts_ms, symbol, decisions) or [])
+    return PipelineResult(action="pass", stage=Stage.RISK, decision=checked)
 
 
 @dataclass
@@ -347,6 +368,8 @@ __all__ = [
     "PipelineResult",
     "closed_bar_guard",
     "apply_no_trade_windows",
+    "policy_decide",
+    "apply_risk",
     "AnomalyDetector",
     "MetricKillSwitch",
     "compute_expires_at",
