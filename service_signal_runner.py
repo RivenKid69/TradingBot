@@ -44,10 +44,10 @@ from pipeline import (
     PipelineConfig,
     PipelineStageConfig,
 )
-from services.utils_app import append_row_csv
 from services.signal_bus import log_drop
 from services.event_bus import EventBus
 from services.shutdown import ShutdownManager
+from services.signal_csv_writer import SignalCSVWriter
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
@@ -210,8 +210,8 @@ class _Worker:
         side = getattr(o, "side", "")
         side = side.value if hasattr(side, "value") else str(side)
         side = str(side).upper()
-        out_csv = getattr(signal_bus, "OUT_CSV", None)
-        if out_csv:
+        writer = getattr(signal_bus, "OUT_WRITER", None)
+        if writer is not None:
             vol = getattr(o, "volume_frac", None)
             if vol is None:
                 vol = getattr(o, "quantity", 0)
@@ -219,17 +219,16 @@ class _Worker:
                 vol_val = float(vol)
             except Exception:
                 vol_val = 0.0
-            header = [
-                "ts_ms",
-                "symbol",
-                "side",
-                "volume_frac",
-                "score",
-                "features_hash",
-            ]
-            row = [bar_close_ms, symbol, side, vol_val, score, fh]
+            row = {
+                "ts_ms": bar_close_ms,
+                "symbol": symbol,
+                "side": side,
+                "volume_frac": vol_val,
+                "score": score,
+                "features_hash": fh,
+            }
             try:
-                append_row_csv(out_csv, header, row)
+                writer.write(row)
             except Exception:
                 pass
         try:
@@ -662,6 +661,15 @@ class ServiceSignalRunner:
             no_trade_cfg=self.no_trade_cfg,
             pipeline_cfg=self.pipeline_cfg,
         )
+
+        out_csv = getattr(signal_bus, "OUT_CSV", None)
+        if out_csv:
+            try:
+                signal_bus.OUT_WRITER = SignalCSVWriter(out_csv)
+                shutdown.on_flush(signal_bus.OUT_WRITER.flush_fsync)
+                shutdown.on_finalize(signal_bus.OUT_WRITER.close)
+            except Exception:
+                signal_bus.OUT_WRITER = None
 
         logs_dir = self.cfg.logs_dir or "logs"
         json_path = self.cfg.snapshot_metrics_json or os.path.join(logs_dir, "snapshot_metrics.json")
