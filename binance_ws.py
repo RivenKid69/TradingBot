@@ -6,7 +6,7 @@ import json
 import logging
 import random
 from pathlib import Path
-from typing import Awaitable, Callable, List
+from typing import List
 from clock import now_ms
 
 from decimal import Decimal
@@ -14,6 +14,8 @@ from decimal import Decimal
 import websockets
 
 from core_models import Bar
+from core_events import EventType, MarketEvent
+from services.event_bus import EventBus
 from config import DataDegradationConfig
 from utils import SignalRateLimiter
 from services import monitoring
@@ -26,7 +28,7 @@ logger = logging.getLogger(__name__)
 class BinanceWS:
     """
     Лёгкий клиент для публичных kline-стримов Binance (без ключей).
-    Поддерживает авто-reconnect с backoff и пользовательский callback на закрытые свечи.
+    Поддерживает авто-reconnect с backoff и публикацию событий в EventBus.
     """
 
     def __init__(
@@ -34,7 +36,7 @@ class BinanceWS:
         *,
         symbols: List[str],
         interval: str = "1m",
-        on_bar: Callable[[Bar], Awaitable[None]],
+        bus: EventBus,
         base_url: str = "wss://stream.binance.com:9443",
         reconnect_initial_delay_s: float = 1.0,
         reconnect_max_delay_s: float = 60.0,
@@ -54,7 +56,7 @@ class BinanceWS:
     ) -> None:
         self.symbols = [s.strip().upper() for s in symbols if s.strip()]
         self.interval = str(interval)
-        self.on_bar = on_bar
+        self._bus = bus
         self.base_url = base_url.rstrip("/")
         self.reconnect_initial_delay_s = float(reconnect_initial_delay_s)
         self.reconnect_max_delay_s = float(reconnect_max_delay_s)
@@ -138,9 +140,34 @@ class BinanceWS:
                 return
             await asyncio.sleep(self.heartbeat_interval_s)
 
+    async def _emit(self, bar: Bar, close_ms: int) -> None:
+        """Send bar event to the bus and persist dedup state."""
+        feed_lag_ms = max(0, now_ms() - close_ms)
+        event = MarketEvent(
+            etype=EventType.MARKET_DATA_BAR,
+            ts=now_ms(),
+            bar=bar,
+            meta={"feed_lag_ms": feed_lag_ms},
+        )
+        accepted = await self._bus.put(event)
+        if not accepted:
+            try:
+                logger.info("BACKPRESSURE_DROP")
+            except Exception:
+                pass
+            try:
+                monitoring.ws_backpressure_drop_count.labels(bar.symbol).inc()
+            except Exception:
+                pass
+        try:
+            signal_bus.update(bar.symbol, close_ms)
+        except Exception:
+            pass
+
     async def run_forever(self) -> None:
         delay = self.reconnect_initial_delay_s
         prev_bar: Bar | None = None
+        prev_close_ms: int | None = None
         try:
             while not self._stop:
                 try:
@@ -186,7 +213,7 @@ class BinanceWS:
                                         if delay_ms > 0:
                                             self._dd_delay += 1
                                             await asyncio.sleep(delay_ms / 1000.0)
-                                    await self.on_bar(prev_bar)
+                                    await self._emit(prev_bar, prev_close_ms or 0)
                                     continue
 
                                 if self._rng.random() < self.data_degradation.dropout_prob:
@@ -208,13 +235,13 @@ class BinanceWS:
                                             except Exception:
                                                 pass
                                             continue
-                                        signal_bus.update(bar.symbol, bar_close_ms)
                                     except Exception:
                                         pass
 
                                 prev_bar = bar
+                                prev_close_ms = bar_close_ms
                                 if await self._check_rate_limit():
-                                    await self.on_bar(bar)
+                                    await self._emit(bar, bar_close_ms)
                         hb_task.cancel()
                 except asyncio.CancelledError:
                     return

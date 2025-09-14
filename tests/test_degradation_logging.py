@@ -28,6 +28,7 @@ class _DummyWS:
     pass
 sys.modules.setdefault("websockets", _DummyWS())
 import binance_ws
+from services.event_bus import EventBus
 
 
 def _simulate_bar_stream(n: int, cfg: DataDegradationConfig) -> tuple[int, int, int]:
@@ -109,10 +110,8 @@ def test_binance_ws_degradation_logging(monkeypatch, caplog):
             json.dumps({"data": {"k": {"x": True, "t": i, "s": "BTCUSDT", "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1}}})
             for i in range(20)
         ]
-        bars = []
-        async def on_bar(bar):
-            bars.append(bar)
-        client = binance_ws.BinanceWS(symbols=["BTCUSDT"], on_bar=on_bar, data_degradation=cfg)
+        bus = EventBus(queue_size=100, drop_policy="newest")
+        client = binance_ws.BinanceWS(symbols=["BTCUSDT"], bus=bus, data_degradation=cfg)
 
         class MockWS:
             def __init__(self, msgs):

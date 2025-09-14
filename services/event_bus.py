@@ -42,11 +42,16 @@ class EventBus:
             pass
 
     # ------------------------------------------------------------------
-    async def put(self, event: Any) -> None:
-        """Put ``event`` into the queue honoring the drop policy."""
+    async def put(self, event: Any) -> bool:
+        """Put ``event`` into the queue honoring the drop policy.
+
+        Returns ``True`` if the event was accepted, ``False`` if it was dropped
+        due to backpressure.
+        """
 
         if self._closed:
             raise RuntimeError("EventBus is closed")
+        accepted = True
         try:
             self._queue.put_nowait(event)
             try:
@@ -54,6 +59,7 @@ class EventBus:
             except Exception:
                 pass
         except asyncio.QueueFull:
+            accepted = False
             try:
                 monitoring.dropped_bp.inc()
             except Exception:
@@ -66,17 +72,19 @@ class EventBus:
                     pass
                 try:
                     self._queue.put_nowait(event)
+                    accepted = True
                     try:
                         monitoring.events_in.inc()
                     except Exception:
                         pass
                 except asyncio.QueueFull:
                     # Queue size zero, drop new event as well
-                    pass
+                    accepted = False
             else:
                 # Drop newest – do nothing
                 pass
         self._set_depth()
+        return accepted
 
     # ------------------------------------------------------------------
     async def get(self) -> Any:

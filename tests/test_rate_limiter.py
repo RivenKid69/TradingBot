@@ -31,6 +31,7 @@ sys.modules.setdefault("websockets", _DummyWS())
 
 import binance_public
 import binance_ws
+from services.event_bus import EventBus
 
 
 # --- TokenBucket tests ---
@@ -124,10 +125,8 @@ def test_binance_public_limiter_enabled_and_disabled():
 # --- BinanceWS limiter inclusion and counters ---
 
 def test_binance_ws_rate_limit_counters(monkeypatch):
-    async def on_bar(_):
-        pass
-
-    ws = binance_ws.BinanceWS(symbols=["BTCUSDT"], on_bar=on_bar, rate_limit=1)
+    bus = EventBus(queue_size=10, drop_policy="newest")
+    ws = binance_ws.BinanceWS(symbols=["BTCUSDT"], bus=bus, rate_limit=1)
     rl_mock = MagicMock()
     rl_mock.can_send.side_effect = [
         (False, "rejected"), (True, "ok"),
