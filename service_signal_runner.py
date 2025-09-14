@@ -735,7 +735,15 @@ class ServiceSignalRunner:
                 shutdown.on_flush(signal_log.flush)
         if hasattr(signal_bus, "flush"):
             shutdown.on_flush(signal_bus.flush)
-        shutdown.on_flush(lambda: monitoring.snapshot_metrics(json_path, csv_path))
+
+        def _flush_snapshot() -> None:
+            try:
+                summary, json_str, _ = monitoring.snapshot_metrics(json_path, csv_path)
+                self.logger.info("SNAPSHOT %s", json_str)
+            except Exception:
+                pass
+
+        shutdown.on_flush(_flush_snapshot)
 
         def _write_marker() -> None:
             try:
@@ -745,8 +753,8 @@ class ServiceSignalRunner:
 
         def _final_summary() -> None:
             try:
-                summary_json, _ = monitoring.snapshot_metrics(json_path, csv_path)
-                self.logger.info("SUMMARY %s", summary_json)
+                summary, json_str, _ = monitoring.snapshot_metrics(json_path, csv_path)
+                self.logger.info("SUMMARY %s", json_str)
             except Exception:
                 pass
 

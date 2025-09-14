@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from typing import Dict, Tuple, Union, Optional, Any
 
@@ -373,7 +374,7 @@ def _collect(counter: Union[Counter, Gauge]) -> Dict[str, float]:
         return {}
 
 
-def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[str, str]:
+def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[Dict[str, Any], str, str]:
     """Persist current metrics snapshot to ``json_path`` and ``csv_path``.
 
     Parameters
@@ -385,8 +386,8 @@ def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[str, str]:
 
     Returns
     -------
-    Tuple[str, str]
-        The JSON and CSV representation of the snapshot.
+    Tuple[Dict[str, Any], str, str]
+        The structured summary along with its JSON and CSV representations.
     """
     feed_lag = _feed_lag_max.copy()
     ws_fail = _collect(ws_failure_count)
@@ -422,20 +423,31 @@ def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[str, str]:
     csv_lines.append(f"worst_error_rate,{worst_err[0] or ''},{worst_err[1]}")
     csv_str = "\n".join(csv_lines)
 
+    def _atomic_write(path: str, data: str, *, newline: Optional[str] = None) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
     try:
-        os.makedirs(os.path.dirname(json_path), exist_ok=True)
-        with open(json_path, "w", encoding="utf-8") as f:
-            f.write(json_str)
+        _atomic_write(json_path, json_str)
     except Exception:
         pass
     try:
-        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-        with open(csv_path, "w", encoding="utf-8", newline="") as f:
-            f.write(csv_str)
+        _atomic_write(csv_path, csv_str, newline="")
     except Exception:
         pass
 
-    return json_str, csv_str
+    return summary, json_str, csv_str
 
 
 __all__ = [
