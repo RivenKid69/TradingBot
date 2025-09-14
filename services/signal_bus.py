@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict
 from dataclasses import dataclass
+from collections import defaultdict
 
 import utils_time
 from .utils_app import append_row_csv
@@ -17,6 +18,8 @@ _STATE_PATH = Path("state/seen_signals.json")
 
 # Глобальное состояние: id -> expires_at_ms
 _SEEN: Dict[str, int] = {}
+# Drop counters by reason
+dropped_by_reason: Dict[str, int] = defaultdict(int)
 _lock = threading.Lock()
 _loaded = False
 
@@ -138,11 +141,13 @@ def log_drop(symbol: str, bar_close_ms: int, payload: Any, reason: str) -> None:
     logging are silenced just like in other helpers.
     """
     if not DROPS_CSV:
+        dropped_by_reason[str(reason)] += 1
         return
     try:
         header = ["symbol", "bar_close_ms", "payload", "reason"]
         row = [symbol, int(bar_close_ms), json.dumps(payload), str(reason)]
         append_row_csv(DROPS_CSV, header, row)
+        dropped_by_reason[str(reason)] += 1
     except Exception:
         # Silently ignore logging errors
         pass

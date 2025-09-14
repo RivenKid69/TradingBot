@@ -12,6 +12,7 @@ def test_publish_signal_dedup(tmp_path):
     # redirect state path to temporary location to avoid polluting repo
     sb._STATE_PATH = tmp_path / "seen.json"
     sb._SEEN.clear()
+    sb.dropped_by_reason.clear()
     sb._loaded = False
     sb.load_state()
 
@@ -42,6 +43,7 @@ def test_publish_signal_dedup(tmp_path):
 def test_publish_signal_payload_fields(tmp_path):
     sb._STATE_PATH = tmp_path / "seen.json"
     sb._SEEN.clear()
+    sb.dropped_by_reason.clear()
     sb._loaded = False
     sb.load_state()
 
@@ -58,6 +60,7 @@ def test_publish_signal_payload_fields(tmp_path):
 def test_publish_signal_disabled(tmp_path):
     sb._STATE_PATH = tmp_path / "seen.json"
     sb._SEEN.clear()
+    sb.dropped_by_reason.clear()
     sb._loaded = False
     sb.load_state()
 
@@ -78,6 +81,7 @@ def test_publish_signal_disabled(tmp_path):
 def test_load_and_flush_state(tmp_path):
     sb._STATE_PATH = tmp_path / "seen.json"
     sb._SEEN.clear()
+    sb.dropped_by_reason.clear()
     sb._loaded = False
     sb.load_state()
     assert sb._SEEN == {}
@@ -113,6 +117,7 @@ def test_load_and_flush_state(tmp_path):
 def test_publish_signal_csv_logging(tmp_path):
     sb._STATE_PATH = tmp_path / "seen.json"
     sb._SEEN.clear()
+    sb.dropped_by_reason.clear()
     sb._loaded = False
     sb.load_state()
 
@@ -142,3 +147,9 @@ def test_publish_signal_csv_logging(tmp_path):
 
     sb.OUT_CSV = None
     sb.DROPS_CSV = None
+
+
+def test_log_drop_counts():
+    sb.dropped_by_reason.clear()
+    sb.log_drop("BTC", 1, {}, "RISK_TEST")
+    assert sb.dropped_by_reason["RISK_TEST"] == 1
