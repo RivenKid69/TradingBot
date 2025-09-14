@@ -40,6 +40,53 @@ def test_publish_signal_dedup(tmp_path):
     assert sb._SEEN[sid] == now + 200 + 100
 
 
+def test_publish_signal_custom_dedup_key(tmp_path):
+    sb._STATE_PATH = tmp_path / "seen.json"
+    sb._SEEN.clear()
+    sb.dropped_by_reason.clear()
+    sb._loaded = False
+    sb.load_state()
+
+    sent: list[dict[str, int]] = []
+    now = 1000
+
+    def send_fn(payload):
+        sent.append(payload)
+
+    # first call with custom dedup key should send
+    assert sb.publish_signal(
+        "BTCUSDT",
+        1,
+        {"p": 1},
+        send_fn,
+        expires_at_ms=now + 100,
+        now_ms=now,
+        dedup_key="custom1",
+    )
+    # duplicate with same key should be skipped
+    assert not sb.publish_signal(
+        "BTCUSDT",
+        1,
+        {"p": 2},
+        send_fn,
+        expires_at_ms=now + 200,
+        now_ms=now + 50,
+        dedup_key="custom1",
+    )
+    # different key should send
+    assert sb.publish_signal(
+        "BTCUSDT",
+        1,
+        {"p": 3},
+        send_fn,
+        expires_at_ms=now + 300,
+        now_ms=now + 60,
+        dedup_key="custom2",
+    )
+
+    assert sent == [{"p": 1}, {"p": 3}]
+
+
 def test_publish_signal_payload_fields(tmp_path):
     sb._STATE_PATH = tmp_path / "seen.json"
     sb._SEEN.clear()
