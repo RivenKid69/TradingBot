@@ -24,6 +24,7 @@ import os
 import logging
 import threading
 from pathlib import Path
+from collections import deque, defaultdict
 
 import yaml
 import clock
@@ -37,6 +38,7 @@ from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig, ClockSyncConfig, ThrottleConfig
+from utils import TokenBucket
 import di_registry
 import ws_dedup_state as signal_bus
 
@@ -71,6 +73,7 @@ class _Provider:
         ws_dedup_enabled: bool = False,
         ws_dedup_log_skips: bool = False,
         ws_dedup_timeframe_ms: int = 0,
+        throttle_cfg: ThrottleConfig | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -82,6 +85,20 @@ class _Provider:
         self._ws_dedup_enabled = ws_dedup_enabled
         self._ws_dedup_log_skips = ws_dedup_log_skips
         self._ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
+        self._throttle_cfg = throttle_cfg
+        self._global_bucket = None
+        self._symbol_bucket_factory = None
+        self._symbol_buckets = None
+        self._queue = None
+        if throttle_cfg is not None and throttle_cfg.enabled:
+            self._global_bucket = TokenBucket(
+                rps=throttle_cfg.global_.rps, burst=throttle_cfg.global_.burst
+            )
+            self._symbol_bucket_factory = lambda: TokenBucket(
+                rps=throttle_cfg.symbol.rps, burst=throttle_cfg.symbol.burst
+            )
+            self._symbol_buckets = defaultdict(self._symbol_bucket_factory)
+            self._queue = deque(maxlen=throttle_cfg.queue.max_items)
 
     def on_bar(self, bar: Bar):
         if self._safe_mode_fn():
@@ -322,6 +339,7 @@ class ServiceSignalRunner:
             ws_dedup_enabled=self.ws_dedup_enabled,
             ws_dedup_log_skips=self.ws_dedup_log_skips,
             ws_dedup_timeframe_ms=self.ws_dedup_timeframe_ms,
+            throttle_cfg=self.throttle_cfg,
         )
 
         client = getattr(self.adapter, "client", None)
