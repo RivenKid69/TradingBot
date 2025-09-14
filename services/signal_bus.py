@@ -14,6 +14,7 @@ _STATE_PATH = Path("state/seen_signals.json")
 # Глобальное состояние: id -> expires_at_ms
 _SEEN: Dict[str, int] = {}
 _lock = threading.Lock()
+_loaded = False
 
 
 def signal_id(symbol: str, bar_close_ms: int) -> str:
@@ -39,8 +40,53 @@ def _flush() -> None:
     _atomic_write(_STATE_PATH)
 
 
+def load_state(path: str | Path | None = None) -> None:
+    """Загрузить состояние из JSON-файла, очищая устаревшие записи."""
+    global _STATE_PATH, _loaded
+    if path is not None:
+        _STATE_PATH = Path(path)
+    p = Path(_STATE_PATH)
+
+    try:
+        data = json.loads(p.read_text()) if p.exists() else {}
+    except Exception:
+        # В случае ошибки стартуем с пустым состоянием
+        _SEEN.clear()
+        _loaded = True
+        return
+
+    now = int(time.time() * 1000)
+    with _lock:
+        _SEEN.clear()
+        for sid, exp in data.items():
+            try:
+                exp_int = int(exp)
+            except Exception:
+                continue
+            if exp_int >= now:
+                _SEEN[str(sid)] = exp_int
+    _loaded = True
+    if len(_SEEN) != len(data):
+        flush_state()
+
+
+def flush_state(path: str | Path | None = None) -> None:
+    """Сохранить текущее состояние на диск."""
+    global _STATE_PATH
+    if path is not None:
+        _STATE_PATH = Path(path)
+    with _lock:
+        _flush()
+
+
+def _ensure_loaded() -> None:
+    if not _loaded:
+        load_state()
+
+
 def already_emitted(sid: str, *, now_ms: int | None = None) -> bool:
     """Проверить, публиковался ли сигнал ``sid`` ранее и не истёк ли его срок."""
+    _ensure_loaded()
     now = now_ms or int(time.time() * 1000)
     with _lock:
         exp = _SEEN.get(sid)
@@ -60,6 +106,7 @@ def mark_emitted(
     now_ms: int | None = None,
 ) -> None:
     """Отметить сигнал как опубликованный до ``expires_at_ms`` (ms since epoch)."""
+    _ensure_loaded()
     now = now_ms or int(time.time() * 1000)
     with _lock:
         _purge(now)
@@ -80,6 +127,7 @@ def publish_signal(
 
     Возвращает True, если сигнал был отправлен, иначе False.
     """
+    _ensure_loaded()
     sid = signal_id(symbol, bar_close_ms)
     if already_emitted(sid, now_ms=now_ms):
         return False
@@ -92,18 +140,7 @@ def publish_signal(
 
 # Загрузить состояние при импорте
 try:
-    if _STATE_PATH.exists():
-        data = json.loads(_STATE_PATH.read_text())
-        now = int(time.time() * 1000)
-        for sid, exp in data.items():
-            exp_int = int(exp)
-            if exp_int >= now:
-                _SEEN[str(sid)] = exp_int
-        if len(_SEEN) != len(data):
-            _flush()
-    else:
-        _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _flush()
+    load_state()
 except Exception:
-    # В случае ошибки стартуем с пустым состоянием
     _SEEN.clear()
+    _loaded = True
