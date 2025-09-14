@@ -59,6 +59,13 @@ ws_dup_skipped_count = Counter(
     ["symbol"],
 )
 
+# Orders dropped because their originating bar exceeded TTL boundary
+ttl_expired_boundary_count = Counter(
+    "ttl_expired_boundary_count",
+    "Orders dropped due to bar TTL expiration before processing",
+    ["symbol"],
+)
+
 _last_sync_ts_ms: float = 0.0
 
 
@@ -111,6 +118,7 @@ def clock_sync_age_seconds() -> float:
 __all__ = [
     "skipped_incomplete_bars",
     "ws_dup_skipped_count",
+    "ttl_expired_boundary_count",
     "clock_sync_fail",
     "clock_sync_success",
     "report_clock_sync",
