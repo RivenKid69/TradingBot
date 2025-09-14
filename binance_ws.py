@@ -144,6 +144,10 @@ class BinanceWS:
     async def _emit(self, bar: Bar, close_ms: int) -> None:
         """Send bar event to the bus and persist dedup state."""
         feed_lag_ms = max(0, now_ms() - close_ms)
+        try:
+            monitoring.report_feed_lag(bar.symbol, feed_lag_ms)
+        except Exception:
+            pass
         event = MarketEvent(
             etype=EventType.MARKET_DATA_BAR,
             ts=now_ms(),
@@ -161,6 +165,7 @@ class BinanceWS:
                 pass
             try:
                 monitoring.ws_backpressure_drop_count.labels(bar.symbol).inc()
+                monitoring.ws_failure_count.labels(bar.symbol).inc()
             except Exception:
                 pass
         try:
@@ -236,6 +241,7 @@ class BinanceWS:
                                                     pass
                                             try:
                                                 monitoring.ws_dup_skipped_count.labels(bar.symbol).inc()
+                                                monitoring.ws_failure_count.labels(bar.symbol).inc()
                                             except Exception:
                                                 pass
                                             continue
