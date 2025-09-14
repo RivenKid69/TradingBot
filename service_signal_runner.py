@@ -25,6 +25,7 @@ import logging
 import threading
 from pathlib import Path
 from collections import deque, defaultdict
+import time
 
 import yaml
 import clock
@@ -32,6 +33,7 @@ from services import monitoring
 from services.monitoring import skipped_incomplete_bars
 from pipeline import check_ttl
 from services.utils_app import append_row_csv
+from services.signal_bus import log_drop
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
@@ -100,9 +102,145 @@ class _Provider:
             self._symbol_buckets = defaultdict(self._symbol_bucket_factory)
             self._queue = deque(maxlen=throttle_cfg.queue.max_items)
 
+    def _acquire_tokens(self, symbol: str) -> tuple[bool, str | None]:
+        if self._global_bucket is None:
+            return True, None
+        now = time.monotonic()
+        if not self._global_bucket.consume(now=now):
+            return False, "THROTTLED_GLOBAL"
+        sb = self._symbol_buckets[symbol]
+        if not sb.consume(now=now):
+            self._global_bucket.tokens = min(
+                self._global_bucket.tokens + 1.0, self._global_bucket.burst
+            )
+            return False, "THROTTLED_SYMBOL"
+        return True, None
+
+    def _refund_tokens(self, symbol: str) -> None:
+        if self._global_bucket is not None:
+            self._global_bucket.tokens = min(
+                self._global_bucket.tokens + 1.0, self._global_bucket.burst
+            )
+        if self._symbol_buckets is not None:
+            sb = self._symbol_buckets[symbol]
+            sb.tokens = min(sb.tokens + 1.0, sb.burst)
+
+    def _emit(self, o: Any, symbol: str, bar_close_ms: int) -> bool:
+        created_ts = int(getattr(o, "created_ts_ms", 0) or 0)
+        now_ms = clock.now_ms()
+        ok, expires_at_ms, _ = check_ttl(
+            bar_close_ms=created_ts,
+            now_ms=now_ms,
+            timeframe_ms=self._ws_dedup_timeframe_ms,
+        )
+        if not ok:
+            try:
+                self._logger.info(
+                    "TTL_EXPIRED_PUBLISH %s",
+                    {
+                        "symbol": symbol,
+                        "created_ts_ms": created_ts,
+                        "now_ms": now_ms,
+                        "expires_at_ms": expires_at_ms,
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                monitoring.signal_absolute_count.labels(symbol).inc()
+            except Exception:
+                pass
+            return False
+        try:
+            age_ms = now_ms - created_ts
+            monitoring.age_at_publish_ms.labels(symbol).observe(age_ms)
+            monitoring.signal_published_count.labels(symbol).inc()
+        except Exception:
+            pass
+
+        score = float(getattr(o, "score", 0) or 0)
+        fh = str(getattr(o, "features_hash", "") or "")
+        side = getattr(o, "side", "")
+        side = side.value if hasattr(side, "value") else str(side)
+        side = str(side).upper()
+        out_csv = getattr(signal_bus, "OUT_CSV", None)
+        if out_csv:
+            vol = getattr(o, "volume_frac", None)
+            if vol is None:
+                vol = getattr(o, "quantity", 0)
+            try:
+                vol_val = float(vol)
+            except Exception:
+                vol_val = 0.0
+            header = [
+                "ts_ms",
+                "symbol",
+                "side",
+                "volume_frac",
+                "score",
+                "features_hash",
+            ]
+            row = [bar_close_ms, symbol, side, vol_val, score, fh]
+            try:
+                append_row_csv(out_csv, header, row)
+            except Exception:
+                pass
+        try:
+            self._logger.info("order %s", o)
+        except Exception:
+            pass
+        if getattr(signal_bus, "ENABLED", False):
+            try:
+                signal_bus.publish_signal(
+                    ts_ms=bar_close_ms,
+                    symbol=symbol,
+                    side=side,
+                    score=score,
+                    features_hash=fh,
+                    bar_close_ms=bar_close_ms,
+                )
+            except Exception:
+                pass
+        submit = getattr(self._executor, "submit", None)
+        if callable(submit):
+            try:
+                submit(o)
+            except Exception:
+                pass
+        return True
+
+    def _drain_queue(self) -> list[Any]:
+        emitted: list[Any] = []
+        if self._queue is None:
+            return emitted
+        now = time.monotonic()
+        while self._queue:
+            exp, symbol, bar_close_ms, order = self._queue[0]
+            if exp <= now:
+                self._queue.popleft()
+                try:
+                    log_drop(symbol, bar_close_ms, order, "QUEUE_EXPIRED")
+                except Exception:
+                    pass
+                continue
+            ok, _ = self._acquire_tokens(symbol)
+            if not ok:
+                break
+            self._queue.popleft()
+            if not self._emit(order, symbol, bar_close_ms):
+                self._refund_tokens(symbol)
+            else:
+                emitted.append(order)
+        return emitted
+
     def on_bar(self, bar: Bar):
         if self._safe_mode_fn():
             return []
+
+        emitted: list[Any] = []
+        if self._queue is not None:
+            emitted.extend(self._drain_queue())
+
         close_ms: int | None = None
         if self._ws_dedup_enabled:
             close_ms = int(bar.ts) + self._ws_dedup_timeframe_ms
@@ -116,7 +254,11 @@ class _Provider:
                     monitoring.ws_dup_skipped_count.labels(bar.symbol).inc()
                 except Exception:
                     pass
-                return []
+                try:
+                    monitoring.queue_len.set(len(self._queue) if self._queue else 0)
+                except Exception:
+                    pass
+                return emitted
         if self._enforce_closed_bars and not bar.is_final:
             try:
                 self._logger.info("SKIP_INCOMPLETE_BAR")
@@ -126,7 +268,12 @@ class _Provider:
                 skipped_incomplete_bars.labels(bar.symbol).inc()
             except Exception:
                 pass
-            return []
+            try:
+                monitoring.queue_len.set(len(self._queue) if self._queue else 0)
+            except Exception:
+                pass
+            return emitted
+
         feats = self._fp.update(bar)
         ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
         orders = list(self._policy.decide({**feats}, ctx) or [])
@@ -160,108 +307,39 @@ class _Provider:
                 except Exception:
                     pass
                 continue
-                
+
             setattr(o, "created_ts_ms", created_ts_ms)
             checked_orders.append(o)
 
-        orders = checked_orders
+        for o in checked_orders:
+            if self._throttle_cfg and self._throttle_cfg.enabled:
+                ok, reason = self._acquire_tokens(bar.symbol)
+                if not ok:
+                    if self._throttle_cfg.mode == "drop":
+                        try:
+                            log_drop(bar.symbol, int(bar.ts), o, reason or "")
+                        except Exception:
+                            pass
+                    elif self._throttle_cfg.mode == "queue" and self._queue is not None:
+                        exp = time.monotonic() + self._throttle_cfg.queue.ttl_ms / 1000.0
+                        self._queue.append((exp, bar.symbol, int(bar.ts), o))
+                    continue
+            if not self._emit(o, bar.symbol, int(bar.ts)):
+                self._refund_tokens(bar.symbol)
+            else:
+                emitted.append(o)
 
-        out_csv = getattr(signal_bus, "OUT_CSV", None)
-        header = [
-            "ts_ms",
-            "symbol",
-            "side",
-            "volume_frac",
-            "score",
-            "features_hash",
-        ]
-        for o in orders:
-            created_ts = int(getattr(o, "created_ts_ms", 0) or 0)
-            now_ms = clock.now_ms()
-            ok, expires_at_ms, _ = check_ttl(
-                bar_close_ms=created_ts,
-                now_ms=now_ms,
-                timeframe_ms=self._ws_dedup_timeframe_ms,
-            )
-            if not ok:
-                try:
-                    self._logger.info(
-                        "TTL_EXPIRED_PUBLISH %s",
-                        {
-                            "symbol": bar.symbol,
-                            "created_ts_ms": created_ts,
-                            "now_ms": now_ms,
-                            "expires_at_ms": expires_at_ms,
-                        },
-                    )
-                except Exception:
-                    pass
-                try:
-                    monitoring.signal_absolute_count.labels(bar.symbol).inc()
-                except Exception:
-                    pass
-                continue
+        try:
+            monitoring.queue_len.set(len(self._queue) if self._queue else 0)
+        except Exception:
+            pass
 
-            try:
-                age_ms = now_ms - created_ts
-                monitoring.age_at_publish_ms.labels(bar.symbol).observe(age_ms)
-                monitoring.signal_published_count.labels(bar.symbol).inc()
-            except Exception:
-                pass
-
-            score = float(getattr(o, "score", 0) or 0)
-            fh = str(getattr(o, "features_hash", "") or "")
-            side = getattr(o, "side", "")
-            side = side.value if hasattr(side, "value") else str(side)
-            side = str(side).upper()
-            if out_csv:
-                vol = getattr(o, "volume_frac", None)
-                if vol is None:
-                    vol = getattr(o, "quantity", 0)
-                try:
-                    vol_val = float(vol)
-                except Exception:
-                    vol_val = 0.0
-                row = [
-                    int(bar.ts),
-                    bar.symbol,
-                    side,
-                    vol_val,
-                    score,
-                    fh,
-                ]
-                try:
-                    append_row_csv(out_csv, header, row)
-                except Exception:
-                    pass
-            try:
-                self._logger.info("order %s", o)
-            except Exception:
-                pass
-            if getattr(signal_bus, "ENABLED", False):
-                try:
-                    signal_bus.publish_signal(
-                        ts_ms=int(bar.ts),
-                        symbol=bar.symbol,
-                        side=side,
-                        score=score,
-                        features_hash=fh,
-                        bar_close_ms=int(bar.ts),
-                    )
-                except Exception:
-                    pass
-            submit = getattr(self._executor, "submit", None)
-            if callable(submit):
-                try:
-                    submit(o)
-                except Exception:
-                    pass
         if self._ws_dedup_enabled and close_ms is not None:
             try:
                 signal_bus.update(bar.symbol, close_ms)
             except Exception:
                 pass
-        return orders
+        return emitted
 
 
 class ServiceSignalRunner:
