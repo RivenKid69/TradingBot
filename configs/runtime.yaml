@@ -1,0 +1,32 @@
+# Runtime settings for live execution
+concurrency:
+  workers: 1
+
+queue:
+  capacity: 1000            # event bus capacity; 0 for unbounded
+  drop_policy: newest       # "newest" drops incoming, "oldest" drops oldest
+
+ws:
+  enabled: true
+  persist_path: state/last_bar_seen.json
+  log_skips: true
+
+throttle:
+  enabled: false              # disable throttling
+  global:
+    rps: 0.0                  # requests per second; 0 disables
+    burst: 0                  # burst capacity
+  symbol:
+    rps: 0.0                  # per-symbol RPS limit
+    burst: 0
+  mode: drop                  # drop or queue
+  queue:
+    max_items: 0              # queue size when mode=queue
+    ttl_ms: 0                 # item lifetime in ms
+  time_source: "monotonic"
+
+ops:
+  kill_switch:
+    feed_lag_ms: 60000       # Enter safe mode if worst feed lag exceeds this; 0 disables
+    ws_failures: 100         # Enter safe mode if WS failures exceed this count; 0 disables
+    error_rate: 0.2          # Enter safe mode if signal error rate exceeds this fraction; 0 disables
