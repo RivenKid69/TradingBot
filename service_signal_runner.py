@@ -139,6 +139,7 @@ class _Provider:
                     pass
                 try:
                     monitoring.ttl_expired_boundary_count.labels(bar.symbol).inc()
+                    monitoring.signal_boundary_count.labels(bar.symbol).inc()
                 except Exception:
                     pass
                 continue
@@ -178,12 +179,16 @@ class _Provider:
                     )
                 except Exception:
                     pass
+                try:
+                    monitoring.signal_absolute_count.labels(bar.symbol).inc()
+                except Exception:
+                    pass
                 continue
 
             try:
                 age_ms = now_ms - created_ts
-                monitoring.signal_publish_age_ms.labels(bar.symbol).observe(age_ms)
-                monitoring.signal_publish_count.labels(bar.symbol).inc()
+                monitoring.age_at_publish_ms.labels(bar.symbol).observe(age_ms)
+                monitoring.signal_published_count.labels(bar.symbol).inc()
             except Exception:
                 pass
 

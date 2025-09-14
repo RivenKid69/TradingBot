@@ -4,10 +4,10 @@ from __future__ import annotations
 import time
 from typing import Union
 
-from utils.prometheus import Counter
+from utils.prometheus import Counter, Histogram
 
 try:  # pragma: no cover - optional dependency
-    from prometheus_client import Gauge, Histogram
+    from prometheus_client import Gauge
 except Exception:  # pragma: no cover - fallback when prometheus_client is missing
     class _DummyGauge:
         def __init__(self, *args, **kwargs) -> None:
@@ -19,18 +19,7 @@ except Exception:  # pragma: no cover - fallback when prometheus_client is missi
         def set(self, *args, **kwargs) -> None:
             pass
 
-    class _DummyHistogram:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        def labels(self, *args, **kwargs) -> "_DummyHistogram":
-            return self
-
-        def observe(self, *args, **kwargs) -> None:
-            pass
-
     Gauge = _DummyGauge  # type: ignore
-    Histogram = _DummyHistogram  # type: ignore
 
 # Gauges for latest clock sync measurements
 _CLOCK_SYNC_DRIFT_MS = Gauge(
@@ -77,15 +66,27 @@ ttl_expired_boundary_count = Counter(
     ["symbol"],
 )
 
-# Age of signals at publish time and publish counts
-signal_publish_age_ms = Histogram(
-    "signal_publish_age_ms",
-    "Age of signals when published in milliseconds",
+# Signals dropped or published
+signal_boundary_count = Counter(
+    "signal_boundary_count",
+    "Signals dropped due to TTL boundary expiration",
     ["symbol"],
 )
-signal_publish_count = Counter(
-    "signal_publish_count",
-    "Signals published",
+signal_absolute_count = Counter(
+    "signal_absolute_count",
+    "Signals dropped due to absolute TTL expiration",
+    ["symbol"],
+)
+signal_published_count = Counter(
+    "signal_published_count",
+    "Signals successfully published",
+    ["symbol"],
+)
+
+# Age of signals at publish time
+age_at_publish_ms = Histogram(
+    "age_at_publish_ms",
+    "Age of signals when published in milliseconds",
     ["symbol"],
 )
 
@@ -142,8 +143,10 @@ __all__ = [
     "skipped_incomplete_bars",
     "ws_dup_skipped_count",
     "ttl_expired_boundary_count",
-    "signal_publish_age_ms",
-    "signal_publish_count",
+    "signal_boundary_count",
+    "signal_absolute_count",
+    "signal_published_count",
+    "age_at_publish_ms",
     "clock_sync_fail",
     "clock_sync_success",
     "report_clock_sync",
