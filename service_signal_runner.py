@@ -58,6 +58,7 @@ from no_trade_config import NoTradeConfig
 from utils import TokenBucket
 import di_registry
 import ws_dedup_state as signal_bus
+import state_store
 
 
 class RiskGuards(Protocol):
@@ -644,6 +645,12 @@ class ServiceSignalRunner:
         stop_event = threading.Event()
         shutdown.on_stop(stop_event.set)
 
+        # Restore persisted runtime state if available
+        try:
+            state_store.load()
+        except Exception:
+            pass
+
         self.feature_pipe.warmup()
         monitoring.configure_kill_switch(self.cfg.kill_switch)
         worker = _Worker(
@@ -744,6 +751,7 @@ class ServiceSignalRunner:
                 pass
 
         shutdown.on_flush(_flush_snapshot)
+        shutdown.on_flush(state_store.save)
 
         def _write_marker() -> None:
             try:
