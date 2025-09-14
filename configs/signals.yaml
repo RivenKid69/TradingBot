@@ -1,0 +1,4 @@
+enabled: false            # Enable or disable signal generation
+out_csv: "signals.csv"    # Path to write signals CSV (null to disable)
+ttl_seconds: 60           # Time-to-live for signal cache entries
+dedup_persist: null       # Path to dedup persistence file or null for in-memory only
