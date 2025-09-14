@@ -77,6 +77,15 @@ class WSDedupConfig(BaseModel):
     log_skips: bool = Field(default=False)
 
 
+class TTLConfig(BaseModel):
+    """Настройки TTL для сигналов и дедупликации."""
+
+    enabled: bool = Field(default=False)
+    ttl_seconds: int = Field(default=60)
+    out_csv: Optional[str] = Field(default=None)
+    dedup_persist: Optional[str] = Field(default=None)
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
         default=None, description="Идентификатор запуска; если None — генерируется."
@@ -103,6 +112,7 @@ class CommonRunConfig(BaseModel):
     timing: TimingConfig = Field(default_factory=TimingConfig)
     clock_sync: ClockSyncConfig = Field(default_factory=ClockSyncConfig)
     ws_dedup: WSDedupConfig = Field(default_factory=WSDedupConfig)
+    ttl: TTLConfig = Field(default_factory=TTLConfig)
     components: Components
 
 
@@ -295,6 +305,7 @@ __all__ = [
     "ClockSyncConfig",
     "TimingConfig",
     "WSDedupConfig",
+    "TTLConfig",
     "CommonRunConfig",
     "SimulationDataConfig",
     "SimulationConfig",
