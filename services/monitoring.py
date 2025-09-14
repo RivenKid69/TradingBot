@@ -22,15 +22,15 @@ except Exception:  # pragma: no cover - fallback when prometheus_client is missi
     Gauge = _DummyGauge  # type: ignore
 
 # Gauges for latest clock sync measurements
-_CLOCK_SYNC_DRIFT_MS = Gauge(
+clock_sync_drift_ms = Gauge(
     "clock_sync_drift_ms",
     "Latest measured clock drift in milliseconds",
 )
-_CLOCK_SYNC_RTT_MS = Gauge(
+clock_sync_rtt_ms = Gauge(
     "clock_sync_rtt_ms",
     "Latest measured clock sync round-trip time in milliseconds",
 )
-_CLOCK_SYNC_LAST_TS = Gauge(
+clock_sync_last_sync_ts = Gauge(
     "clock_sync_last_sync_ts",
     "Timestamp of last successful clock sync in milliseconds since epoch",
 )
@@ -123,11 +123,11 @@ def report_clock_sync(
         pass
 
     try:
-        _CLOCK_SYNC_DRIFT_MS.set(float(drift_ms))
-        _CLOCK_SYNC_RTT_MS.set(float(rtt_ms))
+        clock_sync_drift_ms.set(float(drift_ms))
+        clock_sync_rtt_ms.set(float(rtt_ms))
         if success:
             _last_sync_ts_ms = float(sync_ts)
-            _CLOCK_SYNC_LAST_TS.set(float(sync_ts))
+            clock_sync_last_sync_ts.set(float(sync_ts))
     except Exception:
         pass
 
@@ -149,6 +149,9 @@ __all__ = [
     "age_at_publish_ms",
     "clock_sync_fail",
     "clock_sync_success",
+    "clock_sync_drift_ms",
+    "clock_sync_rtt_ms",
+    "clock_sync_last_sync_ts",
     "report_clock_sync",
     "clock_sync_age_seconds",
 ]
