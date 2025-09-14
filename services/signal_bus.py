@@ -130,6 +130,24 @@ def mark_emitted(
         _flush()
 
 
+def log_drop(symbol: str, bar_close_ms: int, payload: Any, reason: str) -> None:
+    """Log a dropped signal to ``DROPS_CSV`` with a reason.
+
+    The CSV mirrors the structure of ``publish_signal``: ``symbol``,
+    ``bar_close_ms``, ``payload`` and ``reason``.  Any exceptions during
+    logging are silenced just like in other helpers.
+    """
+    if not DROPS_CSV:
+        return
+    try:
+        header = ["symbol", "bar_close_ms", "payload", "reason"]
+        row = [symbol, int(bar_close_ms), json.dumps(payload), str(reason)]
+        append_row_csv(DROPS_CSV, header, row)
+    except Exception:
+        # Silently ignore logging errors
+        pass
+
+
 def publish_signal(
     symbol: str,
     bar_close_ms: int,
@@ -144,20 +162,16 @@ def publish_signal(
     Возвращает True, если сигнал был отправлен, иначе False.
     """
     if not config.enabled:
+        log_drop(symbol, bar_close_ms, payload, "disabled")
         return False
     _ensure_loaded()
     sid = signal_id(symbol, bar_close_ms)
     now = now_ms if now_ms is not None else utils_time.now_ms()
     if now >= int(expires_at_ms):
-        if DROPS_CSV:
-            try:
-                header = ["symbol", "bar_close_ms", "payload", "expires_at_ms"]
-                row = [symbol, int(bar_close_ms), json.dumps(payload), int(expires_at_ms)]
-                append_row_csv(DROPS_CSV, header, row)
-            except Exception:
-                pass
+        log_drop(symbol, bar_close_ms, payload, "expired")
         return False
     if already_emitted(sid, now_ms=now):
+        log_drop(symbol, bar_close_ms, payload, "duplicate")
         return False
     send_fn(payload)
     mark_emitted(sid, expires_at_ms=int(expires_at_ms), now_ms=now)
