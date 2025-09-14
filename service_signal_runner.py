@@ -32,7 +32,7 @@ import yaml
 import clock
 from services import monitoring
 from services.monitoring import skipped_incomplete_bars
-from pipeline import check_ttl, closed_bar_guard
+from pipeline import check_ttl, closed_bar_guard, apply_no_trade_windows
 from services.utils_app import append_row_csv
 from services.signal_bus import log_drop
 from services.event_bus import EventBus
@@ -42,6 +42,7 @@ from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import CommonRunConfig, ClockSyncConfig, ThrottleConfig
+from no_trade_config import NoTradeConfig
 from utils import TokenBucket
 import di_registry
 import ws_dedup_state as signal_bus
@@ -81,6 +82,7 @@ class _Worker:
         ws_dedup_log_skips: bool = False,
         ws_dedup_timeframe_ms: int = 0,
         throttle_cfg: ThrottleConfig | None = None,
+        no_trade_cfg: NoTradeConfig | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -93,6 +95,7 @@ class _Worker:
         self._ws_dedup_log_skips = ws_dedup_log_skips
         self._ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
         self._throttle_cfg = throttle_cfg
+        self._no_trade_cfg = no_trade_cfg
         self._global_bucket = None
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
@@ -287,6 +290,15 @@ class _Worker:
                 pass
             return emitted
 
+        if self._no_trade_cfg is not None:
+            win_res = apply_no_trade_windows(int(bar.ts), bar.symbol, self._no_trade_cfg)
+            if win_res.action == "drop":
+                try:
+                    self._logger.info("SKIP_NO_TRADE_WINDOW")
+                except Exception:
+                    pass
+                return emitted
+
         feats = self._fp.update(bar)
         ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
         orders = list(self._policy.decide({**feats}, ctx) or [])
@@ -406,6 +418,7 @@ class ServiceSignalRunner:
         cfg: Optional[SignalRunnerConfig] = None,
         clock_sync_cfg: ClockSyncConfig | None = None,
         throttle_cfg: ThrottleConfig | None = None,
+        no_trade_cfg: NoTradeConfig | None = None,
         *,
         enforce_closed_bars: bool = True,
         ws_dedup_enabled: bool = False,
@@ -420,6 +433,7 @@ class ServiceSignalRunner:
         self.logger = logging.getLogger(__name__)
         self.clock_sync_cfg = clock_sync_cfg
         self.throttle_cfg = throttle_cfg
+        self.no_trade_cfg = no_trade_cfg
         self._clock_safe_mode = False
         self._clock_stop = threading.Event()
         self._clock_thread: Optional[threading.Thread] = None
@@ -473,6 +487,7 @@ class ServiceSignalRunner:
             ws_dedup_log_skips=self.ws_dedup_log_skips,
             ws_dedup_timeframe_ms=self.ws_dedup_timeframe_ms,
             throttle_cfg=self.throttle_cfg,
+            no_trade_cfg=self.no_trade_cfg,
         )
 
         logs_dir = self.cfg.logs_dir or "logs"
@@ -790,6 +805,7 @@ def from_config(
         svc_cfg,
         cfg.clock_sync,
         cfg.throttle,
+        NoTradeConfig(**(cfg.no_trade or {})),
         enforce_closed_bars=cfg.timing.enforce_closed_bars,
         ws_dedup_enabled=cfg.ws_dedup.enabled,
         ws_dedup_log_skips=cfg.ws_dedup.log_skips,
