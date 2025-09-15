@@ -167,6 +167,8 @@ class MonitoringThresholdsConfig:
     feed_lag_ms: float = 0.0
     ws_failures: float = 0.0
     error_rate: float = 0.0
+    fill_ratio_min: float = 0.0
+    pnl_min: float = 0.0
 
 
 @dataclass

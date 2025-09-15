@@ -478,6 +478,9 @@ class MonitoringAggregator:
         self._http_events: deque[tuple[int, bool, Optional[int]]] = deque()
         self._signal_events: deque[tuple[int, str, int, int]] = deque()
         self._last_bar_close_ms: Dict[str, int] = {}
+        # Latest computed metrics
+        self.fill_ratio: Optional[float] = None
+        self.daily_pnl: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Recording helpers
@@ -509,6 +512,50 @@ class MonitoringAggregator:
         if not self.enabled:
             return
         self._signal_events.append((int(time.time() * 1000), symbol, int(emitted), int(duplicates)))
+
+    def record_fill(self, requested: Optional[float], filled: Optional[float]) -> None:
+        """Record executed vs requested volume and compute fill ratio."""
+        if not self.enabled:
+            return
+        if requested is None or filled is None:
+            return
+        try:
+            req = float(requested)
+            fil = float(filled)
+        except (TypeError, ValueError):
+            return
+        if req <= 0:
+            return
+        ratio = fil / req
+        self.fill_ratio = ratio
+        th = self.cfg.thresholds
+        fill_ratio_min = getattr(th, "fill_ratio_min", 0.0)
+        if fill_ratio_min and ratio < fill_ratio_min:
+            try:
+                self.alerts.notify(
+                    "fill_ratio", f"fill ratio {ratio:.3f} below {fill_ratio_min}"
+                )
+            except Exception:
+                pass
+
+    def record_pnl(self, daily_pnl: Optional[float]) -> None:
+        """Record daily PnL and emit alerts if below threshold."""
+        if not self.enabled:
+            return
+        if daily_pnl is None:
+            return
+        try:
+            pnl = float(daily_pnl)
+        except (TypeError, ValueError):
+            return
+        self.daily_pnl = pnl
+        th = self.cfg.thresholds
+        pnl_min = getattr(th, "pnl_min", 0.0)
+        if pnl_min and pnl < pnl_min:
+            try:
+                self.alerts.notify("pnl", f"daily pnl {pnl:.2f} below {pnl_min}")
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     def _prune(self, dq: deque[tuple], cutoff_ms: int) -> None:
@@ -602,6 +649,8 @@ class MonitoringAggregator:
             metrics = {
                 "ts_ms": now_ms,
                 "feed_lag_ms": feed_lags,
+                "fill_ratio": self.fill_ratio,
+                "pnl": self.daily_pnl,
                 "ws": {
                     "reconnects_1m": ws_rec_1m,
                     "reconnects_5m": ws_rec_5m,
