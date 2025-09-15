@@ -109,6 +109,7 @@ class _Worker:
         throttle_cfg: ThrottleConfig | None = None,
         no_trade_cfg: NoTradeConfig | None = None,
         pipeline_cfg: PipelineConfig | None = None,
+        zero_signal_alert: int = 0,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -123,6 +124,8 @@ class _Worker:
         self._throttle_cfg = throttle_cfg
         self._no_trade_cfg = no_trade_cfg
         self._pipeline_cfg = pipeline_cfg
+        self._zero_signal_alert = int(zero_signal_alert)
+        self._zero_signal_streak = 0
         self._global_bucket = None
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
@@ -326,12 +329,31 @@ class _Worker:
         return emitted
 
     def process(self, bar: Bar):
-        if self._pipeline_cfg is not None and not self._pipeline_cfg.enabled:
-            return []
-        if self._safe_mode_fn():
-            return []
-
+        duplicates = 0
         emitted: list[Any] = []
+
+        def _finalize() -> list[Any]:
+            emitted_count = len(emitted)
+            try:
+                monitoring.record_signals(bar.symbol, emitted_count, duplicates)
+            except Exception:
+                pass
+            if emitted_count == 0:
+                self._zero_signal_streak += 1
+                if self._zero_signal_alert > 0 and self._zero_signal_streak >= self._zero_signal_alert:
+                    try:
+                        monitoring.alert_zero_signals(bar.symbol)
+                    except Exception:
+                        pass
+            else:
+                self._zero_signal_streak = 0
+            return emitted
+
+        if self._pipeline_cfg is not None and not self._pipeline_cfg.enabled:
+            return _finalize()
+        if self._safe_mode_fn():
+            return _finalize()
+
         if self._queue is not None:
             emitted.extend(self._drain_queue())
 
@@ -352,7 +374,8 @@ class _Worker:
                     monitoring.queue_len.set(len(self._queue) if self._queue else 0)
                 except Exception:
                     pass
-                return emitted
+                duplicates = 1
+                return _finalize()
         guard_res = closed_bar_guard(
             bar=bar,
             now_ms=clock.now_ms(),
@@ -387,7 +410,7 @@ class _Worker:
                 monitoring.queue_len.set(len(self._queue) if self._queue else 0)
             except Exception:
                 pass
-            return emitted
+            return _finalize()
 
         if self._no_trade_cfg is not None:
             win_res = apply_no_trade_windows(
@@ -415,7 +438,7 @@ class _Worker:
                     ).inc()
                 except Exception:
                     pass
-                return emitted
+                return _finalize()
 
         pol_res = policy_decide(
             self._fp,
@@ -442,7 +465,7 @@ class _Worker:
                 ).inc()
             except Exception:
                 pass
-            return emitted
+            return _finalize()
         orders = list(pol_res.decision or [])
 
         risk_res = apply_risk(
@@ -471,7 +494,7 @@ class _Worker:
                 ).inc()
             except Exception:
                 pass
-            return emitted
+            return _finalize()
         orders = list(risk_res.decision or [])
 
         created_ts_ms = clock.now_ms()
@@ -544,7 +567,7 @@ class _Worker:
                 signal_bus.update(bar.symbol, close_ms)
             except Exception:
                 pass
-        return emitted
+        return _finalize()
 
     # Backwards compatibility: legacy callers may still use ``on_bar``.
     on_bar = process
@@ -745,6 +768,9 @@ class ServiceSignalRunner:
             throttle_cfg=self.throttle_cfg,
             no_trade_cfg=self.no_trade_cfg,
             pipeline_cfg=self.pipeline_cfg,
+            zero_signal_alert=getattr(
+                self.monitoring_cfg.thresholds, "zero_signals", 0
+            ),
         )
 
         out_csv = getattr(signal_bus, "OUT_CSV", None)
