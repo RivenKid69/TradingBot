@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from services.universe import get_symbols
 from core_config import load_config
 from service_signal_runner import from_config
 
@@ -31,7 +32,17 @@ def main() -> None:
         action="store_true",
         help="Удалить файлы состояния перед запуском",
     )
+    p.add_argument(
+        "--symbols",
+        default="",
+        help="Список символов через запятую; пусто = загрузить из universe",
+    )
     args = p.parse_args()
+    symbols = (
+        [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        if args.symbols
+        else get_symbols()
+    )
 
     try:
         with open(args.state_config, "r", encoding="utf-8") as f:
@@ -49,6 +60,11 @@ def main() -> None:
                     pass
 
     cfg = load_config(args.config)
+    cfg.data.symbols = symbols
+    try:
+        cfg.components.executor.params["symbol"] = symbols[0]
+    except Exception:
+        pass
     if state_data:
         cfg.state = cfg.state.copy(update=state_data)
 
