@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import time
-from typing import List
+from typing import Dict, List
 
 import requests
 
@@ -14,13 +15,17 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(d, exist_ok=True)
 
 
-def run(out: str = "data/universe/symbols.json") -> List[str]:
+def run(
+    out: str = "data/universe/symbols.json", liquidity_threshold: float = 0.0
+) -> List[str]:
     """Fetch Binance spot symbols trading against USDT and store them.
 
     Parameters
     ----------
     out:
         Destination JSON file. The parent directory is created if needed.
+    liquidity_threshold:
+        Minimum 24h quote volume (USDT) required to keep a symbol.
     Returns
     -------
     List[str]
@@ -31,12 +36,27 @@ def run(out: str = "data/universe/symbols.json") -> List[str]:
     resp.raise_for_status()
     data = resp.json()
 
+    volumes: Dict[str, float] = {}
+    if liquidity_threshold > 0:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/ticker/24hr", timeout=20
+        )
+        resp.raise_for_status()
+        volumes = {
+            t["symbol"].upper(): float(t.get("quoteVolume", 0.0))
+            for t in resp.json()
+        }
+
     symbols = [
         s["symbol"].upper()
         for s in data.get("symbols", [])
         if s.get("status") == "TRADING"
         and s.get("quoteAsset") == "USDT"
         and "SPOT" in s.get("permissions", [])
+        and (
+            liquidity_threshold <= 0
+            or volumes.get(s["symbol"].upper(), 0.0) >= liquidity_threshold
+        )
     ]
     symbols.sort()
 
@@ -59,12 +79,15 @@ def _is_stale(path: str, ttl: int) -> bool:
 
 
 def get_symbols(
-    ttl: int = _DEFAULT_TTL_SECONDS, out: str = "data/universe/symbols.json"
+    ttl: int = _DEFAULT_TTL_SECONDS,
+    out: str = "data/universe/symbols.json",
+    liquidity_threshold: float = 0.0,
+    force: bool = False,
 ) -> List[str]:
-    """Return cached Binance symbols list, refreshing if ``ttl`` expired."""
+    """Return cached Binance symbols list, refreshing if needed."""
 
-    if _is_stale(out, ttl):
-        run(out)
+    if force or _is_stale(out, ttl):
+        run(out, liquidity_threshold=liquidity_threshold)
 
     with open(out, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -72,10 +95,40 @@ def get_symbols(
 
 __all__ = ["run", "get_symbols"]
 
-# Perform a freshness check when the module is imported so that consumers
-# get an up-to-date universe without needing to call ``get_symbols`` first.
-try:  # pragma: no cover - network may be unavailable during tests
-    get_symbols()
-except Exception:
-    # The refresh is best effort; failures are surfaced on explicit call.
-    pass
+
+def _main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Fetch Binance spot symbols trading against USDT."
+    )
+    parser.add_argument(
+        "--liquidity-threshold",
+        type=float,
+        default=0.0,
+        help="Minimum 24h quote volume (USDT) to include a symbol",
+    )
+    parser.add_argument(
+        "--output",
+        default="data/universe/symbols.json",
+        help="Destination JSON file",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Refresh even if cache is fresh",
+    )
+    args = parser.parse_args()
+    get_symbols(
+        out=args.output,
+        liquidity_threshold=args.liquidity_threshold,
+        force=args.force,
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI is tested via integration
+    _main()
+else:  # Perform a freshness check when imported
+    try:  # pragma: no cover - network may be unavailable during tests
+        get_symbols()
+    except Exception:
+        # The refresh is best effort; failures are surfaced on explicit call.
+        pass
