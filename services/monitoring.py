@@ -118,6 +118,46 @@ ws_backpressure_drop_count = Counter(
     ["symbol"],
 )
 
+# HTTP request metrics
+http_request_count = Counter(
+    "http_request_count",
+    "Total number of HTTP requests",
+)
+http_success_count = Counter(
+    "http_success_count",
+    "Total number of successful HTTP responses",
+    ["status"],
+)
+http_error_count = Counter(
+    "http_error_count",
+    "Total number of HTTP request errors",
+    ["code"],
+)
+
+
+def record_http_request() -> None:
+    """Record an HTTP request attempt."""
+    try:
+        http_request_count.inc()
+    except Exception:
+        pass
+
+
+def record_http_success(status: Union[int, str]) -> None:
+    """Record successful HTTP response with ``status`` code."""
+    try:
+        http_success_count.labels(str(status)).inc()
+    except Exception:
+        pass
+
+
+def record_http_error(code: Union[int, str]) -> None:
+    """Record HTTP error with classification ``code``."""
+    try:
+        http_error_count.labels(str(code)).inc()
+    except Exception:
+        pass
+
 # Pipeline stage drops
 pipeline_stage_drop_count = Counter(
     "pipeline_stage_drop_count",
@@ -630,6 +670,9 @@ __all__ = [
     "skipped_incomplete_bars",
     "ws_dup_skipped_count",
     "ws_backpressure_drop_count",
+    "http_request_count",
+    "http_success_count",
+    "http_error_count",
     "pipeline_stage_drop_count",
     "pipeline_stage_count",
     "pipeline_reason_count",
@@ -650,6 +693,9 @@ __all__ = [
     "queue_depth",
     "events_in",
     "dropped_bp",
+    "record_http_request",
+    "record_http_success",
+    "record_http_error",
     "report_clock_sync",
     "clock_sync_age_seconds",
     "feed_lag_max_ms",
