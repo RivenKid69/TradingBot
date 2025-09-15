@@ -143,6 +143,20 @@ class OpsKillSwitchConfig(BaseModel):
     alert_command: Optional[str] = None
 
 
+class RetryConfig(BaseModel):
+    """Retry strategy settings."""
+
+    max_attempts: int = Field(
+        default=5, description="Maximum number of retry attempts; non-positive disables"
+    )
+    backoff_base_s: float = Field(
+        default=2.0, description="Initial backoff in seconds for retry backoff"
+    )
+    max_backoff_s: float = Field(
+        default=60.0, description="Maximum backoff in seconds for retry backoff"
+    )
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
         default=None, description="Идентификатор запуска; если None — генерируется."
@@ -173,6 +187,7 @@ class CommonRunConfig(BaseModel):
     throttle: ThrottleConfig = Field(default_factory=ThrottleConfig)
     kill_switch: KillSwitchConfig = Field(default_factory=KillSwitchConfig)
     kill_switch_ops: OpsKillSwitchConfig = Field(default_factory=OpsKillSwitchConfig)
+    retry: RetryConfig = Field(default_factory=RetryConfig)
     components: Components
 
 
@@ -369,6 +384,7 @@ __all__ = [
     "ThrottleConfig",
     "KillSwitchConfig",
     "OpsKillSwitchConfig",
+    "RetryConfig",
     "CommonRunConfig",
     "SimulationDataConfig",
     "SimulationConfig",
