@@ -53,7 +53,7 @@ clock_sync_last_sync_ts = Gauge(
 # Binance filters metadata freshness
 filters_age_days = Gauge(
     "filters_age_days",
-    "Age of the Binance symbol filters file in days",
+    "Age of binance_filters.json in days",
 )
 
 # Length of throttling queue
