@@ -177,9 +177,9 @@ class Quantizer:
     ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
         """Загружает словарь фильтров и метаданные из JSON.
 
-        Помимо чтения файла проверяет свежесть поля ``metadata.generated_at`` и
-        предупреждает, если данные устарели. При ``fatal=True`` вместо
-        предупреждения выбрасывается :class:`RuntimeError`.
+        Помимо чтения файла проверяет свежесть поля ``metadata.built_at`` (если есть)
+        или ``metadata.generated_at`` и предупреждает, если данные устарели. При
+        ``fatal=True`` вместо предупреждения выбрасывается :class:`RuntimeError`.
 
         Возвращает пару ``(filters, metadata)`` или ``({}, {})`` если файл
         отсутствует. Совместимо с прежним форматом без метаданных.
@@ -190,19 +190,32 @@ class Quantizer:
             raw = json.load(f) or {}
         if "filters" in raw:
             filters = raw.get("filters", {})
-            meta = raw.get("metadata", {})
+            meta_raw = raw.get("metadata", {})
         else:
-            filters, meta = raw, {}
+            filters, meta_raw = raw, {}
 
-        ga = meta.get("generated_at")
-        if isinstance(ga, str):
+        meta: Dict[str, Any] = dict(meta_raw) if isinstance(meta_raw, dict) else {}
+
+        timestamp_field: Optional[str] = None
+        timestamp_value: Optional[str] = None
+        for field in ("built_at", "generated_at"):
+            value = meta.get(field)
+            if isinstance(value, str):
+                timestamp_field = field
+                timestamp_value = value
+                break
+
+        if timestamp_value:
+            if timestamp_field == "built_at" and "generated_at" not in meta:
+                meta["generated_at"] = timestamp_value
             try:
-                ts = datetime.fromisoformat(ga.replace("Z", "+00:00"))
+                ts = datetime.fromisoformat(timestamp_value.replace("Z", "+00:00"))
                 age_days = (datetime.now(timezone.utc) - ts).days
                 if age_days > int(max_age_days):
+                    field_label = f"metadata.{timestamp_field}" if timestamp_field else "metadata timestamp"
                     msg = (
-                        f"{path} is {age_days} days old (>={max_age_days}d); "
-                        f"refresh via fetch_binance_filters.py"
+                        f"{path} {field_label} is {age_days} days old (>={max_age_days}d); "
+                        f"refresh via python scripts/fetch_binance_filters.py"
                     )
                     if fatal:
                         raise RuntimeError(msg)
