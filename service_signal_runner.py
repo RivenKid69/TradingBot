@@ -72,7 +72,7 @@ from no_trade_config import NoTradeConfig
 from utils import TokenBucket
 import di_registry
 import ws_dedup_state as signal_bus
-import state_store
+from services import state_storage
 
 
 class RiskGuards(Protocol):
@@ -708,17 +708,27 @@ class ServiceSignalRunner:
             marker_path.unlink()
         except Exception:
             dirty_restart = True
-        if dirty_restart:
-            if self.cfg.state.enabled:
-                try:
-                    state_store.load(self.cfg.state.path)
-                except Exception:
-                    pass
-            if self.monitoring_cfg.enabled:
-                try:
-                    monitoring.reset_kill_switch_counters()
-                except Exception:
-                    pass
+        if self.cfg.state.enabled:
+            try:
+                loaded_state = state_storage.load_state(
+                    self.cfg.state.path,
+                    backend=self.cfg.state.backend,
+                    lock_path=self.cfg.state.lock_path,
+                )
+                if self.ws_dedup_enabled:
+                    try:
+                        seen = dict(getattr(loaded_state, "seen_signals", {}) or {})
+                        for sid, exp in seen.items():
+                            signal_bus.STATE[str(sid)] = int(exp)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        if dirty_restart and self.monitoring_cfg.enabled:
+            try:
+                monitoring.reset_kill_switch_counters()
+            except Exception:
+                pass
 
         shutdown = ShutdownManager(self.shutdown_cfg)
         stop_event = threading.Event()
@@ -850,7 +860,11 @@ class ServiceSignalRunner:
             def _state_loop() -> None:
                 while not state_stop.wait(self.cfg.state.snapshot_interval_s):
                     try:
-                        state_store.save(self.cfg.state.path)
+                        state_storage.save_state(
+                            self.cfg.state.path,
+                            backend=self.cfg.state.backend,
+                            lock_path=self.cfg.state.lock_path,
+                        )
                     except Exception:
                         pass
 
@@ -914,7 +928,13 @@ class ServiceSignalRunner:
 
         shutdown.on_flush(_flush_snapshot)
         if self.cfg.state.enabled and self.cfg.state.flush_on_event:
-            shutdown.on_flush(lambda: state_store.save(self.cfg.state.path))
+            shutdown.on_flush(
+                lambda: state_storage.save_state(
+                    self.cfg.state.path,
+                    backend=self.cfg.state.backend,
+                    lock_path=self.cfg.state.lock_path,
+                )
+            )
 
         def _write_marker() -> None:
             try:
@@ -1004,6 +1024,80 @@ class ServiceSignalRunner:
 
         ws_failures = 0
         limit = int(self.cfg.kill_switch_ops.error_limit)
+
+        def _handle_report(rep: Dict[str, Any]) -> None:
+            if not self.cfg.state.enabled:
+                return
+            updated = False
+            try:
+                symbol = rep.get("symbol")
+                pos_qty = rep.get("position_qty")
+                if symbol is not None and pos_qty is not None:
+                    st = state_storage.get_state()
+                    positions = dict(getattr(st, "positions", {}))
+                    if positions.get(symbol) != pos_qty:
+                        positions[symbol] = pos_qty
+                        state_storage.update_state(positions=positions)
+                        updated = True
+
+                orders = rep.get("core_orders") or []
+                if orders:
+                    st = state_storage.get_state()
+                    open_orders = dict(getattr(st, "open_orders", {}))
+                    for o in orders:
+                        oid = str(
+                            o.get("order_id")
+                            or o.get("client_order_id")
+                            or len(open_orders)
+                        )
+                        open_orders[oid] = o
+                    state_storage.update_state(open_orders=open_orders)
+                    updated = True
+
+                reports = rep.get("core_exec_reports") or []
+                if reports:
+                    st = state_storage.get_state()
+                    open_orders = dict(getattr(st, "open_orders", {}))
+                    for er in reports:
+                        oid = str(er.get("order_id") or er.get("client_order_id"))
+                        status = str(
+                            er.get("status") or er.get("exec_status") or ""
+                        ).upper()
+                        if status in {"FILLED", "CANCELLED"}:
+                            open_orders.pop(oid, None)
+                        else:
+                            if oid in open_orders:
+                                try:
+                                    open_orders[oid].update(er)
+                                except Exception:
+                                    open_orders[oid] = er
+                    state_storage.update_state(open_orders=open_orders)
+                    updated = True
+
+                ts_ms = rep.get("ts_ms")
+                if ts_ms is not None:
+                    seen = getattr(signal_bus, "STATE", {})
+                    try:
+                        seen_items = list(getattr(seen, "items", lambda: [])())
+                    except Exception:
+                        seen_items = []
+                    state_storage.update_state(
+                        last_processed_bar_ms=int(ts_ms),
+                        seen_signals=seen_items,
+                    )
+                    updated = True
+            except Exception:
+                pass
+            if updated and self.cfg.state.flush_on_event:
+                try:
+                    state_storage.save_state(
+                        self.cfg.state.path,
+                        backend=self.cfg.state.backend,
+                        lock_path=self.cfg.state.lock_path,
+                    )
+                except Exception:
+                    pass
+
         while not stop_event.is_set():
             try:
                 for rep in self.adapter.run_events(worker):
@@ -1015,6 +1109,7 @@ class ServiceSignalRunner:
                         except Exception:
                             pass
                         ws_failures = 0
+                    _handle_report(rep)
                     yield rep
                 break
             except Exception:
