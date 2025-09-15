@@ -46,6 +46,19 @@ Runners load the symbol universe from ``data/universe/symbols.json`` by default.
 Override it with the ``--symbols`` CLI flag or an explicit ``data.symbols``
 entry in the YAML configuration.
 
+The list is managed by ``services/universe.py`` which caches Binance spot
+symbols trading against USDT.  The cache is refreshed on first use if it is
+missing or older than 24 hours and can be updated manually:
+
+```bash
+python -m services.universe --output data/universe/symbols.json --liquidity-threshold 1e6
+```
+
+Schedule the command daily via cron or rely on the automatic refresh at
+startup.  Use ``--liquidity-threshold 0`` to bypass the volume filter or
+point ``--output`` to maintain a custom symbols file.  See
+[docs/universe.md](docs/universe.md) for details.
+
 ### Обновление биржевых фильтров и спецификаций
 
 JSON‑файлы `binance_filters.json` и `exchange_specs.json` содержат поле
