@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -59,11 +60,9 @@ class TradingState:
 class StateBackend(Protocol):
     """Backend API for persisting :class:`TradingState`."""
 
-    def load(self, path: Path) -> TradingState:
-        ...
+    def load(self, path: Path) -> TradingState: ...
 
-    def save(self, path: Path, state: TradingState) -> None:
-        ...
+    def save(self, path: Path, state: TradingState) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -72,24 +71,9 @@ class StateBackend(Protocol):
 
 class JsonBackend:
     def load(self, path: Path) -> TradingState:
-        if not path.exists():
-            return TradingState()
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return TradingState.from_dict(data)
-        except Exception:
-            logger.warning("Failed to load JSON state from %s", path, exc_info=True)
-            bak = path.with_suffix(path.suffix + ".bak")
-            if bak.exists():
-                try:
-                    with bak.open("r", encoding="utf-8") as fh:
-                        data = json.load(fh)
-                    logger.warning("Recovered state from backup %s", bak)
-                    return TradingState.from_dict(data)
-                except Exception:
-                    logger.warning("Backup state %s corrupted", bak, exc_info=True)
-            return TradingState()
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return TradingState.from_dict(data)
 
     def save(self, path: Path, state: TradingState) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,9 +123,9 @@ class SQLiteBackend:
 
     def load(self, path: Path) -> TradingState:
         if not path.exists():
-            return TradingState()
+            raise FileNotFoundError(path)
+        con = sqlite3.connect(path)
         try:
-            con = sqlite3.connect(path)
             with con:
                 con.execute("PRAGMA journal_mode=WAL;")
                 con.execute(self.TABLE_SQL)
@@ -151,50 +135,21 @@ class SQLiteBackend:
                     " WHERE id = 1"
                 )
                 row = cur.fetchone()
+        finally:
             con.close()
-            if not row:
-                return TradingState()
-            data = {
-                "positions": json.loads(row[0] or "{}"),
-                "open_orders": json.loads(row[1] or "{}"),
-                "cash": row[2] or 0.0,
-                "last_processed_bar_ms": row[3],
-                "seen_signals": json.loads(row[4] or "[]"),
-                "config_snapshot": json.loads(row[5] or "{}"),
-                "git_hash": row[6],
-                "version": row[7] or 1,
-            }
-            return TradingState.from_dict(data)
-        except Exception:
-            logger.warning("Failed to load SQLite state from %s", path, exc_info=True)
-            bak = path.with_suffix(path.suffix + ".bak")
-            if bak.exists():
-                try:
-                    con = sqlite3.connect(bak)
-                    with con:
-                        cur = con.execute(
-                            "SELECT positions, open_orders, cash, last_processed_bar_ms,"
-                            " seen_signals, config_snapshot, git_hash, version FROM state"
-                            " WHERE id = 1"
-                        )
-                        row = cur.fetchone()
-                    con.close()
-                    if row:
-                        data = {
-                            "positions": json.loads(row[0] or "{}"),
-                            "open_orders": json.loads(row[1] or "{}"),
-                            "cash": row[2] or 0.0,
-                            "last_processed_bar_ms": row[3],
-                            "seen_signals": json.loads(row[4] or "[]"),
-                            "config_snapshot": json.loads(row[5] or "{}"),
-                            "git_hash": row[6],
-                            "version": row[7] or 1,
-                        }
-                        logger.warning("Recovered state from backup %s", bak)
-                        return TradingState.from_dict(data)
-                except Exception:
-                    logger.warning("Backup SQLite state %s corrupted", bak, exc_info=True)
+        if not row:
             return TradingState()
+        data = {
+            "positions": json.loads(row[0] or "{}"),
+            "open_orders": json.loads(row[1] or "{}"),
+            "cash": row[2] or 0.0,
+            "last_processed_bar_ms": row[3],
+            "seen_signals": json.loads(row[4] or "[]"),
+            "config_snapshot": json.loads(row[5] or "{}"),
+            "git_hash": row[6],
+            "version": row[7] or 1,
+        }
+        return TradingState.from_dict(data)
 
     def save(self, path: Path, state: TradingState) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -273,6 +228,49 @@ def _file_lock(lock_path: Path):
                 pass
 
 
+def _rotate_backups(p: Path, keep: int) -> None:
+    bak = p.with_suffix(p.suffix + ".bak")
+    pattern = re.compile(re.escape(p.name) + r"\.bak(\d+)$")
+    if keep <= 0:
+        for old in p.parent.glob(p.name + ".bak*"):
+            try:
+                old.unlink()
+            except Exception:
+                pass
+        if bak.exists():
+            try:
+                bak.unlink()
+            except Exception:
+                pass
+        return
+    for old in p.parent.glob(p.name + ".bak*"):
+        m = pattern.match(old.name)
+        if m and int(m.group(1)) > keep:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+    for i in range(keep, 0, -1):
+        src = p.with_suffix(p.suffix + f".bak{i}")
+        if src.exists():
+            if i == keep:
+                try:
+                    src.unlink()
+                except Exception:
+                    pass
+            else:
+                dst = p.with_suffix(p.suffix + f".bak{i+1}")
+                try:
+                    src.rename(dst)
+                except Exception:
+                    pass
+    if bak.exists():
+        try:
+            bak.rename(p.with_suffix(p.suffix + ".bak1"))
+        except Exception:
+            pass
+
+
 def _get_backend(backend: str | StateBackend) -> StateBackend:
     if isinstance(backend, str):
         if backend == "json":
@@ -283,19 +281,44 @@ def _get_backend(backend: str | StateBackend) -> StateBackend:
     return backend
 
 
-def load_state(path: str | Path, backend: str | StateBackend = "json", lock_path: str | Path | None = None) -> TradingState:
+def load_state(
+    path: str | Path,
+    backend: str | StateBackend = "json",
+    lock_path: str | Path | None = None,
+    backup_keep: int = 0,
+) -> TradingState:
     p = Path(path)
     backend_obj = _get_backend(backend)
     lock_p = Path(lock_path) if lock_path else p.with_suffix(p.suffix + ".lock")
     with _file_lock(lock_p):
-        state = backend_obj.load(p)
+        try:
+            state = backend_obj.load(p)
+        except Exception:
+            logger.warning("Failed to load state from %s", p, exc_info=True)
+            state = None
+            for i in range(1, backup_keep + 1):
+                bak = p.with_suffix(p.suffix + f".bak{i}")
+                try:
+                    state = backend_obj.load(bak)
+                    logger.warning("Recovered state from backup %s", bak)
+                    break
+                except Exception:
+                    continue
+            if state is None:
+                state = TradingState()
     with _state_lock:
         for k, v in state.to_dict().items():
             setattr(_state, k, v)
     return state
 
 
-def save_state(path: str | Path, backend: str | StateBackend = "json", lock_path: str | Path | None = None, state: TradingState | None = None) -> None:
+def save_state(
+    path: str | Path,
+    backend: str | StateBackend = "json",
+    lock_path: str | Path | None = None,
+    backup_keep: int = 0,
+    state: TradingState | None = None,
+) -> None:
     p = Path(path)
     backend_obj = _get_backend(backend)
     lock_p = Path(lock_path) if lock_path else p.with_suffix(p.suffix + ".lock")
@@ -303,3 +326,4 @@ def save_state(path: str | Path, backend: str | StateBackend = "json", lock_path
         state_obj = state or TradingState.from_dict(_state.to_dict())
     with _file_lock(lock_p):
         backend_obj.save(p, state_obj)
+        _rotate_backups(p, backup_keep)
