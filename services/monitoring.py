@@ -111,6 +111,13 @@ ws_dup_skipped_count = Counter(
     ["symbol"],
 )
 
+# Consecutive zero-signal bars exceeding threshold
+zero_signals_alert_count = Counter(
+    "zero_signals_alert_count",
+    "Zero-signal bar alerts",
+    ["symbol"],
+)
+
 # Websocket bars dropped due to event bus backpressure
 ws_backpressure_drop_count = Counter(
     "ws_backpressure_drop_count",
@@ -155,6 +162,25 @@ def record_http_error(code: Union[int, str]) -> None:
     """Record HTTP error with classification ``code``."""
     try:
         http_error_count.labels(str(code)).inc()
+    except Exception:
+        pass
+
+
+def record_signals(symbol: str, emitted: int, duplicates: int) -> None:
+    """Record per-bar signal statistics for ``symbol``."""
+    total = int(emitted) + int(duplicates)
+    if total <= 0:
+        return
+    try:
+        signal_error_rate.labels(symbol).set(float(duplicates) / float(total))
+    except Exception:
+        pass
+
+
+def alert_zero_signals(symbol: str) -> None:
+    """Record an alert for consecutive zero-signal bars for ``symbol``."""
+    try:
+        zero_signals_alert_count.labels(symbol).inc()
     except Exception:
         pass
 
@@ -673,6 +699,7 @@ __all__ = [
     "http_request_count",
     "http_success_count",
     "http_error_count",
+    "zero_signals_alert_count",
     "pipeline_stage_drop_count",
     "pipeline_stage_count",
     "pipeline_reason_count",
@@ -696,6 +723,8 @@ __all__ = [
     "record_http_request",
     "record_http_success",
     "record_http_error",
+    "record_signals",
+    "alert_zero_signals",
     "report_clock_sync",
     "clock_sync_age_seconds",
     "feed_lag_max_ms",
