@@ -1,0 +1,10 @@
+monitoring:
+  enabled: false              # disable monitoring, snapshots and kill switch
+  snapshot_metrics_sec: 60    # interval for metrics snapshots in seconds
+thresholds:
+  feed_lag_ms: 0              # enter safe mode if worst feed lag exceeds this; 0 disables
+  ws_failures: 0              # enter safe mode if websocket failures exceed this; 0 disables
+  error_rate: 0.0             # enter safe mode if signal error rate exceeds this; 0 disables
+alerts:
+  enabled: false              # disable external alerting
+  command: null               # command to execute when alerts trigger

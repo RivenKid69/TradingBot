@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Dict, Any, Optional, List, Mapping, Union, Literal
 from enum import Enum
+from dataclasses import dataclass, field
 
 import yaml
 from pydantic import BaseModel, Field, validator
@@ -156,6 +157,34 @@ class RetryConfig(BaseModel):
         default=60.0, description="Maximum backoff in seconds for retry backoff"
     )
 
+
+
+
+@dataclass
+class MonitoringThresholdsConfig:
+    """Monitoring thresholds for automatic safe-mode triggers."""
+
+    feed_lag_ms: float = 0.0
+    ws_failures: float = 0.0
+    error_rate: float = 0.0
+
+
+@dataclass
+class MonitoringAlertConfig:
+    """External alert command configuration."""
+
+    enabled: bool = False
+    command: Optional[str] = None
+
+
+@dataclass
+class MonitoringConfig:
+    """Top-level monitoring configuration."""
+
+    enabled: bool = False
+    snapshot_metrics_sec: int = 60
+    thresholds: MonitoringThresholdsConfig = field(default_factory=MonitoringThresholdsConfig)
+    alerts: MonitoringAlertConfig = field(default_factory=MonitoringAlertConfig)
 
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
@@ -384,6 +413,9 @@ __all__ = [
     "ThrottleConfig",
     "KillSwitchConfig",
     "OpsKillSwitchConfig",
+    "MonitoringThresholdsConfig",
+    "MonitoringAlertConfig",
+    "MonitoringConfig",
     "RetryConfig",
     "CommonRunConfig",
     "SimulationDataConfig",
