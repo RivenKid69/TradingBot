@@ -66,6 +66,7 @@ from core_config import (
     ThrottleConfig,
     OpsKillSwitchConfig,
     MonitoringConfig,
+    StateConfig,
 )
 from no_trade_config import NoTradeConfig
 from utils import TokenBucket
@@ -91,6 +92,7 @@ class SignalRunnerConfig:
     snapshot_metrics_csv: Optional[str] = None
     snapshot_metrics_sec: int = 60
     kill_switch_ops: OpsKillSwitchConfig = field(default_factory=OpsKillSwitchConfig)
+    state: StateConfig = field(default_factory=StateConfig)
 
 
 # обратная совместимость
@@ -707,10 +709,11 @@ class ServiceSignalRunner:
         except Exception:
             dirty_restart = True
         if dirty_restart:
-            try:
-                state_store.load()
-            except Exception:
-                pass
+            if self.cfg.state.enabled:
+                try:
+                    state_store.load(self.cfg.state.path)
+                except Exception:
+                    pass
             if self.monitoring_cfg.enabled:
                 try:
                     monitoring.reset_kill_switch_counters()
@@ -841,6 +844,20 @@ class ServiceSignalRunner:
             snapshot_thread.start()
             shutdown.on_stop(snapshot_stop.set)
 
+        state_stop = threading.Event()
+        state_thread: threading.Thread | None = None
+        if self.cfg.state.enabled and self.cfg.state.snapshot_interval_s > 0:
+            def _state_loop() -> None:
+                while not state_stop.wait(self.cfg.state.snapshot_interval_s):
+                    try:
+                        state_store.save(self.cfg.state.path)
+                    except Exception:
+                        pass
+
+            state_thread = threading.Thread(target=_state_loop, daemon=True)
+            state_thread.start()
+            shutdown.on_stop(state_stop.set)
+
         # Optional asynchronous event bus processing
         bus = getattr(self.adapter, "bus", None)
         loop_thread: threading.Thread | None = None
@@ -896,7 +913,8 @@ class ServiceSignalRunner:
                 pass
 
         shutdown.on_flush(_flush_snapshot)
-        shutdown.on_flush(state_store.save)
+        if self.cfg.state.enabled and self.cfg.state.flush_on_event:
+            shutdown.on_flush(lambda: state_store.save(self.cfg.state.path))
 
         def _write_marker() -> None:
             try:
@@ -914,6 +932,8 @@ class ServiceSignalRunner:
         shutdown.on_finalize(_write_marker)
         if snapshot_thread is not None:
             shutdown.on_finalize(lambda: snapshot_thread.join(timeout=1.0))
+        if state_thread is not None:
+            shutdown.on_finalize(lambda: state_thread.join(timeout=1.0))
         shutdown.on_finalize(lambda: self._clock_stop.set())
         shutdown.on_finalize(lambda: self._clock_thread.join(timeout=self.clock_sync_cfg.refresh_sec if self.clock_sync_cfg else 1.0) if self._clock_thread is not None else None)
         shutdown.on_finalize(lambda: signal_bus.shutdown() if signal_bus.ENABLED else None)
@@ -1054,6 +1074,28 @@ def from_config(
                 rt_cfg = yaml.safe_load(f) or {}
         except Exception:
             rt_cfg = {}
+
+    # Load state persistence configuration
+    state_data: Dict[str, Any] = {}
+    state_cfg_path = Path("configs/state.yaml")
+    if state_cfg_path.exists():
+        try:
+            with state_cfg_path.open("r", encoding="utf-8") as f:
+                state_data = yaml.safe_load(f) or {}
+        except Exception:
+            state_data = {}
+    if state_data:
+        cfg.state.enabled = bool(state_data.get("enabled", cfg.state.enabled))
+        cfg.state.backend = str(state_data.get("backend", cfg.state.backend))
+        cfg.state.path = str(state_data.get("path", cfg.state.path))
+        cfg.state.snapshot_interval_s = int(
+            state_data.get("snapshot_interval_s", cfg.state.snapshot_interval_s)
+        )
+        cfg.state.flush_on_event = bool(
+            state_data.get("flush_on_event", cfg.state.flush_on_event)
+        )
+        cfg.state.backup_keep = int(state_data.get("backup_keep", cfg.state.backup_keep))
+        cfg.state.lock_path = str(state_data.get("lock_path", cfg.state.lock_path))
 
     # Queue configuration for the asynchronous event bus
     queue_cfg = rt_cfg.get("queue", {})
@@ -1240,6 +1282,7 @@ def from_config(
         snapshot_metrics_csv=os.path.join(cfg.logs_dir, "snapshot_metrics.csv"),
         snapshot_metrics_sec=monitoring_cfg.snapshot_metrics_sec,
         kill_switch_ops=cfg.kill_switch_ops,
+        state=cfg.state,
     )
     sec = rt_cfg.get("ops", {}).get("snapshot_metrics_sec")
     if isinstance(sec, (int, float)) and sec > 0:
