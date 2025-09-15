@@ -31,6 +31,7 @@ def atomic_write_with_retry(
     data: str | bytes | None,
     retries: int = 3,
     backoff: float = 0.1,
+    mode: str = "w",
 ) -> None:
     """Atomically write *data* to *path* with retry logic.
 
@@ -53,30 +54,48 @@ def atomic_write_with_retry(
                     os.close(fd)
             else:
                 p.parent.mkdir(parents=True, exist_ok=True)
-                fd, tmp_path = tempfile.mkstemp(dir=str(p.parent))
-                try:
+                if mode == "a":
                     if isinstance(data, (bytes, bytearray)):
-                        with os.fdopen(fd, "wb") as f:
+                        with open(p, "ab") as f:
                             f.write(data)
                             f.flush()
                             os.fsync(f.fileno())
                     else:
-                        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                        with open(p, "a", encoding="utf-8", newline="") as f:
                             f.write(str(data))
                             f.flush()
                             os.fsync(f.fileno())
-                    os.replace(tmp_path, str(p))
                     try:
                         dir_fd = os.open(str(p.parent), os.O_DIRECTORY)
                         os.fsync(dir_fd)
                         os.close(dir_fd)
                     except Exception:
                         pass
-                finally:
+                else:
+                    fd, tmp_path = tempfile.mkstemp(dir=str(p.parent))
                     try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
+                        if isinstance(data, (bytes, bytearray)):
+                            with os.fdopen(fd, "wb") as f:
+                                f.write(data)
+                                f.flush()
+                                os.fsync(f.fileno())
+                        else:
+                            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                                f.write(str(data))
+                                f.flush()
+                                os.fsync(f.fileno())
+                        os.replace(tmp_path, str(p))
+                        try:
+                            dir_fd = os.open(str(p.parent), os.O_DIRECTORY)
+                            os.fsync(dir_fd)
+                            os.close(dir_fd)
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
             return
         except Exception:
             if attempt >= retries:
@@ -195,6 +214,18 @@ def read_csv(path: str, n: int = 200) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def read_signals_csv(path: str, n: int = 200) -> pd.DataFrame:
+    df = read_csv(path, n=n)
+    if df.empty:
+        return df
+    try:
+        if "uid" not in df.columns:
+            df["uid"] = df.apply(lambda r: signal_uid(r.to_dict()), axis=1)
+    except Exception:
+        pass
+    return df
+
+
 def signal_uid(row: Dict[str, Any]) -> str:
     ts = str(int(row.get("ts_ms", 0)))
     sym = str(row.get("symbol", "")).upper()
@@ -215,13 +246,31 @@ def append_row_csv(path: str, header: List[str], row: List[Any]) -> None:
         w.writerow(row)
 
 
+def append_jsonl(path: str, data: Dict[str, Any]) -> None:
+    atomic_write_with_retry(
+        path,
+        json.dumps(data, separators=(",", ":")) + "\n",
+        mode="a",
+    )
+
+
 def load_signals_full(path: str, max_rows: int = 500) -> pd.DataFrame:
-    df = read_csv(path, n=max_rows)
-    if df.empty:
-        return df
-    try:
-        if "uid" not in df.columns:
-            df["uid"] = df.apply(lambda r: signal_uid(r.to_dict()), axis=1)
-    except Exception:
-        pass
-    return df
+    return read_signals_csv(path, n=max_rows)
+
+
+__all__ = [
+    "ensure_dir",
+    "atomic_write_with_retry",
+    "run_cmd",
+    "start_background",
+    "stop_background",
+    "background_running",
+    "tail_file",
+    "read_json",
+    "read_csv",
+    "read_signals_csv",
+    "signal_uid",
+    "append_row_csv",
+    "append_jsonl",
+    "load_signals_full",
+]
