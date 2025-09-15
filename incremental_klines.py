@@ -34,6 +34,9 @@ HEADER = [
     "taker_buy_base_asset_volume","taker_buy_quote_asset_volume","ignore","symbol"
 ]
 
+SYMBOL_MAX_ERRORS = 3
+SYMBOL_RETRY_BACKOFF = 1.0
+
 
 def _read_last_ts(path: str) -> Optional[int]:
     """Read the last numeric open_time from an existing CSV (skip header/blank lines).
@@ -138,12 +141,29 @@ def append_closed(symbol: str, close_lag_ms: int) -> bool:
 
 def run_many(symbols: List[str], close_lag_ms: int) -> int:
     appended = 0
+    skipped: List[str] = []
     for sym in symbols:
-        try:
-            if append_closed(sym, close_lag_ms):
-                appended += 1
-        except Exception as e:
-            print(f"[WARN] {sym}: {e}")
+        errors = 0
+        while True:
+            try:
+                if append_closed(sym, close_lag_ms):
+                    appended += 1
+                break
+            except Exception as e:
+                errors += 1
+                print(
+                    f"[WARN] {sym}: {e} (attempt {errors}/{SYMBOL_MAX_ERRORS})"
+                )
+                if errors >= SYMBOL_MAX_ERRORS:
+                    print(
+                        f"[WARN] {sym}: skipping after {SYMBOL_MAX_ERRORS} errors"
+                    )
+                    skipped.append(sym)
+                    break
+                time.sleep(SYMBOL_RETRY_BACKOFF * errors)
+    if skipped:
+        skipped_names = ", ".join(sorted(set(skipped)))
+        print(f"[WARN] Skipped symbols: {skipped_names}")
     print(f"\u2713 Appended {appended} closed bars.")
     return appended
 

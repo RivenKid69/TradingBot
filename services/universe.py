@@ -4,9 +4,50 @@ import argparse
 import json
 import os
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
+
+
+_REQUEST_THROTTLE_SECONDS = 0.2
+_REQUEST_MAX_ATTEMPTS = 3
+_REQUEST_BACKOFF_BASE = 0.5
+_last_request_ts: float = 0.0
+
+
+def _throttled_get(
+    url: str,
+    *,
+    params: Optional[Dict[str, str]] = None,
+    timeout: int = 20,
+    max_attempts: int = _REQUEST_MAX_ATTEMPTS,
+    backoff_base: float = _REQUEST_BACKOFF_BASE,
+) -> requests.Response:
+    """Perform ``requests.get`` with basic throttling and backoff."""
+
+    global _last_request_ts
+
+    params = params or {}
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        now = time.time()
+        wait = _REQUEST_THROTTLE_SECONDS - (now - _last_request_ts)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+        except Exception as exc:  # pragma: no cover - network dependent
+            last_error = exc
+            if attempt == max_attempts:
+                raise
+            time.sleep(backoff_base * attempt)
+        else:
+            _last_request_ts = time.time()
+            return resp
+    # ``raise`` above ensures this is unreachable, keep for mypy friendliness
+    assert last_error is not None
+    raise last_error
 
 
 def _ensure_dir(path: str) -> None:
@@ -32,16 +73,14 @@ def run(
         Sorted list of symbols that were saved to ``out``.
     """
 
-    resp = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=20)
-    resp.raise_for_status()
+    resp = _throttled_get("https://api.binance.com/api/v3/exchangeInfo", timeout=20)
     data = resp.json()
 
     volumes: Dict[str, float] = {}
     if liquidity_threshold > 0:
-        resp = requests.get(
+        resp = _throttled_get(
             "https://api.binance.com/api/v3/ticker/24hr", timeout=20
         )
-        resp.raise_for_status()
         volumes = {
             t["symbol"].upper(): float(t.get("quoteVolume", 0.0))
             for t in resp.json()
