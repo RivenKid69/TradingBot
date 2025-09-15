@@ -1,0 +1,7 @@
+# Default quantizer configuration shared across run modes.
+quantizer:
+  filters_path: "binance_filters.json"
+  strict: true
+  enforce_percent_price_by_side: true
+  auto_refresh_days: 30
+  refresh_on_start: false
