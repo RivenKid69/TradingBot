@@ -18,7 +18,7 @@ for report in from_config(cfg):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable
 import os
 import logging
@@ -55,7 +55,13 @@ from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-по�
 from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy
 from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
-from core_config import CommonRunConfig, ClockSyncConfig, ThrottleConfig
+from core_config import (
+    CommonRunConfig,
+    ClockSyncConfig,
+    ThrottleConfig,
+    OpsKillSwitchConfig,
+    MonitoringConfig,
+)
 from no_trade_config import NoTradeConfig
 from utils import TokenBucket
 import di_registry
@@ -79,6 +85,7 @@ class SignalRunnerConfig:
     snapshot_metrics_json: Optional[str] = None
     snapshot_metrics_csv: Optional[str] = None
     snapshot_metrics_sec: int = 60
+    kill_switch_ops: OpsKillSwitchConfig = field(default_factory=OpsKillSwitchConfig)
 
 
 # обратная совместимость
@@ -589,6 +596,7 @@ class ServiceSignalRunner:
         no_trade_cfg: NoTradeConfig | None = None,
         pipeline_cfg: PipelineConfig | None = None,
         shutdown_cfg: Dict[str, Any] | None = None,
+        monitoring_cfg: MonitoringConfig | None = None,
         *,
         enforce_closed_bars: bool = True,
         ws_dedup_enabled: bool = False,
@@ -606,6 +614,7 @@ class ServiceSignalRunner:
         self.no_trade_cfg = no_trade_cfg
         self.pipeline_cfg = pipeline_cfg
         self.shutdown_cfg = shutdown_cfg or {}
+        self.monitoring_cfg = monitoring_cfg or MonitoringConfig()
         self._clock_safe_mode = False
         self._clock_stop = threading.Event()
         self._clock_thread: Optional[threading.Thread] = None
@@ -659,17 +668,21 @@ class ServiceSignalRunner:
                 state_store.load()
             except Exception:
                 pass
-            try:
-                monitoring.reset_kill_switch_counters()
-            except Exception:
-                pass
+            if self.monitoring_cfg.enabled:
+                try:
+                    monitoring.reset_kill_switch_counters()
+                except Exception:
+                    pass
 
         shutdown = ShutdownManager(self.shutdown_cfg)
         stop_event = threading.Event()
         shutdown.on_stop(stop_event.set)
 
         self.feature_pipe.warmup()
-        monitoring.configure_kill_switch(self.cfg.kill_switch)
+        if self.monitoring_cfg.enabled:
+            monitoring.configure_kill_switch(self.monitoring_cfg.thresholds)
+        else:
+            monitoring.configure_kill_switch(None)
 
         ops_cfg = {
             "rest_limit": self.cfg.kill_switch_ops.error_limit,
@@ -747,7 +760,7 @@ class ServiceSignalRunner:
         csv_path = self.cfg.snapshot_metrics_csv or os.path.join(logs_dir, "snapshot_metrics.csv")
         snapshot_stop = threading.Event()
         snapshot_thread: threading.Thread | None = None
-        if self.cfg.snapshot_metrics_sec > 0:
+        if self.monitoring_cfg.enabled and self.cfg.snapshot_metrics_sec > 0:
             def _snapshot_loop() -> None:
                 while not snapshot_stop.wait(self.cfg.snapshot_metrics_sec):
                     try:
@@ -1121,6 +1134,37 @@ def from_config(
     except Exception:
         pass
 
+    monitoring_cfg = MonitoringConfig()
+    mon_path = Path("configs/monitoring.yaml")
+    if mon_path.exists():
+        try:
+            with mon_path.open("r", encoding="utf-8") as f:
+                mon_data = yaml.safe_load(f) or {}
+        except Exception:
+            mon_data = {}
+        mon_section = mon_data.get("monitoring", {}) or {}
+        monitoring_cfg.enabled = bool(mon_section.get("enabled", monitoring_cfg.enabled))
+        monitoring_cfg.snapshot_metrics_sec = int(
+            mon_section.get("snapshot_metrics_sec", monitoring_cfg.snapshot_metrics_sec)
+        )
+        thr = mon_data.get("thresholds", {}) or {}
+        monitoring_cfg.thresholds.feed_lag_ms = float(
+            thr.get("feed_lag_ms", monitoring_cfg.thresholds.feed_lag_ms)
+        )
+        monitoring_cfg.thresholds.ws_failures = float(
+            thr.get("ws_failures", monitoring_cfg.thresholds.ws_failures)
+        )
+        monitoring_cfg.thresholds.error_rate = float(
+            thr.get("error_rate", monitoring_cfg.thresholds.error_rate)
+        )
+        al = mon_data.get("alerts", {}) or {}
+        monitoring_cfg.alerts.enabled = bool(
+            al.get("enabled", monitoring_cfg.alerts.enabled)
+        )
+        monitoring_cfg.alerts.command = al.get(
+            "command", monitoring_cfg.alerts.command
+        )
+
     svc_cfg = SignalRunnerConfig(
         snapshot_config_path=snapshot_config_path,
         artifacts_dir=cfg.artifacts_dir,
@@ -1129,10 +1173,13 @@ def from_config(
         run_id=cfg.run_id,
         snapshot_metrics_json=os.path.join(cfg.logs_dir, "snapshot_metrics.json"),
         snapshot_metrics_csv=os.path.join(cfg.logs_dir, "snapshot_metrics.csv"),
+        snapshot_metrics_sec=monitoring_cfg.snapshot_metrics_sec,
+        kill_switch_ops=cfg.kill_switch_ops,
     )
     sec = rt_cfg.get("ops", {}).get("snapshot_metrics_sec")
     if isinstance(sec, (int, float)) and sec > 0:
         svc_cfg.snapshot_metrics_sec = int(sec)
+        monitoring_cfg.snapshot_metrics_sec = int(sec)
 
     container = di_registry.build_graph(cfg.components, cfg)
     adapter: SimAdapter = container["executor"]
@@ -1155,6 +1202,7 @@ def from_config(
         NoTradeConfig(**(cfg.no_trade or {})),
         pipeline_cfg=pipeline_cfg,
         shutdown_cfg=shutdown_cfg,
+        monitoring_cfg=monitoring_cfg,
         enforce_closed_bars=cfg.timing.enforce_closed_bars,
         ws_dedup_enabled=cfg.ws_dedup.enabled,
         ws_dedup_log_skips=cfg.ws_dedup.log_skips,
