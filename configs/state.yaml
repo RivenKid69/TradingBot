@@ -1,0 +1,7 @@
+enabled: false
+backend: json
+path: state/state_store.json
+snapshot_interval_s: 60
+flush_on_event: true
+backup_keep: 3
+lock_path: state/state.lock

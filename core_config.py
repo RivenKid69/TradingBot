@@ -160,6 +160,17 @@ class RetryConfig(BaseModel):
 
 
 
+class StateConfig(BaseModel):
+    """Settings for persisting runner state."""
+
+    enabled: bool = Field(default=False)
+    backend: str = Field(default="json")
+    path: str = Field(default="state/state_store.json")
+    snapshot_interval_s: int = Field(default=0)
+    flush_on_event: bool = Field(default=True)
+    backup_keep: int = Field(default=0)
+    lock_path: str = Field(default="state/state.lock")
+
 @dataclass
 class MonitoringThresholdsConfig:
     """Monitoring thresholds for automatic safe-mode triggers."""
@@ -219,6 +230,7 @@ class CommonRunConfig(BaseModel):
     kill_switch: KillSwitchConfig = Field(default_factory=KillSwitchConfig)
     kill_switch_ops: OpsKillSwitchConfig = Field(default_factory=OpsKillSwitchConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    state: StateConfig = Field(default_factory=StateConfig)
     components: Components
 
 
