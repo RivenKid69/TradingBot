@@ -55,6 +55,7 @@ from services.signal_bus import log_drop
 from services.event_bus import EventBus
 from services.shutdown import ShutdownManager
 from services.signal_csv_writer import SignalCSVWriter
+from adapters.binance_spot_private import reconcile_state
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
@@ -722,6 +723,15 @@ class ServiceSignalRunner:
                             signal_bus.STATE[str(sid)] = int(exp)
                     except Exception:
                         pass
+                client = getattr(self.adapter, "client", None)
+                if client is not None:
+                    try:
+                        summary = reconcile_state(loaded_state, client)
+                        self.logger.info("state reconciliation: %s", summary)
+                    except Exception as e:
+                        self.logger.warning(
+                            "state reconciliation skipped: %s", e
+                        )
             except Exception:
                 pass
         if dirty_restart and self.monitoring_cfg.enabled:
