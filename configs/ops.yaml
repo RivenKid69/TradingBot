@@ -52,6 +52,17 @@ throttle:
     ttl_ms: 0                 # item lifetime in ms
   time_source: "monotonic"
 
+retry:
+  enabled: true               # set to false to restore legacy non-retrying behavior
+  max_attempts: 5             # maximum number of retry attempts; 0 disables
+  backoff_base_s: 0.5         # initial delay before first retry in seconds
+  max_backoff_s: 5.0          # maximum backoff time in seconds
+  classify:                   # map error patterns to kill-switch categories
+    http_5xx: rest            # HTTP 5xx responses counted as REST errors
+    http_429: rest            # rate-limit responses counted as REST errors
+    network_timeout: rest     # network timeouts counted as REST errors
+    websocket_error: ws       # websocket disconnects counted as WS errors
+
 runtime:
   queue:
     capacity: 1000            # event bus capacity; 0 for unbounded

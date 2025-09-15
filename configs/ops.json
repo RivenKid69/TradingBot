@@ -1,0 +1,80 @@
+{
+  "clock_sync": {
+    "refresh_sec": 300,
+    "warn_threshold_ms": 500,
+    "kill_threshold_ms": 2000,
+    "max_step_ms": 1000,
+    "attempts": 5
+  },
+  "ws_dedup": {
+    "enabled": true,
+    "persist_path": "state/last_bar_seen.json",
+    "log_skips": true
+  },
+  "kill_switch": {
+    "feed_lag_ms": 60000,
+    "ws_failures": 100,
+    "error_rate": 0.2,
+    "enabled": false,
+    "error_limit": 0,
+    "duplicate_limit": 0,
+    "stale_intervals_limit": 0,
+    "reset_cooldown_sec": 60,
+    "flag_path": null,
+    "alert_command": null
+  },
+  "shutdown": {
+    "grace_period": 5.0,
+    "drain_policy": "graceful",
+    "timeouts": {
+      "stop": 10.0,
+      "flush": 10.0,
+      "finalize": 5.0
+    }
+  },
+  "ttl": {
+    "enabled": false,
+    "ttl_seconds": 60,
+    "out_csv": null,
+    "dedup_persist": null
+  },
+  "throttle": {
+    "enabled": false,
+    "global": { "rps": 0.0, "burst": 0 },
+    "symbol": { "rps": 0.0, "burst": 0 },
+    "mode": "drop",
+    "queue": { "max_items": 0, "ttl_ms": 0 },
+    "time_source": "monotonic"
+  },
+  "retry": {
+    "_comment": "set enabled=false to restore legacy non-retrying behavior",
+    "enabled": true,
+    "max_attempts": 5,
+    "backoff_base_s": 0.5,
+    "max_backoff_s": 5.0,
+    "classify": {
+      "http_5xx": "rest",
+      "http_429": "rest",
+      "network_timeout": "rest",
+      "websocket_error": "ws"
+    }
+  },
+  "runtime": {
+    "queue": {
+      "capacity": 1000,
+      "drop_policy": "newest"
+    }
+  },
+  "pipeline": {
+    "enabled": true,
+    "stages": {
+      "closed_bar": { "enabled": true },
+      "windows": { "enabled": true },
+      "anomaly": { "enabled": true },
+      "extreme": { "enabled": true },
+      "policy": { "enabled": true },
+      "risk": { "enabled": true },
+      "publish": { "enabled": true }
+    }
+  }
+}
