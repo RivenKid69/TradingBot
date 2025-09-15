@@ -31,12 +31,9 @@ latency_seasonality_path: "configs/liquidity_latency_seasonality.json"
 use_seasonality: true
 
 market: spot
-spot_symbols: ["BTCUSDT"]
-futures_symbols: ["BTCUSDT"]
 
 data:
-  symbols: ["BTCUSDT"]
-  timeframe: "1m"
+  timeframe: "1m"  # symbols are loaded from data/universe/symbols.json
 
 model:
   algo: "ppo"

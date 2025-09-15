@@ -1,7 +1,6 @@
 # configs/realtime.yaml
 market: "futures"             # "spot" или "futures" (используется для бэкапа REST в backfill)
-symbols:
-  - "BTCUSDT"
+# symbols are loaded from data/universe/symbols.json
 interval: "1m"
 
 max_signals_per_sec: 5.0

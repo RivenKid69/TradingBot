@@ -57,13 +57,17 @@ class ServiceBacktest:
     class _EmptySource:
         """Заглушка источника данных для SimAdapter."""
 
-        def stream_bars(self, symbols, interval_ms):  # pragma: no cover - простая заглушка
+        def stream_bars(
+            self, symbols, interval_ms
+        ):  # pragma: no cover - простая заглушка
             return iter(())
 
         def stream_ticks(self, symbols):  # pragma: no cover - простая заглушка
             return iter(())
 
-    def __init__(self, policy: SignalPolicy, sim: ExecutionSimulator, cfg: BacktestConfig) -> None:
+    def __init__(
+        self, policy: SignalPolicy, sim: ExecutionSimulator, cfg: BacktestConfig
+    ) -> None:
         self.policy = policy
         self.sim = sim
         self.cfg = cfg
@@ -77,7 +81,9 @@ class ServiceBacktest:
         try:  # переподключаем логгер симулятора с нужными путями
             from logging import LogWriter, LogConfig  # type: ignore
 
-            self.sim._logger = LogWriter(LogConfig.from_dict(logging_config), run_id=run_id)
+            self.sim._logger = LogWriter(
+                LogConfig.from_dict(logging_config), run_id=run_id
+            )
         except Exception:
             pass
 
@@ -99,10 +105,19 @@ class ServiceBacktest:
             timing_config=self.cfg.timing_config,
         )
 
-    def run(self, df: pd.DataFrame, *, ts_col: str = "ts_ms", symbol_col: str = "symbol", price_col: str = "ref_price") -> List[Dict[str, Any]]:
+    def run(
+        self,
+        df: pd.DataFrame,
+        *,
+        ts_col: str = "ts_ms",
+        symbol_col: str = "symbol",
+        price_col: str = "ref_price",
+    ) -> List[Dict[str, Any]]:
         if self.cfg.snapshot_config_path and self.cfg.artifacts_dir:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
-        reports = self._bt.run(df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col)
+        reports = self._bt.run(
+            df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col
+        )
         try:
             if getattr(self.sim, "_logger", None):
                 self.sim._logger.flush()
@@ -121,8 +136,14 @@ def from_config(
     params = cfg.components.backtest_engine.params or {}
     bt_kwargs = {k: v for k, v in params.items() if k in BacktestConfig.__annotations__}
 
-    symbol = bt_kwargs.get("symbol") or (cfg.symbols[0] if getattr(cfg, "symbols", []) else None)
-    timeframe = bt_kwargs.get("timeframe") or getattr(getattr(cfg, "data", None), "timeframe", None)
+    symbol = bt_kwargs.get("symbol") or (
+        cfg.data.symbols[0]
+        if getattr(getattr(cfg, "data", None), "symbols", [])
+        else None
+    )
+    timeframe = bt_kwargs.get("timeframe") or getattr(
+        getattr(cfg, "data", None), "timeframe", None
+    )
     if not symbol or not timeframe:
         raise ValueError("Config must provide symbols and data.timeframe")
 
@@ -133,7 +154,8 @@ def from_config(
         dynamic_spread_config=bt_kwargs.get("dynamic_spread_config"),
         guards_config=bt_kwargs.get("guards_config"),
         signal_cooldown_s=bt_kwargs.get("signal_cooldown_s", 0),
-        no_trade_config=bt_kwargs.get("no_trade_config") or getattr(cfg, "no_trade", None),
+        no_trade_config=bt_kwargs.get("no_trade_config")
+        or getattr(cfg, "no_trade", None),
         snapshot_config_path=snapshot_config_path,
         artifacts_dir=cfg.artifacts_dir,
         logs_dir=bt_kwargs.get("logs_dir") or cfg.logs_dir,

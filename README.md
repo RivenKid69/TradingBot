@@ -42,6 +42,10 @@ python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT
 python scripts/validate_seasonality.py --historical path/to/trades.csv --multipliers configs/liquidity_latency_seasonality.json
 ```
 
+Runners load the symbol universe from ``data/universe/symbols.json`` by default.
+Override it with the ``--symbols`` CLI flag or an explicit ``data.symbols``
+entry in the YAML configuration.
+
 ### Обновление биржевых фильтров и спецификаций
 
 JSON‑файлы `binance_filters.json` и `exchange_specs.json` содержат поле
