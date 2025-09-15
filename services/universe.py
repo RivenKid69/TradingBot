@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import List
 
 import requests
@@ -45,4 +46,36 @@ def run(out: str = "data/universe/symbols.json") -> List[str]:
     return symbols
 
 
-__all__ = ["run"]
+_DEFAULT_TTL_SECONDS = 24 * 60 * 60
+
+
+def _is_stale(path: str, ttl: int) -> bool:
+    """Return ``True`` if ``path`` is missing or older than ``ttl`` seconds."""
+    try:
+        mtime = os.path.getmtime(path)
+    except FileNotFoundError:
+        return True
+    return (time.time() - mtime) > ttl
+
+
+def get_symbols(
+    ttl: int = _DEFAULT_TTL_SECONDS, out: str = "data/universe/symbols.json"
+) -> List[str]:
+    """Return cached Binance symbols list, refreshing if ``ttl`` expired."""
+
+    if _is_stale(out, ttl):
+        run(out)
+
+    with open(out, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+__all__ = ["run", "get_symbols"]
+
+# Perform a freshness check when the module is imported so that consumers
+# get an up-to-date universe without needing to call ``get_symbols`` first.
+try:  # pragma: no cover - network may be unavailable during tests
+    get_symbols()
+except Exception:
+    # The refresh is best effort; failures are surfaced on explicit call.
+    pass
