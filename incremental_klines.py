@@ -10,6 +10,7 @@ Output CSV per symbol at data/candles/{SYMBOL}.csv with Binance 12 fields + 'sym
 
 CLI:
   python incremental_klines.py --symbols BTCUSDT,ETHUSDT [--close-lag-ms 2000]
+  python incremental_klines.py                       # load symbols from data/universe/symbols.json
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import os
 import csv
 import time
 import argparse
+import json
 from typing import List, Optional
 import requests
 import clock
@@ -151,9 +153,15 @@ def _parse_symbols(s: str) -> List[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Incrementally append last CLOSED 1h candles from Binance.")
-    parser.add_argument("--symbols", type=str, default="BTCUSDT,ETHUSDT",
-                        help="Comma-separated symbols, e.g. BTCUSDT,ETHUSDT")
+    parser = argparse.ArgumentParser(
+        description="Incrementally append last CLOSED 1h candles from Binance."
+    )
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        default="",
+        help="Comma-separated symbols or leave empty to use data/universe/symbols.json",
+    )
     parser.add_argument(
         "--close-lag-ms",
         type=int,
@@ -161,7 +169,12 @@ def main():
         help="Allowed lag in ms when verifying if the fetched bar is closed",
     )
     args = parser.parse_args()
-    symbols = _parse_symbols(args.symbols)
+    if args.symbols:
+        symbols = _parse_symbols(args.symbols)
+    else:
+        json_path = os.path.join("data", "universe", "symbols.json")
+        with open(json_path, "r") as f:
+            symbols = [s.strip().upper() for s in json.load(f)]
     run_many(symbols, args.close_lag_ms)
 
 
