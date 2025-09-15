@@ -29,6 +29,7 @@ from collections import deque, defaultdict
 import time
 import shlex
 
+import json
 import yaml
 import clock
 from services import monitoring, ops_kill_switch
@@ -1037,16 +1038,24 @@ def from_config(
 
     ops_pipeline = PipelineConfig()
     ops_shutdown: Dict[str, Any] = {}
-    ops_path = Path("configs/ops.yaml")
-    if ops_path.exists():
-        try:
-            with ops_path.open("r", encoding="utf-8") as f:
-                ops_data = yaml.safe_load(f) or {}
-            ops_pipeline = _parse_pipeline(ops_data.get("pipeline", {}))
-            ops_shutdown = ops_data.get("shutdown", {}) or {}
-        except Exception:
-            ops_pipeline = PipelineConfig()
-            ops_shutdown = {}
+    ops_retry: Dict[str, Any] = {}
+    ops_data: Dict[str, Any] = {}
+    for name, loader in (
+        ("configs/ops.yaml", yaml.safe_load),
+        ("configs/ops.json", json.load),
+    ):
+        ops_path = Path(name)
+        if ops_path.exists():
+            try:
+                with ops_path.open("r", encoding="utf-8") as f:
+                    ops_data = loader(f) or {}
+            except Exception:
+                ops_data = {}
+            break
+    if ops_data:
+        ops_pipeline = _parse_pipeline(ops_data.get("pipeline", {}))
+        ops_shutdown = ops_data.get("shutdown", {}) or {}
+        ops_retry = ops_data.get("retry", {}) or {}
     elif rt_cfg.get("pipeline"):
         ops_pipeline = _parse_pipeline(rt_cfg.get("pipeline", {}))
 
@@ -1056,6 +1065,17 @@ def from_config(
     shutdown_cfg.update(base_shutdown)
     shutdown_cfg.update(ops_shutdown)
     shutdown_cfg.update(rt_cfg.get("shutdown", {}))
+
+    if ops_retry:
+        cfg.retry.max_attempts = int(
+            ops_retry.get("max_attempts", cfg.retry.max_attempts)
+        )
+        cfg.retry.backoff_base_s = float(
+            ops_retry.get("backoff_base_s", cfg.retry.backoff_base_s)
+        )
+        cfg.retry.max_backoff_s = float(
+            ops_retry.get("max_backoff_s", cfg.retry.max_backoff_s)
+        )
 
     # Ensure components receive the bus if they accept it
     try:
