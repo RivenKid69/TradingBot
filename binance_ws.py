@@ -22,6 +22,7 @@ from services import monitoring, ops_kill_switch
 from services.retry import retry_async
 from core_config import RetryConfig
 import ws_dedup_state as signal_bus
+from services.monitoring import MonitoringAggregator
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ class BinanceWS:
         ws_dedup_enabled: bool = False,
         ws_dedup_log_skips: bool = False,
         ws_dedup_persist_path: str | Path | None = None,
+        monitoring_agg: MonitoringAggregator | None = None,
     ) -> None:
         self.symbols = [s.strip().upper() for s in symbols if s.strip()]
         self.interval = str(interval)
@@ -99,6 +101,9 @@ class BinanceWS:
         self._rl_dropped = 0
 
         self._retry_cfg = retry_cfg or RetryConfig()
+
+        self._monitoring = monitoring_agg
+        self.consecutive_ws_failures = 0
 
         self._ws_dedup_enabled = ws_dedup_enabled
         self._ws_dedup_log_skips = ws_dedup_log_skips
@@ -199,6 +204,9 @@ class BinanceWS:
         )
         self._dd_total = self._dd_drop = self._dd_stale = self._dd_delay = 0
         self._rl_total = self._rl_delayed = self._rl_dropped = 0
+        if self._monitoring is not None:
+            self._monitoring.record_ws("reconnect")
+        self.consecutive_ws_failures = 0
         return ws
 
     async def run_forever(self) -> None:
@@ -323,6 +331,9 @@ class BinanceWS:
                     except Exception:
                         pass
                     had_ws_error = True
+                    self.consecutive_ws_failures += 1
+                    if self._monitoring is not None:
+                        self._monitoring.record_ws("failure")
                     continue
         finally:
             self._ws = None
