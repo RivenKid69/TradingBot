@@ -12,12 +12,14 @@ import json
 import os
 import time
 from typing import Dict, Tuple, Union, Optional, Any
+from collections import deque
 
 from enum import Enum
 from utils.prometheus import Counter, Histogram
 from .utils_app import atomic_write_with_retry
+from .alerts import AlertManager
 
-from core_config import KillSwitchConfig
+from core_config import KillSwitchConfig, MonitoringConfig
 
 try:  # pragma: no cover - optional dependency
     from prometheus_client import Gauge
@@ -387,6 +389,182 @@ def _collect(counter: Union[Counter, Gauge]) -> Dict[str, float]:
         return {}
 
 
+class MonitoringAggregator:
+    """Aggregate runtime metrics and emit alerts.
+
+    The aggregator collects various runtime statistics and periodically
+    evaluates them against :class:`MonitoringConfig.thresholds`.  If any of the
+    thresholds are exceeded an alert is sent via the provided
+    :class:`AlertManager` instance.  Metrics are also periodically flushed to a
+    JSON lines file for external processing.
+    """
+
+    def __init__(self, cfg: MonitoringConfig, alerts: AlertManager) -> None:
+        self.cfg = cfg
+        self.alerts = alerts
+        self.enabled = bool(cfg.enabled)
+        # Frequency of metrics flushes
+        self.flush_interval_sec = int(getattr(cfg, "snapshot_metrics_sec", 60))
+        self._last_flush = time.time()
+
+        # Sliding window stores
+        self._ws_events: deque[tuple[int, str]] = deque()
+        self._http_events: deque[tuple[int, bool, Optional[int]]] = deque()
+        self._signal_events: deque[tuple[int, str, int, int]] = deque()
+        self._last_bar_close_ms: Dict[str, int] = {}
+
+    # ------------------------------------------------------------------
+    # Recording helpers
+    def record_feed(self, symbol: str, close_ms: int) -> None:
+        """Record receipt of latest bar for *symbol* with ``close_ms``."""
+        if not self.enabled:
+            return
+        now_ms = int(time.time() * 1000)
+        self._last_bar_close_ms[symbol] = int(close_ms)
+        try:
+            report_feed_lag(symbol, now_ms - int(close_ms))
+        except Exception:
+            pass
+
+    def record_ws(self, event: str) -> None:
+        """Record websocket ``event`` (e.g. ``reconnect`` or ``failure``)."""
+        if not self.enabled:
+            return
+        self._ws_events.append((int(time.time() * 1000), str(event)))
+
+    def record_http(self, success: bool, status: Optional[int]) -> None:
+        """Record outcome of an HTTP request."""
+        if not self.enabled:
+            return
+        self._http_events.append((int(time.time() * 1000), bool(success), status))
+
+    def record_signals(self, symbol: str, emitted: int, duplicates: int) -> None:
+        """Record signal counts for ``symbol``."""
+        if not self.enabled:
+            return
+        self._signal_events.append((int(time.time() * 1000), symbol, int(emitted), int(duplicates)))
+
+    # ------------------------------------------------------------------
+    def _prune(self, dq: deque[tuple], cutoff_ms: int) -> None:
+        """Drop events older than ``cutoff_ms`` from ``dq``."""
+        while dq and dq[0][0] < cutoff_ms:
+            dq.popleft()
+
+    def tick(self, now_ms: int) -> None:
+        """Aggregate recent data and emit alerts if thresholds exceeded."""
+        if not self.enabled:
+            return
+
+        cutoff_1m = now_ms - 60_000
+        cutoff_5m = now_ms - 5 * 60_000
+
+        # Prune outdated events
+        self._prune(self._ws_events, cutoff_5m)
+        self._prune(self._http_events, cutoff_5m)
+        self._prune(self._signal_events, cutoff_5m)
+
+        th = self.cfg.thresholds
+
+        # Feed lag checks
+        feed_lags: Dict[str, int] = {}
+        if th.feed_lag_ms > 0:
+            for sym, close in self._last_bar_close_ms.items():
+                lag = int(now_ms - close)
+                feed_lags[sym] = lag
+                if lag > th.feed_lag_ms:
+                    try:
+                        self.alerts.notify(
+                            f"feed_lag_{sym}",
+                            f"{sym} feed lag {lag}ms exceeds {th.feed_lag_ms}",
+                        )
+                    except Exception:
+                        pass
+
+        # Websocket events
+        ws_fail_1m = sum(1 for ts, ev in self._ws_events if ts >= cutoff_1m and ev == "failure")
+        ws_fail_5m = sum(1 for _, ev in self._ws_events if ev == "failure")
+        ws_rec_1m = sum(1 for ts, ev in self._ws_events if ts >= cutoff_1m and ev == "reconnect")
+        ws_rec_5m = sum(1 for _, ev in self._ws_events if ev == "reconnect")
+        if th.ws_failures > 0 and ws_fail_1m > th.ws_failures:
+            try:
+                self.alerts.notify(
+                    "ws_failures", f"websocket failures last minute: {ws_fail_1m}"
+                )
+            except Exception:
+                pass
+
+        # HTTP statistics
+        http_total_1m = sum(1 for ts, *_ in self._http_events if ts >= cutoff_1m)
+        http_error_1m = sum(1 for ts, ok, _ in self._http_events if ts >= cutoff_1m and not ok)
+        http_total_5m = len(self._http_events)
+        http_error_5m = sum(1 for _, ok, _ in self._http_events if not ok)
+
+        # Signal statistics
+        emitted_1m: Dict[str, int] = {}
+        dup_1m: Dict[str, int] = {}
+        for ts, sym, em, du in self._signal_events:
+            if ts >= cutoff_1m:
+                emitted_1m[sym] = emitted_1m.get(sym, 0) + em
+                dup_1m[sym] = dup_1m.get(sym, 0) + du
+        emitted_5m: Dict[str, int] = {}
+        dup_5m: Dict[str, int] = {}
+        for _, sym, em, du in self._signal_events:
+            emitted_5m[sym] = emitted_5m.get(sym, 0) + em
+            dup_5m[sym] = dup_5m.get(sym, 0) + du
+
+        worst_sym: Optional[str] = None
+        worst_rate = 0.0
+        for sym in set(emitted_1m) | set(dup_1m):
+            em = emitted_1m.get(sym, 0)
+            du = dup_1m.get(sym, 0)
+            rate = du / em if em > 0 else 0.0
+            if rate > worst_rate:
+                worst_rate = rate
+                worst_sym = sym
+        if th.error_rate > 0 and worst_rate > th.error_rate and worst_sym is not None:
+            try:
+                self.alerts.notify(
+                    "signal_error_rate",
+                    f"{worst_sym} duplicate rate {worst_rate:.3f} exceeds {th.error_rate}",
+                )
+            except Exception:
+                pass
+
+        # Periodic flush to metrics file
+        now_sec = now_ms / 1000.0
+        if now_sec - self._last_flush >= self.flush_interval_sec:
+            metrics = {
+                "ts_ms": now_ms,
+                "feed_lag_ms": feed_lags,
+                "ws": {
+                    "reconnects_1m": ws_rec_1m,
+                    "reconnects_5m": ws_rec_5m,
+                    "failures_1m": ws_fail_1m,
+                    "failures_5m": ws_fail_5m,
+                },
+                "http": {
+                    "total_1m": http_total_1m,
+                    "errors_1m": http_error_1m,
+                    "total_5m": http_total_5m,
+                    "errors_5m": http_error_5m,
+                },
+                "signals": {
+                    "emitted_1m": sum(emitted_1m.values()),
+                    "duplicates_1m": sum(dup_1m.values()),
+                    "emitted_5m": sum(emitted_5m.values()),
+                    "duplicates_5m": sum(dup_5m.values()),
+                },
+            }
+            line = json.dumps(metrics, sort_keys=True)
+            try:
+                atomic_write_with_retry(
+                    os.path.join("logs", "metrics.jsonl"), line + "\n", retries=3, backoff=0.1
+                )
+            except Exception:
+                pass
+            self._last_flush = now_sec
+
+
 def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[Dict[str, Any], str, str]:
     """Persist current metrics snapshot to ``json_path`` and ``csv_path``.
 
@@ -485,5 +663,6 @@ __all__ = [
     "kill_switch_triggered",
     "kill_switch_info",
     "reset_kill_switch_counters",
+    "MonitoringAggregator",
     "snapshot_metrics",
 ]
