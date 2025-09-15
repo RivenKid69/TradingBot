@@ -197,7 +197,7 @@ class Mediator:
         self.quantizer = None
         self.enforce_ppbs = True
         qcfg = getattr(rc, "quantizer", {}) if rc is not None else {}
-        filters_path = qcfg.get("path", "")
+        filters_path = str(qcfg.get("filters_path") or qcfg.get("path") or "")
         strict = bool(qcfg.get("strict", True))
         self.enforce_ppbs = bool(qcfg.get("enforce_percent_price_by_side", True))
         if Quantizer is not None and filters_path:

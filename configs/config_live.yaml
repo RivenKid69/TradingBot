@@ -63,6 +63,13 @@ latency:
   timeout_ms: 2500
   retries: 1
   seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
+quantizer:
+  filters_path: "binance_filters.json"
+  strict: true
+  enforce_percent_price_by_side: true
+  auto_refresh_days: 30
+  refresh_on_start: false
+ 
 pipeline:
   enabled: true
   stages:

@@ -46,9 +46,11 @@ model:
   params: {}
 
 quantizer:
-  path: "binance_filters.json"
+  filters_path: "binance_filters.json"
   strict: true
   enforce_percent_price_by_side: true
+  auto_refresh_days: 30
+  refresh_on_start: false
 
 fees:
   maker_bps: 1.0
