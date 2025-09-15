@@ -60,7 +60,9 @@ from adapters.binance_spot_private import reconcile_state
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
 from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy
-from services.utils_config import snapshot_config  # снапшот конфига (Фаза 3)  # noqa: F401
+from services.utils_config import (
+    snapshot_config,
+)  # снапшот конфига (Фаза 3)  # noqa: F401
 from core_config import (
     CommonRunConfig,
     ClockSyncConfig,
@@ -295,7 +297,9 @@ class _Worker:
                     exp = time.monotonic() + self._throttle_cfg.queue.ttl_ms / 1000.0
                     self._queue.append((exp, symbol, bar_close_ms, o))
                     try:
-                        monitoring.throttle_enqueued_count.labels(symbol, reason or "").inc()
+                        monitoring.throttle_enqueued_count.labels(
+                            symbol, reason or ""
+                        ).inc()
                     except Exception:
                         pass
                     return PipelineResult(action="queue", stage=Stage.PUBLISH)
@@ -304,10 +308,14 @@ class _Worker:
                     monitoring.throttle_dropped_count.labels(symbol, reason or "").inc()
                 except Exception:
                     pass
-                return PipelineResult(action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER)
+                return PipelineResult(
+                    action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER
+                )
         if not self._emit(o, symbol, bar_close_ms):
             self._refund_tokens(symbol)
-            return PipelineResult(action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER)
+            return PipelineResult(
+                action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER
+            )
         return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
 
     def _drain_queue(self) -> list[Any]:
@@ -322,7 +330,9 @@ class _Worker:
                 try:
                     log_drop(symbol, bar_close_ms, order, "QUEUE_EXPIRED")
                     monitoring.throttle_queue_expired_count.labels(symbol).inc()
-                    monitoring.throttle_dropped_count.labels(symbol, "QUEUE_EXPIRED").inc()
+                    monitoring.throttle_dropped_count.labels(
+                        symbol, "QUEUE_EXPIRED"
+                    ).inc()
                 except Exception:
                     pass
                 continue
@@ -348,7 +358,10 @@ class _Worker:
                 pass
             if emitted_count == 0:
                 self._zero_signal_streak += 1
-                if self._zero_signal_alert > 0 and self._zero_signal_streak >= self._zero_signal_alert:
+                if (
+                    self._zero_signal_alert > 0
+                    and self._zero_signal_streak >= self._zero_signal_alert
+                ):
                     try:
                         monitoring.alert_zero_signals(bar.symbol)
                     except Exception:
@@ -389,7 +402,9 @@ class _Worker:
             now_ms=clock.now_ms(),
             enforce=self._enforce_closed_bars,
             lag_ms=0,
-            stage_cfg=self._pipeline_cfg.get("closed_bar") if self._pipeline_cfg else None,
+            stage_cfg=(
+                self._pipeline_cfg.get("closed_bar") if self._pipeline_cfg else None
+            ),
         )
         if guard_res.action == "drop":
             try:
@@ -425,7 +440,9 @@ class _Worker:
                 int(bar.ts),
                 bar.symbol,
                 self._no_trade_cfg,
-                stage_cfg=self._pipeline_cfg.get("windows") if self._pipeline_cfg else None,
+                stage_cfg=(
+                    self._pipeline_cfg.get("windows") if self._pipeline_cfg else None
+                ),
             )
             if win_res.action == "drop":
                 try:
@@ -541,7 +558,9 @@ class _Worker:
                 o,
                 bar.symbol,
                 int(bar.ts),
-                stage_cfg=self._pipeline_cfg.get("publish") if self._pipeline_cfg else None,
+                stage_cfg=(
+                    self._pipeline_cfg.get("publish") if self._pipeline_cfg else None
+                ),
             )
             if res.action == "pass":
                 emitted.append(o)
@@ -691,7 +710,9 @@ class ServiceSignalRunner:
             try:
                 from logging import LogWriter, LogConfig  # type: ignore
 
-                sim._logger = LogWriter(LogConfig.from_dict(logging_config), run_id=run_id)
+                sim._logger = LogWriter(
+                    LogConfig.from_dict(logging_config), run_id=run_id
+                )
             except Exception:
                 pass
 
@@ -701,7 +722,9 @@ class ServiceSignalRunner:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
 
         logs_dir = self.cfg.logs_dir or "logs"
-        marker_path = Path(self.cfg.marker_path or os.path.join(logs_dir, "shutdown.marker"))
+        marker_path = Path(
+            self.cfg.marker_path or os.path.join(logs_dir, "shutdown.marker")
+        )
         dirty_restart = True
         try:
             if marker_path.exists():
@@ -715,6 +738,7 @@ class ServiceSignalRunner:
                     self.cfg.state.path,
                     backend=self.cfg.state.backend,
                     lock_path=self.cfg.state.lock_path,
+                    backup_keep=self.cfg.state.backup_keep,
                 )
                 if self.ws_dedup_enabled:
                     try:
@@ -729,9 +753,7 @@ class ServiceSignalRunner:
                         summary = reconcile_state(loaded_state, client)
                         self.logger.info("state reconciliation: %s", summary)
                     except Exception as e:
-                        self.logger.warning(
-                            "state reconciliation skipped: %s", e
-                        )
+                        self.logger.warning("state reconciliation skipped: %s", e)
             except Exception:
                 pass
         if dirty_restart and self.monitoring_cfg.enabled:
@@ -798,6 +820,7 @@ class ServiceSignalRunner:
         monitoring_stop = threading.Event()
         monitoring_thread: threading.Thread | None = None
         if self.monitoring_agg is not None:
+
             def _monitoring_loop() -> None:
                 interval = float(getattr(self.monitoring_cfg, "tick_sec", 1.0))
                 while not monitoring_stop.is_set():
@@ -844,11 +867,16 @@ class ServiceSignalRunner:
             except Exception:
                 signal_bus.OUT_WRITER = None
 
-        json_path = self.cfg.snapshot_metrics_json or os.path.join(logs_dir, "snapshot_metrics.json")
-        csv_path = self.cfg.snapshot_metrics_csv or os.path.join(logs_dir, "snapshot_metrics.csv")
+        json_path = self.cfg.snapshot_metrics_json or os.path.join(
+            logs_dir, "snapshot_metrics.json"
+        )
+        csv_path = self.cfg.snapshot_metrics_csv or os.path.join(
+            logs_dir, "snapshot_metrics.csv"
+        )
         snapshot_stop = threading.Event()
         snapshot_thread: threading.Thread | None = None
         if self.monitoring_cfg.enabled and self.cfg.snapshot_metrics_sec > 0:
+
             def _snapshot_loop() -> None:
                 while not snapshot_stop.wait(self.cfg.snapshot_metrics_sec):
                     try:
@@ -867,6 +895,7 @@ class ServiceSignalRunner:
         state_stop = threading.Event()
         state_thread: threading.Thread | None = None
         if self.cfg.state.enabled and self.cfg.state.snapshot_interval_s > 0:
+
             def _state_loop() -> None:
                 while not state_stop.wait(self.cfg.state.snapshot_interval_s):
                     try:
@@ -874,6 +903,7 @@ class ServiceSignalRunner:
                             self.cfg.state.path,
                             backend=self.cfg.state.backend,
                             lock_path=self.cfg.state.lock_path,
+                            backup_keep=self.cfg.state.backup_keep,
                         )
                     except Exception:
                         pass
@@ -892,7 +922,10 @@ class ServiceSignalRunner:
             loop = asyncio.new_event_loop()
 
             async def _run_workers() -> None:
-                tasks = [asyncio.create_task(worker_loop(bus, worker)) for _ in range(n_workers)]
+                tasks = [
+                    asyncio.create_task(worker_loop(bus, worker))
+                    for _ in range(n_workers)
+                ]
                 try:
                     await asyncio.gather(*tasks)
                 finally:
@@ -908,10 +941,15 @@ class ServiceSignalRunner:
             loop_thread = threading.Thread(target=_loop_runner, daemon=True)
             loop_thread.start()
             shutdown.on_stop(bus.close)
-            shutdown.on_finalize(lambda: loop_thread.join(timeout=1.0) if loop_thread else None)
+            shutdown.on_finalize(
+                lambda: loop_thread.join(timeout=1.0) if loop_thread else None
+            )
 
-        ws_client = getattr(self.adapter, "ws", None) or getattr(self.adapter, "source", None)
+        ws_client = getattr(self.adapter, "ws", None) or getattr(
+            self.adapter, "source", None
+        )
         if ws_client is not None and hasattr(ws_client, "stop"):
+
             async def _stop_ws_client() -> None:
                 await ws_client.stop()
 
@@ -943,6 +981,7 @@ class ServiceSignalRunner:
                     self.cfg.state.path,
                     backend=self.cfg.state.backend,
                     lock_path=self.cfg.state.lock_path,
+                    backup_keep=self.cfg.state.backup_keep,
                 )
             )
 
@@ -965,8 +1004,20 @@ class ServiceSignalRunner:
         if state_thread is not None:
             shutdown.on_finalize(lambda: state_thread.join(timeout=1.0))
         shutdown.on_finalize(lambda: self._clock_stop.set())
-        shutdown.on_finalize(lambda: self._clock_thread.join(timeout=self.clock_sync_cfg.refresh_sec if self.clock_sync_cfg else 1.0) if self._clock_thread is not None else None)
-        shutdown.on_finalize(lambda: signal_bus.shutdown() if signal_bus.ENABLED else None)
+        shutdown.on_finalize(
+            lambda: (
+                self._clock_thread.join(
+                    timeout=(
+                        self.clock_sync_cfg.refresh_sec if self.clock_sync_cfg else 1.0
+                    )
+                )
+                if self._clock_thread is not None
+                else None
+            )
+        )
+        shutdown.on_finalize(
+            lambda: signal_bus.shutdown() if signal_bus.ENABLED else None
+        )
         shutdown.on_finalize(_final_summary)
 
         shutdown.register(signal.SIGINT, signal.SIGTERM)
@@ -989,7 +1040,9 @@ class ServiceSignalRunner:
                 backoff = self.clock_sync_cfg.refresh_sec
                 while not self._clock_stop.wait(backoff):
                     before = clock.last_sync_at
-                    drift_local = clock.sync_clock(client, self.clock_sync_cfg, monitoring)
+                    drift_local = clock.sync_clock(
+                        client, self.clock_sync_cfg, monitoring
+                    )
                     success = clock.last_sync_at != before
                     try:
                         monitoring.report_clock_sync(
@@ -1002,7 +1055,9 @@ class ServiceSignalRunner:
                             monitoring.clock_sync_fail.inc()
                         except Exception:
                             pass
-                        backoff = min(backoff * 2.0, self.clock_sync_cfg.refresh_sec * 10.0)
+                        backoff = min(
+                            backoff * 2.0, self.clock_sync_cfg.refresh_sec * 10.0
+                        )
                         continue
                     backoff = self.clock_sync_cfg.refresh_sec
                     if drift_local > self.clock_sync_cfg.kill_threshold_ms:
@@ -1104,6 +1159,7 @@ class ServiceSignalRunner:
                         self.cfg.state.path,
                         backend=self.cfg.state.backend,
                         lock_path=self.cfg.state.lock_path,
+                        backup_keep=self.cfg.state.backup_keep,
                     )
                 except Exception:
                     pass
@@ -1189,7 +1245,9 @@ def from_config(
     # WS deduplication overrides
     ws_cfg = rt_cfg.get("ws", {})
     cfg.ws_dedup.enabled = bool(ws_cfg.get("enabled", cfg.ws_dedup.enabled))
-    cfg.ws_dedup.persist_path = str(ws_cfg.get("persist_path", cfg.ws_dedup.persist_path))
+    cfg.ws_dedup.persist_path = str(
+        ws_cfg.get("persist_path", cfg.ws_dedup.persist_path)
+    )
     cfg.ws_dedup.log_skips = bool(ws_cfg.get("log_skips", cfg.ws_dedup.log_skips))
 
     # Throttle configuration overrides
@@ -1197,16 +1255,24 @@ def from_config(
     if throttle_cfg:
         cfg.throttle.enabled = bool(throttle_cfg.get("enabled", cfg.throttle.enabled))
         global_cfg = throttle_cfg.get("global", {})
-        cfg.throttle.global_.rps = float(global_cfg.get("rps", cfg.throttle.global_.rps))
-        cfg.throttle.global_.burst = int(global_cfg.get("burst", cfg.throttle.global_.burst))
+        cfg.throttle.global_.rps = float(
+            global_cfg.get("rps", cfg.throttle.global_.rps)
+        )
+        cfg.throttle.global_.burst = int(
+            global_cfg.get("burst", cfg.throttle.global_.burst)
+        )
         sym_cfg = throttle_cfg.get("symbol", {})
         cfg.throttle.symbol.rps = float(sym_cfg.get("rps", cfg.throttle.symbol.rps))
         cfg.throttle.symbol.burst = int(sym_cfg.get("burst", cfg.throttle.symbol.burst))
         cfg.throttle.mode = str(throttle_cfg.get("mode", cfg.throttle.mode))
         q_cfg = throttle_cfg.get("queue", {})
-        cfg.throttle.queue.max_items = int(q_cfg.get("max_items", cfg.throttle.queue.max_items))
+        cfg.throttle.queue.max_items = int(
+            q_cfg.get("max_items", cfg.throttle.queue.max_items)
+        )
         cfg.throttle.queue.ttl_ms = int(q_cfg.get("ttl_ms", cfg.throttle.queue.ttl_ms))
-        cfg.throttle.time_source = str(throttle_cfg.get("time_source", cfg.throttle.time_source))
+        cfg.throttle.time_source = str(
+            throttle_cfg.get("time_source", cfg.throttle.time_source)
+        )
 
     # Kill switch overrides
     kill_cfg = rt_cfg.get("ops", {}).get("kill_switch", {})
@@ -1235,9 +1301,7 @@ def from_config(
             )
         )
         cfg.kill_switch_ops.reset_cooldown_sec = int(
-            kill_cfg.get(
-                "reset_cooldown_sec", cfg.kill_switch_ops.reset_cooldown_sec
-            )
+            kill_cfg.get("reset_cooldown_sec", cfg.kill_switch_ops.reset_cooldown_sec)
         )
         cfg.kill_switch_ops.flag_path = kill_cfg.get(
             "flag_path", cfg.kill_switch_ops.flag_path
@@ -1333,7 +1397,9 @@ def from_config(
         except Exception:
             mon_data = {}
         mon_section = mon_data.get("monitoring", {}) or {}
-        monitoring_cfg.enabled = bool(mon_section.get("enabled", monitoring_cfg.enabled))
+        monitoring_cfg.enabled = bool(
+            mon_section.get("enabled", monitoring_cfg.enabled)
+        )
         monitoring_cfg.snapshot_metrics_sec = int(
             mon_section.get("snapshot_metrics_sec", monitoring_cfg.snapshot_metrics_sec)
         )
@@ -1351,9 +1417,7 @@ def from_config(
         monitoring_cfg.alerts.enabled = bool(
             al.get("enabled", monitoring_cfg.alerts.enabled)
         )
-        monitoring_cfg.alerts.command = al.get(
-            "command", monitoring_cfg.alerts.command
-        )
+        monitoring_cfg.alerts.command = al.get("command", monitoring_cfg.alerts.command)
 
     svc_cfg = SignalRunnerConfig(
         snapshot_config_path=snapshot_config_path,

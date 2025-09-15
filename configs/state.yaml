@@ -3,5 +3,7 @@ backend: json
 path: state/state_store.json
 snapshot_interval_s: 60
 flush_on_event: true
+# number of backup files to keep (rotated as .bak1, .bak2, ...); 0 disables
 backup_keep: 3
+# separate lock file to prevent concurrent state access
 lock_path: state/state.lock
