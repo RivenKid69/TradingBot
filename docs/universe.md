@@ -38,3 +38,65 @@ it via the ``--symbols`` flag or the ``data.symbols`` field in YAML config.
 You can also maintain the JSON manually and run the CLI with
 ``--liquidity-threshold 0`` to store the latest exchange symbols without
 filtering by volume.
+
+## Validation
+
+### Confirm the cache refresh
+
+After invoking the CLI (or importing :func:`get_symbols`), check the cache age
+and a preview of the downloaded symbols:
+
+```bash
+python - <<'PY'
+import json, os, time
+path = "data/universe/symbols.json"
+print("age_s", round(time.time() - os.path.getmtime(path), 1))
+with open(path, "r", encoding="utf-8") as fh:
+    symbols = json.load(fh)
+print("first", symbols[:5])
+print("count", len(symbols))
+PY
+```
+
+An ``age_s`` close to ``0`` confirms the file was refreshed.  The preview makes
+it easy to spot unexpected tickers.
+
+### Verify runner wiring
+
+Runners load the same JSON through ``core_config.get_symbols``.  Load your
+configuration and inspect the resolved list before starting long processes:
+
+```bash
+python - <<'PY'
+from core_config import load_config
+cfg = load_config("configs/config_live.yaml")
+print("runner_symbols", cfg.data.symbols[:5])
+print("total", len(cfg.data.symbols))
+PY
+```
+
+Override the symbols via the CLI ``--symbols`` flag or ``data.symbols`` in the
+configuration if you need a subset.
+
+## Unit and integration checklist
+
+Use this checklist when touching ``services.universe`` or its consumers.
+
+### Unit tests
+
+- [ ] Cover ``_is_stale`` so missing files and TTL-expired caches are detected
+      as stale while fresh caches are accepted.
+- [ ] Exercise ``get_symbols`` with combinations of ``ttl`` and ``force`` to
+      ensure refreshes occur only when appropriate (file freshness).
+- [ ] Validate ``run`` filters tickers below ``liquidity_threshold`` and sorts
+      the output.
+
+### Integration tests
+
+- [ ] Invoke ``python -m services.universe`` in an isolated workspace and
+      assert the cache modification time advances (file freshness).
+- [ ] Load a runner configuration via ``core_config.load_config`` and confirm
+      the resolved symbols match the refreshed JSON (symbol list usage).
+- [ ] Exercise a runner path (e.g. ``script_live`` with a temporary universe)
+      to confirm low-liquidity symbols are excluded when
+      ``--liquidity-threshold`` is set (liquidity threshold enforcement).

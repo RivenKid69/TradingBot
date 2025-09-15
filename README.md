@@ -54,6 +54,32 @@ missing or older than 24 hours and can be updated manually:
 python -m services.universe --output data/universe/symbols.json --liquidity-threshold 1e6
 ```
 
+To confirm the refresh succeeded, inspect the modification time and a sample
+of the cached symbols:
+
+```bash
+python - <<'PY'
+import json, os, time
+path = "data/universe/symbols.json"
+print("age_s", round(time.time() - os.path.getmtime(path), 1))
+with open(path, "r", encoding="utf-8") as fh:
+    symbols = json.load(fh)
+print("first", symbols[:5])
+print("count", len(symbols))
+PY
+```
+
+Runners resolve the same list through ``core_config.get_symbols``.  Load a
+configuration to verify the symbols wired into the service:
+
+```bash
+python - <<'PY'
+from core_config import load_config
+cfg = load_config("configs/config_live.yaml")
+print("runner_symbols", cfg.data.symbols[:5])
+PY
+```
+
 Schedule the command daily via cron or rely on the automatic refresh at
 startup.  Use ``--liquidity-threshold 0`` to bypass the volume filter or
 point ``--output`` to maintain a custom symbols file.  See
