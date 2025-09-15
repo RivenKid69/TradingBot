@@ -73,7 +73,6 @@ components:
     target: impl_sim_executor:SimExecutor
     params: {symbol: "BTCUSDT"}
 data:
-  symbols: ["BTCUSDT"]
   timeframe: "1m"
 ```
 
@@ -82,6 +81,9 @@ from core_config import load_config
 
 cfg = load_config("configs/config_sim.yaml")
 ```
+
+The runner loads the symbol universe from ``data/universe/symbols.json`` by default.
+Override it via the ``--symbols`` CLI flag or an explicit ``data.symbols`` field.
 
 Отдельные параметры можно переопределить из командной строки. Например,
 так временно изменяются проскальзывание и задержка:

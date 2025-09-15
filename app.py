@@ -16,7 +16,10 @@ import yaml
 from utils_time import load_seasonality
 
 from core_config import load_config, load_config_from_str
-from ingest_config import load_config as load_ingest_config, load_config_from_str as parse_ingest_config
+from ingest_config import (
+    load_config as load_ingest_config,
+    load_config_from_str as parse_ingest_config,
+)
 from legacy_sandbox_config import (
     load_config as load_sandbox_config,
     load_config_from_str as parse_sandbox_config,
@@ -112,57 +115,75 @@ def monitoring_snapshot(
 
 # --------------------------- Utility ---------------------------
 
+
 def build_all_pipeline(
-        *,
-        py: str,
-        cfg_ingest: str,
-        prices_in: str,
-        features_out: str,
-        lookbacks: str,
-        rsi_period: int,
-        bt_base: str,
-        bt_prices: str,
-        bt_price_col: str,
-        bt_decision_delay: int,
-        bt_horizon: int,
-        bt_out: str,
-        cfg_sandbox: str,
-        trades_path: str,
-        reports_path: str,
-        metrics_json: str,
-        out_md: str,
-        equity_png: str,
-        cfg_realtime: str,
-        start_realtime: bool,
-        realtime_pid: str,
-        realtime_log: str,
-        logs_dir: str,
+    *,
+    py: str,
+    cfg_ingest: str,
+    prices_in: str,
+    features_out: str,
+    lookbacks: str,
+    rsi_period: int,
+    bt_base: str,
+    bt_prices: str,
+    bt_price_col: str,
+    bt_decision_delay: int,
+    bt_horizon: int,
+    bt_out: str,
+    cfg_sandbox: str,
+    trades_path: str,
+    reports_path: str,
+    metrics_json: str,
+    out_md: str,
+    equity_png: str,
+    cfg_realtime: str,
+    start_realtime: bool,
+    realtime_pid: str,
+    realtime_log: str,
+    logs_dir: str,
 ) -> None:
-    rc = run_cmd([py, "scripts/ingest_orchestrator.py", "--config", cfg_ingest],
-                 log_path=os.path.join(logs_dir, "ingest.log"))
+    rc = run_cmd(
+        [py, "scripts/ingest_orchestrator.py", "--config", cfg_ingest],
+        log_path=os.path.join(logs_dir, "ingest.log"),
+    )
     if rc != 0:
         st.error(f"Ingest завершился с кодом {rc}")
         return
 
-    rc = run_cmd([
-        py, "scripts/make_features.py",
-        "--in", prices_in,
-        "--out", features_out,
-        "--lookbacks", lookbacks,
-        "--rsi-period", str(int(rsi_period)),
-    ], log_path=os.path.join(logs_dir, "features.log"))
+    rc = run_cmd(
+        [
+            py,
+            "scripts/make_features.py",
+            "--in",
+            prices_in,
+            "--out",
+            features_out,
+            "--lookbacks",
+            lookbacks,
+            "--rsi-period",
+            str(int(rsi_period)),
+        ],
+        log_path=os.path.join(logs_dir, "features.log"),
+    )
     if rc != 0:
         st.error(f"make_features завершился с кодом {rc}")
         return
 
     args = [
-        py, "scripts/build_training_table.py",
-        "--base", bt_base,
-        "--prices", bt_prices,
-        "--price-col", bt_price_col,
-        "--decision-delay-ms", str(int(bt_decision_delay)),
-        "--label-horizon-ms", str(int(bt_horizon)),
-        "--out", bt_out,
+        py,
+        "scripts/build_training_table.py",
+        "--base",
+        bt_base,
+        "--prices",
+        bt_prices,
+        "--price-col",
+        bt_price_col,
+        "--decision-delay-ms",
+        str(int(bt_decision_delay)),
+        "--label-horizon-ms",
+        str(int(bt_horizon)),
+        "--out",
+        bt_out,
     ]
     rc = run_cmd(args, log_path=os.path.join(logs_dir, "train_table.log"))
     if rc != 0:
@@ -209,12 +230,17 @@ def build_all_pipeline(
 
 # --------------------------- Service wrappers ---------------------------
 
+
 def run_backtest_from_yaml(cfg_path: str, default_out: str, logs_dir: str) -> str:
     cfg: SandboxConfig = load_sandbox_config(cfg_path)
     sim_cfg = load_config(cfg.sim_config_path)
 
     sb_cfg = BacktestConfig(
-        symbol=sim_cfg.symbols[0] if getattr(sim_cfg, "symbols", []) else "BTCUSDT",
+        symbol=(
+            sim_cfg.data.symbols[0]
+            if getattr(getattr(sim_cfg, "data", None), "symbols", [])
+            else "BTCUSDT"
+        ),
         timeframe=getattr(sim_cfg.data, "timeframe", "1m"),
         dynamic_spread_config=cfg.dynamic_spread,
         exchange_specs_path=cfg.exchange_specs_path,
@@ -226,7 +252,11 @@ def run_backtest_from_yaml(cfg_path: str, default_out: str, logs_dir: str) -> st
 
     data_cfg = cfg.data
     path = data_cfg.path
-    df = pd.read_parquet(path) if path.lower().endswith(".parquet") else pd.read_csv(path)
+    df = (
+        pd.read_parquet(path)
+        if path.lower().endswith(".parquet")
+        else pd.read_csv(path)
+    )
     reports = backtest_from_config(
         sim_cfg,
         df,
@@ -242,6 +272,7 @@ def run_backtest_from_yaml(cfg_path: str, default_out: str, logs_dir: str) -> st
     else:
         pd.DataFrame(reports).to_csv(out_path, index=False)
     return out_path
+
 
 # --------------------------- Streamlit UI ---------------------------
 
@@ -262,42 +293,59 @@ with st.sidebar:
     logs_dir = st.text_input("Каталог логов", value="logs")
     _ensure_dir(logs_dir)
 
-    trades_path = st.text_input("Путь к трейдам (для evaluate)", value=os.path.join(logs_dir, "log_trades_*.csv"))
-    reports_path = st.text_input("Путь к отчётам (для evaluate)", value=os.path.join(logs_dir, "reports.csv"))
-    metrics_json = st.text_input("Выход метрик JSON", value=os.path.join(logs_dir, "metrics.json"))
+    trades_path = st.text_input(
+        "Путь к трейдам (для evaluate)",
+        value=os.path.join(logs_dir, "log_trades_*.csv"),
+    )
+    reports_path = st.text_input(
+        "Путь к отчётам (для evaluate)", value=os.path.join(logs_dir, "reports.csv")
+    )
+    metrics_json = st.text_input(
+        "Выход метрик JSON", value=os.path.join(logs_dir, "metrics.json")
+    )
     snapshot_json = st.text_input(
         "Snapshot metrics JSON", value=os.path.join(logs_dir, "snapshot_metrics.json")
     )
     snapshot_csv = st.text_input(
         "Snapshot metrics CSV", value=os.path.join(logs_dir, "snapshot_metrics.csv")
     )
-    equity_png = st.text_input("PNG с equity", value=os.path.join(logs_dir, "equity.png"))
-    signals_csv = st.text_input("Файл сигналов (realtime)", value=os.path.join(logs_dir, "signals.csv"))
-    realtime_log = st.text_input("Лог realtime", value=os.path.join(logs_dir, "realtime.log"))
-    realtime_pid = st.text_input("PID-файл realtime", value=os.path.join(".run", "rt_signaler.pid"))
+    equity_png = st.text_input(
+        "PNG с equity", value=os.path.join(logs_dir, "equity.png")
+    )
+    signals_csv = st.text_input(
+        "Файл сигналов (realtime)", value=os.path.join(logs_dir, "signals.csv")
+    )
+    realtime_log = st.text_input(
+        "Лог realtime", value=os.path.join(logs_dir, "realtime.log")
+    )
+    realtime_pid = st.text_input(
+        "PID-файл realtime", value=os.path.join(".run", "rt_signaler.pid")
+    )
 
-tabs = st.tabs([
-    "Статус",
-    "Ingest",
-    "Features",
-    "Training Table",
-    "Sandbox Backtest",
-    "Evaluate",
-    "Realtime Signaler",
-    "Исполнение",
-    "Логи",
-    "Полный прогон",
-    "Model Train",
-    "YAML-редактор",
-    "Sim Settings",
-    "T-cost Calibrate",
-    "Target Builder",
-    "No-Trade Mask",
-    "Walk-Forward Splits",
-    "Threshold Tuner",
-    "Probability Calibration",
-    "Drift Monitor",
-])
+tabs = st.tabs(
+    [
+        "Статус",
+        "Ingest",
+        "Features",
+        "Training Table",
+        "Sandbox Backtest",
+        "Evaluate",
+        "Realtime Signaler",
+        "Исполнение",
+        "Логи",
+        "Полный прогон",
+        "Model Train",
+        "YAML-редактор",
+        "Sim Settings",
+        "T-cost Calibrate",
+        "Target Builder",
+        "No-Trade Mask",
+        "Walk-Forward Splits",
+        "Threshold Tuner",
+        "Probability Calibration",
+        "Drift Monitor",
+    ]
+)
 # --------------------------- Tab: Status ---------------------------
 
 with tabs[0]:
@@ -310,19 +358,37 @@ with tabs[0]:
         pnl_total = eq.get("pnl_total", None)
         sharpe = eq.get("sharpe", None)
         maxdd = eq.get("max_drawdown", None)
-        st.metric("PNL total", f"{pnl_total:.2f}" if isinstance(pnl_total, (int, float)) else "—")
-        st.metric("Sharpe", f"{sharpe:.2f}" if isinstance(sharpe, (int, float)) else "—")
-        st.metric("Max Drawdown", f"{maxdd:.4f}" if isinstance(maxdd, (int, float)) else "—")
+        st.metric(
+            "PNL total",
+            f"{pnl_total:.2f}" if isinstance(pnl_total, (int, float)) else "—",
+        )
+        st.metric(
+            "Sharpe", f"{sharpe:.2f}" if isinstance(sharpe, (int, float)) else "—"
+        )
+        st.metric(
+            "Max Drawdown", f"{maxdd:.4f}" if isinstance(maxdd, (int, float)) else "—"
+        )
     with col2:
         running = background_running(realtime_pid)
         st.metric("Realtime сигналер", "запущен" if running else "остановлен")
         sig_df = read_csv(signals_csv, n=1)
-        last_sig_ts = int(sig_df.iloc[-1]["ts_ms"]) if not sig_df.empty and "ts_ms" in sig_df.columns else None
+        last_sig_ts = (
+            int(sig_df.iloc[-1]["ts_ms"])
+            if not sig_df.empty and "ts_ms" in sig_df.columns
+            else None
+        )
         st.metric("Последний сигнал ts_ms", str(last_sig_ts) if last_sig_ts else "—")
     with col3:
         rep_df = read_csv(reports_path, n=1)
-        last_eq = float(rep_df.iloc[-1]["equity"]) if not rep_df.empty and "equity" in rep_df.columns else None
-        st.metric("Equity (последняя точка)", f"{last_eq:.2f}" if isinstance(last_eq, (int, float)) else "—")
+        last_eq = (
+            float(rep_df.iloc[-1]["equity"])
+            if not rep_df.empty and "equity" in rep_df.columns
+            else None
+        )
+        st.metric(
+            "Equity (последняя точка)",
+            f"{last_eq:.2f}" if isinstance(last_eq, (int, float)) else "—",
+        )
 
     st.divider()
     st.subheader("Equity (если есть)")
@@ -346,12 +412,21 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Публичный Ingest (orchestrator)")
-    st.caption("Читает configs/ingest.yaml и запускает полный цикл: klines → aggregate → funding/mark → prices.")
+    st.caption(
+        "Читает configs/ingest.yaml и запускает полный цикл: klines → aggregate → funding/mark → prices."
+    )
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Запустить ingest", type="primary"):
-            rc = run_cmd([sys.executable, "scripts/ingest_orchestrator.py", "--config", cfg_ingest],
-                         log_path=os.path.join(logs_dir, "ingest.log"))
+            rc = run_cmd(
+                [
+                    sys.executable,
+                    "scripts/ingest_orchestrator.py",
+                    "--config",
+                    cfg_ingest,
+                ],
+                log_path=os.path.join(logs_dir, "ingest.log"),
+            )
             if rc == 0:
                 st.success("Ingest завершён успешно")
             else:
@@ -369,18 +444,30 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Оффлайн-фичи (единый код с онлайном)")
     prices_in = st.text_input("Входной prices.parquet/csv", value="data/prices.parquet")
-    features_out = st.text_input("Выход features.parquet", value="data/features.parquet")
+    features_out = st.text_input(
+        "Выход features.parquet", value="data/features.parquet"
+    )
     lookbacks = st.text_input("Окна SMA/ret (через запятую)", value="5,15,60")
-    rsi_period = st.number_input("RSI period", min_value=2, max_value=200, value=14, step=1)
+    rsi_period = st.number_input(
+        "RSI period", min_value=2, max_value=200, value=14, step=1
+    )
 
     if st.button("Собрать фичи (make_features.py)", type="primary"):
-        rc = run_cmd([
-            sys.executable, "scripts/make_features.py",
-            "--in", prices_in,
-            "--out", features_out,
-            "--lookbacks", lookbacks,
-            "--rsi-period", str(int(rsi_period)),
-        ], log_path=os.path.join(logs_dir, "features.log"))
+        rc = run_cmd(
+            [
+                sys.executable,
+                "scripts/make_features.py",
+                "--in",
+                prices_in,
+                "--out",
+                features_out,
+                "--lookbacks",
+                lookbacks,
+                "--rsi-period",
+                str(int(rsi_period)),
+            ],
+            log_path=os.path.join(logs_dir, "features.log"),
+        )
         if rc == 0:
             st.success("Фичи собраны")
         else:
@@ -390,30 +477,43 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Training table (сбор меток и merge asof)")
-    st.caption("Вызов вашего scripts/build_training_table.py (аргументы подставьте под ваш проект).")
+    st.caption(
+        "Вызов вашего scripts/build_training_table.py (аргументы подставьте под ваш проект)."
+    )
 
     bt_base = st.text_input("features base (--base)", value="data/features.parquet")
     bt_prices = st.text_input("prices (--prices)", value="data/prices.parquet")
     bt_price_col = st.text_input("price col (--price-col)", value="price")
-    bt_decision_delay = st.number_input("decision_delay_ms", min_value=0, value=500, step=100)
-    bt_horizon = st.number_input("label_horizon_ms", min_value=60_000, value=3_600_000, step=60_000)
+    bt_decision_delay = st.number_input(
+        "decision_delay_ms", min_value=0, value=500, step=100
+    )
+    bt_horizon = st.number_input(
+        "label_horizon_ms", min_value=60_000, value=3_600_000, step=60_000
+    )
     bt_out = st.text_input("Выход train.parquet (--out)", value="data/train.parquet")
 
     extra_sources = st.text_area(
         "Доп. источники (--sources, JSON-список объектов) (опционально)",
-        value='',
-        placeholder='Например: [{"name":"funding","path":"data/futures/BTCUSDT_funding.parquet","time_col":"ts_ms","keys":["symbol"],"direction":"backward","tolerance_ms":86400000}]'
+        value="",
+        placeholder='Например: [{"name":"funding","path":"data/futures/BTCUSDT_funding.parquet","time_col":"ts_ms","keys":["symbol"],"direction":"backward","tolerance_ms":86400000}]',
     )
 
     if st.button("Собрать training table", type="primary"):
         args = [
-            sys.executable, "scripts/build_training_table.py",
-            "--base", bt_base,
-            "--prices", bt_prices,
-            "--price-col", bt_price_col,
-            "--decision-delay-ms", str(int(bt_decision_delay)),
-            "--label-horizon-ms", str(int(bt_horizon)),
-            "--out", bt_out,
+            sys.executable,
+            "scripts/build_training_table.py",
+            "--base",
+            bt_base,
+            "--prices",
+            bt_prices,
+            "--price-col",
+            bt_price_col,
+            "--decision-delay-ms",
+            str(int(bt_decision_delay)),
+            "--label-horizon-ms",
+            str(int(bt_horizon)),
+            "--out",
+            bt_out,
         ]
         if extra_sources.strip():
             args += ["--sources", extra_sources.strip()]
@@ -446,7 +546,9 @@ with tabs[4]:
 
 with tabs[5]:
     st.subheader("Оценка эффективности (ServiceEval)")
-    artifacts_dir_eval = st.text_input("Каталог артефактов", value=os.path.join(logs_dir, "eval"))
+    artifacts_dir_eval = st.text_input(
+        "Каталог артефактов", value=os.path.join(logs_dir, "eval")
+    )
     if st.button("Посчитать метрики", type="primary"):
         cfg_eval = EvalConfig(
             trades_path=trades_path,
@@ -475,15 +577,24 @@ with tabs[5]:
 with tabs[6]:
     st.subheader("Realtime сигналер (WebSocket Binance, без ключей)")
 
-    with st.expander("Параметры стратегии (сохранить в configs/realtime.yaml)", expanded=False):
+    with st.expander(
+        "Параметры стратегии (сохранить в configs/realtime.yaml)", expanded=False
+    ):
         try:
             import copy
+
             rt_cfg = load_config(cfg_realtime).model_dump()
             st.write("Текущая стратегия:")
             strat = rt_cfg.get("strategy", {}) or {}
             st.code(json.dumps(strat, ensure_ascii=False, indent=2), language="json")
-            model_path = st.text_input("Путь к модели (strategy.params.model_path)", value=str(strat.get("params", {}).get("model_path", "")))
-            thr = st.text_input("Порог (strategy.params.threshold)", value=str(strat.get("params", {}).get("threshold", "0.0")))
+            model_path = st.text_input(
+                "Путь к модели (strategy.params.model_path)",
+                value=str(strat.get("params", {}).get("model_path", "")),
+            )
+            thr = st.text_input(
+                "Порог (strategy.params.threshold)",
+                value=str(strat.get("params", {}).get("threshold", "0.0")),
+            )
             if st.button("Сохранить изменения в configs/realtime.yaml"):
                 new_cfg = copy.deepcopy(rt_cfg)
                 new_cfg.setdefault("strategy", {}).setdefault("params", {})
@@ -539,11 +650,21 @@ with tabs[6]:
     st.divider()
     st.markdown("### Демо ServiceSignalRunner")
     if st.button("Запустить демо ServiceSignalRunner"):
+
         class DummyAdapter:
             def run_events(self, provider):
                 from core_models import Bar
+
                 for i in range(3):
-                    bar = Bar(symbol="BTCUSDT", ts=i, open=0.0, high=0.0, low=0.0, close=100.0 + i, volume_base=1.0)
+                    bar = Bar(
+                        symbol="BTCUSDT",
+                        ts=i,
+                        open=0.0,
+                        high=0.0,
+                        low=0.0,
+                        close=100.0 + i,
+                        volume_base=1.0,
+                    )
                     provider.on_bar(bar)
                     yield {"ts_ms": i, "symbol": "BTCUSDT"}
 
@@ -563,7 +684,9 @@ with tabs[6]:
 
         try:
             adapter = DummyAdapter()
-            runner = ServiceSignalRunner(adapter, DummyFP(), DummyStrat(), None, RunnerConfig())
+            runner = ServiceSignalRunner(
+                adapter, DummyFP(), DummyStrat(), None, RunnerConfig()
+            )
             list(runner.run())
             st.success("ServiceSignalRunner выполнен (демо)")
         except Exception as e:
@@ -572,8 +695,16 @@ with tabs[6]:
 with tabs[7]:
     st.subheader("Очередь на исполнение (manual approve)")
 
-    st.caption("Берём последние сигналы из logs/signals.csv. Можно Approve/Reject, экспортировать подтверждённые.")
-    max_rows = st.number_input("Сколько последних строк показывать", min_value=10, max_value=5000, value=200, step=10)
+    st.caption(
+        "Берём последние сигналы из logs/signals.csv. Можно Approve/Reject, экспортировать подтверждённые."
+    )
+    max_rows = st.number_input(
+        "Сколько последних строк показывать",
+        min_value=10,
+        max_value=5000,
+        value=200,
+        step=10,
+    )
     sig_df = load_signals_full(signals_csv, max_rows=max_rows)
 
     colA, colB, colC = st.columns(3)
@@ -585,7 +716,9 @@ with tabs[7]:
         st.caption(f"Approved: `{approved_path}`")
         st.caption(f"Rejected: `{rejected_path}`")
     with colC:
-        st.caption("Формат файла approved/rejected совпадает с logs/signals.csv + колонка uid")
+        st.caption(
+            "Формат файла approved/rejected совпадает с logs/signals.csv + колонка uid"
+        )
 
     if sig_df.empty:
         st.info("Сигналов пока нет.")
@@ -595,7 +728,10 @@ with tabs[7]:
 
         st.divider()
         st.subheader("Approve / Reject (по одному сигналу)")
-        uid = st.text_input("UID сигнала для действия (см. колонку uid)", value=str(sig_df.iloc[-1]["uid"]))
+        uid = st.text_input(
+            "UID сигнала для действия (см. колонку uid)",
+            value=str(sig_df.iloc[-1]["uid"]),
+        )
         action_cols = st.columns(2)
         with action_cols[0]:
             if st.button("Approve выбранный UID", type="primary"):
@@ -605,7 +741,9 @@ with tabs[7]:
                 else:
                     r = row.iloc[-1].to_dict()
                     header = list(sig_df.columns)
-                    append_row_csv(approved_path, header, [r.get(c, "") for c in header])
+                    append_row_csv(
+                        approved_path, header, [r.get(c, "") for c in header]
+                    )
                     st.success("Добавлено в approved.")
         with action_cols[1]:
             if st.button("Reject выбранный UID", type="secondary"):
@@ -615,7 +753,9 @@ with tabs[7]:
                 else:
                     r = row.iloc[-1].to_dict()
                     header = list(sig_df.columns)
-                    append_row_csv(rejected_path, header, [r.get(c, "") for c in header])
+                    append_row_csv(
+                        rejected_path, header, [r.get(c, "") for c in header]
+                    )
                     st.success("Добавлено в rejected.")
 
         st.divider()
@@ -624,11 +764,16 @@ with tabs[7]:
             ap_df = read_csv(approved_path, n=10_000)
             if not ap_df.empty:
                 csv_bytes = ap_df.to_csv(index=False).encode("utf-8")
-                st.download_button("Скачать approved CSV", data=csv_bytes, file_name="signals_approved.csv", mime="text/csv")
+                st.download_button(
+                    "Скачать approved CSV",
+                    data=csv_bytes,
+                    file_name="signals_approved.csv",
+                    mime="text/csv",
+                )
             else:
                 st.info("Файл approved пуст.")
         except Exception as e:
-            st.error(str(e)) 
+            st.error(str(e))
 
 # --------------------------- Tab: Логи ---------------------------
 
@@ -648,31 +793,71 @@ with tabs[8]:
             st.code(content if content else "(пусто)")
 
 with tabs[9]:
-    st.subheader("Полный прогон (ingest → features → train table → backtest → evaluate)")
-    st.caption("Один клик запускает весь конвейер. Параметры ниже можно откорректировать.")
+    st.subheader(
+        "Полный прогон (ingest → features → train table → backtest → evaluate)"
+    )
+    st.caption(
+        "Один клик запускает весь конвейер. Параметры ниже можно откорректировать."
+    )
 
     colA, colB = st.columns(2)
     with colA:
         st.markdown("**Ingest / Features**")
-        prices_in = st.text_input("prices (вход, после orchestrator)", value="data/prices.parquet", key="full_prices_in")
-        features_out = st.text_input("features (выход make_features.py)", value="data/features.parquet", key="full_features_out")
-        lookbacks = st.text_input("Окна SMA/ret (через запятую)", value="5,15,60", key="full_lookbacks")
-        rsi_period = st.number_input("RSI period", min_value=2, max_value=200, value=14, step=1, key="full_rsi")
+        prices_in = st.text_input(
+            "prices (вход, после orchestrator)",
+            value="data/prices.parquet",
+            key="full_prices_in",
+        )
+        features_out = st.text_input(
+            "features (выход make_features.py)",
+            value="data/features.parquet",
+            key="full_features_out",
+        )
+        lookbacks = st.text_input(
+            "Окна SMA/ret (через запятую)", value="5,15,60", key="full_lookbacks"
+        )
+        rsi_period = st.number_input(
+            "RSI period", min_value=2, max_value=200, value=14, step=1, key="full_rsi"
+        )
 
     with colB:
         st.markdown("**Training Table**")
-        bt_base = st.text_input("features base (--base)", value="data/features.parquet", key="full_bt_base")
-        bt_prices = st.text_input("prices (--prices)", value="data/prices.parquet", key="full_bt_prices")
-        bt_price_col = st.text_input("price col (--price-col)", value="price", key="full_bt_price_col")
-        bt_decision_delay = st.number_input("decision_delay_ms", min_value=0, value=500, step=100, key="full_decision_delay")
-        bt_horizon = st.number_input("label_horizon_ms", min_value=60_000, value=3_600_000, step=60_000, key="full_horizon")
-        bt_out = st.text_input("Выход train.parquet (--out)", value="data/train.parquet", key="full_bt_out")
+        bt_base = st.text_input(
+            "features base (--base)", value="data/features.parquet", key="full_bt_base"
+        )
+        bt_prices = st.text_input(
+            "prices (--prices)", value="data/prices.parquet", key="full_bt_prices"
+        )
+        bt_price_col = st.text_input(
+            "price col (--price-col)", value="price", key="full_bt_price_col"
+        )
+        bt_decision_delay = st.number_input(
+            "decision_delay_ms",
+            min_value=0,
+            value=500,
+            step=100,
+            key="full_decision_delay",
+        )
+        bt_horizon = st.number_input(
+            "label_horizon_ms",
+            min_value=60_000,
+            value=3_600_000,
+            step=60_000,
+            key="full_horizon",
+        )
+        bt_out = st.text_input(
+            "Выход train.parquet (--out)", value="data/train.parquet", key="full_bt_out"
+        )
 
     st.markdown("**Evaluate**")
-    out_md = st.text_input("Выход markdown", value=os.path.join(logs_dir, "metrics.md"), key="full_out_md")
+    out_md = st.text_input(
+        "Выход markdown", value=os.path.join(logs_dir, "metrics.md"), key="full_out_md"
+    )
 
     st.markdown("**Realtime (опционально)**")
-    start_rt = st.checkbox("Запустить realtime сигналер после завершения", value=False, key="full_start_rt")
+    start_rt = st.checkbox(
+        "Запустить realtime сигналер после завершения", value=False, key="full_start_rt"
+    )
 
     if st.button("Запустить полный прогон", type="primary", key="full_build_btn"):
         build_all_pipeline(
@@ -728,6 +913,7 @@ with tabs[10]:
             # Разобьём команду по пробелам простым способом; при необходимости пользователь может обрамлять пути кавычками
             try:
                 import shlex
+
                 cmd_list = shlex.split(custom_cmd)
                 rc = run_cmd(cmd_list, log_path=custom_log)
                 if rc == 0:
@@ -742,13 +928,22 @@ with tabs[10]:
 
     st.divider()
     st.markdown("### Указать артефакт модели и записать в configs/realtime.yaml")
-    model_art = st.text_input("Путь к готовому файлу модели (.pkl или др.)", value="artifacts/model.pkl", key="mt_art_path_a")
+    model_art = st.text_input(
+        "Путь к готовому файлу модели (.pkl или др.)",
+        value="artifacts/model.pkl",
+        key="mt_art_path_a",
+    )
 
     set_cols = st.columns(2)
     with set_cols[0]:
-        if st.button("Записать model_path в configs/realtime.yaml", type="primary", key="mt_set_model_a"):
+        if st.button(
+            "Записать model_path в configs/realtime.yaml",
+            type="primary",
+            key="mt_set_model_a",
+        ):
             try:
                 import copy
+
                 rt_cfg = load_config(cfg_realtime).model_dump()
                 new_cfg = copy.deepcopy(rt_cfg)
                 new_cfg.setdefault("strategy", {}).setdefault("params", {})
@@ -771,7 +966,9 @@ with tabs[10]:
 with tabs[11]:
     st.subheader("YAML-редактор конфигов проекта")
 
-    st.caption("Редактируйте и сохраняйте конфиги: ingest.yaml, sandbox.yaml, sim.yaml, realtime.yaml. Есть проверка синтаксиса YAML и базовая валидация ключей.")
+    st.caption(
+        "Редактируйте и сохраняйте конфиги: ingest.yaml, sandbox.yaml, sim.yaml, realtime.yaml. Есть проверка синтаксиса YAML и базовая валидация ключей."
+    )
 
     files = {
         "configs/ingest.yaml": cfg_ingest,
@@ -790,7 +987,12 @@ with tabs[11]:
         )
     with col_top[1]:
         path = files.get(choice, choice)
-        st.text_input("Полный путь к выбранному файлу", value=path, key="yaml_editor_path", disabled=True)
+        st.text_input(
+            "Полный путь к выбранному файлу",
+            value=path,
+            key="yaml_editor_path",
+            disabled=True,
+        )
 
     # читаем содержимое
     initial_text = ""
@@ -803,7 +1005,9 @@ with tabs[11]:
     except Exception as e:
         initial_text = f"# ошибка чтения файла: {e}\n"
 
-    content = st.text_area("Содержимое YAML", value=initial_text, height=500, key="yaml_editor_content")
+    content = st.text_area(
+        "Содержимое YAML", value=initial_text, height=500, key="yaml_editor_content"
+    )
 
     col_actions = st.columns(3)
     with col_actions[0]:
@@ -833,9 +1037,14 @@ with tabs[11]:
                         if not isinstance(data, dict) or k not in data:
                             issues.append(f"нет ключа '{k}'")
                 elif fname == "sim.yaml":
-                    soft_any = any(k in (data or {}) for k in ["fees", "slippage", "risk", "pnl", "leakguard"])
+                    soft_any = any(
+                        k in (data or {})
+                        for k in ["fees", "slippage", "risk", "pnl", "leakguard"]
+                    )
                     if not soft_any:
-                        issues.append("не найден ни один из ожидаемых блоков: fees/slippage/risk/pnl/leakguard")
+                        issues.append(
+                            "не найден ни один из ожидаемых блоков: fees/slippage/risk/pnl/leakguard"
+                        )
                 elif fname == "realtime.yaml":
                     required = ["market", "symbols", "interval", "strategy", "out_csv"]
                     for k in required:
@@ -880,7 +1089,8 @@ with tabs[11]:
     st.divider()
     st.subheader("Подсказки по ключам (необязательные)")
     with st.expander("ingest.yaml — ожидаемые ключи", expanded=False):
-        st.code("""symbols: ["BTCUSDT", "ETHUSDT"]
+        st.code(
+            """symbols: ["BTCUSDT", "ETHUSDT"]
 market: "futures"         # "spot" или "futures"
 intervals: ["1m"]
 aggregate_to: ["5m", "15m", "1h"]
@@ -896,10 +1106,13 @@ futures:
 slowness:
   api_limit: 1500
   sleep_ms: 350
-""", language="yaml")
+""",
+            language="yaml",
+        )
 
     with st.expander("sandbox.yaml — ожидаемые ключи", expanded=False):
-        st.code("""mode: "backtest"
+        st.code(
+            """mode: "backtest"
 symbol: "BTCUSDT"
 latency_steps: 0
 sim_config_path: "configs/sim.yaml"
@@ -926,10 +1139,13 @@ dynamic_spread:
   min_bps: 1.0
   max_bps: 25.0
 out_reports: "logs/sandbox_reports.csv"
-""", language="yaml")
+""",
+            language="yaml",
+        )
 
     with st.expander("sim.yaml — примерные блоки", expanded=False):
-        st.code("""fees:
+        st.code(
+            """fees:
   maker_bps: 1.0
   taker_bps: 5.0
 slippage:
@@ -944,10 +1160,13 @@ risk:
   max_order_notional: 200.0
   max_abs_position_notional: 1000.0
   max_orders_per_min: 10
-""", language="yaml")
+""",
+            language="yaml",
+        )
 
     with st.expander("realtime.yaml — ожидаемые ключи", expanded=False):
-        st.code("""market: "futures"
+        st.code(
+            """market: "futures"
 symbols: ["BTCUSDT"]
 interval: "1m"
 strategy:
@@ -964,14 +1183,18 @@ features:
 out_csv: "logs/signals.csv"
 min_signal_gap_s: 300
 backfill_on_gap: true
-""", language="yaml")
+""",
+            language="yaml",
+        )
 
 
 with tabs[12]:
     st.subheader("Sim Settings — тонкая настройка симулятора (configs/sim.yaml)")
 
-    st.caption("Редактируйте параметры симулятора через форму. Неизвестные ключи в sim.yaml будут сохранены без изменений. "
-               "Это влияет на бэктест (script_backtest.py).")
+    st.caption(
+        "Редактируйте параметры симулятора через форму. Неизвестные ключи в sim.yaml будут сохранены без изменений. "
+        "Это влияет на бэктест (script_backtest.py)."
+    )
 
     # читаем текущий sim.yaml
     current = {}
@@ -991,33 +1214,88 @@ with tabs[12]:
     st.markdown("### Комиссии (fees)")
     col_f1, col_f2 = st.columns(2)
     with col_f1:
-        maker_bps = st.number_input("maker_bps (bps)", min_value=0.0, value=float(fees.get("maker_bps", 1.0)), step=0.1)
+        maker_bps = st.number_input(
+            "maker_bps (bps)",
+            min_value=0.0,
+            value=float(fees.get("maker_bps", 1.0)),
+            step=0.1,
+        )
     with col_f2:
-        taker_bps = st.number_input("taker_bps (bps)", min_value=0.0, value=float(fees.get("taker_bps", 5.0)), step=0.1)
+        taker_bps = st.number_input(
+            "taker_bps (bps)",
+            min_value=0.0,
+            value=float(fees.get("taker_bps", 5.0)),
+            step=0.1,
+        )
 
     st.markdown("### Слиппедж/спред (slippage)")
     col_s1, col_s2, col_s3 = st.columns(3)
     with col_s1:
-        k_slip = st.number_input("k (множитель слиппеджа)", min_value=0.0, value=float(slippage.get("k", 0.8)), step=0.1)
+        k_slip = st.number_input(
+            "k (множитель слиппеджа)",
+            min_value=0.0,
+            value=float(slippage.get("k", 0.8)),
+            step=0.1,
+        )
     with col_s2:
-        default_spread_bps = st.number_input("default_spread_bps (bps)", min_value=0.0, value=float(slippage.get("default_spread_bps", 3.0)), step=0.5)
+        default_spread_bps = st.number_input(
+            "default_spread_bps (bps)",
+            min_value=0.0,
+            value=float(slippage.get("default_spread_bps", 3.0)),
+            step=0.5,
+        )
     with col_s3:
-        min_half_spread_bps = st.number_input("min_half_spread_bps (bps)", min_value=0.0, value=float(slippage.get("min_half_spread_bps", 0.0)), step=0.1)
+        min_half_spread_bps = st.number_input(
+            "min_half_spread_bps (bps)",
+            min_value=0.0,
+            value=float(slippage.get("min_half_spread_bps", 0.0)),
+            step=0.1,
+        )
 
     st.markdown("### PnL")
-    mark_to = st.selectbox("mark_to", options=["side", "mid", "close"], index=["side", "mid", "close"].index(str(pnl.get("mark_to", "side")) if pnl.get("mark_to") in ["side", "mid", "close"] else "side"))
+    mark_to = st.selectbox(
+        "mark_to",
+        options=["side", "mid", "close"],
+        index=["side", "mid", "close"].index(
+            str(pnl.get("mark_to", "side"))
+            if pnl.get("mark_to") in ["side", "mid", "close"]
+            else "side"
+        ),
+    )
 
     st.markdown("### Leakguard (защита от утечек времени)")
-    decision_delay_ms = st.number_input("decision_delay_ms (мс)", min_value=0, value=int(leakguard.get("decision_delay_ms", 500)), step=50)
+    decision_delay_ms = st.number_input(
+        "decision_delay_ms (мс)",
+        min_value=0,
+        value=int(leakguard.get("decision_delay_ms", 500)),
+        step=50,
+    )
 
     st.markdown("### Риск-менеджмент")
     col_r1, col_r2, col_r3 = st.columns(3)
     with col_r1:
-        max_order_notional = st.number_input("max_order_notional", min_value=0.0, value=float(risk.get("max_order_notional", 200.0)), step=10.0, format="%.6f")
+        max_order_notional = st.number_input(
+            "max_order_notional",
+            min_value=0.0,
+            value=float(risk.get("max_order_notional", 200.0)),
+            step=10.0,
+            format="%.6f",
+        )
     with col_r2:
-        max_abs_position_notional = st.number_input("max_abs_position_notional", min_value=0.0, value=float(risk.get("max_abs_position_notional", 1000.0)), step=10.0, format="%.6f")
+        max_abs_position_notional = st.number_input(
+            "max_abs_position_notional",
+            min_value=0.0,
+            value=float(risk.get("max_abs_position_notional", 1000.0)),
+            step=10.0,
+            format="%.6f",
+        )
     with col_r3:
-        max_orders_per_min = st.number_input("max_orders_per_min", min_value=0, value=int(risk.get("max_orders_per_min", 10)), step=1)
+        max_orders_per_min = st.number_input(
+            "max_orders_per_min",
+            min_value=0,
+            value=int(risk.get("max_orders_per_min", 10)),
+            step=1,
+        )
 
     st.divider()
     col_act1, col_act2, col_act3 = st.columns(3)
@@ -1082,10 +1360,16 @@ with tabs[12]:
                             issues.append(f"slippage: нет ключа '{k}'")
                 if "pnl" in data and "mark_to" not in (data["pnl"] or {}):
                     issues.append("pnl: нет ключа 'mark_to'")
-                if "leakguard" in data and "decision_delay_ms" not in (data["leakguard"] or {}):
+                if "leakguard" in data and "decision_delay_ms" not in (
+                    data["leakguard"] or {}
+                ):
                     issues.append("leakguard: нет ключа 'decision_delay_ms'")
                 if "risk" in data:
-                    for k in ["max_order_notional", "max_abs_position_notional", "max_orders_per_min"]:
+                    for k in [
+                        "max_order_notional",
+                        "max_abs_position_notional",
+                        "max_orders_per_min",
+                    ]:
                         if k not in (data["risk"] or {}):
                             issues.append(f"risk: нет ключа '{k}'")
                 if issues:
@@ -1110,10 +1394,14 @@ with tabs[12]:
     )
 
 with tabs[13]:
-    st.subheader("T-cost Calibrate — калибровка модели издержек (base_bps, alpha_vol, beta_illiquidity)")
+    st.subheader(
+        "T-cost Calibrate — калибровка модели издержек (base_bps, alpha_vol, beta_illiquidity)"
+    )
 
-    st.caption("Форма ниже читает ваш датасет (CSV/Parquet), строит прокси-спред по high/low (или |log return|), "
-               "оценивает параметры линейной модели спреда и при желании записывает их в configs/sandbox.yaml → dynamic_spread.")
+    st.caption(
+        "Форма ниже читает ваш датасет (CSV/Parquet), строит прокси-спред по high/low (или |log return|), "
+        "оценивает параметры линейной модели спреда и при желании записывает их в configs/sandbox.yaml → dynamic_spread."
+    )
 
     import io
     import json
@@ -1159,7 +1447,11 @@ with tabs[13]:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         df = df.sort_values([symbol_col, ts_col]).reset_index(drop=True)
 
-        if vol_mode.lower() == "hl" and ("high" in df.columns) and ("low" in df.columns):
+        if (
+            vol_mode.lower() == "hl"
+            and ("high" in df.columns)
+            and ("low" in df.columns)
+        ):
             hi = pd.to_numeric(df["high"], errors="coerce").astype(float)
             lo = pd.to_numeric(df["low"], errors="coerce").astype(float)
             ref = pd.to_numeric(df[price_col], errors="coerce").astype(float)
@@ -1171,7 +1463,9 @@ with tabs[13]:
             ref = pd.to_numeric(df[price_col], errors="coerce").astype(float)
             prev = ref.shift(1)
             with np.errstate(divide="ignore", invalid="ignore"):
-                ret = np.abs(np.log(np.where((ref > 0) & (prev > 0), ref / prev, np.nan)))
+                ret = np.abs(
+                    np.log(np.where((ref > 0) & (prev > 0), ref / prev, np.nan))
+                )
             vol_factor = ret
             v_bps = vol_factor * 10000.0
             y_bps = v_bps * 0.5
@@ -1194,7 +1488,9 @@ with tabs[13]:
         v_bps = v_bps.to_numpy() if isinstance(v_bps, pd.Series) else np.asarray(v_bps)
         return v_bps, r_liq, y_bps
 
-    def _fit_linear(y_bps: np.ndarray, v_bps: np.ndarray, r_liq: np.ndarray, winsor: float):
+    def _fit_linear(
+        y_bps: np.ndarray, v_bps: np.ndarray, r_liq: np.ndarray, winsor: float
+    ):
         mask = np.isfinite(y_bps) & np.isfinite(v_bps) & np.isfinite(r_liq)
         y = y_bps[mask].astype(float)
         v = v_bps[mask].astype(float)
@@ -1234,28 +1530,71 @@ with tabs[13]:
     with col_now2:
         st.metric("alpha_vol (текущий)", f"{float(dyn.get('alpha_vol', 0.5)):.6f}")
     with col_now3:
-        st.metric("beta_illiquidity (текущий)", f"{float(dyn.get('beta_illiquidity', 1.0)):.6f}")
+        st.metric(
+            "beta_illiquidity (текущий)",
+            f"{float(dyn.get('beta_illiquidity', 1.0)):.6f}",
+        )
 
     st.divider()
 
     # ---------- UI: форма калибровки ----------
     with st.form("tcost_calib_form"):
-        data_path = st.text_input("Путь к датасету (CSV/Parquet)", value=str(current_cfg.get("data", {}).get("path", "data/train.parquet")))
-        symbol = st.text_input("Символ (опционально, напр. BTCUSDT)", value=str(current_cfg.get("symbol", "BTCUSDT")))
-        ts_col = st.text_input("Колонка времени", value=str(current_cfg.get("data", {}).get("ts_col", "ts_ms")))
-        symbol_col = st.text_input("Колонка символа", value=str(current_cfg.get("data", {}).get("symbol_col", "symbol")))
-        price_col = st.text_input("Колонка цены-референса", value=str(current_cfg.get("data", {}).get("price_col", "ref_price")))
+        data_path = st.text_input(
+            "Путь к датасету (CSV/Parquet)",
+            value=str(current_cfg.get("data", {}).get("path", "data/train.parquet")),
+        )
+        symbol = st.text_input(
+            "Символ (опционально, напр. BTCUSDT)",
+            value=str(current_cfg.get("symbol", "BTCUSDT")),
+        )
+        ts_col = st.text_input(
+            "Колонка времени",
+            value=str(current_cfg.get("data", {}).get("ts_col", "ts_ms")),
+        )
+        symbol_col = st.text_input(
+            "Колонка символа",
+            value=str(current_cfg.get("data", {}).get("symbol_col", "symbol")),
+        )
+        price_col = st.text_input(
+            "Колонка цены-референса",
+            value=str(current_cfg.get("data", {}).get("price_col", "ref_price")),
+        )
 
         col_a, col_b, col_c = st.columns(3)
         with col_a:
-            vol_mode = st.selectbox("Источник волатильности", options=["hl", "ret"], index=0 if str((current_cfg.get("dynamic_spread", {}) or {}).get("vol_mode", "hl")).lower() == "hl" else 1)
+            vol_mode = st.selectbox(
+                "Источник волатильности",
+                options=["hl", "ret"],
+                index=(
+                    0
+                    if str(
+                        (current_cfg.get("dynamic_spread", {}) or {}).get(
+                            "vol_mode", "hl"
+                        )
+                    ).lower()
+                    == "hl"
+                    else 1
+                ),
+            )
         with col_b:
-            winsor = st.number_input("Винзоризация (доля, 0..0.2)", min_value=0.0, max_value=0.2, step=0.01, value=0.01)
+            winsor = st.number_input(
+                "Винзоризация (доля, 0..0.2)",
+                min_value=0.0,
+                max_value=0.2,
+                step=0.01,
+                value=0.01,
+            )
         with col_c:
             dry_run = st.checkbox("Только посмотреть (не записывать YAML)", value=False)
 
-        liq_col = str((current_cfg.get("dynamic_spread", {}) or {}).get("liq_col", "number_of_trades"))
-        liq_ref = float((current_cfg.get("dynamic_spread", {}) or {}).get("liq_ref", 1000.0))
+        liq_col = str(
+            (current_cfg.get("dynamic_spread", {}) or {}).get(
+                "liq_col", "number_of_trades"
+            )
+        )
+        liq_ref = float(
+            (current_cfg.get("dynamic_spread", {}) or {}).get("liq_ref", 1000.0)
+        )
 
         st.caption(f"Ликвидность: liq_col='{liq_col}', liq_ref={liq_ref}")
 
@@ -1268,7 +1607,10 @@ with tabs[13]:
             else:
                 df = _read_table(data_path)
                 if symbol:
-                    df = df.loc[df[symbol_col].astype(str).str.upper() == str(symbol).strip().upper()].copy()
+                    df = df.loc[
+                        df[symbol_col].astype(str).str.upper()
+                        == str(symbol).strip().upper()
+                    ].copy()
                     if df.empty:
                         st.error(f"В данных нет строк для символа {symbol}")
                         st.stop()
@@ -1282,15 +1624,19 @@ with tabs[13]:
                     liq_col=liq_col,
                     liq_ref=liq_ref,
                 )
-                base_bps, alpha_vol, beta_ill, rmse, mae, corr = _fit_linear(y_bps, v_bps, r_liq, winsor)
+                base_bps, alpha_vol, beta_ill, rmse, mae, corr = _fit_linear(
+                    y_bps, v_bps, r_liq, winsor
+                )
 
                 st.success("Калибровка выполнена")
-                st.json({
-                    "base_bps": float(base_bps),
-                    "alpha_vol": float(alpha_vol),
-                    "beta_illiquidity": float(beta_ill),
-                    "fit": {"rmse_bps": rmse, "mae_bps": mae, "corr": corr},
-                })
+                st.json(
+                    {
+                        "base_bps": float(base_bps),
+                        "alpha_vol": float(alpha_vol),
+                        "beta_illiquidity": float(beta_ill),
+                        "fit": {"rmse_bps": rmse, "mae_bps": mae, "corr": corr},
+                    }
+                )
 
                 if not dry_run:
                     # обновим YAML
@@ -1307,7 +1653,14 @@ with tabs[13]:
                     st.success(f"Обновлено: {cfg_sandbox}")
 
                     # покажем итоговые параметры
-                    st.code(yaml.safe_dump({"dynamic_spread": new_dyn}, sort_keys=False, allow_unicode=True), language="yaml")
+                    st.code(
+                        yaml.safe_dump(
+                            {"dynamic_spread": new_dyn},
+                            sort_keys=False,
+                            allow_unicode=True,
+                        ),
+                        language="yaml",
+                    )
                 else:
                     st.info("DRY-RUN: файл configs/sandbox.yaml не изменён.")
         except Exception as e:
@@ -1320,7 +1673,9 @@ with tabs[13]:
     )
 
 with tabs[14]:
-    st.subheader("Target Builder — cost-aware таргет с учётом комиссий и динамического спреда")
+    st.subheader(
+        "Target Builder — cost-aware таргет с учётом комиссий и динамического спреда"
+    )
 
     import os
     import pandas as pd
@@ -1347,13 +1702,27 @@ with tabs[14]:
         raise ValueError(f"Неизвестный формат файла вывода: {ext}")
 
     with st.form("target_builder_form"):
-        data_path = st.text_input("Входной датасет (CSV/Parquet)", value="data/train.parquet")
-        out_path = st.text_input("Куда сохранить (если пусто — рядом с суффиксом _costaware)", value="")
-        sandbox_yaml = st.text_input("sandbox.yaml (динамический спред)", value="configs/sandbox.yaml")
-        sim_yaml = st.text_input("sim.yaml (комиссии, опционально)", value="configs/sim.yaml")
-        fees_bps_total = st.text_input("Комиссия (bps round-trip, опционально — перебивает sim.yaml)", value="")
-        horizon_bars = st.number_input("Горизонт (в барах)", min_value=1, step=1, value=60)
-        threshold = st.text_input("Порог для бинарной метки (опционально, например 0.0005)", value="")
+        data_path = st.text_input(
+            "Входной датасет (CSV/Parquet)", value="data/train.parquet"
+        )
+        out_path = st.text_input(
+            "Куда сохранить (если пусто — рядом с суффиксом _costaware)", value=""
+        )
+        sandbox_yaml = st.text_input(
+            "sandbox.yaml (динамический спред)", value="configs/sandbox.yaml"
+        )
+        sim_yaml = st.text_input(
+            "sim.yaml (комиссии, опционально)", value="configs/sim.yaml"
+        )
+        fees_bps_total = st.text_input(
+            "Комиссия (bps round-trip, опционально — перебивает sim.yaml)", value=""
+        )
+        horizon_bars = st.number_input(
+            "Горизонт (в барах)", min_value=1, step=1, value=60
+        )
+        threshold = st.text_input(
+            "Порог для бинарной метки (опционально, например 0.0005)", value=""
+        )
         ts_col = st.text_input("Колонка времени", value="ts_ms")
         symbol_col = st.text_input("Колонка символа", value="symbol")
         price_col = st.text_input("Колонка цены", value="ref_price")
@@ -1386,7 +1755,11 @@ with tabs[14]:
 
             _write_table(out_df, out_path)
             st.success(f"Готово. Записано: {out_path}")
-            cols = [c for c in out_df.columns if c.startswith("eff_ret_") or c.startswith("y_eff_")] + ["slippage_bps", "fees_bps_total"]
+            cols = [
+                c
+                for c in out_df.columns
+                if c.startswith("eff_ret_") or c.startswith("y_eff_")
+            ] + ["slippage_bps", "fees_bps_total"]
             st.caption("Добавленные колонки:")
             st.code(", ".join(cols))
         except Exception as e:
@@ -1419,9 +1792,16 @@ with tabs[15]:
         raise ValueError(f"Неизвестный формат файла вывода: {ext}")
 
     with st.form("no_trade_mask_form"):
-        data_path = st.text_input("Входной датасет (после Target Builder)", value="data/train_costaware.parquet")
-        out_path = st.text_input("Куда сохранить (если пусто — суффикс _masked)", value="")
-        sandbox_yaml = st.text_input("sandbox.yaml (правила no_trade)", value="configs/sandbox.yaml")
+        data_path = st.text_input(
+            "Входной датасет (после Target Builder)",
+            value="data/train_costaware.parquet",
+        )
+        out_path = st.text_input(
+            "Куда сохранить (если пусто — суффикс _masked)", value=""
+        )
+        sandbox_yaml = st.text_input(
+            "sandbox.yaml (правила no_trade)", value="configs/sandbox.yaml"
+        )
         ts_col = st.text_input("Колонка времени", value="ts_ms")
         mode = st.selectbox("Режим", options=["drop", "weight"], index=0)
         submitted = st.form_submit_button("Применить маску")
@@ -1432,7 +1812,9 @@ with tabs[15]:
                 st.error(f"Файл не найден: {data_path}")
                 st.stop()
             df = _read_table_mask(data_path)
-            mask_block = compute_no_trade_mask(df, sandbox_yaml_path=sandbox_yaml, ts_col=ts_col)
+            mask_block = compute_no_trade_mask(
+                df, sandbox_yaml_path=sandbox_yaml, ts_col=ts_col
+            )
 
             if mode == "drop":
                 out_df = df.loc[~mask_block].reset_index(drop=True)
@@ -1450,9 +1832,13 @@ with tabs[15]:
             total = int(len(df))
             blocked = int(mask_block.sum())
             kept = int(len(out_df))
-            st.success(f"Готово. Всего строк: {total}. Запрещённых (no_trade): {blocked}. Вышло: {kept}.")
+            st.success(
+                f"Готово. Всего строк: {total}. Запрещённых (no_trade): {blocked}. Вышло: {kept}."
+            )
             if mode == "weight":
-                z = int((out_df.get('train_weight', pd.Series(dtype=float)) == 0.0).sum())
+                z = int(
+                    (out_df.get("train_weight", pd.Series(dtype=float)) == 0.0).sum()
+                )
                 st.info(f"Назначено train_weight=0 для {z} строк.")
         except Exception as e:
             st.error(f"Ошибка: {e}")
@@ -1494,24 +1880,38 @@ with tabs[16]:
             yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
     with st.form("walkforward_form"):
-        data_path = st.text_input("Входной датасет (после маски)", value="data/train_costaware_masked.parquet")
+        data_path = st.text_input(
+            "Входной датасет (после маски)", value="data/train_costaware_masked.parquet"
+        )
         out_path = st.text_input("Куда сохранить (если пусто — суффикс _wf)", value="")
         ts_col = st.text_input("Колонка времени", value="ts_ms")
         symbol_col = st.text_input("Колонка символа (если есть)", value="symbol")
-        interval_ms = st.text_input("Интервал бара, мс (опционально, иначе оценим)", value="")
+        interval_ms = st.text_input(
+            "Интервал бара, мс (опционально, иначе оценим)", value=""
+        )
         col1, col2, col3 = st.columns(3)
         with col1:
-            train_span_bars = st.number_input("train_span_bars", min_value=1, step=1, value=7*24*60)
+            train_span_bars = st.number_input(
+                "train_span_bars", min_value=1, step=1, value=7 * 24 * 60
+            )
         with col2:
-            val_span_bars = st.number_input("val_span_bars", min_value=1, step=1, value=24*60)
+            val_span_bars = st.number_input(
+                "val_span_bars", min_value=1, step=1, value=24 * 60
+            )
         with col3:
-            step_bars = st.number_input("step_bars", min_value=1, step=1, value=24*60)
+            step_bars = st.number_input("step_bars", min_value=1, step=1, value=24 * 60)
         col4, col5 = st.columns(2)
         with col4:
-            horizon_bars = st.number_input("horizon_bars (PURGE)", min_value=1, step=1, value=60)
+            horizon_bars = st.number_input(
+                "horizon_bars (PURGE)", min_value=1, step=1, value=60
+            )
         with col5:
-            embargo_bars = st.number_input("embargo_bars (EMBARGO)", min_value=0, step=1, value=5)
-        manifest_dir = st.text_input("Куда писать манифест (JSON/YAML)", value="logs/walkforward")
+            embargo_bars = st.number_input(
+                "embargo_bars (EMBARGO)", min_value=0, step=1, value=5
+            )
+        manifest_dir = st.text_input(
+            "Куда писать манифест (JSON/YAML)", value="logs/walkforward"
+        )
         submitted = st.form_submit_button("Сделать сплиты")
 
     if submitted:
@@ -1551,7 +1951,9 @@ with tabs[16]:
             n_val = int((df_out["wf_role"] == "val").sum())
 
             st.success(f"Готово. Датасет со сплитами: {out_path}")
-            st.info(f"Всего строк: {total}. В сплитах train: {n_train}, val: {n_val}, вне окон: {total - used}.")
+            st.info(
+                f"Всего строк: {total}. В сплитах train: {n_train}, val: {n_val}, вне окон: {total - used}."
+            )
             st.caption("Манифесты записаны:")
             st.code(json_path)
             st.code(yaml_path)
@@ -1560,11 +1962,17 @@ with tabs[16]:
 
 
 with tabs[17]:
-    st.subheader("Threshold Tuner — подбор порога под целевую частоту с учётом кулдауна и no-trade")
+    st.subheader(
+        "Threshold Tuner — подбор порога под целевую частоту с учётом кулдауна и no-trade"
+    )
 
     import os
     import pandas as pd
-    from training.threshold_tuner import TuneConfig, tune_threshold, load_min_signal_gap_s_from_yaml
+    from training.threshold_tuner import (
+        TuneConfig,
+        tune_threshold,
+        load_min_signal_gap_s_from_yaml,
+    )
 
     def _read_table_thr(path: str) -> pd.DataFrame:
         ext = os.path.splitext(path)[1].lower()
@@ -1579,43 +1987,72 @@ with tabs[17]:
         df.to_csv(path, index=False)
 
     with st.form("threshold_tuner_form"):
-        data_path = st.text_input("Датасет предсказаний (CSV/Parquet):", value="data/val_predictions.parquet")
+        data_path = st.text_input(
+            "Датасет предсказаний (CSV/Parquet):", value="data/val_predictions.parquet"
+        )
         score_col = st.text_input("Колонка со скором/вероятностью:", value="score")
         col1, col2 = st.columns(2)
         with col1:
-            y_col = st.text_input("Колонка бинарной метки (если классификация):", value="y_eff_60")
+            y_col = st.text_input(
+                "Колонка бинарной метки (если классификация):", value="y_eff_60"
+            )
         with col2:
-            ret_col = st.text_input("Колонка эффективного ретёрна (если регрессия):", value="eff_ret_60")
+            ret_col = st.text_input(
+                "Колонка эффективного ретёрна (если регрессия):", value="eff_ret_60"
+            )
 
         ts_col = st.text_input("Колонка времени:", value="ts_ms")
         symbol_col = st.text_input("Колонка символа:", value="symbol")
-        direction = st.selectbox("Правило сигнала", options=["greater", "less"], index=0)
+        direction = st.selectbox(
+            "Правило сигнала", options=["greater", "less"], index=0
+        )
 
         col3, col4, col5 = st.columns(3)
         with col3:
-            target_signals_per_day = st.number_input("Желаемые сигналы/день", min_value=0.1, step=0.1, value=1.5)
+            target_signals_per_day = st.number_input(
+                "Желаемые сигналы/день", min_value=0.1, step=0.1, value=1.5
+            )
         with col4:
-            tolerance = st.number_input("Допуск по частоте", min_value=0.0, step=0.1, value=0.5)
+            tolerance = st.number_input(
+                "Допуск по частоте", min_value=0.0, step=0.1, value=0.5
+            )
         with col5:
-            optimize_for = st.selectbox("Метрика оптимизации", options=["sharpe", "precision", "f1"], index=0)
+            optimize_for = st.selectbox(
+                "Метрика оптимизации", options=["sharpe", "precision", "f1"], index=0
+            )
 
         col6, col7, col8 = st.columns(3)
         with col6:
-            min_thr = st.number_input("Минимальный порог", min_value=0.0, max_value=1.0, step=0.01, value=0.50)
+            min_thr = st.number_input(
+                "Минимальный порог", min_value=0.0, max_value=1.0, step=0.01, value=0.50
+            )
         with col7:
-            max_thr = st.number_input("Максимальный порог", min_value=0.0, max_value=1.0, step=0.01, value=0.99)
+            max_thr = st.number_input(
+                "Максимальный порог",
+                min_value=0.0,
+                max_value=1.0,
+                step=0.01,
+                value=0.99,
+            )
         with col8:
             steps = st.number_input("Число шагов сетки", min_value=5, step=1, value=50)
 
         col9, col10 = st.columns(2)
         with col9:
-            realtime_yaml = st.text_input("realtime.yaml (для чтения min_signal_gap_s):", value="configs/realtime.yaml")
+            realtime_yaml = st.text_input(
+                "realtime.yaml (для чтения min_signal_gap_s):",
+                value="configs/realtime.yaml",
+            )
         with col10:
-            manual_gap = st.text_input("min_signal_gap_s (перебьёт realtime.yaml, опционально):", value="")
+            manual_gap = st.text_input(
+                "min_signal_gap_s (перебьёт realtime.yaml, опционально):", value=""
+            )
 
         col11, col12 = st.columns(2)
         with col11:
-            sandbox_yaml = st.text_input("sandbox.yaml (no_trade):", value="configs/sandbox.yaml")
+            sandbox_yaml = st.text_input(
+                "sandbox.yaml (no_trade):", value="configs/sandbox.yaml"
+            )
         with col12:
             drop_no_trade = st.checkbox("Учитывать no-trade (фильтровать)", value=True)
 
@@ -1663,7 +2100,12 @@ with tabs[17]:
             _write_csv_thr(res, out_csv)
 
             st.success("Готово. Рекомендованный порог и метрики ниже.")
-            st.json({k: (float(v) if isinstance(v, (int, float)) else v) for k, v in best.items()})
+            st.json(
+                {
+                    k: (float(v) if isinstance(v, (int, float)) else v)
+                    for k, v in best.items()
+                }
+            )
             st.caption("Первые 20 строк таблицы результатов:")
             st.dataframe(res.sort_values("signals_per_day").head(20))
 
@@ -1700,14 +2142,24 @@ with tabs[18]:
 
     st.markdown("### Обучение калибратора")
     with st.form("calibration_train_form"):
-        data_path = st.text_input("Файл с предсказаниями (CSV/Parquet):", value="data/val_predictions.parquet")
+        data_path = st.text_input(
+            "Файл с предсказаниями (CSV/Parquet):", value="data/val_predictions.parquet"
+        )
         score_col = st.text_input("Колонка со скором/вероятностью:", value="score")
         y_col = st.text_input("Колонка бинарной метки 0/1:", value="y_eff_60")
         filter_val = st.checkbox("Фильтровать wf_role=='val'", value=True)
-        wf_role_col = st.text_input("Имя колонки роли (если фильтруем):", value="wf_role")
-        method = st.selectbox("Метод калибровки:", options=["platt", "isotonic"], index=0)
-        out_model = st.text_input("Куда сохранить калибратор (.json):", value="models/calibrator.json")
-        report_csv = st.text_input("Куда сохранить calibration-table (.csv, опционально):", value="")
+        wf_role_col = st.text_input(
+            "Имя колонки роли (если фильтруем):", value="wf_role"
+        )
+        method = st.selectbox(
+            "Метод калибровки:", options=["platt", "isotonic"], index=0
+        )
+        out_model = st.text_input(
+            "Куда сохранить калибратор (.json):", value="models/calibrator.json"
+        )
+        report_csv = st.text_input(
+            "Куда сохранить calibration-table (.csv, опционально):", value=""
+        )
         submitted_train = st.form_submit_button("Обучить калибратор")
 
     if submitted_train:
@@ -1730,7 +2182,12 @@ with tabs[18]:
 
             metrics = evaluate_before_after(s, y, cal, bins=10)
             st.success(f"Готово. Калибратор сохранён: {out_model}")
-            st.json({k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()})
+            st.json(
+                {
+                    k: (float(v) if isinstance(v, (int, float)) else v)
+                    for k, v in metrics.items()
+                }
+            )
 
             # calibration-table после калибровки
             p_after = np.clip(cal.predict_proba(s), 0.0, 1.0)
@@ -1746,11 +2203,18 @@ with tabs[18]:
     st.markdown("### Применение калибратора к датасету")
 
     with st.form("calibration_apply_form"):
-        data_path2 = st.text_input("Файл с предсказаниями (CSV/Parquet) для применения:", value="data/val_predictions.parquet")
+        data_path2 = st.text_input(
+            "Файл с предсказаниями (CSV/Parquet) для применения:",
+            value="data/val_predictions.parquet",
+        )
         model_json = st.text_input("JSON калибратора:", value="models/calibrator.json")
         score_col2 = st.text_input("Имя колонки со скором:", value="score")
-        out_col = st.text_input("Имя новой колонки для калиброванной вероятности:", value="score_calibrated")
-        out_path2 = st.text_input("Куда сохранить (если пусто — суффикс _calibrated):", value="")
+        out_col = st.text_input(
+            "Имя новой колонки для калиброванной вероятности:", value="score_calibrated"
+        )
+        out_path2 = st.text_input(
+            "Куда сохранить (если пусто — суффикс _calibrated):", value=""
+        )
         submitted_apply = st.form_submit_button("Применить калибратор")
 
     if submitted_apply:
@@ -1768,7 +2232,9 @@ with tabs[18]:
                 st.stop()
 
             cal = BaseCalibrator.load_json(model_json)
-            s2 = pd.to_numeric(df2[score_col2], errors="coerce").astype(float).to_numpy()
+            s2 = (
+                pd.to_numeric(df2[score_col2], errors="coerce").astype(float).to_numpy()
+            )
             p2 = cal.predict_proba(s2)
             df2[out_col] = p2
 
@@ -1791,7 +2257,13 @@ with tabs[19]:
     import os
     import numpy as np
     import pandas as pd
-    from training.drift import make_baseline, save_baseline_json, load_baseline_json, compute_psi, default_feature_list
+    from training.drift import (
+        make_baseline,
+        save_baseline_json,
+        load_baseline_json,
+        compute_psi,
+        default_feature_list,
+    )
 
     def _read_table_dm(path: str) -> pd.DataFrame:
         ext = os.path.splitext(path)[1].lower()
@@ -1809,11 +2281,22 @@ with tabs[19]:
     with colA:
         st.markdown("### 1) Сформировать baseline")
         with st.form("drift_baseline_form"):
-            base_data = st.text_input("Файл для baseline (обычно валид. срез)", value="data/val_predictions.parquet")
-            base_features = st.text_input("Фичи (через запятую, пусто — авто f_* и score)", value="")
-            base_bins = st.number_input("Число бинов (числовые фичи)", min_value=2, step=1, value=10)
-            base_topk = st.number_input("Top-K категорий", min_value=5, step=1, value=20)
-            base_out = st.text_input("Куда сохранить baseline JSON", value="models/drift_baseline.json")
+            base_data = st.text_input(
+                "Файл для baseline (обычно валид. срез)",
+                value="data/val_predictions.parquet",
+            )
+            base_features = st.text_input(
+                "Фичи (через запятую, пусто — авто f_* и score)", value=""
+            )
+            base_bins = st.number_input(
+                "Число бинов (числовые фичи)", min_value=2, step=1, value=10
+            )
+            base_topk = st.number_input(
+                "Top-K категорий", min_value=5, step=1, value=20
+            )
+            base_out = st.text_input(
+                "Куда сохранить baseline JSON", value="models/drift_baseline.json"
+            )
             submitted_base = st.form_submit_button("Сделать baseline")
 
         if submitted_base:
@@ -1829,7 +2312,9 @@ with tabs[19]:
                     if not feats:
                         st.error("Не удалось автодетектить фичи. Укажи их явно.")
                         st.stop()
-                spec = make_baseline(dfb, feats, bins=int(base_bins), top_k_cats=int(base_topk))
+                spec = make_baseline(
+                    dfb, feats, bins=int(base_bins), top_k_cats=int(base_topk)
+                )
                 save_baseline_json(spec, base_out)
                 st.success(f"Baseline сохранён: {base_out}")
                 st.code(", ".join(feats))
@@ -1839,13 +2324,24 @@ with tabs[19]:
     with colB:
         st.markdown("### 2) Проверить дрифт")
         with st.form("drift_check_form"):
-            cur_data = st.text_input("Текущий датасет (онлайн/последние дни)", value="data/online_last.parquet")
-            baseline_json = st.text_input("Baseline JSON", value="models/drift_baseline.json")
+            cur_data = st.text_input(
+                "Текущий датасет (онлайн/последние дни)",
+                value="data/online_last.parquet",
+            )
+            baseline_json = st.text_input(
+                "Baseline JSON", value="models/drift_baseline.json"
+            )
             features = st.text_input("Фичи (пусто — из baseline)", value="")
             ts_col = st.text_input("Колонка времени (UTC мс)", value="ts_ms")
-            last_days = st.number_input("Сколько последних дней взять", min_value=0, step=1, value=14)
-            psi_warn = st.number_input("Порог предупреждения PSI", min_value=0.0, step=0.01, value=0.10)
-            psi_alert = st.number_input("Порог алёрта PSI", min_value=0.0, step=0.01, value=0.25)
+            last_days = st.number_input(
+                "Сколько последних дней взять", min_value=0, step=1, value=14
+            )
+            psi_warn = st.number_input(
+                "Порог предупреждения PSI", min_value=0.0, step=0.01, value=0.10
+            )
+            psi_alert = st.number_input(
+                "Порог алёрта PSI", min_value=0.0, step=0.01, value=0.25
+            )
             out_csv = st.text_input("Куда сохранить CSV с PSI (опционально)", value="")
             submitted_check = st.form_submit_button("Посчитать PSI")
 
@@ -1862,7 +2358,9 @@ with tabs[19]:
                 if int(last_days) > 0 and ts_col in dfc.columns:
                     max_ts = int(pd.to_numeric(dfc[ts_col], errors="coerce").max())
                     cutoff = max_ts - int(last_days) * 86400000
-                    dfc = dfc.loc[pd.to_numeric(dfc[ts_col], errors="coerce") >= cutoff].reset_index(drop=True)
+                    dfc = dfc.loc[
+                        pd.to_numeric(dfc[ts_col], errors="coerce") >= cutoff
+                    ].reset_index(drop=True)
 
                 base = load_baseline_json(baseline_json)
                 if features.strip():
@@ -1877,16 +2375,26 @@ with tabs[19]:
 
                 st.success("PSI посчитан")
                 if not res.empty:
-                    avg_psi = float(res["psi"].replace([np.inf, -np.inf], np.nan).dropna().mean())
+                    avg_psi = float(
+                        res["psi"].replace([np.inf, -np.inf], np.nan).dropna().mean()
+                    )
                     worst_feature = res.iloc[0]["feature"]
                     worst_psi = float(res.iloc[0]["psi"])
                     st.metric("Средний PSI", f"{avg_psi:.4f}")
-                    st.metric("Максимальный PSI", f"{worst_psi:.4f}", help=f"Фича: {worst_feature}")
+                    st.metric(
+                        "Максимальный PSI",
+                        f"{worst_psi:.4f}",
+                        help=f"Фича: {worst_feature}",
+                    )
 
                     if worst_psi >= psi_alert or avg_psi >= psi_alert:
-                        st.error("⚠️ Сильный дрифт: PSI > alert. Рекомендуется переобучение/перекалибровка.")
+                        st.error(
+                            "⚠️ Сильный дрифт: PSI > alert. Рекомендуется переобучение/перекалибровка."
+                        )
                     elif worst_psi >= psi_warn or avg_psi >= psi_warn:
-                        st.warning("ℹ️ Умеренный дрифт: PSI > warn. Наблюдать, возможно готовить переобучение.")
+                        st.warning(
+                            "ℹ️ Умеренный дрифт: PSI > warn. Наблюдать, возможно готовить переобучение."
+                        )
                     else:
                         st.info("✅ Дрифт незначительный: PSI в норме.")
 

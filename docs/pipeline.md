@@ -42,13 +42,16 @@ PipelineConfig(
     enabled=True,
     stages={
         "closed_bar": PipelineStageConfig(enabled=True),
-        "windows": PipelineStageConfig(enabled=True, params={"symbols": ["BTCUSDT"]}),
+        "windows": PipelineStageConfig(enabled=True),
         "policy": PipelineStageConfig(enabled=True),
         "risk": PipelineStageConfig(enabled=True),
         "publish": PipelineStageConfig(enabled=True),
     },
 )
 ```
+
+By default, symbol lists come from ``data/universe/symbols.json`` and can be
+overridden via CLI or ``data.symbols`` in the configuration.
 
 Disabling a stage removes it from the processing chain.  Individual stage
 parameters allow finer control, such as no-trade window definitions or risk

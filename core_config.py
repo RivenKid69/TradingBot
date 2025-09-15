@@ -12,8 +12,10 @@ from enum import Enum
 from dataclasses import dataclass, field
 
 import yaml
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, root_validator
 import logging
+
+from services.universe import get_symbols
 
 
 class ComponentSpec(BaseModel):
@@ -105,7 +107,9 @@ class ThrottleConfig(BaseModel):
     """Global throttling configuration."""
 
     enabled: bool = False
-    global_: TokenBucketConfig = Field(default_factory=TokenBucketConfig, alias="global")
+    global_: TokenBucketConfig = Field(
+        default_factory=TokenBucketConfig, alias="global"
+    )
     symbol: TokenBucketConfig = Field(default_factory=TokenBucketConfig)
     mode: str = "drop"
     queue: ThrottleQueueConfig = Field(default_factory=ThrottleQueueConfig)
@@ -117,18 +121,15 @@ class KillSwitchConfig(BaseModel):
 
     feed_lag_ms: float = Field(
         default=0.0,
-        description=
-        "Enter safe mode if worst feed lag exceeds this many milliseconds; non-positive disables",
+        description="Enter safe mode if worst feed lag exceeds this many milliseconds; non-positive disables",
     )
     ws_failures: float = Field(
         default=0.0,
-        description=
-        "Enter safe mode if websocket failures for any symbol exceed this count; non-positive disables",
+        description="Enter safe mode if websocket failures for any symbol exceed this count; non-positive disables",
     )
     error_rate: float = Field(
         default=0.0,
-        description=
-        "Enter safe mode if signal error rate for any symbol exceeds this fraction; non-positive disables",
+        description="Enter safe mode if signal error rate for any symbol exceeds this fraction; non-positive disables",
     )
 
 
@@ -158,8 +159,6 @@ class RetryConfig(BaseModel):
     )
 
 
-
-
 class StateConfig(BaseModel):
     """Settings for persisting runner state."""
 
@@ -170,6 +169,7 @@ class StateConfig(BaseModel):
     flush_on_event: bool = Field(default=True)
     backup_keep: int = Field(default=0)
     lock_path: str = Field(default="state/state.lock")
+
 
 @dataclass
 class MonitoringThresholdsConfig:
@@ -196,8 +196,11 @@ class MonitoringConfig:
 
     enabled: bool = False
     snapshot_metrics_sec: int = 60
-    thresholds: MonitoringThresholdsConfig = field(default_factory=MonitoringThresholdsConfig)
+    thresholds: MonitoringThresholdsConfig = field(
+        default_factory=MonitoringThresholdsConfig
+    )
     alerts: MonitoringAlertConfig = field(default_factory=MonitoringAlertConfig)
+
 
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
@@ -250,7 +253,7 @@ class ExecutionParams(BaseModel):
 
 
 class SimulationDataConfig(BaseModel):
-    symbols: List[str]
+    symbols: List[str] = Field(default_factory=get_symbols)
     timeframe: str = Field(..., description="Например: '1m', '5m'")
     start_ts: Optional[int] = None
     end_ts: Optional[int] = None
@@ -263,7 +266,7 @@ class SimulationConfig(CommonRunConfig):
     mode: str = Field(default="sim")
     timing: TimingConfig = Field(default_factory=TimingConfig)
     market: Literal["spot", "futures"] = Field(default="spot")
-    symbols: List[str] = Field(default_factory=list)
+    symbols: List[str] = Field(default_factory=get_symbols)
     quantizer: Dict[str, Any] = Field(default_factory=dict)
     fees: Dict[str, Any] = Field(default_factory=dict)
     slippage: Dict[str, Any] = Field(default_factory=dict)
@@ -277,11 +280,14 @@ class SimulationConfig(CommonRunConfig):
     )
     execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
 
-    @validator("symbols", always=True)
-    def validate_symbols(cls, v, values):
-        if values.get("market") and not v:
-            raise ValueError("symbols must be provided for the selected market")
-        return v
+    @root_validator(pre=True)
+    def _sync_symbols(cls, values):
+        syms = values.get("symbols")
+        data = values.get("data") or {}
+        if syms and isinstance(data, dict) and not data.get("symbols"):
+            data["symbols"] = syms
+            values["data"] = data
+        return values
 
 
 class LiveAPIConfig(BaseModel):
@@ -293,7 +299,7 @@ class LiveAPIConfig(BaseModel):
 
 
 class LiveDataConfig(BaseModel):
-    symbols: List[str]
+    symbols: List[str] = Field(default_factory=get_symbols)
     timeframe: str
     reconnect: bool = True
     heartbeat_ms: int = 10_000
@@ -309,7 +315,7 @@ class LiveConfig(CommonRunConfig):
 
 
 class TrainDataConfig(BaseModel):
-    symbols: List[str]
+    symbols: List[str] = Field(default_factory=get_symbols)
     timeframe: str
     start_ts: Optional[int] = None
     end_ts: Optional[int] = None
@@ -325,7 +331,7 @@ class ModelConfig(BaseModel):
 class TrainConfig(CommonRunConfig):
     mode: str = Field(default="train")
     market: Literal["spot", "futures"] = Field(default="spot")
-    symbols: List[str] = Field(default_factory=list)
+    symbols: List[str] = Field(default_factory=get_symbols)
     quantizer: Dict[str, Any] = Field(default_factory=dict)
     fees: Dict[str, Any] = Field(default_factory=dict)
     slippage: Dict[str, Any] = Field(default_factory=dict)
@@ -339,11 +345,14 @@ class TrainConfig(CommonRunConfig):
     )
     execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
 
-    @validator("symbols", always=True)
-    def validate_symbols(cls, v, values):
-        if values.get("market") and not v:
-            raise ValueError("symbols must be provided for the selected market")
-        return v
+    @root_validator(pre=True)
+    def _sync_symbols(cls, values):
+        syms = values.get("symbols")
+        data = values.get("data") or {}
+        if syms and isinstance(data, dict) and not data.get("symbols"):
+            data["symbols"] = syms
+            values["data"] = data
+        return values
 
 
 class EvalInputConfig(BaseModel):

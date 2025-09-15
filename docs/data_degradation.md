@@ -20,7 +20,6 @@ unchanged.
 
 ```yaml
 # config_sim.yaml
-symbols: ["BTCUSDT"]
 data_degradation:
   stale_prob: 0.1
   drop_prob: 0.05
@@ -28,6 +27,8 @@ data_degradation:
   max_delay_ms: 50
   seed: 42
 ```
+
+By default, runners load symbols from ``data/universe/symbols.json``.
 
 Run:
 
@@ -41,11 +42,12 @@ python script_backtest.py --config config_sim.yaml
 from binance_ws import BinanceWS
 from services.event_bus import EventBus
 from config import DataDegradationConfig
+from services.universe import get_symbols
 
 cfg = DataDegradationConfig(stale_prob=0.05, drop_prob=0.02,
                             dropout_prob=0.1, max_delay_ms=50, seed=7)
 bus = EventBus(queue_size=1000, drop_policy="newest")
-ws = BinanceWS(symbols=["BTCUSDT"], bus=bus, data_degradation=cfg)
+ws = BinanceWS(symbols=get_symbols(), bus=bus, data_degradation=cfg)
 ws.run()
 ```
 

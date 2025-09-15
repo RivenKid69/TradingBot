@@ -42,8 +42,7 @@ api:
   api_key: null
   api_secret: null
 data:
-  symbols: ["BTCUSDT"]
-  timeframe: "1m"
+  timeframe: "1m"  # symbols are loaded from data/universe/symbols.json
 # Optional path to 168 hourly liquidity multipliers (indexed by UTC hour-of-week;
 # values clamped to [0.1, 10.0])
 liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
