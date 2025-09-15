@@ -166,10 +166,9 @@ class QuantizerImpl:
             missing,
         )
 
+        age = float(age_days) if age_days is not None else float("nan")
         try:
-            monitoring.filters_age_days.set(
-                float(age_days) if age_days is not None else float("nan")
-            )
+            monitoring.filters_age_days.set(age)
         except Exception:
             pass
 
