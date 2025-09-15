@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import time
 import json
-import math
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -14,11 +13,35 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from utils import SignalRateLimiter
 from services import ops_kill_switch
+from services.retry import retry_sync
+from core_config import RetryConfig
 
 
 logger = logging.getLogger(__name__)
 
 
+def _classify_http_error(e: Exception) -> str | None:
+    """Classify HTTP and network errors for retry logic."""
+    if isinstance(e, urllib.error.HTTPError):
+        code = getattr(e, "code", 0)
+        if code == 429 or 500 <= code < 600:
+            return "rest"
+    elif isinstance(e, urllib.error.URLError):
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return "rest"
+        msg = str(reason).lower()
+        if "timed out" in msg or "timeout" in msg:
+            return "rest"
+    elif isinstance(e, (TimeoutError, socket.timeout)):
+        return "rest"
+    return None
+
+
+@retry_sync(
+    RetryConfig(max_attempts=5, backoff_base_s=0.5, max_backoff_s=60.0),
+    _classify_http_error,
+)
 def _http_get(url: str, params: Dict[str, Any], *, timeout: int = 20) -> Dict[str, Any] | List[Any]:
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     full = f"{url}?{query}" if query else url
@@ -31,48 +54,6 @@ def _http_get(url: str, params: Dict[str, Any], *, timeout: int = 20) -> Dict[st
     except Exception:
         # в редких случаях API отдаёт текст — вернём как есть
         return {"raw": data.decode("utf-8", errors="ignore")}
-
-
-def _retrying_get(
-    url: str,
-    params: Dict[str, Any],
-    *,
-    timeout: int = 20,
-    retries: int = 5,
-    backoff_base: float = 0.5,
-) -> Dict[str, Any] | List[Any]:
-    had_error = False
-    for i in range(max(1, retries)):
-        try:
-            data = _http_get(url, params, timeout=timeout)
-            if had_error:
-                ops_kill_switch.manual_reset()
-            return data
-        except Exception as e:
-            record = False
-            if isinstance(e, urllib.error.HTTPError):
-                code = getattr(e, "code", 0)
-                if code == 429 or 500 <= code < 600:
-                    record = True
-            elif isinstance(e, urllib.error.URLError):
-                reason = getattr(e, "reason", None)
-                if isinstance(reason, (TimeoutError, socket.timeout)):
-                    record = True
-                else:
-                    msg = str(reason).lower()
-                    if "timed out" in msg or "timeout" in msg:
-                        record = True
-            elif isinstance(e, (TimeoutError, socket.timeout)):
-                record = True
-            if record:
-                ops_kill_switch.record_error("rest")
-                had_error = True
-            if i == retries - 1:
-                raise
-            sleep_s = backoff_base * (2 ** i) + (0.1 * i)
-            time.sleep(sleep_s)
-    # недостижимо
-    return {}
 
 
 @dataclass
@@ -150,7 +131,7 @@ class BinancePublicClient:
         params: Dict[str, Any] = {}
         self._throttle()
         t0 = time.time()
-        data = _retrying_get(url, params, timeout=self.timeout)
+        data = _http_get(url, params, timeout=self.timeout)
         t1 = time.time()
         if isinstance(data, dict) and "serverTime" in data:
             return int(data["serverTime"]), (t1 - t0) * 1000.0
@@ -179,7 +160,7 @@ class BinancePublicClient:
         if end_ms is not None:
             params["endTime"] = int(end_ms)
         self._throttle()
-        data = _retrying_get(url, params, timeout=self.timeout)
+        data = _http_get(url, params, timeout=self.timeout)
         if isinstance(data, list):
             return data  # type: ignore
         raise RuntimeError(f"Unexpected klines response: {data}")
@@ -210,7 +191,7 @@ class BinancePublicClient:
         if end_ms is not None:
             params["endTime"] = int(end_ms)
         self._throttle()
-        data = _retrying_get(url, params, timeout=self.timeout)
+        data = _http_get(url, params, timeout=self.timeout)
         if isinstance(data, list):
             return data  # type: ignore[return-value]
         raise RuntimeError(f"Unexpected aggTrades response: {data}")
@@ -231,7 +212,7 @@ class BinancePublicClient:
         if end_ms is not None:
             params["endTime"] = int(end_ms)
         self._throttle()
-        data = _retrying_get(url, params, timeout=self.timeout)
+        data = _http_get(url, params, timeout=self.timeout)
         if isinstance(data, list):
             return data  # type: ignore
         raise RuntimeError(f"Unexpected markPriceKlines response: {data}")
@@ -251,7 +232,7 @@ class BinancePublicClient:
         if end_ms is not None:
             params["endTime"] = int(end_ms)
         self._throttle()
-        data = _retrying_get(url, params, timeout=self.timeout)
+        data = _http_get(url, params, timeout=self.timeout)
         if isinstance(data, list):
             return data  # type: ignore
         raise RuntimeError(f"Unexpected funding response: {data}")
@@ -273,7 +254,7 @@ class BinancePublicClient:
         if symbols:
             params["symbols"] = json.dumps([s.upper() for s in symbols])
         self._throttle()
-        data = _retrying_get(url, params, timeout=self.timeout)
+        data = _http_get(url, params, timeout=self.timeout)
         out: Dict[str, Dict[str, Any]] = {}
         if isinstance(data, dict):
             for s in data.get("symbols", []):
