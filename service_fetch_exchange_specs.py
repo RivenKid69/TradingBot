@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime
 from typing import Dict, Sequence
 
 import requests
+from binance_public import BinancePublicClient
 
 
 def _endpoint(market: str) -> str:
@@ -26,8 +28,17 @@ def run(
     market: str = "futures",
     symbols: Sequence[str] | str | None = None,
     out: str = "data/exchange_specs.json",
+    volume_threshold: float = 0.0,
+    volume_out: str | None = None,
+    days: int = 30,
 ) -> Dict[str, Dict[str, float]]:
-    """Fetch Binance exchangeInfo and store minimal specs JSON."""
+    """Fetch Binance exchangeInfo and store minimal specs JSON.
+
+    Additionally computes average daily quote volume over the last ``days``
+    for each symbol and optionally filters out symbols whose average falls
+    below ``volume_threshold``.  The computed averages can be stored in
+    ``volume_out`` for transparency.
+    """
 
     url = _endpoint(market)
     resp = requests.get(url, timeout=20)
@@ -61,6 +72,43 @@ def run(
             "stepSize": step_size,
             "minNotional": min_notional,
         }
+
+    # --- compute average quote volume per symbol ---
+    client = BinancePublicClient()
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - int(days) * 86_400_000
+    avg_quote_vol: Dict[str, float] = {}
+    for sym in list(by_symbol.keys()):
+        try:
+            kl = client.get_klines(
+                market=market,
+                symbol=sym,
+                interval="1d",
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=days,
+            )
+            vols = [float(k[7]) for k in kl]
+            avg_quote_vol[sym] = sum(vols) / len(vols) if vols else 0.0
+        except Exception:
+            avg_quote_vol[sym] = 0.0
+
+    if volume_threshold > 0.0:
+        before = len(by_symbol)
+        by_symbol = {
+            sym: spec
+            for sym, spec in by_symbol.items()
+            if avg_quote_vol.get(sym, 0.0) >= volume_threshold
+        }
+        dropped = before - len(by_symbol)
+        print(
+            f"Dropped {dropped} symbols below volume threshold {volume_threshold}"
+        )
+
+    if volume_out:
+        _ensure_dir(volume_out)
+        with open(volume_out, "w", encoding="utf-8") as f:
+            json.dump(avg_quote_vol, f, ensure_ascii=False, indent=2)
 
     meta = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
