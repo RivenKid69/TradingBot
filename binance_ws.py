@@ -19,6 +19,8 @@ from services.event_bus import EventBus
 from config import DataDegradationConfig
 from utils import SignalRateLimiter
 from services import monitoring, ops_kill_switch
+from services.retry import retry_async
+from core_config import RetryConfig
 import ws_dedup_state as signal_bus
 
 
@@ -46,8 +48,6 @@ class BinanceWS:
         interval: str = "1m",
         bus: EventBus,
         base_url: str = "wss://stream.binance.com:9443",
-        reconnect_initial_delay_s: float = 1.0,
-        reconnect_max_delay_s: float = 60.0,
         heartbeat_interval_s: float = 15.0,
         data_degradation: DataDegradationConfig | None = None,
         stale_prob: float | None = None,
@@ -58,6 +58,7 @@ class BinanceWS:
         rate_limit: float | None = None,
         backoff_base: float = 2.0,
         max_backoff: float = 60.0,
+        retry_cfg: RetryConfig | None = None,
         ws_dedup_enabled: bool = False,
         ws_dedup_log_skips: bool = False,
         ws_dedup_persist_path: str | Path | None = None,
@@ -66,8 +67,6 @@ class BinanceWS:
         self.interval = str(interval)
         self._bus = bus
         self.base_url = base_url.rstrip("/")
-        self.reconnect_initial_delay_s = float(reconnect_initial_delay_s)
-        self.reconnect_max_delay_s = float(reconnect_max_delay_s)
         self.heartbeat_interval_s = float(heartbeat_interval_s)
 
         if data_degradation is None:
@@ -99,6 +98,8 @@ class BinanceWS:
         self._rl_delayed = 0
         self._rl_dropped = 0
 
+        self._retry_cfg = retry_cfg or RetryConfig()
+
         self._ws_dedup_enabled = ws_dedup_enabled
         self._ws_dedup_log_skips = ws_dedup_log_skips
         self._ws_dedup_persist_path = (
@@ -119,8 +120,7 @@ class BinanceWS:
             raise ValueError("Не задан список symbols для подписки")
 
         self._streams = [f"{s.lower()}@kline_{self.interval}" for s in self.symbols]
-        streams = "/".join(self._streams)
-        self.ws_url = f"{self.base_url}/stream?streams={streams}"
+        self.ws_url = f"{self.base_url}/ws"
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._stop = False
@@ -186,8 +186,22 @@ class BinanceWS:
         except Exception:
             pass
 
+    async def _connect_once(self) -> websockets.WebSocketClientProtocol:
+        ws = await websockets.connect(self.ws_url, ping_interval=None, close_timeout=5)
+        await ws.send(
+            json.dumps(
+                {
+                    "method": "SUBSCRIBE",
+                    "params": self._streams,
+                    "id": 1,
+                }
+            )
+        )
+        self._dd_total = self._dd_drop = self._dd_stale = self._dd_delay = 0
+        self._rl_total = self._rl_delayed = self._rl_dropped = 0
+        return ws
+
     async def run_forever(self) -> None:
-        delay = self.reconnect_initial_delay_s
         prev_bar: Bar | None = None
         prev_close_ms: int | None = None
         had_ws_error = False
@@ -204,19 +218,20 @@ class BinanceWS:
                         pass
 
         stale_task = asyncio.create_task(_stale_monitor())
+        connect = retry_async(self._retry_cfg, lambda e: "ws")(self._connect_once)
         try:
             while not self._stop and not ops_kill_switch.tripped():
                 try:
-                    async with websockets.connect(self.ws_url, ping_interval=None, close_timeout=5) as ws:
-                        self._ws = ws
-                        if had_ws_error:
-                            try:
-                                ops_kill_switch.manual_reset()
-                            except Exception:
-                                pass
-                            had_ws_error = False
-                        hb_task = asyncio.create_task(self._heartbeat(ws))
-                        delay = self.reconnect_initial_delay_s  # сбросим backoff при успешном коннекте
+                    ws = await connect()
+                    self._ws = ws
+                    if had_ws_error:
+                        try:
+                            ops_kill_switch.manual_reset()
+                        except Exception:
+                            pass
+                        had_ws_error = False
+                    hb_task = asyncio.create_task(self._heartbeat(ws))
+                    try:
                         async for msg in ws:
                             if self._stop or ops_kill_switch.tripped():
                                 break
@@ -289,9 +304,14 @@ class BinanceWS:
                                 self._last_close_ms = bar_close_ms
                                 if await self._check_rate_limit():
                                     await self._emit(bar, bar_close_ms)
+                    finally:
                         hb_task.cancel()
                         try:
                             await hb_task
+                        except Exception:
+                            pass
+                        try:
+                            await ws.close()
                         except Exception:
                             pass
                         self._ws = None
@@ -303,8 +323,7 @@ class BinanceWS:
                     except Exception:
                         pass
                     had_ws_error = True
-                    await asyncio.sleep(delay)
-                    delay = min(self.reconnect_max_delay_s, delay * 2.0)
+                    continue
         finally:
             self._ws = None
             stale_task.cancel()
