@@ -630,6 +630,17 @@ class MonitoringAggregator:
                 pass
             self._last_flush = now_sec
 
+    def flush(self) -> None:
+        """Force flush of accumulated metrics to disk."""
+        if not self.enabled:
+            return
+        try:
+            # Reset flush timestamp so that ``tick`` writes out immediately.
+            self._last_flush = 0.0
+            self.tick(int(time.time() * 1000))
+        except Exception:
+            pass
+
 
 def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[Dict[str, Any], str, str]:
     """Persist current metrics snapshot to ``json_path`` and ``csv_path``.

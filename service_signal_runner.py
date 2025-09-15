@@ -33,7 +33,12 @@ import json
 import yaml
 import clock
 from services import monitoring, ops_kill_switch
-from services.monitoring import skipped_incomplete_bars, pipeline_stage_drop_count
+from services.monitoring import (
+    skipped_incomplete_bars,
+    pipeline_stage_drop_count,
+    MonitoringAggregator,
+)
+from services.alerts import AlertManager
 from pipeline import (
     check_ttl,
     closed_bar_guard,
@@ -638,6 +643,8 @@ class ServiceSignalRunner:
         self.pipeline_cfg = pipeline_cfg
         self.shutdown_cfg = shutdown_cfg or {}
         self.monitoring_cfg = monitoring_cfg or MonitoringConfig()
+        self.alerts: AlertManager | None = None
+        self.monitoring_agg: MonitoringAggregator | None = None
         self._clock_safe_mode = False
         self._clock_stop = threading.Event()
         self._clock_thread: Optional[threading.Thread] = None
@@ -645,6 +652,19 @@ class ServiceSignalRunner:
         self.ws_dedup_enabled = ws_dedup_enabled
         self.ws_dedup_log_skips = ws_dedup_log_skips
         self.ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
+
+        if self.monitoring_cfg.enabled:
+            alert_cfg = getattr(self.monitoring_cfg, "alerts", None)
+            channel = getattr(alert_cfg, "channel", "noop")
+            cooldown = float(getattr(alert_cfg, "cooldown_sec", 0.0))
+            try:
+                self.alerts = AlertManager(channel, cooldown)
+                self.monitoring_agg = MonitoringAggregator(
+                    self.monitoring_cfg, self.alerts
+                )
+            except Exception:
+                self.alerts = None
+                self.monitoring_agg = None
 
         if self.throttle_cfg is not None:
             self.logger.info(
@@ -751,6 +771,25 @@ class ServiceSignalRunner:
         shutdown.on_flush(ops_kill_switch.tick)
         shutdown.on_finalize(ops_flush_stop.set)
         shutdown.on_finalize(lambda: ops_flush_thread.join(timeout=1.0))
+
+        monitoring_stop = threading.Event()
+        monitoring_thread: threading.Thread | None = None
+        if self.monitoring_agg is not None:
+            def _monitoring_loop() -> None:
+                interval = float(getattr(self.monitoring_cfg, "tick_sec", 1.0))
+                while not monitoring_stop.is_set():
+                    try:
+                        self.monitoring_agg.tick(int(time.time() * 1000))
+                    except Exception:
+                        pass
+                    if monitoring_stop.wait(interval):
+                        break
+
+            monitoring_thread = threading.Thread(target=_monitoring_loop, daemon=True)
+            monitoring_thread.start()
+            shutdown.on_stop(monitoring_stop.set)
+            shutdown.on_flush(self.monitoring_agg.flush)
+            shutdown.on_finalize(lambda: monitoring_thread.join(timeout=1.0))
 
         worker = _Worker(
             self.feature_pipe,
