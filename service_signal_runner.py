@@ -1170,28 +1170,6 @@ def from_config(
         except Exception:
             rt_cfg = {}
 
-    # Load state persistence configuration
-    state_data: Dict[str, Any] = {}
-    state_cfg_path = Path("configs/state.yaml")
-    if state_cfg_path.exists():
-        try:
-            with state_cfg_path.open("r", encoding="utf-8") as f:
-                state_data = yaml.safe_load(f) or {}
-        except Exception:
-            state_data = {}
-    if state_data:
-        cfg.state.enabled = bool(state_data.get("enabled", cfg.state.enabled))
-        cfg.state.backend = str(state_data.get("backend", cfg.state.backend))
-        cfg.state.path = str(state_data.get("path", cfg.state.path))
-        cfg.state.snapshot_interval_s = int(
-            state_data.get("snapshot_interval_s", cfg.state.snapshot_interval_s)
-        )
-        cfg.state.flush_on_event = bool(
-            state_data.get("flush_on_event", cfg.state.flush_on_event)
-        )
-        cfg.state.backup_keep = int(state_data.get("backup_keep", cfg.state.backup_keep))
-        cfg.state.lock_path = str(state_data.get("lock_path", cfg.state.lock_path))
-
     # Queue configuration for the asynchronous event bus
     queue_cfg = rt_cfg.get("queue", {})
     queue_capacity = int(queue_cfg.get("capacity", 0))
