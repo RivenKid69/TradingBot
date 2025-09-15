@@ -687,13 +687,28 @@ class ServiceSignalRunner:
         ops_kill_switch.init(ops_cfg)
 
         ops_flush_stop = threading.Event()
+        rest_failures = 0
 
         def _ops_flush_loop() -> None:
+            nonlocal rest_failures
+            limit = int(self.cfg.kill_switch_ops.error_limit)
             while not ops_flush_stop.wait(1.0):
                 try:
                     ops_kill_switch.tick()
+                    if rest_failures:
+                        try:
+                            ops_kill_switch.manual_reset()
+                        except Exception:
+                            pass
+                        rest_failures = 0
                 except Exception:
-                    pass
+                    rest_failures += 1
+                    if limit > 0 and rest_failures >= limit:
+                        try:
+                            ops_kill_switch.record_error("rest")
+                        except Exception:
+                            pass
+                        rest_failures = 0
 
         ops_flush_thread = threading.Thread(target=_ops_flush_loop, daemon=True)
         ops_flush_thread.start()
@@ -889,14 +904,33 @@ class ServiceSignalRunner:
             self._clock_thread = threading.Thread(target=_sync_loop, daemon=True)
             self._clock_thread.start()
 
-        try:
-            for rep in self.adapter.run_events(worker):
-                if stop_event.is_set():
-                    break
-                yield rep
-        finally:
-            shutdown.unregister(signal.SIGINT, signal.SIGTERM)
-            shutdown.request_shutdown()
+        ws_failures = 0
+        limit = int(self.cfg.kill_switch_ops.error_limit)
+        while not stop_event.is_set():
+            try:
+                for rep in self.adapter.run_events(worker):
+                    if stop_event.is_set():
+                        break
+                    if ws_failures:
+                        try:
+                            ops_kill_switch.manual_reset()
+                        except Exception:
+                            pass
+                        ws_failures = 0
+                    yield rep
+                break
+            except Exception:
+                ws_failures += 1
+                if limit > 0 and ws_failures >= limit:
+                    try:
+                        ops_kill_switch.record_error("ws")
+                    except Exception:
+                        pass
+                    ws_failures = 0
+                time.sleep(1.0)
+
+        shutdown.unregister(signal.SIGINT, signal.SIGTERM)
+        shutdown.request_shutdown()
 
 
 def from_config(
