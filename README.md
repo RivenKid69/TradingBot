@@ -89,17 +89,37 @@ point ``--output`` to maintain a custom symbols file.  See
 
 JSON‑файлы `binance_filters.json` и `exchange_specs.json` содержат поле
 `metadata.generated_at`. При запуске симулятора дата сравнивается с текущей;
-если файл старше 30 дней, выводится предупреждение. Обновить данные можно
-с помощью:
+если файл старше 30 дней, выводится предупреждение. Сформировать свежие
+фильтры можно с помощью CLI‑скрипта из каталога `scripts/`:
 
 ```bash
-python fetch_binance_filters.py binance_filters.json
+python scripts/fetch_binance_filters.py --universe --out data/binance_filters.json
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
 ```
+
+Флаг `--universe` загружает список инструментов из `services.universe`
+(`data/universe/symbols.json`), а позиционные аргументы позволяют дополнительно
+указать конкретные тикеры. Скрипт перезаписывает целевой файл атомарно, чтобы
+долгосрочные задачи могли читать его без гонок.
+
+Параметр `auto_refresh_days` в YAML‑конфигурациях (`quantizer.auto_refresh_days`)
+определяет максимальный возраст фильтров в днях. Как только файл старше порога,
+он считается устаревшим и попадает в логи. Если одновременно включён флаг
+`refresh_on_start`, то при запуске
+сервиса или симулятора квантайзер автоматически вызовет `scripts/fetch_binance_filters.py`
+для пополнения файла, когда он отсутствует или старше установленного порога.
+Без `refresh_on_start` система лишь записывает предупреждение в логи, позволяя
+обновить фильтры вручную или по расписанию.
 
 Для жёсткого контроля свежести установите переменную окружения
 `TB_FAIL_ON_STALE_FILTERS=1` — симулятор завершит работу при обнаружении
 устаревших файлов.
+
+Простой пример ежедневного обновления через `cron`:
+
+```cron
+15 4 * * * /bin/bash -lc 'cd /opt/tradingbot && python scripts/fetch_binance_filters.py --universe --out data/binance_filters.json'
+```
 
 Скрипт `scripts/validate_seasonality.py` воспроизводит почасовое поведение
 ликвидности, спреда и задержек и сравнивает его с историческим датасетом.

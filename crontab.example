@@ -2,5 +2,7 @@ SHELL=/bin/bash
 TZ=UTC
 # Every hour at :02, single-run guarded by flock in the wrapper
 2 * * * * /bin/bash -lc '/path/to/project/deploy/run_update.sh'
+# Daily Binance filters refresh at 04:15 UTC
+15 4 * * * /bin/bash -lc 'cd /path/to/project && python scripts/fetch_binance_filters.py --universe --out data/binance_filters.json'
 # Weekly seasonality rebuild every Monday 03:05 UTC
 5 3 * * 1 /bin/bash -lc '/path/to/project/scripts/cron_update_seasonality.sh'
