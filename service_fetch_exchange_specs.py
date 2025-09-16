@@ -6,7 +6,7 @@ import random
 import signal
 import time
 from datetime import datetime
-from typing import Any, Dict, Sequence
+from typing import Any, Callable, Dict, Sequence
 
 from services.rest_budget import RestBudgetSession, iter_time_chunks
 
@@ -56,6 +56,8 @@ def run(
     *,
     shuffle: bool = False,
     session: RestBudgetSession | None = None,
+    checkpoint_listener: Callable[[Dict[str, Any]], None] | None = None,
+    install_signal_handlers: bool = True,
 ) -> Dict[str, Dict[str, float]]:
     """Fetch Binance exchangeInfo and store minimal specs JSON.
 
@@ -65,6 +67,10 @@ def run(
     ``volume_out`` for transparency.  When ``shuffle`` is true the symbol
     processing order is randomised (unless restored from checkpoint).
     ``session`` controls HTTP budgeting, caching and checkpoint persistence.
+    When provided, ``checkpoint_listener`` is called with every checkpoint
+    payload before it is persisted which can be useful for external signal
+    handlers.  To manage signals outside this function pass
+    ``install_signal_handlers=False``.
     """
 
     session = session or RestBudgetSession({})
@@ -152,6 +158,11 @@ def run(
             payload["completed"] = True
         checkpoint_payload = payload
         session.save_checkpoint(checkpoint_payload)
+        if checkpoint_listener is not None:
+            try:
+                checkpoint_listener(dict(payload))
+            except Exception:  # pragma: no cover - best effort notification
+                pass
 
     def _handle_signal(signum: int, frame: Any | None) -> None:  # pragma: no cover - signal handler
         session.save_checkpoint(checkpoint_payload)
@@ -161,14 +172,15 @@ def run(
 
     _update_checkpoint(start_index)
 
-    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
-        if sig is None:
-            continue
-        try:
-            handled_signals[sig] = signal.getsignal(sig)
-            signal.signal(sig, _handle_signal)
-        except (ValueError, OSError):  # pragma: no cover - platform dependent
-            handled_signals.pop(sig, None)
+    if install_signal_handlers:
+        for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+            if sig is None:
+                continue
+            try:
+                handled_signals[sig] = signal.getsignal(sig)
+                signal.signal(sig, _handle_signal)
+            except (ValueError, OSError):  # pragma: no cover - platform dependent
+                handled_signals.pop(sig, None)
 
     end_ms = int(time.time() * 1000)
     window_ms = max(1, int(days)) * 86_400_000
@@ -237,11 +249,12 @@ def run(
                 _update_checkpoint(absolute + 1, symbol=sym)
             idx += max(len(batch), 1)
     finally:
-        for sig, handler in handled_signals.items():
-            try:
-                signal.signal(sig, handler)
-            except (ValueError, OSError):  # pragma: no cover - platform dependent
-                pass
+        if install_signal_handlers:
+            for sig, handler in handled_signals.items():
+                try:
+                    signal.signal(sig, handler)
+                except (ValueError, OSError):  # pragma: no cover - platform dependent
+                    pass
 
     _update_checkpoint(len(symbols_order), completed=True)
 
