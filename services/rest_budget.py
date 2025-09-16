@@ -143,6 +143,9 @@ class RestBudgetSession:
         self._session_lock = threading.Lock()
         self._child_sessions: "weakref.WeakSet[requests.Session]" = weakref.WeakSet()
 
+        enabled_flag = self._interpret_bool(_get_attr(cfg, "enabled", None))
+        self._enabled = True if enabled_flag is None else bool(enabled_flag)
+
         concurrency_cfg = _get_attr(cfg, "concurrency", None)
         workers_val = self._coerce_positive_int(
             _get_attr(concurrency_cfg, "workers", None)
@@ -222,25 +225,55 @@ class RestBudgetSession:
 
         self._endpoint_cache_settings: MutableMapping[str, dict[str, Any]] = {}
 
-        jitter_ms = _get_attr(cfg, "jitter_ms", 0.0)
-        self._jitter_min_ms, self._jitter_max_ms = self._parse_jitter(jitter_ms)
-        self._cooldown_s = float(
-            _get_attr(cfg, "cooldown_s", _get_attr(cfg, "cooldown_sec", 0.0))
+        global_cfg = _get_attr(cfg, "global_", _get_attr(cfg, "global", None))
+
+        jitter_value = _get_attr(cfg, "jitter_ms", None)
+        if jitter_value is None:
+            jitter_value = _get_attr(cfg, "jitter", None)
+        if jitter_value is None and global_cfg is not None:
+            jitter_value = _get_attr(
+                global_cfg,
+                "jitter_ms",
+                _get_attr(global_cfg, "jitter", None),
+            )
+        if jitter_value is None:
+            jitter_value = 0.0
+        self._jitter_min_ms, self._jitter_max_ms = self._parse_jitter(jitter_value)
+
+        cooldown_value = _get_attr(
+            cfg, "cooldown_s", _get_attr(cfg, "cooldown_sec", None)
         )
+        if cooldown_value is None and global_cfg is not None:
+            cooldown_value = _get_attr(
+                global_cfg,
+                "cooldown_s",
+                _get_attr(global_cfg, "cooldown_sec", None),
+            )
+        try:
+            cooldown_float = float(cooldown_value) if cooldown_value is not None else 0.0
+        except (TypeError, ValueError):
+            cooldown_float = 0.0
+        self._cooldown_s = max(cooldown_float, 0.0)
+
         timeout_default = _get_attr(cfg, "timeout", _get_attr(cfg, "timeout_s", 0.0))
+        if timeout_default is None and global_cfg is not None:
+            timeout_default = _get_attr(
+                global_cfg,
+                "timeout",
+                _get_attr(global_cfg, "timeout_s", None),
+            )
         self._timeout = float(timeout_default) if timeout_default else None
 
         retry_cfg = _get_attr(cfg, "retry", None)
         self._retry_cfg = self._parse_retry_cfg(retry_cfg)
 
-        global_cfg = _get_attr(cfg, "global_", _get_attr(cfg, "global", None))
-        self._global_bucket = self._make_bucket(global_cfg)
+        self._global_bucket = self._make_bucket(global_cfg) if self._enabled else None
 
         self._endpoint_buckets: MutableMapping[str, TokenBucket] = {}
         endpoints_cfg = _get_attr(cfg, "endpoints", {}) or {}
         if isinstance(endpoints_cfg, Mapping):
             for key, spec in endpoints_cfg.items():
-                bucket = self._make_bucket(spec)
+                bucket = self._make_bucket(spec) if self._enabled else None
                 if bucket:
                     self._register_endpoint_bucket(str(key), bucket)
                 cache_meta = self._parse_endpoint_cache_spec(spec)
@@ -269,6 +302,21 @@ class RestBudgetSession:
         return RetryConfig()
 
     @staticmethod
+    def _interpret_bool(value: Any) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"", "unset"}:
+                return None
+            if text in {"true", "yes", "1", "on", "enabled"}:
+                return True
+            if text in {"false", "no", "0", "off", "disabled"}:
+                return False
+            return None
+        return bool(value)
+
+    @staticmethod
     def _parse_jitter(jitter: Any) -> tuple[float, float]:
         if isinstance(jitter, (tuple, list)) and len(jitter) == 2:
             lo, hi = jitter
@@ -288,20 +336,57 @@ class RestBudgetSession:
 
     @staticmethod
     def _make_bucket(spec: Any) -> TokenBucket | None:
+        def _is_disabled(candidate: Any) -> bool:
+            enabled_flag = RestBudgetSession._interpret_bool(
+                _get_attr(candidate, "enabled", None)
+            )
+            disabled_flag = RestBudgetSession._interpret_bool(
+                _get_attr(candidate, "disabled", None)
+            )
+            if disabled_flag is True:
+                return True
+            if enabled_flag is False:
+                return True
+            return False
+
+        if _is_disabled(spec):
+            return None
         if isinstance(spec, TokenBucket):
             return spec
         if isinstance(spec, TokenBucketConfig):
             rps = spec.rps
             burst = spec.burst
         elif isinstance(spec, Mapping):
-            rps = spec.get("rps") or spec.get("rate") or 0.0
-            burst = spec.get("burst") or spec.get("capacity") or spec.get("tokens") or 0.0
+            rps = (
+                spec.get("rps")
+                or spec.get("rate")
+                or spec.get("qps")
+                or spec.get("requests_per_second")
+                or spec.get("queries_per_second")
+                or spec.get("per_second")
+            )
+            burst = (
+                spec.get("burst")
+                or spec.get("capacity")
+                or spec.get("tokens")
+                or spec.get("max_tokens")
+                or spec.get("burst_tokens")
+            )
         else:
-            rps = getattr(spec, "rps", None) or getattr(spec, "rate", 0.0)
+            rps = (
+                getattr(spec, "rps", None)
+                or getattr(spec, "rate", None)
+                or getattr(spec, "qps", None)
+                or getattr(spec, "requests_per_second", None)
+                or getattr(spec, "queries_per_second", None)
+                or getattr(spec, "per_second", 0.0)
+            )
             burst = (
                 getattr(spec, "burst", None)
                 or getattr(spec, "capacity", None)
                 or getattr(spec, "tokens", 0.0)
+                or getattr(spec, "max_tokens", None)
+                or getattr(spec, "burst_tokens", None)
             )
         try:
             rps_f = float(rps)

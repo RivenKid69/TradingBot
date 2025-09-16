@@ -127,6 +127,18 @@ python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT
 превысит допуск `--threshold` (по умолчанию 10%).
 Подробные шаги и критерии приёмки описаны в [docs/seasonality_QA.md](docs/seasonality_QA.md).
 
+### Offline REST budget configuration
+
+Файл `configs/offline.yaml` содержит общие параметры для офлайн‑скриптов,
+использующих `services.rest_budget.RestBudgetSession`. Ключ `rest_budget` включает
+лимитер (`enabled`), задаёт глобальный токен‑бакет (`global.qps` и `burst`) и
+опции кэширования (`cache.dir`, `ttl_days`, `mode`). В секции `endpoints`
+переопределяются квоты и дополнительные параметры для отдельных маршрутов API
+(`min_refresh_days`). Блок `checkpoint` управляет путём и режимом восстановления
+прогресса, а `concurrency.workers`/`batch_size` ограничивают параллелизм.
+Флаг `shuffle_symbols` включает случайную перестановку символов при обновлении
+вселенной.
+
 Параметры симуляции можно временно переопределить через CLI:
 
 ```bash

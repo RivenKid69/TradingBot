@@ -132,3 +132,29 @@ def test_stats_requests_and_cache(tmp_path: Path) -> None:
     assert stats["checkpoint"] == {"loads": 0, "saves": 0}
     assert pytest.approx(1.5) == stats["request_tokens"]["GET /api"]
     json.dumps(stats)
+
+
+def test_qps_bucket_support() -> None:
+    session = RestBudgetSession({"global": {"qps": 2.5, "burst": 5}})
+    try:
+        bucket = session._global_bucket
+        assert bucket is not None
+        assert bucket.rps == pytest.approx(2.5)
+        assert bucket.burst == pytest.approx(5.0)
+    finally:
+        session.close()
+
+
+def test_rest_budget_disabled_flag() -> None:
+    session = RestBudgetSession(
+        {
+            "enabled": False,
+            "global": {"qps": 2, "burst": 3},
+            "endpoints": {"klines": {"qps": 1, "burst": 2}},
+        }
+    )
+    try:
+        assert session._global_bucket is None
+        assert session._endpoint_buckets == {}
+    finally:
+        session.close()
