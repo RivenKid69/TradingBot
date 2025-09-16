@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
+import json
 import logging
+import os
 import random
+import tempfile
 import time
 import urllib.parse
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, MutableMapping
+
+from pathlib import Path
 
 import requests
 
@@ -111,11 +117,47 @@ class RestBudgetSession:
         session: requests.Session | None = None,
         rng: random.Random | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        cache_dir: str | os.PathLike[str] | None = None,
+        ttl_days: float | int | None = None,
+        mode: str | None = None,
     ) -> None:
         self._cfg = cfg
         self._session = session or requests.Session()
         self._rng = rng or random.Random()
         self._sleep = sleep
+
+        cache_cfg = _get_attr(cfg, "cache", None)
+
+        cache_dir_value = cache_dir
+        if cache_dir_value is None and cache_cfg is not None:
+            cache_dir_value = (
+                _get_attr(cache_cfg, "dir", None)
+                or _get_attr(cache_cfg, "path", None)
+                or _get_attr(cache_cfg, "cache_dir", None)
+            )
+        if cache_dir_value is None:
+            cache_dir_value = _get_attr(cfg, "cache_dir", None)
+        self._cache_dir = Path(cache_dir_value).expanduser() if cache_dir_value else None
+
+        ttl_value = ttl_days
+        if ttl_value is None and cache_cfg is not None:
+            ttl_value = _get_attr(cache_cfg, "ttl_days", None)
+            if ttl_value is None:
+                ttl_value = _get_attr(cache_cfg, "ttl", None)
+        if ttl_value is None:
+            ttl_value = _get_attr(cfg, "cache_ttl_days", None)
+            if ttl_value is None:
+                ttl_value = _get_attr(cfg, "ttl_days", None)
+        self._cache_ttl_days = self._coerce_positive_float(ttl_value)
+
+        mode_value = mode
+        if mode_value is None and cache_cfg is not None:
+            mode_value = _get_attr(cache_cfg, "mode", None)
+        if mode_value is None:
+            mode_value = _get_attr(cfg, "cache_mode", None)
+        self._cache_mode = self._normalize_cache_mode(mode_value)
+
+        self._endpoint_cache_settings: MutableMapping[str, dict[str, Any]] = {}
 
         jitter_ms = _get_attr(cfg, "jitter_ms", 0.0)
         self._jitter_min_ms, self._jitter_max_ms = self._parse_jitter(jitter_ms)
@@ -138,6 +180,9 @@ class RestBudgetSession:
                 bucket = self._make_bucket(spec)
                 if bucket:
                     self._register_endpoint_bucket(str(key), bucket)
+                cache_meta = self._parse_endpoint_cache_spec(spec)
+                if cache_meta:
+                    self._register_endpoint_cache_cfg(str(key), cache_meta)
 
         self.wait_counts: Counter[str] = Counter()
         self.cooldown_counts: Counter[str] = Counter()
@@ -198,7 +243,40 @@ class RestBudgetSession:
             return None
         return TokenBucket(rps=rps_f, burst=burst_f)
 
-    def _register_endpoint_bucket(self, key: str, bucket: TokenBucket) -> None:
+    @staticmethod
+    def _coerce_positive_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return None
+        if val <= 0.0:
+            return None
+        return val
+
+    @staticmethod
+    def _normalize_cache_mode(mode: Any) -> str:
+        if mode is None:
+            return "off"
+        text = str(mode).strip().lower().replace("-", "_")
+        if not text:
+            return "off"
+        if text in {"rw", "readwrite", "read_write", "write"}:
+            return "read_write"
+        if text in {"ro", "read", "read_only", "readonly"}:
+            return "read"
+        if text in {"off", "disable", "disabled", "none"}:
+            return "off"
+        return text if text in {"off", "read", "read_write"} else "off"
+
+    @staticmethod
+    def _sanitize_cache_token(token: str) -> str:
+        return "".join(
+            ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in token
+        )
+
+    def _endpoint_variants(self, key: str) -> set[str]:
         variants = {key.strip()}
         norm = self._normalize_endpoint_key(key)
         if norm:
@@ -206,9 +284,47 @@ class RestBudgetSession:
             if " " in norm:
                 _, path = norm.split(" ", 1)
                 variants.add(path)
-        variants = {v for v in variants if v}
-        for v in variants:
+        return {v for v in variants if v}
+
+    def _register_endpoint_bucket(self, key: str, bucket: TokenBucket) -> None:
+        for v in self._endpoint_variants(key):
             self._endpoint_buckets[v] = bucket
+
+    def _register_endpoint_cache_cfg(self, key: str, cfg: Mapping[str, Any]) -> None:
+        for v in self._endpoint_variants(key):
+            current = self._endpoint_cache_settings.setdefault(v, {})
+            current.update(cfg)
+
+    @staticmethod
+    def _parse_endpoint_cache_spec(spec: Any) -> dict[str, Any]:
+        meta: dict[str, Any] = {}
+        candidates = []
+        cache_candidate = _get_attr(spec, "cache", None)
+        if cache_candidate is not None:
+            candidates.append(cache_candidate)
+        candidates.append(spec)
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if isinstance(candidate, Mapping):
+                min_refresh = candidate.get("min_refresh_days")
+            else:
+                min_refresh = getattr(candidate, "min_refresh_days", None)
+            if min_refresh is not None:
+                try:
+                    val = float(min_refresh)
+                except (TypeError, ValueError):
+                    continue
+                if val > 0.0:
+                    meta["min_refresh_days"] = val
+        return meta
+
+    def _get_endpoint_cache_meta(self, key: str) -> Mapping[str, Any] | None:
+        for variant in self._endpoint_variants(key):
+            cfg = self._endpoint_cache_settings.get(variant)
+            if cfg:
+                return cfg
+        return None
 
     @staticmethod
     def _normalize_endpoint_key(key: str) -> str:
@@ -240,6 +356,83 @@ class RestBudgetSession:
             return path
         return key
 
+    def _make_cache_key(
+        self,
+        method: str,
+        url: str,
+        params: Mapping[str, Any] | None,
+        endpoint_key: str,
+    ) -> str:
+        prepared = requests.Request(method.upper(), url, params=params).prepare()
+        canonical_url = prepared.url or url
+        digest = hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()
+        base = self._normalize_endpoint_key(endpoint_key) or endpoint_key or method.upper()
+        safe_base = self._sanitize_cache_token(base.replace(" ", "_"))
+        if not safe_base:
+            safe_base = method.upper()
+        return f"{safe_base}_{digest}"
+
+    def _cache_path(self, key: str) -> Path | None:
+        if self._cache_dir is None:
+            return None
+        safe_key = self._sanitize_cache_token(key)
+        if not safe_key:
+            safe_key = "cache_entry"
+        return self._cache_dir / f"{safe_key}.json"
+
+    def _cache_lookup(self, key: str, ttl_days: float | None = None) -> Any | None:
+        path = self._cache_path(key)
+        if path is None:
+            return None
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+        ttl = self._coerce_positive_float(ttl_days) if ttl_days is not None else self._cache_ttl_days
+        if ttl is not None:
+            ttl_seconds = ttl * 86_400.0
+            if ttl_seconds <= 0.0:
+                return None
+            age = time.time() - stat.st_mtime
+            if age > ttl_seconds:
+                return None
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read cache file %s: %s", path, exc)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+
+    def _cache_store(self, key: str, payload: Any) -> None:
+        path = self._cache_path(key)
+        if path is None:
+            return
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError):
+            logger.debug("Skipping cache store for %s: payload not JSON-serializable", key)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        prefix = f".{path.stem}."
+        try:
+            fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=prefix, suffix=".tmp")
+        except OSError as exc:
+            logger.warning("Failed to create cache temp file in %s: %s", path.parent, exc)
+            return
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                tmp_file.write(encoded)
+            os.replace(tmp_name, path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write cache file %s: %s", path, exc)
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
     def _next_jitter(self) -> float:
         if self._jitter_max_ms <= 0.0:
             return 0.0
@@ -351,6 +544,25 @@ class RestBudgetSession:
 
         key = self._resolve_endpoint_key("GET", url, endpoint)
 
+        cache_key: str | None = None
+        if self._cache_mode != "off" and self._cache_dir is not None:
+            cache_key = self._make_cache_key("GET", url, params, key)
+            cache_meta = self._get_endpoint_cache_meta(key)
+            min_refresh_days = None
+            if cache_meta is not None:
+                min_refresh_days = cache_meta.get("min_refresh_days")
+            if min_refresh_days is not None:
+                cached_payload = self._cache_lookup(cache_key, ttl_days=min_refresh_days)
+                if cached_payload is not None:
+                    return cached_payload
+            cached_payload = self._cache_lookup(cache_key)
+            if cached_payload is not None:
+                return cached_payload
+
+        should_store_cache = (
+            cache_key is not None and self._cache_mode == "read_write"
+        )
+
         def _do_request() -> Any:
             self._acquire_tokens(key, tokens=tokens)
             jitter = self._next_jitter()
@@ -387,7 +599,10 @@ class RestBudgetSession:
                 raise
 
             monitoring.record_http_success(status)
-            return self._extract_body(resp)
+            payload = self._extract_body(resp)
+            if should_store_cache and cache_key is not None:
+                self._cache_store(cache_key, payload)
+            return payload
 
         wrapped = retry_sync(self._retry_cfg, self._classify_for_retry)(_do_request)
         return wrapped()
