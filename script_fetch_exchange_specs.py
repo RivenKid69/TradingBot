@@ -4,6 +4,7 @@ import argparse
 import os
 
 from service_fetch_exchange_specs import run
+from services.rest_budget import RestBudgetSession
 
 
 def main() -> None:
@@ -25,7 +26,41 @@ def main() -> None:
         help="Куда сохранить средний quote volume по символам",
     )
     p.add_argument("--days", type=int, default=30, help="Число дней для оценки quote volume")
+    p.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Перемешать порядок символов перед обращениями к API",
+    )
+    p.add_argument(
+        "--checkpoint-path",
+        default="",
+        help="Путь к файлу чекпоинта (JSON); пусто = не сохранять прогресс",
+    )
+    p.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        help="Возобновить обработку из чекпоинта, если он найден",
+    )
+    p.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="Игнорировать существующий чекпоинт",
+    )
+    p.set_defaults(resume=False)
     args = p.parse_args()
+
+    checkpoint_cfg: dict[str, object] = {}
+    checkpoint_path = args.checkpoint_path.strip()
+    if checkpoint_path:
+        resume_flag = bool(args.resume)
+        checkpoint_cfg = {
+            "path": checkpoint_path,
+            "enabled": True,
+            "resume_from_checkpoint": resume_flag,
+        }
+    session = RestBudgetSession({"checkpoint": checkpoint_cfg} if checkpoint_cfg else {})
 
     run(
         market=args.market,
@@ -34,6 +69,8 @@ def main() -> None:
         volume_threshold=args.volume_threshold,
         volume_out=args.volume_out,
         days=args.days,
+        shuffle=args.shuffle,
+        session=session,
     )
 
 
