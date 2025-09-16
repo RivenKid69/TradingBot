@@ -120,6 +120,9 @@ class RestBudgetSession:
         cache_dir: str | os.PathLike[str] | None = None,
         ttl_days: float | int | None = None,
         mode: str | None = None,
+        checkpoint_path: str | os.PathLike[str] | None = None,
+        checkpoint_enabled: bool | None = None,
+        resume_from_checkpoint: bool | None = None,
     ) -> None:
         self._cfg = cfg
         self._session = session or requests.Session()
@@ -156,6 +159,28 @@ class RestBudgetSession:
         if mode_value is None:
             mode_value = _get_attr(cfg, "cache_mode", None)
         self._cache_mode = self._normalize_cache_mode(mode_value)
+
+        checkpoint_cfg = _get_attr(cfg, "checkpoint", None)
+
+        checkpoint_path_value = checkpoint_path
+        if checkpoint_path_value is None and checkpoint_cfg is not None:
+            checkpoint_path_value = _get_attr(checkpoint_cfg, "path", None)
+        self._checkpoint_path = (
+            Path(checkpoint_path_value).expanduser() if checkpoint_path_value else None
+        )
+
+        if checkpoint_enabled is None and checkpoint_cfg is not None:
+            checkpoint_enabled = _get_attr(checkpoint_cfg, "enabled", None)
+        if checkpoint_enabled is None:
+            checkpoint_enabled = bool(checkpoint_path_value)
+        self._checkpoint_enabled = bool(checkpoint_enabled) and self._checkpoint_path is not None
+
+        resume_value = resume_from_checkpoint
+        if resume_value is None and checkpoint_cfg is not None:
+            resume_value = _get_attr(checkpoint_cfg, "resume_from_checkpoint", None)
+        if resume_value is None:
+            resume_value = self._checkpoint_enabled
+        self._resume_from_checkpoint = bool(resume_value) and self._checkpoint_enabled
 
         self._endpoint_cache_settings: MutableMapping[str, dict[str, Any]] = {}
 
@@ -529,6 +554,53 @@ class RestBudgetSession:
             return resp.json()
         except ValueError:
             return resp.text
+
+    def load_checkpoint(self) -> Any | None:
+        """Return checkpoint payload when resume is enabled."""
+
+        if not self._resume_from_checkpoint or not self._checkpoint_path:
+            return None
+        try:
+            with self._checkpoint_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read checkpoint %s: %s", self._checkpoint_path, exc)
+            return None
+
+    def save_checkpoint(self, data: Any) -> None:
+        """Persist *data* atomically when checkpointing is enabled."""
+
+        if not self._checkpoint_enabled or not self._checkpoint_path:
+            return
+        try:
+            encoded = json.dumps(data, ensure_ascii=False)
+        except (TypeError, ValueError):
+            logger.warning("Checkpoint payload is not JSON serialisable: %r", data)
+            return
+        path = self._checkpoint_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        prefix = f".{path.stem}.ckpt."
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix=prefix, suffix=".tmp"
+            )
+        except OSError as exc:
+            logger.warning("Failed to create checkpoint temp file in %s: %s", path.parent, exc)
+            return
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                tmp_file.write(encoded)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            os.replace(tmp_name, path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write checkpoint %s: %s", path, exc)
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
 
     def get(
         self,
