@@ -2,8 +2,8 @@ import sys
 import pathlib
 
 import sys
+import json
 import pathlib
-import gc
 import asyncio
 
 
@@ -81,45 +81,81 @@ def test_exponential_backoff():
     assert rl._current_backoff == pytest.approx(0.05)
 
 
-# --- BinancePublicClient logging and limiter inclusion ---
+# --- BinancePublicClient REST integration ---
 
-def test_binance_public_logging_and_counts(monkeypatch, caplog):
-    client = binance_public.BinancePublicClient(rate_limit=1)
-    rl_mock = MagicMock()
-    rl_mock.can_send.side_effect = [
-        (False, "delayed"), (True, "ok"),
-        (False, "rejected"), (True, "ok"),
-    ]
-    rl_mock._cooldown_until = 0.0
-    client._rate_limiter = rl_mock
-    monkeypatch.setattr(binance_public.time, "sleep", lambda _: None)
+@pytest.mark.parametrize(
+    "method_name, kwargs, response, expected_url, expected_budget, expected_result",
+    [
+        (
+            "get_exchange_filters",
+            {"market": "spot", "symbols": ["btcusdt"]},
+            {
+                "symbols": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.1"}
+                        ],
+                    }
+                ]
+            },
+            "https://api.binance.com/api/v3/exchangeInfo",
+            "exchangeInfo",
+            {"BTCUSDT": {"PRICE_FILTER": {"tickSize": "0.1"}}},
+        ),
+        (
+            "get_klines",
+            {"market": "spot", "symbol": "btcusdt", "interval": "1m"},
+            [[1, 2, 3]],
+            "https://api.binance.com/api/v3/klines",
+            "klines",
+            [[1, 2, 3]],
+        ),
+        (
+            "get_mark_klines",
+            {"symbol": "btcusdt", "interval": "1m"},
+            [[1, 2, 3]],
+            "https://fapi.binance.com/fapi/v1/markPriceKlines",
+            "markPriceKlines",
+            [[1, 2, 3]],
+        ),
+        (
+            "get_funding",
+            {"symbol": "btcusdt"},
+            [{"symbol": "BTCUSDT"}],
+            "https://fapi.binance.com/fapi/v1/fundingRate",
+            "fundingRate",
+            [{"symbol": "BTCUSDT"}],
+        ),
+    ],
+)
+def test_binance_public_uses_rest_session_budget(
+    method_name: str,
+    kwargs: dict[str, object],
+    response: object,
+    expected_url: str,
+    expected_budget: str,
+    expected_result: object,
+):
+    session = MagicMock()
+    session.get.return_value = response
+    client = binance_public.BinancePublicClient(session=session)
 
-    caplog.set_level(logging.INFO, logger=binance_public.__name__)
-    client._throttle()  # delayed
-    client._throttle()  # rejected
+    method = getattr(client, method_name)
+    result = method(**kwargs)
 
-    assert client._rl_total == 2
-    assert client._rl_delayed == 1
-    assert client._rl_rejected == 1
-
-    del client
-    gc.collect()
-
-    rec = next(r for r in caplog.records if "BinancePublicClient rate limiting" in r.message)
-    assert "delayed=50.00% (1/2)" in rec.message
-    assert "rejected=50.00% (1/2)" in rec.message
-
-
-def test_binance_public_limiter_enabled_and_disabled():
-    with_limiter = binance_public.BinancePublicClient(rate_limit=1)
-    no_limiter = binance_public.BinancePublicClient(rate_limit=None)
-    try:
-        assert with_limiter._rate_limiter is not None
-        assert no_limiter._rate_limiter is None
-    finally:
-        # avoid logging on destruction
-        with_limiter._rl_total = 0
-        no_limiter._rl_total = 0
+    assert result == expected_result
+    assert session.get.call_count == 1
+    args, call_kwargs = session.get.call_args
+    assert args == (expected_url,)
+    assert call_kwargs["budget"] == expected_budget
+    assert call_kwargs["timeout"] == client.timeout
+    params = call_kwargs["params"]
+    assert isinstance(params, dict)
+    if method_name == "get_exchange_filters":
+        assert json.loads(params["symbols"]) == ["BTCUSDT"]
+    else:
+        assert params["symbol"] == "BTCUSDT"
 
 
 # --- BinanceWS limiter inclusion and counters ---

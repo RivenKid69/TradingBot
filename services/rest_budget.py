@@ -829,11 +829,13 @@ class RestBudgetSession:
         headers: Mapping[str, str] | None = None,
         timeout: float | None = None,
         endpoint: str | None = None,
+        budget: str | None = None,
         tokens: float = 1.0,
     ) -> Any:
         """Perform GET request obeying configured budgets."""
 
-        key = self._resolve_endpoint_key("GET", url, endpoint)
+        override = endpoint or budget
+        key = self._resolve_endpoint_key("GET", url, override)
         stats_key = self._normalize_endpoint_key(key) or key
 
         cache_key: str | None = None

@@ -1,80 +1,16 @@
 # data/binance_public.py
 from __future__ import annotations
 
-import time
 import json
-import urllib.parse
-import urllib.request
-import urllib.error
-import socket
-import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from utils import SignalRateLimiter
-from services import ops_kill_switch, monitoring
-from services.retry import retry_sync
 from core_config import RetryConfig
-
-
-logger = logging.getLogger(__name__)
+from services.rest_budget import RestBudgetSession
 
 
 DEFAULT_RETRY_CFG = RetryConfig(max_attempts=5, backoff_base_s=0.5, max_backoff_s=60.0)
-
-
-def _classify_http_error(e: Exception) -> str | None:
-    """Classify HTTP and network errors for retry logic."""
-    if isinstance(e, urllib.error.HTTPError):
-        code = getattr(e, "code", 0)
-        if code == 429 or 500 <= code < 600:
-            return "rest"
-    elif isinstance(e, urllib.error.URLError):
-        reason = getattr(e, "reason", None)
-        if isinstance(reason, (TimeoutError, socket.timeout)):
-            return "rest"
-        msg = str(reason).lower()
-        if "timed out" in msg or "timeout" in msg:
-            return "rest"
-    elif isinstance(e, (TimeoutError, socket.timeout)):
-        return "rest"
-    return None
-
-
-def _http_get(
-    url: str, params: Dict[str, Any], *, timeout: int = 20
-) -> Tuple[int, Dict[str, Any] | List[Any]]:
-    query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
-    full = f"{url}?{query}" if query else url
-    req = urllib.request.Request(full, method="GET")
-    req.add_header(
-        "User-Agent", "BinancePublicClient/1.0 (+https://github.com/yourrepo)"
-    )
-    monitoring.record_http_request()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = getattr(resp, "status", 0)
-            data = resp.read()
-    except urllib.error.HTTPError as e:
-        monitoring.record_http_error(getattr(e, "code", 0))
-        raise
-    except urllib.error.URLError as e:
-        reason = getattr(e, "reason", None)
-        if isinstance(reason, (TimeoutError, socket.timeout)):
-            code: str | int = "timeout"
-        else:
-            code = (
-                getattr(reason, "errno", None)
-                or getattr(reason, "code", None)
-                or "urlerror"
-            )
-        monitoring.record_http_error(code)
-        raise
-    try:
-        return status, json.loads(data.decode("utf-8"))
-    except Exception:
-        # в редких случаях API отдаёт текст — вернём как есть
-        return status, {"raw": data.decode("utf-8", errors="ignore")}
 
 
 @dataclass
@@ -97,53 +33,33 @@ class BinancePublicClient:
         self,
         endpoints: Optional[PublicEndpoints] = None,
         timeout: int = 20,
-        rate_limit: float | None = None,
-        backoff_base: float = 2.0,
-        max_backoff: float = 60.0,
         retry_cfg: RetryConfig | None = None,
+        session: RestBudgetSession | None = None,
     ) -> None:
         self.e = endpoints or PublicEndpoints()
         self.timeout = int(timeout)
-        self._rate_limiter = (
-            SignalRateLimiter(rate_limit, backoff_base, max_backoff)
-            if rate_limit and rate_limit > 0
-            else None
-        )
-        self._rl_total = 0
-        self._rl_delayed = 0
-        self._rl_rejected = 0
-        self._retry_cfg = retry_cfg or DEFAULT_RETRY_CFG
-        self._http_get = retry_sync(self._retry_cfg, _classify_http_error)(_http_get)
+        cfg_retry = retry_cfg or DEFAULT_RETRY_CFG
+        self._owns_session = session is None
+        if session is None:
+            session_cfg: Dict[str, Any] = {"timeout": self.timeout, "retry": cfg_retry}
+            self.session = RestBudgetSession(session_cfg)
+        else:
+            self.session = session
 
-    def _throttle(self) -> None:
-        """Apply rate limiter with blocking backoff."""
-        if self._rate_limiter is None:
-            return
-        self._rl_total += 1
-        while True:
-            allowed, status = self._rate_limiter.can_send()
-            if allowed:
-                return
-            if status == "rejected":
-                self._rl_rejected += 1
-                ops_kill_switch.record_error("rest")
-            else:
-                self._rl_delayed += 1
-            wait = max(self._rate_limiter._cooldown_until - time.time(), 0.0)
-            if wait > 0:
-                time.sleep(wait)
+    def close(self) -> None:
+        """Release owned REST session resources."""
 
-    def __del__(self) -> None:  # pragma: no cover - best effort logging
-        if getattr(self, "_rl_total", 0):
-            logger.info(
-                "BinancePublicClient rate limiting: delayed=%0.2f%% (%d/%d), rejected=%0.2f%% (%d/%d)",
-                self._rl_delayed / self._rl_total * 100.0,
-                self._rl_delayed,
-                self._rl_total,
-                self._rl_rejected / self._rl_total * 100.0,
-                self._rl_rejected,
-                self._rl_total,
-            )
+        if getattr(self, "_owns_session", False):
+            try:
+                self.session.close()
+            except Exception:  # pragma: no cover - best effort cleanup
+                pass
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # -------- SERVER TIME --------
 
@@ -153,10 +69,8 @@ class BinancePublicClient:
         path = "/api/v3/time"
         url = f"{base}{path}"
         params: Dict[str, Any] = {}
-        self._throttle()
         t0 = time.time()
-        status, data = self._http_get(url, params, timeout=self.timeout)
-        monitoring.record_http_success(status)
+        data = self.session.get(url, params=params, timeout=self.timeout)
         t1 = time.time()
         if isinstance(data, dict) and "serverTime" in data:
             return int(data["serverTime"]), (t1 - t0) * 1000.0
@@ -184,9 +98,9 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        self._throttle()
-        status, data = self._http_get(url, params, timeout=self.timeout)
-        monitoring.record_http_success(status)
+        data = self.session.get(
+            url, params=params, timeout=self.timeout, budget="klines"
+        )
         if isinstance(data, list):
             return data  # type: ignore
         raise RuntimeError(f"Unexpected klines response: {data}")
@@ -216,9 +130,9 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        self._throttle()
-        status, data = self._http_get(url, params, timeout=self.timeout)
-        monitoring.record_http_success(status)
+        data = self.session.get(
+            url, params=params, timeout=self.timeout, budget="aggTrades"
+        )
         if isinstance(data, list):
             return data  # type: ignore[return-value]
         raise RuntimeError(f"Unexpected aggTrades response: {data}")
@@ -238,8 +152,9 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        self._throttle()
-        _, data = self._http_get(url, params, timeout=self.timeout)
+        data = self.session.get(
+            url, params=params, timeout=self.timeout, budget="markPriceKlines"
+        )
         if isinstance(data, list):
             return data  # type: ignore
         raise RuntimeError(f"Unexpected markPriceKlines response: {data}")
@@ -258,8 +173,9 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        self._throttle()
-        _, data = self._http_get(url, params, timeout=self.timeout)
+        data = self.session.get(
+            url, params=params, timeout=self.timeout, budget="fundingRate"
+        )
         if isinstance(data, list):
             return data  # type: ignore
         raise RuntimeError(f"Unexpected funding response: {data}")
@@ -280,8 +196,9 @@ class BinancePublicClient:
         params: Dict[str, Any] = {}
         if symbols:
             params["symbols"] = json.dumps([s.upper() for s in symbols])
-        self._throttle()
-        _, data = self._http_get(url, params, timeout=self.timeout)
+        data = self.session.get(
+            url, params=params, timeout=self.timeout, budget="exchangeInfo"
+        )
         out: Dict[str, Dict[str, Any]] = {}
         if isinstance(data, dict):
             for s in data.get("symbols", []):
