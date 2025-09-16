@@ -1,0 +1,17 @@
+# Default REST budget configuration for Binance data fetch scripts.
+# The worker count controls how many concurrent HTTP requests are dispatched.
+# ``batch_size`` limits the number of outstanding requests before producers wait
+# for the queue to free up (acts as a bounded buffer for futures).
+concurrency:
+  workers: 4
+batch_size: 16
+
+# Optional global token bucket; non-positive values disable the limit.
+global:
+  rps: 8.0
+  burst: 8
+
+retry:
+  max_attempts: 5
+  backoff_base_s: 0.5
+  max_backoff_s: 5.0

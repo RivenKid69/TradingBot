@@ -9,11 +9,14 @@ import logging
 import os
 import random
 import tempfile
+import threading
 import time
 import urllib.parse
-from collections import Counter
+import weakref
+from collections import Counter, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, MutableMapping
+from typing import Any, Callable, Iterable, Iterator, Mapping, MutableMapping, TypeVar
 
 from pathlib import Path
 
@@ -26,6 +29,9 @@ from .retry import retry_sync
 
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 
 def _get_attr(obj: Any, name: str, default: Any = None) -> Any:
@@ -45,6 +51,9 @@ class TokenBucket:
     tokens: float | None = None
     last_ts: float = field(default_factory=time.monotonic)
     cooldown_until: float = 0.0
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         self.rps = float(self.rps)
@@ -72,16 +81,17 @@ class TokenBucket:
         if not self.enabled:
             return 0.0
         now = float(time.monotonic() if now is None else now)
-        self._refill(now)
-        if now < self.cooldown_until:
-            return self.cooldown_until - now
-        tokens = float(tokens)
-        if self.tokens >= tokens:
-            return 0.0
-        if self.rps <= 0.0:
-            return float("inf")
-        deficit = tokens - self.tokens
-        return max(deficit / self.rps, 0.0)
+        with self._lock:
+            self._refill(now)
+            if now < self.cooldown_until:
+                return self.cooldown_until - now
+            tokens = float(tokens)
+            if self.tokens >= tokens:
+                return 0.0
+            if self.rps <= 0.0:
+                return float("inf")
+            deficit = tokens - self.tokens
+            return max(deficit / self.rps, 0.0)
 
     def consume(self, tokens: float = 1.0, now: float | None = None) -> None:
         """Consume ``tokens`` if available, assuming :meth:`wait_time` was 0."""
@@ -89,13 +99,14 @@ class TokenBucket:
         if not self.enabled:
             return
         now = float(time.monotonic() if now is None else now)
-        self._refill(now)
-        if now < self.cooldown_until:
-            raise RuntimeError("cooldown in effect")
-        tokens = float(tokens)
-        if self.tokens < tokens:
-            raise RuntimeError("insufficient tokens")
-        self.tokens -= tokens
+        with self._lock:
+            self._refill(now)
+            if now < self.cooldown_until:
+                raise RuntimeError("cooldown in effect")
+            tokens = float(tokens)
+            if self.tokens < tokens:
+                raise RuntimeError("insufficient tokens")
+            self.tokens -= tokens
 
     def start_cooldown(self, seconds: float, now: float | None = None) -> None:
         """Start (or extend) cooldown for ``seconds`` seconds."""
@@ -104,7 +115,8 @@ class TokenBucket:
         if seconds <= 0.0:
             return
         now = float(time.monotonic() if now is None else now)
-        self.cooldown_until = max(self.cooldown_until, now + seconds)
+        with self._lock:
+            self.cooldown_until = max(self.cooldown_until, now + seconds)
 
 
 class RestBudgetSession:
@@ -125,9 +137,35 @@ class RestBudgetSession:
         resume_from_checkpoint: bool | None = None,
     ) -> None:
         self._cfg = cfg
-        self._session = session or requests.Session()
+        self._base_session = session or requests.Session()
+        self._owns_session = session is None
+        self._thread_local = threading.local()
+        self._session_lock = threading.Lock()
+        self._child_sessions: "weakref.WeakSet[requests.Session]" = weakref.WeakSet()
+
+        concurrency_cfg = _get_attr(cfg, "concurrency", None)
+        workers_val = self._coerce_positive_int(
+            _get_attr(concurrency_cfg, "workers", None)
+        )
+        self._max_workers = workers_val
+        batch_val = self._coerce_positive_int(_get_attr(cfg, "batch_size", None))
+        self.batch_size = batch_val
+
+        self._executor: ThreadPoolExecutor | None = None
+        self._task_semaphore: threading.BoundedSemaphore | None = None
+        self._queue_capacity = 0
+        if workers_val > 0:
+            self._executor = ThreadPoolExecutor(
+                max_workers=workers_val, thread_name_prefix="rest-budget"
+            )
+            queue_capacity = batch_val if batch_val > 0 else workers_val
+            self._task_semaphore = threading.BoundedSemaphore(queue_capacity)
+            self._queue_capacity = queue_capacity
+
         self._rng = rng or random.Random()
+        self._rng_lock = threading.Lock()
         self._sleep = sleep
+        self._stats_lock = threading.Lock()
 
         cache_cfg = _get_attr(cfg, "cache", None)
 
@@ -281,6 +319,16 @@ class RestBudgetSession:
         return val
 
     @staticmethod
+    def _coerce_positive_int(value: Any) -> int:
+        if value is None:
+            return 0
+        try:
+            val = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return val if val > 0 else 0
+
+    @staticmethod
     def _normalize_cache_mode(mode: Any) -> str:
         if mode is None:
             return "off"
@@ -319,6 +367,36 @@ class RestBudgetSession:
         for v in self._endpoint_variants(key):
             current = self._endpoint_cache_settings.setdefault(v, {})
             current.update(cfg)
+
+    def _clone_session(self) -> requests.Session:
+        base = self._base_session
+        clone = requests.Session()
+        clone.headers.update(base.headers)
+        if getattr(base, "params", None):
+            clone.params = dict(base.params)  # type: ignore[arg-type]
+        clone.auth = base.auth
+        clone.cookies.update(base.cookies)
+        clone.hooks = {k: list(v) for k, v in base.hooks.items()}
+        clone.proxies = dict(base.proxies)
+        clone.verify = base.verify
+        clone.cert = base.cert
+        clone.trust_env = base.trust_env
+        clone.stream = base.stream
+        clone.max_redirects = base.max_redirects
+        for prefix, adapter in base.adapters.items():
+            clone.mount(prefix, adapter)
+        return clone
+
+    def _get_requests_session(self) -> requests.Session:
+        if self._executor is None:
+            return self._base_session
+        sess = getattr(self._thread_local, "session", None)
+        if sess is None:
+            sess = self._clone_session()
+            self._thread_local.session = sess
+            with self._session_lock:
+                self._child_sessions.add(sess)
+        return sess
 
     @staticmethod
     def _parse_endpoint_cache_spec(spec: Any) -> dict[str, Any]:
@@ -461,7 +539,8 @@ class RestBudgetSession:
     def _next_jitter(self) -> float:
         if self._jitter_max_ms <= 0.0:
             return 0.0
-        return self._rng.uniform(self._jitter_min_ms, self._jitter_max_ms) / 1000.0
+        with self._rng_lock:
+            return self._rng.uniform(self._jitter_min_ms, self._jitter_max_ms) / 1000.0
 
     def _acquire_tokens(self, key: str, tokens: float = 1.0) -> None:
         while True:
@@ -484,10 +563,12 @@ class RestBudgetSession:
                 return
             wait_for = max(w for _, w, _ in waits)
             for name, _, b in waits:
-                self.wait_counts[name] += 1
+                with self._stats_lock:
+                    self.wait_counts[name] += 1
                 if self._cooldown_s > 0.0:
                     b.start_cooldown(self._cooldown_s, now=now)
-                    self.cooldown_counts[name] += 1
+                    with self._stats_lock:
+                        self.cooldown_counts[name] += 1
             self._sleep(wait_for)
 
     @staticmethod
@@ -519,11 +600,13 @@ class RestBudgetSession:
         now = time.monotonic()
         if self._global_bucket:
             self._global_bucket.start_cooldown(sec, now=now)
-            self.cooldown_counts["global"] += 1
+            with self._stats_lock:
+                self.cooldown_counts["global"] += 1
         bucket = self._endpoint_buckets.get(key)
         if bucket is not None:
             bucket.start_cooldown(sec, now=now)
-            self.cooldown_counts[key] += 1
+            with self._stats_lock:
+                self.cooldown_counts[key] += 1
 
     @staticmethod
     def _classify_for_retry(exc: Exception) -> str | None:
@@ -602,6 +685,110 @@ class RestBudgetSession:
             except OSError:
                 pass
 
+    def submit(self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> Future[T]:
+        if self._executor is None:
+            return self._submit_sync(fn, *args, **kwargs)
+        sem = self._task_semaphore
+        if sem is not None:
+            sem.acquire()
+        try:
+            future = self._executor.submit(fn, *args, **kwargs)
+        except BaseException:
+            if sem is not None:
+                sem.release()
+            raise
+        if sem is not None:
+            future.add_done_callback(lambda _: sem.release())
+        return future
+
+    @staticmethod
+    def _submit_sync(fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> Future[T]:
+        future: Future[T] = Future()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:  # pragma: no cover - passthrough
+            future.set_exception(exc)
+        else:
+            future.set_result(result)
+        return future
+
+    def map(
+        self,
+        fn: Callable[..., R],
+        *iterables: Iterable[Any],
+        prefetch: int | None = None,
+    ) -> Iterator[R]:
+        if not iterables:
+            raise ValueError("map() requires at least one iterable")
+        if self._executor is None:
+            for args in zip(*iterables):
+                yield fn(*args)
+            return
+
+        iterator = zip(*iterables)
+        max_pending = prefetch if prefetch is not None and prefetch > 0 else 0
+        if max_pending <= 0:
+            default_prefetch = self.batch_size or self._queue_capacity or self._max_workers or 1
+            max_pending = max(int(default_prefetch), 1)
+
+        pending: deque[Future[R]] = deque()
+        while True:
+            while len(pending) < max_pending:
+                try:
+                    args = next(iterator)
+                except StopIteration:
+                    break
+                pending.append(self.submit(fn, *args))
+            if not pending:
+                break
+            yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
+
+    def shutdown(self, wait: bool = True) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=wait)
+            self._executor = None
+            self._task_semaphore = None
+            self._queue_capacity = 0
+
+    def close(self) -> None:
+        self.shutdown(wait=True)
+        sessions: list[requests.Session] = []
+        with self._session_lock:
+            sessions.extend(list(self._child_sessions))
+            self._child_sessions.clear()
+        for sess in sessions:
+            try:
+                sess.close()
+            except Exception:  # pragma: no cover - best effort cleanup
+                continue
+        try:
+            del self._thread_local.session
+        except AttributeError:
+            pass
+        if self._owns_session:
+            try:
+                self._base_session.close()
+            except Exception:  # pragma: no cover - best effort cleanup
+                pass
+
+    def __enter__(self) -> "RestBudgetSession":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - best effort cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @property
+    def max_workers(self) -> int:
+        return self._max_workers
+
     def get(
         self,
         url: str,
@@ -642,8 +829,9 @@ class RestBudgetSession:
                 self._sleep(jitter)
 
             monitoring.record_http_request()
+            http_session = self._get_requests_session()
             try:
-                resp = self._session.get(
+                resp = http_session.get(
                     url,
                     params=params,
                     headers=headers,
@@ -651,18 +839,21 @@ class RestBudgetSession:
                 )
             except requests.exceptions.RequestException as exc:
                 label = self._error_label(exc)
-                self.error_counts[label] += 1
+                with self._stats_lock:
+                    self.error_counts[label] += 1
                 monitoring.record_http_error(label)
                 raise
 
             status = resp.status_code
             if status == 429:
-                self.error_counts[str(status)] += 1
+                with self._stats_lock:
+                    self.error_counts[str(status)] += 1
                 retry_after = self._parse_retry_after(resp.headers.get("Retry-After"))
                 self._start_cooldown(key, seconds=retry_after)
                 monitoring.record_http_error(status)
             elif 500 <= status < 600:
-                self.error_counts[str(status)] += 1
+                with self._stats_lock:
+                    self.error_counts[str(status)] += 1
                 monitoring.record_http_error(status)
 
             try:
@@ -680,4 +871,40 @@ class RestBudgetSession:
         return wrapped()
 
 
-__all__ = ["TokenBucket", "RestBudgetSession"]
+DAY_MS = 86_400_000
+
+
+def iter_time_chunks(
+    start_ms: int, end_ms: int, *, chunk_days: int = 30
+) -> Iterator[tuple[int, int]]:
+    """Yield ``(start, end)`` windows covering ``[start_ms, end_ms)``.
+
+    Each chunk spans at most ``chunk_days`` days (default 30).  The ``end``
+    value is never less than ``start`` and the final chunk always ends at
+    ``end_ms``.  Empty ranges yield no chunks.
+    """
+
+    start = int(start_ms)
+    end = int(end_ms)
+    if end <= start:
+        return
+    days = max(int(chunk_days), 1)
+    span_ms = days * DAY_MS
+    current = start
+    while current < end:
+        stop = min(current + span_ms, end)
+        yield current, stop
+        if stop >= end:
+            break
+        current = stop
+
+
+def split_time_range(
+    start_ms: int, end_ms: int, *, chunk_days: int = 30
+) -> list[tuple[int, int]]:
+    """Return a list of ``(start, end)`` chunks covering the range."""
+
+    return list(iter_time_chunks(start_ms, end_ms, chunk_days=chunk_days))
+
+
+__all__ = ["TokenBucket", "RestBudgetSession", "iter_time_chunks", "split_time_range"]

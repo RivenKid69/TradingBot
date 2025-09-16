@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Sequence
 
-from services.rest_budget import RestBudgetSession
+from services.rest_budget import RestBudgetSession, iter_time_chunks
 
 
 def _endpoint(market: str) -> str:
@@ -175,35 +175,67 @@ def run(
     start_ms = end_ms - window_ms
     limit = max(1, min(int(days), 1500))
 
-    try:
-        for idx in range(start_index, len(symbols_order)):
-            sym = symbols_order[idx]
-            _update_checkpoint(idx, symbol=sym)
+    chunk_windows = list(iter_time_chunks(start_ms, end_ms, chunk_days=30))
+    if not chunk_windows:
+        chunk_windows = [(start_ms, end_ms)]
+
+    batch_pref = int(getattr(session, "batch_size", 0) or 0)
+    worker_pref = int(getattr(session, "max_workers", 0) or 0)
+    batch_size = max(1, batch_pref or worker_pref or 1)
+
+    def _fetch_symbol_volume(symbol: str) -> float:
+        sym = str(symbol).upper()
+        seen_opens: set[int] = set()
+        volumes: list[float] = []
+        for chunk_start, chunk_end in chunk_windows:
             params = {
                 "symbol": sym,
                 "interval": "1d",
-                "startTime": start_ms,
-                "endTime": end_ms,
+                "startTime": chunk_start,
+                "endTime": chunk_end,
                 "limit": limit,
             }
-            try:
-                kl = session.get(
-                    _klines_endpoint(market),
-                    params=params,
-                    endpoint=_klines_endpoint_key(market),
-                )
-            except Exception:
-                avg_quote_vol[sym] = 0.0
-            else:
-                vols: list[float] = []
-                if isinstance(kl, list):
-                    for item in kl:
-                        try:
-                            vols.append(float(item[7]))
-                        except (IndexError, TypeError, ValueError):
-                            continue
-                avg_quote_vol[sym] = sum(vols) / len(vols) if vols else 0.0
-            _update_checkpoint(idx + 1, symbol=sym)
+            payload = session.get(
+                _klines_endpoint(market),
+                params=params,
+                endpoint=_klines_endpoint_key(market),
+            )
+            if not isinstance(payload, list):
+                continue
+            for item in payload:
+                if not isinstance(item, (list, tuple)) or len(item) < 8:
+                    continue
+                try:
+                    open_ts = int(item[0])
+                except (TypeError, ValueError):
+                    continue
+                if open_ts in seen_opens:
+                    continue
+                seen_opens.add(open_ts)
+                try:
+                    quote_volume = float(item[7])
+                except (TypeError, ValueError):
+                    continue
+                volumes.append(quote_volume)
+        return sum(volumes) / len(volumes) if volumes else 0.0
+
+    try:
+        idx = start_index
+        while idx < len(symbols_order):
+            batch = symbols_order[idx : idx + batch_size]
+            futures: list[tuple[int, str, Any]] = []
+            for offset, sym in enumerate(batch):
+                absolute = idx + offset
+                _update_checkpoint(absolute, symbol=sym)
+                future = session.submit(_fetch_symbol_volume, sym)
+                futures.append((absolute, sym, future))
+            for absolute, sym, future in futures:
+                try:
+                    avg_quote_vol[sym] = float(future.result())
+                except Exception:
+                    avg_quote_vol[sym] = 0.0
+                _update_checkpoint(absolute + 1, symbol=sym)
+            idx += max(len(batch), 1)
     finally:
         for sig, handler in handled_signals.items():
             try:

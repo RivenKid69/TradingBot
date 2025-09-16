@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 from service_fetch_exchange_specs import run
 from services.rest_budget import RestBudgetSession
+import yaml
 
 
 def main() -> None:
@@ -49,6 +51,11 @@ def main() -> None:
         help="Игнорировать существующий чекпоинт",
     )
     p.set_defaults(resume=False)
+    p.add_argument(
+        "--rest-budget-config",
+        default="configs/rest_budget.yaml",
+        help="Путь к YAML с настройками RestBudgetSession (по умолчанию configs/rest_budget.yaml)",
+    )
     args = p.parse_args()
 
     checkpoint_cfg: dict[str, object] = {}
@@ -60,18 +67,44 @@ def main() -> None:
             "enabled": True,
             "resume_from_checkpoint": resume_flag,
         }
-    session = RestBudgetSession({"checkpoint": checkpoint_cfg} if checkpoint_cfg else {})
+    rest_cfg: dict[str, object] = {}
+    config_path = str(args.rest_budget_config or "").strip()
+    if config_path:
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                loaded = yaml.safe_load(f) or {}
+            if isinstance(loaded, dict):
+                rest_cfg = dict(loaded)
+            else:
+                raise TypeError("rest budget config must be a mapping")
+        except FileNotFoundError:
+            print(f"[WARN] rest budget config not found: {config_path}", file=sys.stderr)
+        except Exception as exc:  # pragma: no cover - best effort CLI warning
+            print(
+                f"[WARN] failed to load rest budget config {config_path}: {exc}",
+                file=sys.stderr,
+            )
 
-    run(
-        market=args.market,
-        symbols=args.symbols,
-        out=args.out,
-        volume_threshold=args.volume_threshold,
-        volume_out=args.volume_out,
-        days=args.days,
-        shuffle=args.shuffle,
-        session=session,
-    )
+    if checkpoint_cfg:
+        existing = rest_cfg.get("checkpoint")
+        merged_checkpoint: dict[str, object] = {}
+        if isinstance(existing, dict):
+            merged_checkpoint.update(existing)
+        merged_checkpoint.update(checkpoint_cfg)
+        rest_cfg = dict(rest_cfg)
+        rest_cfg["checkpoint"] = merged_checkpoint
+
+    with RestBudgetSession(rest_cfg) as session:
+        run(
+            market=args.market,
+            symbols=args.symbols,
+            out=args.out,
+            volume_threshold=args.volume_threshold,
+            volume_out=args.volume_out,
+            days=args.days,
+            shuffle=args.shuffle,
+            session=session,
+        )
 
 
 if __name__ == "__main__":
