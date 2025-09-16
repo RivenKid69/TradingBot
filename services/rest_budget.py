@@ -13,7 +13,7 @@ import threading
 import time
 import urllib.parse
 import weakref
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator, Mapping, MutableMapping, TypeVar
@@ -250,6 +250,15 @@ class RestBudgetSession:
         self.wait_counts: Counter[str] = Counter()
         self.cooldown_counts: Counter[str] = Counter()
         self.error_counts: Counter[str] = Counter()
+        self._request_counts: Counter[str] = Counter()
+        self._request_tokens: defaultdict[str, float] = defaultdict(float)
+        self._planned_counts: Counter[str] = Counter()
+        self._planned_tokens: defaultdict[str, float] = defaultdict(float)
+        self._cache_hits: Counter[str] = Counter()
+        self._cache_misses: Counter[str] = Counter()
+        self._cache_stores: Counter[str] = Counter()
+        self._checkpoint_loads = 0
+        self._checkpoint_saves = 0
 
     @staticmethod
     def _parse_retry_cfg(cfg: Any) -> RetryConfig:
@@ -571,6 +580,23 @@ class RestBudgetSession:
                         self.cooldown_counts[name] += 1
             self._sleep(wait_for)
 
+    def _record_request(self, key: str, tokens: float) -> None:
+        with self._stats_lock:
+            self._request_counts[key] += 1
+            self._request_tokens[key] += float(tokens)
+
+    def _record_cache_hit(self, key: str) -> None:
+        with self._stats_lock:
+            self._cache_hits[key] += 1
+
+    def _record_cache_miss(self, key: str) -> None:
+        with self._stats_lock:
+            self._cache_misses[key] += 1
+
+    def _record_cache_store(self, key: str) -> None:
+        with self._stats_lock:
+            self._cache_stores[key] += 1
+
     @staticmethod
     def _parse_retry_after(value: str | None) -> float | None:
         if not value:
@@ -645,12 +671,15 @@ class RestBudgetSession:
             return None
         try:
             with self._checkpoint_path.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                payload = json.load(f)
         except FileNotFoundError:
             return None
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Failed to read checkpoint %s: %s", self._checkpoint_path, exc)
             return None
+        with self._stats_lock:
+            self._checkpoint_loads += 1
+        return payload
 
     def save_checkpoint(self, data: Any) -> None:
         """Persist *data* atomically when checkpointing is enabled."""
@@ -684,6 +713,9 @@ class RestBudgetSession:
                 os.remove(tmp_name)
             except OSError:
                 pass
+        else:
+            with self._stats_lock:
+                self._checkpoint_saves += 1
 
     def submit(self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> Future[T]:
         if self._executor is None:
@@ -802,6 +834,7 @@ class RestBudgetSession:
         """Perform GET request obeying configured budgets."""
 
         key = self._resolve_endpoint_key("GET", url, endpoint)
+        stats_key = self._normalize_endpoint_key(key) or key
 
         cache_key: str | None = None
         if self._cache_mode != "off" and self._cache_dir is not None:
@@ -813,16 +846,21 @@ class RestBudgetSession:
             if min_refresh_days is not None:
                 cached_payload = self._cache_lookup(cache_key, ttl_days=min_refresh_days)
                 if cached_payload is not None:
+                    self._record_cache_hit(stats_key)
                     return cached_payload
+                self._record_cache_miss(stats_key)
             cached_payload = self._cache_lookup(cache_key)
             if cached_payload is not None:
+                self._record_cache_hit(stats_key)
                 return cached_payload
+            self._record_cache_miss(stats_key)
 
         should_store_cache = (
             cache_key is not None and self._cache_mode == "read_write"
         )
 
         def _do_request() -> Any:
+            self._record_request(stats_key, tokens)
             self._acquire_tokens(key, tokens=tokens)
             jitter = self._next_jitter()
             if jitter > 0.0:
@@ -865,10 +903,59 @@ class RestBudgetSession:
             payload = self._extract_body(resp)
             if should_store_cache and cache_key is not None:
                 self._cache_store(cache_key, payload)
+                self._record_cache_store(stats_key)
             return payload
 
         wrapped = retry_sync(self._retry_cfg, self._classify_for_retry)(_do_request)
         return wrapped()
+
+    def plan_request(
+        self,
+        endpoint: str,
+        *,
+        count: int = 1,
+        tokens: float = 1.0,
+    ) -> None:
+        """Record a planned request without performing HTTP calls."""
+
+        key = self._normalize_endpoint_key(str(endpoint))
+        if not key:
+            return
+        try:
+            cnt = int(count)
+        except (TypeError, ValueError):
+            return
+        if cnt <= 0:
+            return
+        try:
+            token_val = float(tokens)
+        except (TypeError, ValueError):
+            token_val = 0.0
+        total_tokens = token_val * cnt
+        with self._stats_lock:
+            self._planned_counts[key] += cnt
+            self._planned_tokens[key] += total_tokens
+
+    def stats(self) -> dict[str, Any]:
+        """Return a JSON-serialisable snapshot of collected statistics."""
+
+        with self._stats_lock:
+            return {
+                "requests": dict(self._request_counts),
+                "request_tokens": {k: float(v) for k, v in self._request_tokens.items()},
+                "planned_requests": dict(self._planned_counts),
+                "planned_tokens": {k: float(v) for k, v in self._planned_tokens.items()},
+                "cache_hits": dict(self._cache_hits),
+                "cache_misses": dict(self._cache_misses),
+                "cache_stores": dict(self._cache_stores),
+                "waits": dict(self.wait_counts),
+                "cooldowns": dict(self.cooldown_counts),
+                "errors": dict(self.error_counts),
+                "checkpoint": {
+                    "loads": self._checkpoint_loads,
+                    "saves": self._checkpoint_saves,
+                },
+            }
 
 
 DAY_MS = 86_400_000
