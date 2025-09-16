@@ -373,6 +373,28 @@ class EvalConfig(CommonRunConfig):
     all_profiles: bool = Field(default=False)
 
 
+def _inject_quantizer_config(cfg: CommonRunConfig, data: Dict[str, Any]) -> None:
+    """Ensure quantizer configuration is preserved on ``cfg``."""
+
+    q_raw = data.get("quantizer")
+    if q_raw is None:
+        return
+    try:
+        q_dict = dict(q_raw)  # type: ignore[arg-type]
+    except Exception:
+        q_dict = {}
+    try:
+        existing = getattr(cfg, "quantizer")
+    except AttributeError:
+        object.__setattr__(cfg, "quantizer", q_dict)
+        return
+    if existing is None or not isinstance(existing, dict):
+        object.__setattr__(cfg, "quantizer", q_dict)
+        return
+    existing.clear()
+    existing.update(q_dict)
+
+
 def load_config(path: str) -> CommonRunConfig:
     """Загрузить конфигурацию запуска из YAML-файла."""
     with open(path, "r", encoding="utf-8") as f:
@@ -391,6 +413,7 @@ def load_config(path: str) -> CommonRunConfig:
     # parse_obj ensures all newly added optional fields are preserved
     cfg = cfg_cls.parse_obj(data)
     _set_seasonality_log_level(cfg)
+    _inject_quantizer_config(cfg, data)
     return cfg
 
 
@@ -410,6 +433,7 @@ def load_config_from_str(content: str) -> CommonRunConfig:
     # parse_obj ensures all newly added optional fields are preserved
     cfg = cfg_cls.parse_obj(data)
     _set_seasonality_log_level(cfg)
+    _inject_quantizer_config(cfg, data)
     return cfg
 
 

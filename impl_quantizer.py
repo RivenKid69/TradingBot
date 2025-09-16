@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import hashlib
 import logging
 import os
 import subprocess
+import time
+import warnings
 
 from services import monitoring
 
@@ -60,6 +62,13 @@ def _is_stale(age_days: Optional[float], max_age_days: int) -> bool:
 def _file_size_bytes(path: str) -> Optional[int]:
     try:
         return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def _file_mtime(path: str) -> Optional[float]:
+    try:
+        return os.path.getmtime(path)
     except OSError:
         return None
 
@@ -112,6 +121,48 @@ class QuantizerConfig:
 
 
 class QuantizerImpl:
+    _REFRESH_GUARD: Dict[str, Tuple[float, Optional[float]]] = {}
+    _REFRESH_COOLDOWN_SEC: float = 30.0
+
+    @classmethod
+    def _should_refresh(cls, path: str, current_mtime: Optional[float]) -> bool:
+        entry = cls._REFRESH_GUARD.get(path)
+        if entry is None:
+            return True
+        last_ts, last_mtime = entry
+        if current_mtime is not None and last_mtime is not None and current_mtime > last_mtime:
+            return True
+        if current_mtime is None and last_mtime is not None:
+            return True
+        if (time.monotonic() - last_ts) > cls._REFRESH_COOLDOWN_SEC:
+            return True
+        return False
+
+    @classmethod
+    def _record_refresh(cls, path: str, current_mtime: Optional[float]) -> None:
+        cls._REFRESH_GUARD[path] = (time.monotonic(), current_mtime)
+
+    @staticmethod
+    def _load_filters(path: str, max_age_days: int) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+        if Quantizer is None:
+            return {}, {}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            filters, meta = Quantizer.load_filters(
+                path,
+                max_age_days=max(0, int(max_age_days)),
+                fatal=False,
+            )
+        for warn in caught:
+            try:
+                formatted = warnings.formatwarning(
+                    warn.message, warn.category, warn.filename, warn.lineno, warn.line
+                )
+            except Exception:
+                formatted = f"{getattr(warn.category, '__name__', 'Warning')}: {warn.message}"
+            logger.warning("Quantizer warning (%s): %s", path, str(formatted).strip())
+        return filters, meta
+
     def __init__(self, cfg: QuantizerConfig) -> None:
         self.cfg = cfg
         self._quantizer = None
@@ -122,37 +173,40 @@ class QuantizerImpl:
             return
 
         max_age_days = max(_as_int(cfg.auto_refresh_days, 30), 0)
-        filters, meta = Quantizer.load_filters(
-            filters_path,
-            max_age_days=max_age_days,
-            fatal=False,
-        )
+        filters, meta = self._load_filters(filters_path, max_age_days)
         meta_dict: Dict[str, Any] = dict(meta or {}) if isinstance(meta, dict) else {}
         age_days = _filters_age_days(meta_dict, filters_path)
         stale = _is_stale(age_days, max_age_days)
         missing = not filters
 
         if cfg.refresh_on_start and (missing or stale):
-            logger.info(
-                "Refreshing Binance filters: path=%s missing=%s stale=%s auto_refresh_days=%s",
-                filters_path,
-                missing,
-                stale,
-                max_age_days,
-            )
-            if self._refresh_filters(filters_path):
-                filters, meta = Quantizer.load_filters(
+            refresh_key = os.path.abspath(filters_path)
+            current_mtime = _file_mtime(filters_path)
+            if self._should_refresh(refresh_key, current_mtime):
+                logger.info(
+                    "Refreshing Binance filters: path=%s missing=%s stale=%s auto_refresh_days=%s",
                     filters_path,
-                    max_age_days=max_age_days,
-                    fatal=False,
+                    missing,
+                    stale,
+                    max_age_days,
                 )
-                meta_dict = dict(meta or {}) if isinstance(meta, dict) else {}
-                age_days = _filters_age_days(meta_dict, filters_path)
-                stale = _is_stale(age_days, max_age_days)
-                missing = not filters
+                if self._refresh_filters(filters_path):
+                    refreshed_mtime = _file_mtime(filters_path)
+                    self._record_refresh(refresh_key, refreshed_mtime)
+                    filters, meta = self._load_filters(filters_path, max_age_days)
+                    meta_dict = dict(meta or {}) if isinstance(meta, dict) else {}
+                    age_days = _filters_age_days(meta_dict, filters_path)
+                    stale = _is_stale(age_days, max_age_days)
+                    missing = not filters
+                else:
+                    self._record_refresh(refresh_key, current_mtime)
+                    filters = {}
+                    missing = True
             else:
-                filters = {}
-                missing = True
+                logger.debug(
+                    "Skipping Binance filters refresh for %s; recent attempt detected",
+                    filters_path,
+                )
 
         size_bytes = _file_size_bytes(filters_path)
         sha256 = _file_sha256(filters_path) if size_bytes is not None else None

@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import logging
 from typing import Any, Dict, Mapping, Optional, Type, TypeVar, get_type_hints
 
 from core_errors import ConfigError
 from core_config import ComponentSpec, Components, CommonRunConfig, RetryConfig
+from impl_quantizer import QuantizerImpl
 
 
 def _load_class(dotted: str):
@@ -32,6 +34,9 @@ def _load_class(dotted: str):
 
 
 T = TypeVar("T")
+
+
+logger = logging.getLogger(__name__)
 
 
 def _instantiate(target_cls, params: Dict[str, Any], container: Mapping[Any, Any]) -> Any:
@@ -99,6 +104,15 @@ def build_graph(components: Components, run_config: Optional[CommonRunConfig] = 
         container["run_config"] = run_config
         container["retry_cfg"] = run_config.retry
         container[RetryConfig] = run_config.retry
+        q_cfg = getattr(run_config, "quantizer", None)
+        if isinstance(q_cfg, Mapping):
+            try:
+                quantizer = QuantizerImpl.from_dict(dict(q_cfg))
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning("Failed to build QuantizerImpl from config: %s", exc)
+            else:
+                container["quantizer"] = quantizer
+                container[QuantizerImpl] = quantizer
     build_component("market_data", components.market_data, container)
     build_component("feature_pipe", components.feature_pipe, container)
     build_component("policy", components.policy, container)
