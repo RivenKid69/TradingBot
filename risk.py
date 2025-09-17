@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 from collections import deque
-from datetime import datetime, timezone
+from utils.time import daily_reset_key
 
 
 @dataclass
@@ -125,13 +125,7 @@ class RiskManager:
 
     def _day_bucket(self, ts_ms: int) -> str:
         # Ключ «дня» по UTC с учётом смещения начала дня (daily_reset_utc_hour)
-        h = int(self.cfg.daily_reset_utc_hour)
-        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
-        # сместим время так, чтобы "день" начинался в h:00
-        adj = dt.replace(hour=h, minute=0, second=0, microsecond=0)
-        if dt < adj:
-            adj = adj.replace(day=(adj.day - 1))
-        return adj.strftime("%Y-%m-%dT%H")
+        return daily_reset_key(ts_ms, self.cfg.daily_reset_utc_hour)
 
     def _ensure_entry_day(self, ts_ms: int) -> None:
         key = self._day_bucket(ts_ms)
