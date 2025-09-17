@@ -2,11 +2,20 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from enum import Enum
 from typing import Any, Dict, List, Mapping, Sequence
 
 from core_contracts import PolicyCtx, SignalPolicy
 from core_models import Order, OrderType, Side, TimeInForce, to_decimal
 from core_strategy import Strategy
+
+
+class SignalPosition(str, Enum):
+    """Enumerates the direction of a trading signal."""
+
+    FLAT = "flat"
+    LONG = "long"
+    SHORT = "short"
 
 
 class BaseStrategy(Strategy):
@@ -53,6 +62,8 @@ class BaseSignalPolicy(SignalPolicy):
 
     def __init__(self, **params: Any) -> None:
         self.params: Dict[str, Any] = dict(params)
+        self._signal_state: dict[str, SignalPosition] = {}
+        self._dirty_signal_state: set[str] = set()
 
     # ------------------------------------------------------------------
     # Utilities
@@ -71,6 +82,70 @@ class BaseSignalPolicy(SignalPolicy):
     def decide(self, features: Mapping[str, Any], ctx: PolicyCtx) -> List[Order]:
         self._validate_inputs(features, ctx)
         return []
+
+    # ------------------------------------------------------------------
+    # Signal state management
+    # ------------------------------------------------------------------
+    def get_signal_state(self, symbol: str) -> SignalPosition:
+        return self._signal_state.get(symbol, SignalPosition.FLAT)
+
+    def update_signal_state(
+        self, symbol: str, state: SignalPosition | str | int
+    ) -> SignalPosition:
+        normalized = self._normalize_signal_state(state)
+        previous = self._signal_state.get(symbol)
+        if normalized is SignalPosition.FLAT:
+            if symbol in self._signal_state:
+                del self._signal_state[symbol]
+        else:
+            self._signal_state[symbol] = normalized
+        if previous != normalized:
+            self._dirty_signal_state.add(symbol)
+        return normalized
+
+    def load_signal_state(self, states: Mapping[str, Any]) -> None:
+        self._signal_state.clear()
+        self._dirty_signal_state.clear()
+        for symbol, state in states.items():
+            normalized = self._normalize_signal_state(state)
+            if normalized is SignalPosition.FLAT:
+                continue
+            self._signal_state[str(symbol)] = normalized
+
+    def export_signal_state(self) -> dict[str, str]:
+        return {symbol: state.value for symbol, state in self._signal_state.items()}
+
+    def consume_dirty_signal_state(self) -> dict[str, str]:
+        dirty_symbols = self._dirty_signal_state.copy()
+        self._dirty_signal_state.clear()
+        return {
+            symbol: self.get_signal_state(symbol).value
+            for symbol in dirty_symbols
+        }
+
+    def _normalize_signal_state(self, state: SignalPosition | str | int) -> SignalPosition:
+        if isinstance(state, SignalPosition):
+            return state
+        if isinstance(state, str):
+            token = state.strip()
+            if not token:
+                raise ValueError("signal state string cannot be empty")
+            upper_token = token.upper()
+            try:
+                return SignalPosition[upper_token]
+            except KeyError:
+                lowered = token.lower()
+                for member in SignalPosition:
+                    if member.value == lowered:
+                        return member
+            raise ValueError(f"unknown signal state string: {state!r}")
+        if isinstance(state, int):
+            if state == 0:
+                return SignalPosition.FLAT
+            if state > 0:
+                return SignalPosition.LONG
+            return SignalPosition.SHORT
+        raise TypeError(f"unsupported signal state type: {type(state)!r}")
 
     # Helper methods to construct orders
     def market_order(
@@ -118,4 +193,4 @@ class BaseSignalPolicy(SignalPolicy):
         )
 
 
-__all__ = ["BaseStrategy", "BaseSignalPolicy"]
+__all__ = ["SignalPosition", "BaseStrategy", "BaseSignalPolicy"]
