@@ -29,6 +29,7 @@ class TradingState:
     last_processed_bar_ms: int | None = None
     seen_signals: Iterable[Any] = field(default_factory=list)
     config_snapshot: Dict[str, Any] = field(default_factory=dict)
+    signal_states: Dict[str, Any] = field(default_factory=dict)
     git_hash: str | None = None
     version: int = 1
 
@@ -42,6 +43,7 @@ class TradingState:
                 last_processed_bar_ms=data.get("last_processed_bar_ms"),
                 seen_signals=data.get("seen_signals", []) or [],
                 config_snapshot=data.get("config_snapshot", {}) or {},
+                signal_states=data.get("signal_states", {}) or {},
                 git_hash=data.get("git_hash"),
                 version=data.get("version", 1) or 1,
             )
@@ -116,6 +118,7 @@ class SQLiteBackend:
         "last_processed_bar_ms INTEGER,"
         "seen_signals TEXT,"
         "config_snapshot TEXT,"
+        "signal_states TEXT,"
         "git_hash TEXT,"
         "version INTEGER"
         ")"
@@ -125,14 +128,13 @@ class SQLiteBackend:
         if not path.exists():
             raise FileNotFoundError(path)
         con = sqlite3.connect(path)
+        con.row_factory = sqlite3.Row
         try:
             with con:
                 con.execute("PRAGMA journal_mode=WAL;")
                 con.execute(self.TABLE_SQL)
                 cur = con.execute(
-                    "SELECT positions, open_orders, cash, last_processed_bar_ms,"
-                    " seen_signals, config_snapshot, git_hash, version FROM state"
-                    " WHERE id = 1"
+                    "SELECT * FROM state WHERE id = 1"
                 )
                 row = cur.fetchone()
         finally:
@@ -140,14 +142,18 @@ class SQLiteBackend:
         if not row:
             return TradingState()
         data = {
-            "positions": json.loads(row[0] or "{}"),
-            "open_orders": json.loads(row[1] or "{}"),
-            "cash": row[2] or 0.0,
-            "last_processed_bar_ms": row[3],
-            "seen_signals": json.loads(row[4] or "[]"),
-            "config_snapshot": json.loads(row[5] or "{}"),
-            "git_hash": row[6],
-            "version": row[7] or 1,
+            "positions": json.loads(row["positions"] or "{}"),
+            "open_orders": json.loads(row["open_orders"] or "{}"),
+            "cash": row["cash"] or 0.0,
+            "last_processed_bar_ms": row["last_processed_bar_ms"],
+            "seen_signals": json.loads(row["seen_signals"] or "[]"),
+            "config_snapshot": json.loads(row["config_snapshot"] or "{}"),
+            "signal_states": json.loads(
+                (row["signal_states"] if "signal_states" in row.keys() else "{}")
+                or "{}"
+            ),
+            "git_hash": row["git_hash"],
+            "version": row["version"] or 1,
         }
         return TradingState.from_dict(data)
 
@@ -166,10 +172,18 @@ class SQLiteBackend:
             cur = con.cursor()
             cur.execute("BEGIN IMMEDIATE;")
             cur.execute(self.TABLE_SQL)
+            try:
+                columns = {
+                    row[1] for row in cur.execute("PRAGMA table_info(state)")
+                }
+            except Exception:
+                columns = set()
+            if "signal_states" not in columns:
+                cur.execute("ALTER TABLE state ADD COLUMN signal_states TEXT")
             cur.execute(
                 "REPLACE INTO state (id, positions, open_orders, cash, last_processed_bar_ms,"
-                " seen_signals, config_snapshot, git_hash, version)"
-                " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " seen_signals, config_snapshot, signal_states, git_hash, version)"
+                " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     json.dumps(state.positions, separators=(",", ":")),
                     json.dumps(state.open_orders, separators=(",", ":")),
@@ -177,6 +191,7 @@ class SQLiteBackend:
                     state.last_processed_bar_ms,
                     json.dumps(list(state.seen_signals), separators=(",", ":")),
                     json.dumps(state.config_snapshot, separators=(",", ":")),
+                    json.dumps(state.signal_states, separators=(",", ":")),
                     state.git_hash,
                     state.version,
                 ),
