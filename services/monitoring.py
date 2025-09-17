@@ -62,6 +62,13 @@ queue_len = Gauge(
     "Current number of queued signals awaiting tokens",
 )
 
+# Daily entry limiter blocks
+entry_limiter_block_count = Counter(
+    "entry_limiter_block_count",
+    "Signals blocked by the daily entry limiter",
+    ["symbol"],
+)
+
 # Throttling outcomes
 throttle_dropped_count = Counter(
     "throttle_dropped_count",
