@@ -65,6 +65,44 @@ def test_dynamic_guard_blocks_and_logs_reasons(tmp_path):
     assert bool(reasons.loc[df.index[3], "dyn_guard_hold"])
     assert not bool(reasons.loc[df.index[2], "dyn_guard_hold"])
 
+    labels = mask.attrs.get("reason_labels")
+    assert isinstance(labels, dict)
+    assert "dynamic_guard" in labels
+
     cfg = get_no_trade_config(str(cfg_path))
     ratio = estimate_block_ratio(df, cfg)
     assert ratio == pytest.approx(mask.mean())
+
+
+def test_dynamic_guard_skipped_when_data_missing(tmp_path):
+    cfg_data = {
+        "no_trade": {
+            "funding_buffer_min": 0,
+            "daily_utc": [],
+            "custom_ms": [],
+            "dynamic_guard": {
+                "enable": True,
+                "sigma_window": 3,
+                "vol_abs": 0.1,
+            },
+        }
+    }
+    cfg_path = tmp_path / "sandbox.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_data), encoding="utf-8")
+
+    df = pd.DataFrame({"ts_ms": np.arange(5, dtype=np.int64) * 60_000})
+
+    mask = compute_no_trade_mask(df, sandbox_yaml_path=str(cfg_path))
+    assert not mask.any()
+
+    reasons = mask.attrs.get("reasons")
+    assert isinstance(reasons, pd.DataFrame)
+    assert "dynamic_guard" in reasons.columns
+    assert not reasons["dynamic_guard"].any()
+
+    meta = mask.attrs.get("meta")
+    assert isinstance(meta, dict)
+    dyn_meta = meta.get("dynamic_guard")
+    assert isinstance(dyn_meta, dict)
+    assert dyn_meta.get("skipped")
+    assert "volatility" in dyn_meta.get("missing", [])

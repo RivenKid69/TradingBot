@@ -216,6 +216,39 @@ def _dynamic_guard_mask(
             derived_spread = (ask - bid) / mid * 10000.0
         spread = spread.fillna(derived_spread)
 
+    dyn_mask = pd.Series(False, index=df.index, dtype=bool)
+    reasons = pd.DataFrame(
+        False,
+        index=df.index,
+        columns=[
+            "dyn_vol_abs",
+            "dyn_vol_pctile",
+            "dyn_spread_abs",
+            "dyn_spread_pctile",
+            "dyn_guard_raw",
+            "dyn_guard_hold",
+        ],
+    )
+    reasons.attrs["meta"] = {}
+
+    thresholds_defined = any(
+        x is not None
+        for x in (
+            dyn_cfg.vol_abs,
+            dyn_cfg.vol_pctile,
+            dyn_cfg.spread_abs_bps,
+            dyn_cfg.spread_pctile,
+        )
+    )
+    if not thresholds_defined:
+        return dyn_mask, reasons
+
+    required_metrics: List[str] = []
+    if dyn_cfg.vol_abs is not None or dyn_cfg.vol_pctile is not None:
+        required_metrics.append("volatility")
+    if dyn_cfg.spread_abs_bps is not None or dyn_cfg.spread_pctile is not None:
+        required_metrics.append("spread")
+
     close = price.replace(0, np.nan)
     returns = price.groupby(symbols).pct_change()
 
@@ -233,26 +266,22 @@ def _dynamic_guard_mask(
     vol_pctile = _rolling_percentile(vol_metric, symbols, sigma_window)
     spread_pctile = _rolling_percentile(spread_proxy, symbols, atr_window)
 
-    dyn_mask = pd.Series(False, index=df.index, dtype=bool)
-    reasons = pd.DataFrame(False, index=df.index, columns=[
-        "dyn_vol_abs",
-        "dyn_vol_pctile",
-        "dyn_spread_abs",
-        "dyn_spread_pctile",
-        "dyn_guard_raw",
-        "dyn_guard_hold",
-    ])
+    missing_requirements: List[str] = []
+    if "volatility" in required_metrics and not (
+        vol_metric.notna().any() or vol_pctile.notna().any()
+    ):
+        missing_requirements.append("volatility")
+    if "spread" in required_metrics and not (
+        spread_proxy.notna().any() or spread_pctile.notna().any()
+    ):
+        missing_requirements.append("spread")
 
-    thresholds_defined = any(
-        x is not None
-        for x in (
-            dyn_cfg.vol_abs,
-            dyn_cfg.vol_pctile,
-            dyn_cfg.spread_abs_bps,
-            dyn_cfg.spread_pctile,
-        )
-    )
-    if not thresholds_defined:
+    if missing_requirements:
+        reasons.attrs["meta"] = {
+            "skipped": True,
+            "reason": "missing_data",
+            "missing": missing_requirements,
+        }
         return dyn_mask, reasons
 
     hysteresis = float(dyn_cfg.hysteresis or 0.0)
@@ -385,15 +414,23 @@ def compute_no_trade_mask(
     dyn_cfg = cfg.dynamic_guard or None
     dyn_mask = pd.Series(False, index=df.index, dtype=bool)
     dyn_reasons: Optional[pd.DataFrame] = None
+    meta: Dict[str, Any] = {}
     if dyn_cfg and dyn_cfg.enable:
         dyn_mask, dyn_reasons = _dynamic_guard_mask(df, dyn_cfg)
         reasons = pd.concat([reasons, dyn_reasons], axis=1).fillna(False)
         window_mask = window_mask | dyn_mask.to_numpy(dtype=bool)
+        dyn_meta = getattr(dyn_reasons, "attrs", {}).get("meta") if dyn_reasons is not None else None
+        if dyn_meta:
+            meta["dynamic_guard"] = dyn_meta
 
     result = pd.Series(window_mask, index=df.index, name="no_trade_block")
     if dyn_cfg and dyn_cfg.enable:
         reasons["dynamic_guard"] = dyn_mask.astype(bool)
     else:
         reasons["dynamic_guard"] = False
-    result.attrs["reasons"] = reasons.astype(bool)
+    reasons = reasons.reindex(df.index).fillna(False).astype(bool)
+    result.attrs["reasons"] = reasons
+    result.attrs["reason_labels"] = {col: col for col in reasons.columns}
+    if meta:
+        result.attrs["meta"] = meta
     return result
