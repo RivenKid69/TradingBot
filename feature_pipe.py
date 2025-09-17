@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from decimal import InvalidOperation
+from decimal import InvalidOperation, Decimal
 from math import sqrt, isfinite
-from typing import Iterable, Mapping, Optional, Any, Deque, Dict
+from typing import Iterable, Mapping, Optional, Any, Deque, Dict, Union
 import copy
 
 import pandas as pd
@@ -39,6 +39,29 @@ class _SymbolMetricsState:
     volumes: Deque[float] = field(default_factory=deque)
     sum_returns: float = 0.0
     sum_sq_returns: float = 0.0
+
+
+@dataclass
+class _FeatureStatsState:
+    prev_close: Optional[float] = None
+    returns: Deque[float] = field(default_factory=deque)
+    bar_count: int = 0
+    ret_last: Optional[float] = None
+    sigma: Optional[float] = None
+    spread_bps: Optional[float] = None
+    spread_ts_ms: Optional[int] = None
+    last_bar_ts: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class MarketMetricsSnapshot:
+    ret_last: Optional[float]
+    sigma: Optional[float]
+    spread_bps: Optional[float]
+    window_ready: bool
+    bar_count: int
+    last_bar_ts: Optional[int]
+    spread_ts: Optional[int]
 
 
 class SignalQualityMetrics:
@@ -193,7 +216,13 @@ class FeaturePipe:
     price_col: str = "price"
     label_col: Optional[str] = None
     metrics: Optional[SignalQualityMetrics] = None
+    sigma_window: int = 120
+    min_sigma_periods: int = 2
+    spread_ttl_ms: int = 60_000
     signal_quality: Dict[str, SignalQualitySnapshot] = field(
+        init=False, default_factory=dict
+    )
+    market_state: Dict[str, MarketMetricsSnapshot] = field(
         init=False, default_factory=dict
     )
 
@@ -201,6 +230,12 @@ class FeaturePipe:
         # Initialize transformer for online mode.
         self._tr = OnlineFeatureTransformer(self.spec)
         self._read_only = False
+        self._sigma_window = max(1, int(self.sigma_window))
+        self._min_sigma_periods = max(2, int(self.min_sigma_periods))
+        if self._min_sigma_periods > self._sigma_window:
+            self._min_sigma_periods = self._sigma_window
+        self._spread_ttl_ms = max(0, int(self.spread_ttl_ms))
+        self._symbol_state: Dict[str, _FeatureStatsState] = {}
 
     # ------------------------------------------------------------------
     # Streaming API
@@ -209,6 +244,8 @@ class FeaturePipe:
         """Reset internal state of the transformer."""
         self._tr = OnlineFeatureTransformer(self.spec)
         self.signal_quality.clear()
+        self.market_state.clear()
+        self._symbol_state.clear()
         if self.metrics is not None:
             try:
                 self.metrics.reset()
@@ -237,6 +274,8 @@ class FeaturePipe:
 
         symbol = bar.symbol.upper()
         ts_ms = int(bar.ts)
+        state = self._get_symbol_state(symbol)
+        self._update_market_metrics(symbol, state, close_value, ts_ms, bar)
 
         if not self._read_only:
             feats = self._tr.update(
@@ -266,6 +305,212 @@ class FeaturePipe:
     # ``core_contracts.FeaturePipe`` historically exposes ``on_bar``.  Keep
     # an alias for backward compatibility with existing call sites.
     on_bar = update
+
+    # ------------------------------------------------------------------
+    # Market metrics helpers
+    # ------------------------------------------------------------------
+    def get_market_metrics(self, symbol: str) -> Optional[MarketMetricsSnapshot]:
+        sym = str(symbol).upper()
+        return self.market_state.get(sym)
+
+    def record_spread(
+        self,
+        symbol: str,
+        *,
+        spread_bps: Optional[Union[float, int, Decimal]] = None,
+        bid: Optional[Union[float, int, Decimal]] = None,
+        ask: Optional[Union[float, int, Decimal]] = None,
+        ts_ms: Optional[int] = None,
+    ) -> None:
+        sym = str(symbol).upper()
+        if not sym:
+            return
+        state = self._get_symbol_state(sym)
+        spread_value = self._coerce_float(spread_bps)
+        if spread_value is None:
+            spread_value = self._compute_spread_from_quotes(bid, ask)
+        if spread_value is None or not isfinite(spread_value) or spread_value <= 0:
+            return
+        state.spread_bps = spread_value
+        if ts_ms is not None:
+            try:
+                state.spread_ts_ms = int(ts_ms)
+            except Exception:
+                pass
+        elif state.last_bar_ts is not None:
+            state.spread_ts_ms = state.last_bar_ts
+        self._publish_market_snapshot(sym, state, state.last_bar_ts)
+
+    def _get_symbol_state(self, symbol: str) -> _FeatureStatsState:
+        sym = str(symbol).upper()
+        state = self._symbol_state.get(sym)
+        if state is None:
+            state = _FeatureStatsState(returns=deque(maxlen=self._sigma_window))
+            self._symbol_state[sym] = state
+        else:
+            if state.returns.maxlen != self._sigma_window:
+                state.returns = deque(state.returns, maxlen=self._sigma_window)
+        return state
+
+    def _update_market_metrics(
+        self,
+        symbol: str,
+        state: _FeatureStatsState,
+        close_value: float,
+        ts_ms: int,
+        bar: Bar,
+    ) -> None:
+        state.last_bar_ts = ts_ms
+        state.bar_count += 1
+        ret_last: Optional[float] = None
+        if state.prev_close not in (None, 0.0):
+            prev = state.prev_close
+            if prev is not None and prev != 0.0:
+                try:
+                    ret_last = close_value / prev - 1.0
+                except Exception:
+                    ret_last = None
+        if ret_last is not None and isfinite(ret_last):
+            state.ret_last = ret_last
+            state.returns.append(ret_last)
+        state.prev_close = close_value
+        state.sigma = self._compute_sigma(state.returns)
+        self._resolve_spread(symbol, state, bar, ts_ms)
+        self._publish_market_snapshot(symbol, state, ts_ms)
+
+    def _publish_market_snapshot(
+        self,
+        symbol: str,
+        state: _FeatureStatsState,
+        ts_ms: Optional[int],
+    ) -> None:
+        ret_last = state.ret_last if state.ret_last is not None and isfinite(state.ret_last) else None
+        sigma = state.sigma if state.sigma is not None and isfinite(state.sigma) else None
+        spread = (
+            state.spread_bps
+            if state.spread_bps is not None
+            and isfinite(state.spread_bps)
+            and state.spread_bps > 0
+            else None
+        )
+        ready = state.bar_count >= self._sigma_window and sigma is not None
+        state.last_bar_ts = ts_ms if ts_ms is not None else state.last_bar_ts
+        snapshot = MarketMetricsSnapshot(
+            ret_last=ret_last,
+            sigma=sigma,
+            spread_bps=spread,
+            window_ready=ready,
+            bar_count=state.bar_count,
+            last_bar_ts=state.last_bar_ts,
+            spread_ts=state.spread_ts_ms,
+        )
+        self.market_state[symbol] = snapshot
+
+    def _compute_sigma(self, returns: Deque[float]) -> Optional[float]:
+        if not returns:
+            return None
+        finite = [r for r in returns if isfinite(r)]
+        if len(finite) < max(2, self._min_sigma_periods):
+            return None
+        mean = sum(finite) / len(finite)
+        variance = sum((r - mean) ** 2 for r in finite)
+        if len(finite) <= 1:
+            return None
+        var = variance / (len(finite) - 1)
+        if var < 0.0:
+            var = 0.0
+        return sqrt(var)
+
+    def _resolve_spread(
+        self,
+        symbol: str,
+        state: _FeatureStatsState,
+        bar: Bar,
+        ts_ms: int,
+    ) -> Optional[float]:
+        spread = None
+        if state.spread_bps is not None:
+            if self._spread_ttl_ms <= 0 or state.spread_ts_ms is None:
+                spread = state.spread_bps
+            else:
+                age = ts_ms - state.spread_ts_ms
+                if age <= self._spread_ttl_ms:
+                    spread = state.spread_bps
+                else:
+                    state.spread_bps = None
+                    state.spread_ts_ms = None
+        if spread is None:
+            spread = self._extract_spread_from_bar(bar)
+            if spread is not None and isfinite(spread) and spread > 0:
+                state.spread_bps = spread
+                state.spread_ts_ms = ts_ms
+        return spread
+
+    def _extract_spread_from_bar(self, bar: Bar) -> Optional[float]:
+        for attr, multiplier in (("spread_bps", 1.0), ("half_spread_bps", 2.0)):
+            raw = getattr(bar, attr, None)
+            val = self._coerce_float(raw)
+            if val is not None and isfinite(val):
+                spread = val * multiplier
+                if spread > 0:
+                    return spread
+        bid = getattr(bar, "bid", None)
+        ask = getattr(bar, "ask", None)
+        if bid is None or ask is None:
+            bid = getattr(bar, "bid_price", None)
+            ask = getattr(bar, "ask_price", None)
+        spread = self._compute_spread_from_quotes(bid, ask)
+        if spread is not None:
+            return spread
+        high = self._coerce_float(getattr(bar, "high", None))
+        low = self._coerce_float(getattr(bar, "low", None))
+        close = self._coerce_float(getattr(bar, "close", None))
+        if (
+            high is not None
+            and low is not None
+            and close is not None
+            and isfinite(high)
+            and isfinite(low)
+            and isfinite(close)
+            and close != 0.0
+        ):
+            span = high - low
+            if span > 0.0:
+                return span / abs(close) * 10000.0
+        return None
+
+    def _compute_spread_from_quotes(
+        self,
+        bid: Optional[Union[float, int, Decimal]],
+        ask: Optional[Union[float, int, Decimal]],
+    ) -> Optional[float]:
+        bid_val = self._coerce_float(bid)
+        ask_val = self._coerce_float(ask)
+        if (
+            bid_val is None
+            or ask_val is None
+            or not isfinite(bid_val)
+            or not isfinite(ask_val)
+            or bid_val <= 0
+            or ask_val <= 0
+        ):
+            return None
+        mid = (bid_val + ask_val) * 0.5
+        if mid <= 0:
+            return None
+        spread = (ask_val - bid_val) / mid * 10000.0
+        if spread <= 0 or not isfinite(spread):
+            return None
+        return spread
+
+    @staticmethod
+    def _coerce_float(value: Optional[Union[float, int, Decimal]]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Offline helpers
@@ -307,5 +552,10 @@ class FeaturePipe:
         return target.rename("target")
 
 
-__all__ = ["FeaturePipe", "SignalQualityMetrics", "SignalQualitySnapshot"]
+__all__ = [
+    "FeaturePipe",
+    "SignalQualityMetrics",
+    "SignalQualitySnapshot",
+    "MarketMetricsSnapshot",
+]
 

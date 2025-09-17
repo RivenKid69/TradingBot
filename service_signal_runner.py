@@ -325,11 +325,23 @@ class _Worker:
                 continue
         return None
 
-    def _extract_spread_bps(self, bar: Bar) -> float | None:
+    def _extract_spread_bps(self, bar: Bar, snapshot: Any | None = None) -> float | None:
         """Best-effort extraction of spread information from ``bar``."""
 
         symbol = str(getattr(bar, "symbol", "")).upper()
         now = clock.now_ms()
+        metrics_snapshot = snapshot
+        if metrics_snapshot is None:
+            metrics_getter = getattr(self._fp, "get_market_metrics", None)
+            if callable(metrics_getter):
+                try:
+                    metrics_snapshot = metrics_getter(symbol)
+                except Exception:
+                    metrics_snapshot = None
+        if metrics_snapshot is not None:
+            spread = getattr(metrics_snapshot, "spread_bps", None)
+            if spread is not None and math.isfinite(float(spread)) and float(spread) > 0:
+                return float(spread)
         injected = self._spread_injections.get(symbol)
         if injected is not None:
             spread_bps, tick_ts = injected
@@ -411,6 +423,18 @@ class _Worker:
             return
         ts_ms = int(getattr(tick, "ts", 0) or clock.now_ms())
         self._spread_injections[symbol] = (float(spread_bps), ts_ms)
+        recorder = getattr(self._fp, "record_spread", None)
+        if callable(recorder):
+            try:
+                recorder(
+                    symbol,
+                    spread_bps=spread_bps,
+                    bid=bid_val,
+                    ask=ask_val,
+                    ts_ms=ts_ms,
+                )
+            except Exception:
+                pass
 
     def _log_signal_quality_drop(
         self,
@@ -902,9 +926,22 @@ class _Worker:
         dyn_stage_cfg = self._pipeline_cfg.get("dynamic_guard") if self._pipeline_cfg else None
         dyn_stage_enabled = dyn_stage_cfg is None or dyn_stage_cfg.enabled
         if self._dynamic_guard is not None:
-            spread_bps = self._extract_spread_bps(bar)
+            fp_snapshot = None
+            metrics_getter = getattr(self._fp, "get_market_metrics", None)
+            if callable(metrics_getter):
+                try:
+                    fp_snapshot = metrics_getter(symbol)
+                except Exception:
+                    fp_snapshot = None
+            spread_bps = self._extract_spread_bps(bar, snapshot=fp_snapshot)
             self._dynamic_guard.update(symbol, bar, spread=spread_bps)
             blocked, reason, snapshot = self._dynamic_guard.should_block(symbol)
+            warmup_ready = True
+            if fp_snapshot is not None:
+                warmup_ready = bool(getattr(fp_snapshot, "window_ready", True))
+            if not warmup_ready:
+                blocked = False
+                reason = None
             if blocked and dyn_stage_enabled:
                 metrics: Dict[str, object] = {}
                 if snapshot:
@@ -921,6 +958,11 @@ class _Worker:
                             "trigger_reasons",
                         )
                     }
+                if fp_snapshot is not None:
+                    metrics.setdefault("warmup_ready", warmup_ready)
+                    fp_spread = getattr(fp_snapshot, "spread_bps", None)
+                    if fp_spread is not None:
+                        metrics.setdefault("spread", fp_spread)
                 try:
                     detail: Dict[str, object] = {
                         "stage": Stage.WINDOWS.name,

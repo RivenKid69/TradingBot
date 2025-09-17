@@ -184,6 +184,7 @@ class Tick:
     bid_qty: Optional[Decimal] = None
     ask_qty: Optional[Decimal] = None
     is_final: bool = True
+    spread_bps: Optional[Decimal] = None
 
     def mid(self) -> Optional[Decimal]:
         if self.bid is not None and self.ask is not None:
@@ -204,6 +205,7 @@ class Tick:
             bid_qty=to_decimal_opt(d.get("bid_qty")),
             ask_qty=to_decimal_opt(d.get("ask_qty")),
             is_final=bool(d.get("is_final", True)),
+            spread_bps=to_decimal_opt(d.get("spread_bps")),
         )
 
 

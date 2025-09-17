@@ -5,6 +5,7 @@ import sys
 import json
 import pathlib
 import asyncio
+import math
 
 
 
@@ -211,6 +212,45 @@ def test_get_book_ticker_multiple_symbols():
     single = client.get_book_ticker("ethusdt")
     assert session.get.call_count == 0
     assert single == quotes["ETHUSDT"]
+
+
+def test_get_spread_bps_prefers_book_ticker():
+    session = MagicMock()
+    session.get.return_value = {
+        "symbol": "BTCUSDT",
+        "bidPrice": "100.0",
+        "askPrice": "101.0",
+    }
+    client = binance_public.BinancePublicClient(session=session)
+
+    spread = client.get_spread_bps("btcusdt")
+
+    expected = (101.0 - 100.0) / ((101.0 + 100.0) * 0.5) * 10000.0
+    assert spread is not None and math.isclose(spread, expected)
+    assert session.get.call_count == 1
+    args, kwargs = session.get.call_args
+    assert args == ("https://api.binance.com/api/v3/ticker/bookTicker",)
+    assert kwargs["budget"] == "bookTicker"
+
+
+def test_get_spread_bps_falls_back_to_range():
+    session = MagicMock()
+    # Only the 24hr endpoint will be called because book ticker is skipped.
+    session.get.return_value = {
+        "symbol": "BTCUSDT",
+        "highPrice": "102.0",
+        "lowPrice": "98.0",
+        "lastPrice": "100.0",
+    }
+    client = binance_public.BinancePublicClient(session=session)
+
+    spread = client.get_spread_bps("btcusdt", prefer_book_ticker=False)
+
+    expected = (102.0 - 98.0) / 100.0 * 10000.0
+    assert spread is not None and math.isclose(spread, expected)
+    args, kwargs = session.get.call_args
+    assert args == ("https://api.binance.com/api/v3/ticker/24hr",)
+    assert kwargs["budget"] == "ticker24hr"
 
 
 # --- BinanceWS limiter inclusion and counters ---
