@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -321,3 +322,159 @@ class BinancePublicClient:
                 )
             return results[sym]
         return results
+
+    def get_spread_bps(
+        self,
+        symbols: List[str] | str,
+        *,
+        market: str = "spot",
+        prefer_book_ticker: bool = True,
+    ) -> Union[Optional[float], Dict[str, Optional[float]]]:
+        """Return spread estimates in basis points for ``symbols``.
+
+        The method prefers real-time best bid/ask quotes obtained via
+        :meth:`get_book_ticker`. When unavailable it falls back to the
+        24-hour statistics ``highPrice``/``lowPrice`` using the approximation
+        ``(high - low) / mid`` where ``mid`` defaults to the latest price.
+        """
+
+        if isinstance(symbols, str):
+            symbol_list = [symbols.upper()]
+            single = True
+        else:
+            symbol_list = [s.upper() for s in symbols]
+            single = len(symbol_list) == 1
+        if not symbol_list:
+            raise ValueError("symbols must be non-empty")
+
+        spreads: Dict[str, Optional[float]] = {sym: None for sym in symbol_list}
+        missing = set(symbol_list)
+
+        if prefer_book_ticker:
+            try:
+                raw_quotes = self.get_book_ticker(
+                    symbol_list if not single else symbol_list[0]
+                )
+                if single:
+                    quote_map = {symbol_list[0]: raw_quotes}
+                else:
+                    quote_map = raw_quotes
+                for sym, quote in quote_map.items():
+                    if not isinstance(quote, tuple) or len(quote) != 2:
+                        continue
+                    spread_val = self._spread_from_quote(*quote)
+                    if spread_val is not None:
+                        spreads[sym] = spread_val
+                        missing.discard(sym)
+            except Exception:
+                pass
+
+        if missing:
+            stats = self._fetch_24h_stats(market=market, symbols=list(missing))
+            for sym, (high, low, last) in stats.items():
+                spread_val = self._spread_from_range(high, low, last)
+                if spread_val is not None:
+                    spreads[sym] = spread_val
+                    missing.discard(sym)
+
+        if single:
+            return spreads.get(symbol_list[0])
+        return spreads
+
+    # -------- Helpers --------
+
+    def _fetch_24h_stats(
+        self, *, market: str, symbols: List[str]
+    ) -> Dict[str, Tuple[
+        Optional[Union[Decimal, float]],
+        Optional[Union[Decimal, float]],
+        Optional[Union[Decimal, float]],
+    ]]:
+        if not symbols:
+            return {}
+        if market not in ("spot", "futures"):
+            raise ValueError("market must be 'spot' or 'futures'")
+        base = self.e.spot_base if market == "spot" else self.e.futures_base
+        path = "/api/v3/ticker/24hr" if market == "spot" else "/fapi/v1/ticker/24hr"
+        url = f"{base}{path}"
+        params: Dict[str, Any]
+        if len(symbols) == 1:
+            params = {"symbol": symbols[0].upper()}
+        else:
+            params = {"symbols": json.dumps([s.upper() for s in symbols])}
+        data = self.session.get(
+            url,
+            params=params,
+            timeout=self.timeout,
+            budget="ticker24hr",
+        )
+        results: Dict[
+            str,
+            Tuple[
+                Optional[Union[Decimal, float]],
+                Optional[Union[Decimal, float]],
+                Optional[Union[Decimal, float]],
+            ],
+        ] = {}
+
+        def _handle(entry: Any) -> None:
+            if not isinstance(entry, dict):
+                return
+            sym = str(entry.get("symbol", "")).upper()
+            if not sym:
+                return
+            high = self._to_number(entry.get("highPrice"))
+            low = self._to_number(entry.get("lowPrice"))
+            last = self._to_number(entry.get("lastPrice"))
+            results[sym] = (high, low, last)
+
+        if isinstance(data, list):
+            for item in data:
+                _handle(item)
+        elif isinstance(data, dict):
+            _handle(data)
+        else:
+            raise RuntimeError(f"Unexpected ticker24hr response: {data}")
+        return results
+
+    @staticmethod
+    def _spread_from_quote(
+        bid: Optional[Union[Decimal, float]],
+        ask: Optional[Union[Decimal, float]],
+    ) -> Optional[float]:
+        try:
+            bid_val = float(bid) if bid is not None else float("nan")
+            ask_val = float(ask) if ask is not None else float("nan")
+        except Exception:
+            return None
+        if not math.isfinite(bid_val) or not math.isfinite(ask_val):
+            return None
+        if bid_val <= 0 or ask_val <= 0:
+            return None
+        mid = (bid_val + ask_val) * 0.5
+        if mid <= 0:
+            return None
+        spread = (ask_val - bid_val) / mid * 10000.0
+        return spread if spread > 0 else None
+
+    @staticmethod
+    def _spread_from_range(
+        high: Optional[Union[Decimal, float]],
+        low: Optional[Union[Decimal, float]],
+        last: Optional[Union[Decimal, float]],
+    ) -> Optional[float]:
+        try:
+            high_val = float(high) if high is not None else float("nan")
+            low_val = float(low) if low is not None else float("nan")
+            last_val = float(last) if last is not None else float("nan")
+        except Exception:
+            return None
+        if not math.isfinite(high_val) or not math.isfinite(low_val):
+            return None
+        if high_val <= 0 or low_val <= 0 or high_val <= low_val:
+            return None
+        mid = last_val if math.isfinite(last_val) and last_val > 0 else (high_val + low_val) * 0.5
+        if mid <= 0:
+            return None
+        spread = (high_val - low_val) / mid * 10000.0
+        return spread if spread > 0 else None

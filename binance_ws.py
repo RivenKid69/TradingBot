@@ -219,11 +219,18 @@ class BinanceWS:
             feed_lag_ms = max(0, now_ms() - int(getattr(tick, "ts", 0) or 0))
         except Exception:
             feed_lag_ms = 0
+        meta = {"feed_lag_ms": feed_lag_ms}
+        spread = getattr(tick, "spread_bps", None)
+        if spread is not None:
+            try:
+                meta["spread_bps"] = float(spread)
+            except Exception:
+                pass
         event = MarketEvent(
             etype=EventType.MARKET_DATA_TICK,
             ts=now_ms(),
             tick=tick,
-            meta={"feed_lag_ms": feed_lag_ms},
+            meta=meta,
         )
         accepted = await self._bus.put(event)
         if not accepted:
@@ -302,15 +309,29 @@ class BinanceWS:
                             event_type = str(data.get("e", "")).lower()
                             if event_type == "bookticker" and self._subscribe_book_ticker:
                                 try:
+                                    bid_raw = data.get("b")
+                                    ask_raw = data.get("a")
+                                    bid_val = (
+                                        Decimal(str(bid_raw)) if bid_raw is not None else None
+                                    )
+                                    ask_val = (
+                                        Decimal(str(ask_raw)) if ask_raw is not None else None
+                                    )
+                                    spread_bps = None
+                                    if (
+                                        bid_val is not None
+                                        and ask_val is not None
+                                        and bid_val > 0
+                                        and ask_val > 0
+                                    ):
+                                        mid = (bid_val + ask_val) / Decimal("2")
+                                        if mid > 0:
+                                            spread_bps = (ask_val - bid_val) / mid * Decimal("10000")
                                     tick = Tick(
                                         ts=int(data.get("E") or data.get("T") or now_ms()),
                                         symbol=str(data.get("s", "")).upper(),
-                                        bid=Decimal(str(data.get("b")))
-                                        if data.get("b") is not None
-                                        else None,
-                                        ask=Decimal(str(data.get("a")))
-                                        if data.get("a") is not None
-                                        else None,
+                                        bid=bid_val,
+                                        ask=ask_val,
                                         bid_qty=Decimal(str(data.get("B")))
                                         if data.get("B") is not None
                                         else None,
@@ -318,6 +339,7 @@ class BinanceWS:
                                         if data.get("A") is not None
                                         else None,
                                         is_final=True,
+                                        spread_bps=spread_bps,
                                     )
                                 except Exception:
                                     continue
