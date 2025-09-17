@@ -122,8 +122,7 @@ class DailyEntryLimiter:
     def __init__(self, limit: Any = None, reset_hour: Any = 0) -> None:
         self._limit: int | None = self.normalize_limit(limit)
         self._reset_hour: int = self.normalize_hour(reset_hour)
-        self._day_key: str | None = None
-        self._count: int = 0
+        self._state: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def normalize_limit(value: Any) -> int | None:
@@ -172,24 +171,94 @@ class DailyEntryLimiter:
             ts_val = int(ts_ms)
         except (TypeError, ValueError):
             ts_val = 0
+        key = self._normalize_symbol(symbol)
         day_key = daily_reset_key(ts_val, self._reset_hour)
-        if day_key != self._day_key:
-            self._day_key = day_key
-            self._count = 0
+        state = self._state.get(key)
+        if state is None:
+            state = {"count": 0, "day_key": day_key}
+            self._state[key] = state
+        elif state.get("day_key") != day_key:
+            state["day_key"] = day_key
+            state["count"] = 0
         if self._limit is None:
             return True
-        if self._count + steps > self._limit:
+        try:
+            current = int(state.get("count", 0))
+        except (TypeError, ValueError):
+            current = 0
+        if current + steps > self._limit:
             return False
-        self._count += steps
+        state["count"] = current + steps
         return True
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self, symbol: str | None = None) -> Dict[str, Any]:
+        key = self._normalize_symbol(symbol) if symbol is not None else None
+        state = self._state.get(key, {}) if key is not None else {}
+        try:
+            count = int(state.get("count", 0))
+        except (TypeError, ValueError):
+            count = 0
+        day_key = state.get("day_key") if isinstance(state, dict) else None
         return {
             "limit": self._limit,
-            "entries_today": self._count,
-            "day_key": self._day_key,
+            "entries_today": count,
+            "day_key": day_key,
             "reset_hour": self._reset_hour,
         }
+
+    def export_state(self) -> Dict[str, Dict[str, Any]]:
+        if not self.enabled:
+            return {}
+        exported: Dict[str, Dict[str, Any]] = {}
+        for symbol, state in self._state.items():
+            if not isinstance(state, dict):
+                continue
+            try:
+                count = int(state.get("count", 0))
+            except (TypeError, ValueError):
+                count = 0
+            day_key = state.get("day_key")
+            exported[symbol] = {
+                "count": max(0, count),
+                "day_key": str(day_key) if day_key is not None else None,
+            }
+        return exported
+
+    def restore_state(self, state: Mapping[str, Any] | None) -> None:
+        if not self.enabled:
+            self._state.clear()
+            return
+        self._state.clear()
+        if not state:
+            return
+        for symbol, payload in state.items():
+            if not isinstance(payload, Mapping):
+                continue
+            try:
+                count = int(payload.get("count", 0))
+            except (TypeError, ValueError):
+                count = 0
+            if count < 0:
+                count = 0
+            day_key = payload.get("day_key")
+            if day_key is not None:
+                try:
+                    day_key = str(day_key)
+                except Exception:
+                    day_key = None
+            key = self._normalize_symbol(symbol)
+            self._state[key] = {"count": count, "day_key": day_key}
+
+    @staticmethod
+    def _normalize_symbol(symbol: Any) -> str:
+        if symbol is None:
+            return ""
+        try:
+            value = str(symbol)
+        except Exception:
+            return ""
+        value = value.strip()
+        return value.upper()
 
 class _ScheduleNoTradeChecker:
     """Evaluate maintenance-based no-trade windows for individual bars."""
@@ -631,8 +700,20 @@ class _Worker:
                     symbol, ts_ms, entry_steps=steps
                 )
                 snapshot = (
-                    self._entry_limiter.snapshot() if not allowed else {}
+                    self._entry_limiter.snapshot(symbol) if not allowed else {}
                 )
+                if (
+                    allowed
+                    and steps > 0
+                    and self._state_enabled
+                    and self._entry_limiter.enabled
+                ):
+                    try:
+                        state_storage.update_state(
+                            entry_limits=self._entry_limiter.export_state()
+                        )
+                    except Exception:
+                        pass
             if allowed:
                 continue
             filtered, removed = self._remove_entry_orders(filtered, symbol)
@@ -2085,6 +2166,7 @@ class ServiceSignalRunner:
             self.cfg.marker_path or os.path.join(logs_dir, "shutdown.marker")
         )
         dirty_restart = True
+        entry_limits_state: Dict[str, Dict[str, Any]] | None = None
         try:
             if marker_path.exists():
                 dirty_restart = False
@@ -2099,6 +2181,18 @@ class ServiceSignalRunner:
                     lock_path=self.cfg.state.lock_path,
                     backup_keep=self.cfg.state.backup_keep,
                 )
+                try:
+                    entry_limits_raw = getattr(loaded_state, "entry_limits", {}) or {}
+                    if isinstance(entry_limits_raw, MappingABC):
+                        entry_limits_state = {
+                            str(symbol): dict(payload)
+                            for symbol, payload in entry_limits_raw.items()
+                            if isinstance(payload, MappingABC)
+                        }
+                    else:
+                        entry_limits_state = None
+                except Exception:
+                    entry_limits_state = None
                 loader = getattr(self.policy, "load_signal_state", None)
                 if callable(loader):
                     try:
@@ -2224,6 +2318,11 @@ class ServiceSignalRunner:
             ),
             state_enabled=self.cfg.state.enabled,
         )
+        if entry_limits_state is not None:
+            try:
+                worker._entry_limiter.restore_state(entry_limits_state)
+            except Exception:
+                pass
 
         def _resolve_history_source(source: Any) -> Any:
             if source is None:
