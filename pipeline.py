@@ -3,7 +3,7 @@ from __future__ import annotations
 """Utilities for basic pipeline time-to-live checks."""
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Tuple, Sequence, Protocol, Dict
+from typing import Any, Tuple, Sequence, Protocol, Dict, Mapping
 
 import numpy as np
 from collections import deque
@@ -207,11 +207,15 @@ def policy_decide(
     *,
     stage_cfg: PipelineStageConfig | None = None,
     signal_quality_cfg: Any | None = None,
+    precomputed_features: Mapping[str, Any] | None = None,
 ) -> PipelineResult:
     inc_stage(Stage.POLICY)
     if stage_cfg is not None and not stage_cfg.enabled:
         return PipelineResult(action="pass", stage=Stage.POLICY, decision=[])
-    feats = fp.update(bar)
+    if precomputed_features is None:
+        feats = fp.update(bar)
+    else:
+        feats = dict(precomputed_features)
     ctx = PolicyCtx(
         ts=int(bar.ts),
         symbol=bar.symbol,

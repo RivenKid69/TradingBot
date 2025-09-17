@@ -185,6 +185,121 @@ class _Worker:
             sb = self._symbol_buckets[symbol]
             sb.tokens = min(sb.tokens + 1.0, sb.burst)
 
+    def _current_bar_volume(self, bar: Bar) -> float | None:
+        for attr in ("volume_quote", "volume_base", "trades"):
+            value = getattr(bar, attr, None)
+            if value is None:
+                continue
+            try:
+                return abs(float(value))
+            except Exception:
+                continue
+        return None
+
+    def _log_signal_quality_drop(
+        self,
+        bar: Bar,
+        snapshot: Any | None,
+        bar_volume: float | None,
+        detail: str | None,
+        sigma_thr: float,
+        vol_frac: float,
+    ) -> None:
+        reason_label = self._signal_quality_cfg.log_reason or Reason.OTHER.name
+        try:
+            monitoring.inc_stage(Stage.POLICY)
+        except Exception:
+            pass
+        try:
+            monitoring.inc_reason(reason_label)
+        except Exception:
+            pass
+        try:
+            pipeline_stage_drop_count.labels(
+                bar.symbol,
+                Stage.POLICY.name,
+                reason_label,
+            ).inc()
+        except Exception:
+            pass
+        payload = {
+            "stage": Stage.POLICY.name,
+            "reason": reason_label,
+            "symbol": bar.symbol,
+            "sigma_threshold": sigma_thr,
+            "vol_floor_frac": vol_frac,
+            "bar_volume": bar_volume,
+        }
+        if detail:
+            payload["detail"] = detail
+        if snapshot is not None:
+            payload["current_sigma"] = getattr(snapshot, "current_sigma", None)
+            payload["vol_median"] = getattr(snapshot, "current_vol_median", None)
+            payload["window_ready"] = getattr(snapshot, "window_ready", None)
+        try:
+            self._logger.info("DROP %s", payload)
+        except Exception:
+            pass
+
+    def _apply_signal_quality_filter(self, bar: Bar) -> tuple[bool, dict[str, Any]]:
+        raw_feats = self._fp.update(bar)
+        if isinstance(raw_feats, dict):
+            feats = dict(raw_feats)
+        else:
+            try:
+                feats = dict(raw_feats or {})
+            except Exception:
+                feats = {}
+
+        sigma_thr = float(self._signal_quality_cfg.sigma_threshold or 0.0)
+        vol_frac = float(self._signal_quality_cfg.vol_floor_frac or 0.0)
+        raw_symbol = str(getattr(bar, "symbol", "") or "")
+        symbol_key = raw_symbol.upper()
+        snapshot = None
+        signal_quality = getattr(self._fp, "signal_quality", None)
+        getter = getattr(signal_quality, "get", None)
+        if callable(getter):
+            snapshot = getter(symbol_key)
+            if snapshot is None and raw_symbol:
+                snapshot = getter(raw_symbol)
+        bar_volume = self._current_bar_volume(bar)
+
+        blocked = False
+        detail = None
+        if snapshot is not None:
+            if not getattr(snapshot, "window_ready", False):
+                blocked = True
+                detail = "WINDOW_NOT_READY"
+            sigma = getattr(snapshot, "current_sigma", None)
+            if (
+                not blocked
+                and sigma_thr > 0.0
+                and sigma is not None
+                and float(sigma) > sigma_thr
+            ):
+                blocked = True
+                detail = "SIGMA_THRESHOLD"
+            median = getattr(snapshot, "current_vol_median", None)
+            if not blocked and vol_frac > 0.0:
+                if median is None or float(median) <= 0.0:
+                    blocked = True
+                    detail = "VOL_MEDIAN"
+                else:
+                    threshold = float(median) * vol_frac
+                    if bar_volume is None or bar_volume < threshold:
+                        blocked = True
+                        detail = "VOLUME_FLOOR"
+        elif sigma_thr > 0.0 or vol_frac > 0.0:
+            # Metrics missing; conservatively block to avoid trading without data.
+            blocked = True
+            detail = "METRICS_MISSING"
+
+        if blocked:
+            self._log_signal_quality_drop(bar, snapshot, bar_volume, detail, sigma_thr, vol_frac)
+            return False, feats
+
+        return True, feats
+
     def _emit(self, o: Any, symbol: str, bar_close_ms: int) -> bool:
         if self._guards is not None:
             checked, reason = self._guards.apply(bar_close_ms, symbol, [o])
@@ -477,12 +592,26 @@ class _Worker:
                     pass
                 return _finalize()
 
+        policy_stage_cfg = (
+            self._pipeline_cfg.get("policy") if self._pipeline_cfg else None
+        )
+        precomputed_feats: dict[str, Any] | None = None
+        if (
+            (policy_stage_cfg is None or policy_stage_cfg.enabled)
+            and self._signal_quality_cfg.enabled
+        ):
+            allowed, feats = self._apply_signal_quality_filter(bar)
+            precomputed_feats = feats
+            if not allowed:
+                return _finalize()
+
         pol_res = policy_decide(
             self._fp,
             self._policy,
             bar,
-            stage_cfg=self._pipeline_cfg.get("policy") if self._pipeline_cfg else None,
+            stage_cfg=policy_stage_cfg,
             signal_quality_cfg=self._signal_quality_cfg,
+            precomputed_features=precomputed_feats,
         )
         if pol_res.action == "drop":
             try:
