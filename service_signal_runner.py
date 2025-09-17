@@ -19,7 +19,7 @@ for report in from_config(cfg):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable
+from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable, Mapping
 import os
 import logging
 import threading
@@ -27,6 +27,7 @@ import signal
 from pathlib import Path
 from collections import deque, defaultdict
 import time
+from datetime import datetime, timezone
 import shlex
 
 import json
@@ -91,7 +92,40 @@ class SignalQualityConfig:
     sigma_threshold: float = 0.0
     vol_median_window: int = 0
     vol_floor_frac: float = 0.0
-    log_reason: str = ""
+    log_reason: bool | str = ""
+
+
+def _format_signal_quality_log(payload: Mapping[str, Any]) -> str:
+    """Render a structured log line for signal quality drops."""
+
+    ordered_keys = (
+        "stage",
+        "reason",
+        "symbol",
+        "bar_close_at",
+        "bar_close_ms",
+        "sigma_threshold",
+        "vol_floor_frac",
+        "bar_volume",
+        "detail",
+        "current_sigma",
+        "vol_median",
+        "window_ready",
+    )
+
+    parts: list[str] = ["DROP"]
+    for key in ordered_keys:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if value is None:
+            continue
+        if isinstance(value, float):
+            value_str = f"{value:.6g}"
+        else:
+            value_str = str(value)
+        parts.append(f"{key}={value_str}")
+    return " ".join(parts)
 
 
 @dataclass
@@ -205,7 +239,17 @@ class _Worker:
         sigma_thr: float,
         vol_frac: float,
     ) -> None:
-        reason_label = self._signal_quality_cfg.log_reason or Reason.OTHER.name
+        reason_cfg = self._signal_quality_cfg.log_reason
+        reason_label = Reason.OTHER.name
+        should_log = False
+        if isinstance(reason_cfg, bool):
+            if reason_cfg:
+                should_log = True
+        else:
+            reason_label_candidate = str(reason_cfg or "").strip()
+            if reason_label_candidate:
+                reason_label = reason_label_candidate
+                should_log = True
         try:
             monitoring.inc_stage(Stage.POLICY)
         except Exception:
@@ -222,7 +266,7 @@ class _Worker:
             ).inc()
         except Exception:
             pass
-        payload = {
+        payload: dict[str, Any] = {
             "stage": Stage.POLICY.name,
             "reason": reason_label,
             "symbol": bar.symbol,
@@ -230,16 +274,31 @@ class _Worker:
             "vol_floor_frac": vol_frac,
             "bar_volume": bar_volume,
         }
+        bar_close_ms = getattr(bar, "closed_at", None)
+        if bar_close_ms is None:
+            bar_close_ms = getattr(bar, "ts", None)
+        try:
+            if bar_close_ms is not None:
+                bar_close_ms_int = int(bar_close_ms)
+                payload["bar_close_ms"] = bar_close_ms_int
+                payload["bar_close_at"] = (
+                    datetime.fromtimestamp(bar_close_ms_int / 1000.0, tz=timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+        except Exception:
+            pass
         if detail:
             payload["detail"] = detail
         if snapshot is not None:
             payload["current_sigma"] = getattr(snapshot, "current_sigma", None)
             payload["vol_median"] = getattr(snapshot, "current_vol_median", None)
             payload["window_ready"] = getattr(snapshot, "window_ready", None)
-        try:
-            self._logger.info("DROP %s", payload)
-        except Exception:
-            pass
+        if should_log:
+            try:
+                self._logger.info(_format_signal_quality_log(payload))
+            except Exception:
+                pass
 
     def _apply_signal_quality_filter(self, bar: Bar) -> tuple[bool, dict[str, Any]]:
         raw_feats = self._fp.update(bar)
@@ -1440,6 +1499,8 @@ def from_config(
             value = data.get("log_reason")
             if value is None:
                 signal_quality_cfg.log_reason = ""
+            elif isinstance(value, bool):
+                signal_quality_cfg.log_reason = value
             else:
                 signal_quality_cfg.log_reason = str(value)
 
