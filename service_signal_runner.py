@@ -86,6 +86,7 @@ from no_trade_config import (
     DynamicGuardConfig,
 )
 from dynamic_no_trade_guard import DynamicNoTradeGuard
+from risk_guard import PortfolioLimitGuard, PortfolioLimitConfig
 from utils import TokenBucket
 import di_registry
 import ws_dedup_state as signal_bus
@@ -400,6 +401,7 @@ class SignalRunnerConfig:
     snapshot_metrics_sec: int = 60
     kill_switch_ops: OpsKillSwitchConfig = field(default_factory=OpsKillSwitchConfig)
     state: StateConfig = field(default_factory=StateConfig)
+    portfolio_limits: Dict[str, Any] = field(default_factory=dict)
 
 
 # обратная совместимость
@@ -453,6 +455,7 @@ class _Worker:
             "updated_at_ms": 0,
             "total_notional": 0.0,
         }
+        self._portfolio_guard: PortfolioLimitGuard | None = None
         self._global_bucket = None
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
@@ -751,6 +754,45 @@ class _Worker:
                 )
             except Exception:
                 pass
+
+    def set_portfolio_guard(self, guard: PortfolioLimitGuard | None) -> None:
+        self._portfolio_guard = guard
+
+    def _portfolio_positions_snapshot(self) -> Dict[str, float]:
+        snapshot: Dict[str, float] = {}
+        for symbol, qty in self._positions.items():
+            try:
+                value = float(qty)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            if math.isclose(value, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                continue
+            snapshot[str(symbol).upper()] = value
+        return snapshot
+
+    def _portfolio_total_notional(self) -> float:
+        try:
+            value = float(self._exposure_state.get("total_notional", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(value) or value < 0.0:
+            return 0.0
+        return value
+
+    def _portfolio_last_price(self, symbol: str) -> float | None:
+        sym = str(symbol or "").upper()
+        price = self._last_prices.get(sym)
+        if price is None:
+            return None
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value <= 0.0:
+            return None
+        return value
 
     def _register_pending_exposure(self, order: Any, ts_ms: int) -> bool:
         key = id(order)
@@ -2268,6 +2310,36 @@ class _Worker:
             return _finalize()
         orders = list(risk_res.decision or [])
 
+        if self._portfolio_guard is not None and orders:
+            guard_orders, guard_reason = self._portfolio_guard.apply(
+                int(bar.ts), bar.symbol, orders
+            )
+            guard_orders = list(guard_orders or [])
+            if guard_reason:
+                try:
+                    self._logger.info(
+                        "DROP %s",
+                        {
+                            "stage": Stage.RISK.name,
+                            "reason": guard_reason,
+                        },
+                    )
+                except Exception:
+                    pass
+                try:
+                    pipeline_stage_drop_count.labels(
+                        bar.symbol,
+                        Stage.RISK.name,
+                        guard_reason,
+                    ).inc()
+                except Exception:
+                    pass
+                return _finalize()
+            orders = guard_orders
+
+        if not orders:
+            return _finalize()
+
         created_ts_ms = clock.now_ms()
         self._stage_exposure_adjustments(orders, created_ts_ms)
         checked_orders = []
@@ -2398,6 +2470,7 @@ class ServiceSignalRunner:
         throttle_cfg: ThrottleConfig | None = None,
         no_trade_cfg: NoTradeConfig | None = None,
         signal_quality_cfg: SignalQualityConfig | None = None,
+        portfolio_limits: Mapping[str, Any] | None = None,
         pipeline_cfg: PipelineConfig | None = None,
         shutdown_cfg: Dict[str, Any] | None = None,
         monitoring_cfg: MonitoringConfig | None = None,
@@ -2417,6 +2490,10 @@ class ServiceSignalRunner:
         self.throttle_cfg = throttle_cfg
         self.no_trade_cfg = no_trade_cfg
         self.signal_quality_cfg = signal_quality_cfg or SignalQualityConfig()
+        limits_payload = portfolio_limits
+        if limits_payload is None:
+            limits_payload = getattr(self.cfg, "portfolio_limits", None)
+        self._portfolio_limits_cfg = dict(limits_payload or {})
         self.pipeline_cfg = pipeline_cfg
         self.shutdown_cfg = shutdown_cfg or {}
         self.monitoring_cfg = monitoring_cfg or MonitoringConfig()
@@ -2731,6 +2808,32 @@ class ServiceSignalRunner:
             state_enabled=self.cfg.state.enabled,
             rest_candidates=rest_candidates,
         )
+        if self._portfolio_limits_cfg:
+            try:
+                guard_cfg = PortfolioLimitConfig.from_mapping(
+                    self._portfolio_limits_cfg
+                )
+            except Exception:
+                guard_cfg = PortfolioLimitConfig()
+            if guard_cfg.enabled:
+                portfolio_guard = PortfolioLimitGuard(
+                    config=guard_cfg,
+                    get_positions=worker._portfolio_positions_snapshot,
+                    get_total_notional=worker._portfolio_total_notional,
+                    get_price=worker._portfolio_last_price,
+                    get_equity=lambda: None,
+                    leg_getter=worker._signal_leg,
+                )
+                worker.set_portfolio_guard(portfolio_guard)
+                try:
+                    self.logger.info(
+                        "portfolio limit guard enabled: max_total_notional=%s max_total_exposure_pct=%s buffer=%s",
+                        guard_cfg.max_total_notional,
+                        guard_cfg.max_total_exposure_pct,
+                        guard_cfg.exposure_buffer_frac,
+                    )
+                except Exception:
+                    pass
         if entry_limits_state is not None:
             try:
                 worker._entry_limiter.restore_state(entry_limits_state)
@@ -3417,7 +3520,26 @@ def from_config(
         monitoring_cfg.alerts.enabled = bool(
             al.get("enabled", monitoring_cfg.alerts.enabled)
         )
-        monitoring_cfg.alerts.command = al.get("command", monitoring_cfg.alerts.command)
+        monitoring_cfg.alerts.command = al.get(
+            "command", monitoring_cfg.alerts.command
+        )
+
+    risk_limits: Dict[str, Any] = dict(cfg.risk.exposure_limits)
+    risk_override_path = Path("configs/risk.yaml")
+    if risk_override_path.exists():
+        try:
+            with risk_override_path.open("r", encoding="utf-8") as fh:
+                override_payload = yaml.safe_load(fh) or {}
+        except Exception:
+            override_payload = {}
+        if isinstance(override_payload, MappingABC):
+            for key in (
+                "max_total_notional",
+                "max_total_exposure_pct",
+                "exposure_buffer_frac",
+            ):
+                if key in override_payload:
+                    risk_limits[key] = override_payload.get(key)
 
     svc_cfg = SignalRunnerConfig(
         snapshot_config_path=snapshot_config_path,
@@ -3456,6 +3578,7 @@ def from_config(
         cfg.throttle,
         NoTradeConfig(**(cfg.no_trade or {})),
         signal_quality_cfg=signal_quality_cfg,
+        portfolio_limits=risk_limits,
         pipeline_cfg=pipeline_cfg,
         shutdown_cfg=shutdown_cfg,
         monitoring_cfg=monitoring_cfg,
