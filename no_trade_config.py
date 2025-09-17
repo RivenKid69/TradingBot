@@ -20,12 +20,43 @@ from pydantic import BaseModel, Field
 DEFAULT_NO_TRADE_STATE_PATH = Path("state/no_trade_state.json")
 
 
+class DynamicGuardMetricConfig(BaseModel):
+    """Base configuration for a dynamic metric window."""
+
+    window: Optional[int] = None
+    min_periods: Optional[int] = None
+    pctile_window: Optional[int] = None
+    pctile_min_periods: Optional[int] = None
+    abs: Optional[float] = None
+    pctile: Optional[float] = None
+
+
+class DynamicGuardSpreadConfig(DynamicGuardMetricConfig):
+    """Spread specific extensions."""
+
+    abs_bps: Optional[float] = None
+
+
+class DynamicGuardVolatilityConfig(DynamicGuardMetricConfig):
+    """Volatility specific extensions."""
+
+    pass
+
+
 class DynamicGuardConfig(BaseModel):
     """Configuration for a dynamic no-trade guard."""
 
     enable: bool = False
+    requested_enable: Optional[bool] = None
+    enabled: Optional[bool] = None
     sigma_window: Optional[int] = None
+    sigma_min_periods: Optional[int] = None
+    vol_pctile_window: Optional[int] = None
+    vol_pctile_min_periods: Optional[int] = None
     atr_window: Optional[int] = None
+    atr_min_periods: Optional[int] = None
+    spread_pctile_window: Optional[int] = None
+    spread_pctile_min_periods: Optional[int] = None
     vol_abs: Optional[float] = None
     vol_pctile: Optional[float] = None
     spread_abs_bps: Optional[float] = None
@@ -34,6 +65,8 @@ class DynamicGuardConfig(BaseModel):
     cooldown_bars: int = 0
     next_bars_block: Dict[str, int] = Field(default_factory=dict)
     log_reason: bool = False
+    volatility: DynamicGuardVolatilityConfig = Field(default_factory=DynamicGuardVolatilityConfig)
+    spread: DynamicGuardSpreadConfig = Field(default_factory=DynamicGuardSpreadConfig)
 
 
 class DynamicHysteresisConfig(BaseModel):
@@ -46,6 +79,7 @@ class DynamicHysteresisConfig(BaseModel):
 class DynamicConfig(BaseModel):
     """Structured dynamic guard configuration."""
 
+    enabled: Optional[bool] = None
     guard: DynamicGuardConfig = Field(default_factory=DynamicGuardConfig)
     hysteresis: DynamicHysteresisConfig = Field(default_factory=DynamicHysteresisConfig)
     next_bars_block: Dict[str, int] = Field(default_factory=dict)
@@ -144,6 +178,133 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
     nested_guard = _ensure_mapping(dynamic.get("guard"))
     guard_data: Dict[str, Any] = {**legacy_guard, **nested_guard}
 
+    # Normalise enable flags
+    if "enabled" in guard_data and "enable" not in guard_data:
+        guard_data["enable"] = guard_data.get("enabled")
+    guard_enable = bool(guard_data.get("enable", False))
+    guard_data["enable"] = guard_enable
+    guard_data["requested_enable"] = guard_enable
+    guard_data["enabled"] = guard_enable
+
+    # Extract structured metric configuration
+    volatility_cfg = _ensure_mapping(guard_data.pop("volatility", {}))
+    spread_cfg = _ensure_mapping(guard_data.pop("spread", {}))
+
+    def _extract_metric(
+        *,
+        block: Mapping[str, Any],
+        window_key: str,
+        min_periods_key: str,
+        pctile_window_key: str,
+        pctile_min_key: str,
+        abs_key: str,
+        abs_alias: Optional[str] = None,
+        pctile_key: str,
+    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[float], Optional[float]]:
+        window_val = _coerce_int(block.get("window"))
+        if window_val is None:
+            window_val = _coerce_int(guard_data.get(window_key))
+
+        min_periods_val = _coerce_int(block.get("min_periods"))
+        if min_periods_val is None:
+            min_periods_val = _coerce_int(guard_data.get(min_periods_key))
+
+        pctile_window_val = _coerce_int(block.get("pctile_window"))
+        if pctile_window_val is None:
+            pctile_window_val = _coerce_int(guard_data.get(pctile_window_key))
+
+        pctile_min_val = _coerce_int(block.get("pctile_min_periods"))
+        if pctile_min_val is None:
+            pctile_min_val = _coerce_int(guard_data.get(pctile_min_key))
+
+        abs_val: Optional[float] = None
+        if abs_alias and block.get(abs_alias) is not None:
+            abs_val = _coerce_float(block.get(abs_alias))
+        if abs_val is None:
+            abs_val = _coerce_float(block.get("abs"))
+        if abs_val is None:
+            abs_val = _coerce_float(guard_data.get(abs_key))
+
+        pctile_val = _coerce_float(block.get("pctile"))
+        if pctile_val is None:
+            pctile_val = _coerce_float(guard_data.get(pctile_key))
+
+        return (
+            window_val,
+            min_periods_val,
+            pctile_window_val,
+            pctile_min_val,
+            abs_val,
+            pctile_val,
+        )
+
+    (
+        sigma_window,
+        sigma_min_periods,
+        vol_pctile_window,
+        vol_pctile_min_periods,
+        vol_abs,
+        vol_pctile,
+    ) = _extract_metric(
+        block=volatility_cfg,
+        window_key="sigma_window",
+        min_periods_key="sigma_min_periods",
+        pctile_window_key="vol_pctile_window",
+        pctile_min_key="vol_pctile_min_periods",
+        abs_key="vol_abs",
+        pctile_key="vol_pctile",
+    )
+
+    (
+        atr_window,
+        atr_min_periods,
+        spread_pctile_window,
+        spread_pctile_min_periods,
+        spread_abs,
+        spread_pctile,
+    ) = _extract_metric(
+        block=spread_cfg,
+        window_key="atr_window",
+        min_periods_key="atr_min_periods",
+        pctile_window_key="spread_pctile_window",
+        pctile_min_key="spread_pctile_min_periods",
+        abs_key="spread_abs_bps",
+        abs_alias="abs_bps",
+        pctile_key="spread_pctile",
+    )
+
+    guard_data["sigma_window"] = sigma_window
+    guard_data["sigma_min_periods"] = sigma_min_periods
+    guard_data["vol_pctile_window"] = vol_pctile_window
+    guard_data["vol_pctile_min_periods"] = vol_pctile_min_periods
+    guard_data["vol_abs"] = vol_abs
+    guard_data["vol_pctile"] = vol_pctile
+
+    guard_data["atr_window"] = atr_window
+    guard_data["atr_min_periods"] = atr_min_periods
+    guard_data["spread_pctile_window"] = spread_pctile_window
+    guard_data["spread_pctile_min_periods"] = spread_pctile_min_periods
+    guard_data["spread_abs_bps"] = spread_abs
+    guard_data["spread_pctile"] = spread_pctile
+
+    guard_data["volatility"] = {
+        "window": sigma_window,
+        "min_periods": sigma_min_periods,
+        "pctile_window": vol_pctile_window,
+        "pctile_min_periods": vol_pctile_min_periods,
+        "abs": vol_abs,
+        "pctile": vol_pctile,
+    }
+    guard_data["spread"] = {
+        "window": atr_window,
+        "min_periods": atr_min_periods,
+        "pctile_window": spread_pctile_window,
+        "pctile_min_periods": spread_pctile_min_periods,
+        "abs": spread_abs,
+        "abs_bps": spread_abs,
+        "pctile": spread_pctile,
+    }
+
     # Extract hysteresis configuration
     hysteresis_cfg = _ensure_mapping(dynamic.get("hysteresis"))
     ratio = _coerce_float(hysteresis_cfg.get("ratio"))
@@ -176,7 +337,12 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
     if "next_bars_block" in guard_data:
         _update_next_block(guard_data.pop("next_bars_block"))
 
+    dynamic_enabled = dynamic.get("enabled")
+    if dynamic_enabled is None:
+        dynamic_enabled = guard_enable
+
     dynamic_payload: Dict[str, Any] = {
+        "enabled": bool(dynamic_enabled) if dynamic_enabled is not None else bool(guard_enable),
         "guard": guard_data,
         "hysteresis": {},
         "next_bars_block": next_block,
@@ -237,6 +403,20 @@ def get_no_trade_config(path: str) -> NoTradeConfig:
     guard = config.dynamic.guard
     hysteresis_cfg = config.dynamic.hysteresis
 
+    requested_enable = guard.requested_enable
+    if requested_enable is None:
+        requested_enable = bool(guard.enable)
+    guard.requested_enable = bool(requested_enable)
+
+    if config.dynamic.enabled is None:
+        config.dynamic.enabled = bool(requested_enable)
+    else:
+        config.dynamic.enabled = bool(config.dynamic.enabled)
+
+    effective_enable = bool(config.dynamic.enabled and requested_enable)
+    guard.enabled = effective_enable
+    guard.enable = effective_enable
+
     if hysteresis_cfg.ratio is None:
         hysteresis_cfg.ratio = guard.hysteresis
     else:
@@ -246,6 +426,80 @@ def get_no_trade_config(path: str) -> NoTradeConfig:
         hysteresis_cfg.cooldown_bars = guard.cooldown_bars
     else:
         guard.cooldown_bars = hysteresis_cfg.cooldown_bars
+
+    vol_cfg = guard.volatility or DynamicGuardVolatilityConfig()
+    if vol_cfg.window is None:
+        vol_cfg.window = guard.sigma_window
+    elif guard.sigma_window is None:
+        guard.sigma_window = vol_cfg.window
+
+    if vol_cfg.min_periods is None:
+        vol_cfg.min_periods = guard.sigma_min_periods
+    elif guard.sigma_min_periods is None:
+        guard.sigma_min_periods = vol_cfg.min_periods
+
+    if vol_cfg.pctile_window is None:
+        vol_cfg.pctile_window = guard.vol_pctile_window
+    elif guard.vol_pctile_window is None:
+        guard.vol_pctile_window = vol_cfg.pctile_window
+
+    if vol_cfg.pctile_min_periods is None:
+        vol_cfg.pctile_min_periods = guard.vol_pctile_min_periods
+    elif guard.vol_pctile_min_periods is None:
+        guard.vol_pctile_min_periods = vol_cfg.pctile_min_periods
+
+    if vol_cfg.abs is None:
+        vol_cfg.abs = guard.vol_abs
+    elif guard.vol_abs is None:
+        guard.vol_abs = vol_cfg.abs
+
+    if vol_cfg.pctile is None:
+        vol_cfg.pctile = guard.vol_pctile
+    elif guard.vol_pctile is None:
+        guard.vol_pctile = vol_cfg.pctile
+
+    guard.volatility = vol_cfg
+
+    spread_cfg = guard.spread or DynamicGuardSpreadConfig()
+    if spread_cfg.window is None:
+        spread_cfg.window = guard.atr_window
+    elif guard.atr_window is None:
+        guard.atr_window = spread_cfg.window
+
+    if spread_cfg.min_periods is None:
+        spread_cfg.min_periods = guard.atr_min_periods
+    elif guard.atr_min_periods is None:
+        guard.atr_min_periods = spread_cfg.min_periods
+
+    if spread_cfg.pctile_window is None:
+        spread_cfg.pctile_window = guard.spread_pctile_window
+    elif guard.spread_pctile_window is None:
+        guard.spread_pctile_window = spread_cfg.pctile_window
+
+    if spread_cfg.pctile_min_periods is None:
+        spread_cfg.pctile_min_periods = guard.spread_pctile_min_periods
+    elif guard.spread_pctile_min_periods is None:
+        guard.spread_pctile_min_periods = spread_cfg.pctile_min_periods
+
+    spread_abs = guard.spread_abs_bps
+    if spread_cfg.abs_bps is None and spread_cfg.abs is not None:
+        spread_cfg.abs_bps = spread_cfg.abs
+    if spread_cfg.abs_bps is None:
+        spread_cfg.abs_bps = spread_abs
+    elif spread_abs is None:
+        spread_abs = spread_cfg.abs_bps
+
+    if spread_cfg.abs is None and spread_cfg.abs_bps is not None:
+        spread_cfg.abs = spread_cfg.abs_bps
+
+    guard.spread_abs_bps = spread_abs
+
+    if spread_cfg.pctile is None:
+        spread_cfg.pctile = guard.spread_pctile
+    elif guard.spread_pctile is None:
+        guard.spread_pctile = spread_cfg.pctile
+
+    guard.spread = spread_cfg
 
     if config.dynamic.next_bars_block:
         guard.next_bars_block = dict(config.dynamic.next_bars_block)
