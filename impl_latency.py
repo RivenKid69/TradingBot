@@ -84,6 +84,13 @@ class LatencyCfg:
     seasonality_interpolate: bool = False
     seasonality_day_only: bool = False
     seasonality_auto_reload: bool = False
+    vol_metric: str = "sigma"
+    vol_window: int = 120
+    volatility_gamma: float = 0.0
+    zscore_clip: float = 3.0
+    min_ms: int = 0
+    max_ms: int = 10000
+    debug_log: bool = False
 
 
 class _LatencyWithSeasonality:
@@ -330,6 +337,13 @@ class LatencyImpl:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "LatencyImpl":
+        vol_metric = d.get("vol_metric")
+        vol_window = d.get("vol_window")
+        volatility_gamma = d.get("volatility_gamma")
+        zscore_clip = d.get("zscore_clip")
+        min_ms = d.get("min_ms")
+        max_ms = d.get("max_ms")
+        debug_log = d.get("debug_log", False)
         return LatencyImpl(LatencyCfg(
             base_ms=int(d.get("base_ms", 250)),
             jitter_ms=int(d.get("jitter_ms", 50)),
@@ -347,4 +361,13 @@ class LatencyImpl:
             seasonality_interpolate=bool(d.get("seasonality_interpolate", False)),
             seasonality_day_only=bool(d.get("seasonality_day_only", False)),
             seasonality_auto_reload=bool(d.get("seasonality_auto_reload", False)),
+            vol_metric=str(vol_metric) if vol_metric is not None else "sigma",
+            vol_window=int(vol_window) if vol_window is not None else 120,
+            volatility_gamma=(
+                float(volatility_gamma) if volatility_gamma is not None else 0.0
+            ),
+            zscore_clip=float(zscore_clip) if zscore_clip is not None else 3.0,
+            min_ms=int(min_ms) if min_ms is not None else 0,
+            max_ms=int(max_ms) if max_ms is not None else 10000,
+            debug_log=bool(debug_log),
         ))
