@@ -129,6 +129,7 @@ class _Worker:
         throttle_cfg: ThrottleConfig | None = None,
         no_trade_cfg: NoTradeConfig | None = None,
         pipeline_cfg: PipelineConfig | None = None,
+        signal_quality_cfg: SignalQualityConfig | None = None,
         zero_signal_alert: int = 0,
     ) -> None:
         self._fp = fp
@@ -144,6 +145,7 @@ class _Worker:
         self._throttle_cfg = throttle_cfg
         self._no_trade_cfg = no_trade_cfg
         self._pipeline_cfg = pipeline_cfg
+        self._signal_quality_cfg = signal_quality_cfg or SignalQualityConfig()
         self._zero_signal_alert = int(zero_signal_alert)
         self._zero_signal_streak = 0
         self._global_bucket = None
@@ -480,6 +482,7 @@ class _Worker:
             self._policy,
             bar,
             stage_cfg=self._pipeline_cfg.get("policy") if self._pipeline_cfg else None,
+            signal_quality_cfg=self._signal_quality_cfg,
         )
         if pol_res.action == "drop":
             try:
@@ -876,6 +879,7 @@ class ServiceSignalRunner:
             throttle_cfg=self.throttle_cfg,
             no_trade_cfg=self.no_trade_cfg,
             pipeline_cfg=self.pipeline_cfg,
+            signal_quality_cfg=self.signal_quality_cfg,
             zero_signal_alert=getattr(
                 self.monitoring_cfg.thresholds, "zero_signals", 0
             ),

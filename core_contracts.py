@@ -114,6 +114,7 @@ class PolicyCtx:
     position: Optional[Position] = None
     limits: Optional[PortfolioLimits] = None
     extra: Optional[Dict[str, Any]] = None
+    signal_quality_cfg: Optional[Any] = None
 
 
 @runtime_checkable
