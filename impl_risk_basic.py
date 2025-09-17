@@ -44,7 +44,7 @@ class RiskBasicCfg:
 class RiskBasicImpl:
     def __init__(self, cfg: RiskBasicCfg) -> None:
         self.cfg = cfg
-        self._manager = RiskManager(RiskConfig.from_dict({
+        payload = {
             "enabled": bool(cfg.enabled),
             "max_abs_position_qty": float(cfg.max_abs_position_qty),
             "max_abs_position_notional": float(cfg.max_abs_position_notional),
@@ -57,7 +57,18 @@ class RiskBasicImpl:
             "max_entries_per_day": (
                 None if cfg.max_entries_per_day is None else int(cfg.max_entries_per_day)
             ),
-        })) if (RiskManager is not None and RiskConfig is not None) else None
+            "exposure_buffer_frac": float(cfg.exposure_buffer_frac or 0.0),
+        }
+        if cfg.max_total_notional is not None:
+            payload["max_total_notional"] = float(cfg.max_total_notional)
+        if cfg.max_total_exposure_pct is not None:
+            payload["max_total_exposure_pct"] = float(cfg.max_total_exposure_pct)
+
+        self._manager = (
+            RiskManager(RiskConfig.from_dict(payload))
+            if (RiskManager is not None and RiskConfig is not None)
+            else None
+        )
 
     @property
     def manager(self):

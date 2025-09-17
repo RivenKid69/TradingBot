@@ -1353,12 +1353,22 @@ class ExecutionSimulator:
                 # риск: пауза/клампинг размера перед планом
                 risk_events_local: List[RiskEvent] = []
                 if self.risk is not None:
+                    portfolio_total = None
+                    if ref is not None:
+                        try:
+                            ref_val = float(ref)
+                        except (TypeError, ValueError):
+                            ref_val = None
+                        else:
+                            if math.isfinite(ref_val) and ref_val > 0.0:
+                                portfolio_total = abs(float(self.position_qty)) * ref_val
                     adj_qty = self.risk.pre_trade_adjust(
                         ts_ms=ts,
                         side=side,
                         intended_qty=qty_total,
                         price=ref,
                         position_qty=self.position_qty,
+                        total_notional=portfolio_total,
                     )
                     risk_events_local.extend(self.risk.pop_events())
                     qty_total = float(adj_qty)
@@ -2003,12 +2013,22 @@ class ExecutionSimulator:
 
                 # риск: корректировка/пауза
                 if self.risk is not None:
+                    portfolio_total = None
+                    if ref is not None:
+                        try:
+                            ref_val = float(ref)
+                        except (TypeError, ValueError):
+                            ref_val = None
+                        else:
+                            if math.isfinite(ref_val) and ref_val > 0.0:
+                                portfolio_total = abs(float(self.position_qty)) * ref_val
                     adj_qty = self.risk.pre_trade_adjust(
                         ts_ms=ts,
                         side=side,
                         intended_qty=qty_total,
                         price=ref,
                         position_qty=self.position_qty,
+                        total_notional=portfolio_total,
                     )
                     qty_total = float(adj_qty)
                     for _e in self.risk.pop_events():
