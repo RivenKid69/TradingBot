@@ -8,10 +8,25 @@ consumers should use this function so that the configuration is loaded from a
 single source of truth.
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import yaml
 from pydantic import BaseModel, Field
+
+
+class DynamicGuardConfig(BaseModel):
+    """Configuration for a dynamic no-trade guard."""
+
+    enable: bool = False
+    sigma_window: Optional[int] = None
+    atr_window: Optional[int] = None
+    vol_abs: Optional[float] = None
+    vol_pctile: Optional[float] = None
+    spread_abs_bps: Optional[float] = None
+    spread_pctile: Optional[float] = None
+    hysteresis: Optional[float] = None
+    cooldown_bars: int = 0
+    log_reason: bool = False
 
 
 class NoTradeConfig(BaseModel):
@@ -20,6 +35,7 @@ class NoTradeConfig(BaseModel):
     funding_buffer_min: int = 0
     daily_utc: List[str] = Field(default_factory=list)
     custom_ms: List[Dict[str, int]] = Field(default_factory=list)
+    dynamic_guard: Optional[DynamicGuardConfig] = None
 
 
 def get_no_trade_config(path: str) -> NoTradeConfig:
@@ -33,4 +49,7 @@ def get_no_trade_config(path: str) -> NoTradeConfig:
 
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    return NoTradeConfig(**(data.get("no_trade", {}) or {}))
+    config = NoTradeConfig(**(data.get("no_trade", {}) or {}))
+    if config.dynamic_guard is None:
+        config.dynamic_guard = DynamicGuardConfig()
+    return config
