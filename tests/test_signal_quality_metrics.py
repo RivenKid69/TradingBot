@@ -62,3 +62,28 @@ def test_feature_pipe_skips_invalid_bar_but_preserves_metrics() -> None:
     skipped = pipe.update(_make_bar(2, "NaN", volume_quote="11"))
     assert skipped == {}
     assert pipe.signal_quality["BTCUSDT"] == snapshot_before
+
+
+def test_signal_quality_reset_symbol_clears_state() -> None:
+    metrics = SignalQualityMetrics(sigma_window=2, vol_median_window=2)
+
+    metrics.update("BTCUSDT", _make_bar(1, "100", volume_quote="10"))
+    metrics.update("BTCUSDT", _make_bar(2, "101", volume_quote="11"))
+    assert "BTCUSDT" in metrics.latest
+
+    metrics.reset_symbol("BTCUSDT")
+    assert "BTCUSDT" not in metrics.latest
+
+
+def test_feature_pipe_can_skip_metric_update() -> None:
+    metrics = SignalQualityMetrics(sigma_window=2, vol_median_window=2)
+    pipe = FeaturePipe(FeatureSpec(lookbacks_prices=[2]), metrics=metrics)
+
+    bar1 = _make_bar(1, "100", volume_quote="10")
+    pipe.update(bar1)
+    snapshot = pipe.signal_quality["BTCUSDT"]
+
+    bar2 = _make_bar(2, "110", volume_quote="11")
+    pipe.update(bar2, skip_metrics=True)
+
+    assert pipe.signal_quality["BTCUSDT"] == snapshot

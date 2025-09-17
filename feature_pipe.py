@@ -70,6 +70,13 @@ class SignalQualityMetrics:
         self._state.clear()
         self._latest.clear()
 
+    def reset_symbol(self, symbol: str) -> None:
+        """Reset state for a specific ``symbol`` if it exists."""
+
+        sym = str(symbol).upper()
+        self._state.pop(sym, None)
+        self._latest.pop(sym, None)
+
     # ------------------------------------------------------------------
     def update(self, symbol: str, bar: Bar) -> SignalQualitySnapshot:
         """Update metrics with a new bar and return current values."""
@@ -218,7 +225,7 @@ class FeaturePipe:
         for b in bars:
             self.update(b)
 
-    def update(self, bar: Bar) -> Mapping[str, Any]:
+    def update(self, bar: Bar, *, skip_metrics: bool = False) -> Mapping[str, Any]:
         """Process a single bar and return computed features."""
         try:
             close_value = float(bar.close)
@@ -246,7 +253,7 @@ class FeaturePipe:
             )
             self._tr._state = state_backup
 
-        if self.metrics is not None:
+        if self.metrics is not None and not skip_metrics:
             try:
                 snapshot = self.metrics.update(symbol, bar)
             except Exception:

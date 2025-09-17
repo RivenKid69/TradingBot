@@ -195,6 +195,7 @@ class _Worker:
             )
             self._symbol_buckets = defaultdict(self._symbol_bucket_factory)
             self._queue = deque(maxlen=throttle_cfg.queue.max_items)
+        self._last_bar_ts: Dict[str, int] = {}
 
     def _acquire_tokens(self, symbol: str) -> tuple[bool, str | None]:
         if self._global_bucket is None:
@@ -300,8 +301,10 @@ class _Worker:
             except Exception:
                 pass
 
-    def _apply_signal_quality_filter(self, bar: Bar) -> tuple[bool, dict[str, Any]]:
-        raw_feats = self._fp.update(bar)
+    def _apply_signal_quality_filter(
+        self, bar: Bar, *, skip_metrics: bool = False
+    ) -> tuple[bool, dict[str, Any]]:
+        raw_feats = self._fp.update(bar, skip_metrics=skip_metrics)
         if isinstance(raw_feats, dict):
             feats = dict(raw_feats)
         else:
@@ -536,6 +539,70 @@ class _Worker:
         duplicates = 0
         emitted: list[Any] = []
 
+        def _format_ts(ms: int | None) -> str | None:
+            if ms is None:
+                return None
+            return (
+                datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        symbol = bar.symbol.upper()
+        ts_ms = int(bar.ts)
+        prev_ts = self._last_bar_ts.get(symbol)
+        gap_ms: int | None = None
+        duplicate_ts = False
+        if prev_ts is not None:
+            delta = ts_ms - prev_ts
+            if delta <= 0:
+                duplicate_ts = True
+            elif self._ws_dedup_timeframe_ms > 0 and delta > self._ws_dedup_timeframe_ms:
+                gap_ms = delta
+        if prev_ts is None or ts_ms >= prev_ts:
+            self._last_bar_ts[symbol] = ts_ms
+
+        if gap_ms is not None:
+            metrics = getattr(self._fp, "metrics", None)
+            reset_symbol = getattr(metrics, "reset_symbol", None)
+            if callable(reset_symbol):
+                try:
+                    reset_symbol(symbol)
+                except Exception:
+                    pass
+            try:
+                self._fp.signal_quality.pop(symbol, None)
+            except Exception:
+                pass
+            try:
+                payload = {
+                    "symbol": bar.symbol,
+                    "previous_open_ms": prev_ts,
+                    "previous_open_at": _format_ts(prev_ts),
+                    "current_open_ms": ts_ms,
+                    "current_open_at": _format_ts(ts_ms),
+                    "gap_ms": gap_ms,
+                    "interval_ms": self._ws_dedup_timeframe_ms,
+                }
+                self._logger.warning("BAR_GAP_DETECTED %s", payload)
+            except Exception:
+                pass
+
+        if duplicate_ts and prev_ts is not None:
+            try:
+                payload = {
+                    "symbol": bar.symbol,
+                    "previous_open_ms": prev_ts,
+                    "previous_open_at": _format_ts(prev_ts),
+                    "current_open_ms": ts_ms,
+                    "current_open_at": _format_ts(ts_ms),
+                }
+                self._logger.info("BAR_DUPLICATE_TIMESTAMP %s", payload)
+            except Exception:
+                pass
+
+        skip_metrics = duplicate_ts
+
         def _finalize() -> list[Any]:
             emitted_count = len(emitted)
             try:
@@ -659,7 +726,9 @@ class _Worker:
             (policy_stage_cfg is None or policy_stage_cfg.enabled)
             and self._signal_quality_cfg.enabled
         ):
-            allowed, feats = self._apply_signal_quality_filter(bar)
+            allowed, feats = self._apply_signal_quality_filter(
+                bar, skip_metrics=skip_metrics
+            )
             precomputed_feats = feats
             if not allowed:
                 return _finalize()

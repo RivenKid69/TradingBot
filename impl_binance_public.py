@@ -9,12 +9,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Iterator, List, Optional, Sequence
+from typing import Dict, Iterator, List, Optional, Sequence
 import json
 import queue
 import threading
 import time
 import asyncio
+from datetime import datetime, timezone
+import logging
 
 try:
     import websockets  # type: ignore
@@ -27,6 +29,9 @@ from config import DataDegradationConfig
 
 
 _BINANCE_WS = "wss://stream.binance.com:9443/stream"
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,6 +58,7 @@ class BinancePublicBarSource(MarketDataSource):
         self._q: "queue.Queue[Bar]" = queue.Queue(maxsize=10000)
         self._stop = threading.Event()
         self._thr: Optional[threading.Thread] = None
+        self._last_open_ts: Dict[str, int] = {}
 
     def stream_bars(self, symbols: Sequence[str], interval_ms: int) -> Iterator[Bar]:
         if interval_ms != self._interval_ms:
@@ -123,6 +129,44 @@ class BinancePublicBarSource(MarketDataSource):
                 trades=int(k.get("n", 0)),
                 is_final=bool(k.get("x", False)),
             )
+            bar_open_ms = int(bar.ts)
+            prev_open = self._last_open_ts.get(bar.symbol)
+            gap_ms = None
+            duplicate_ts = False
+            if prev_open is not None:
+                delta = bar_open_ms - prev_open
+                if delta <= 0:
+                    duplicate_ts = True
+                elif self._interval_ms > 0 and delta > self._interval_ms:
+                    gap_ms = delta
+            if prev_open is None or bar_open_ms >= prev_open:
+                self._last_open_ts[bar.symbol] = bar_open_ms
+            if gap_ms is not None:
+                try:
+                    log_payload = {
+                        "symbol": bar.symbol,
+                        "previous_open_ms": prev_open,
+                        "previous_open_at": _format_utc(prev_open),
+                        "current_open_ms": bar_open_ms,
+                        "current_open_at": _format_utc(bar_open_ms),
+                        "gap_ms": gap_ms,
+                        "interval_ms": self._interval_ms,
+                    }
+                    logger.warning("PUBLIC_WS_BAR_GAP %s", log_payload)
+                except Exception:
+                    pass
+            if duplicate_ts and prev_open is not None:
+                try:
+                    log_payload = {
+                        "symbol": bar.symbol,
+                        "previous_open_ms": prev_open,
+                        "previous_open_at": _format_utc(prev_open),
+                        "current_open_ms": bar_open_ms,
+                        "current_open_at": _format_utc(bar_open_ms),
+                    }
+                    logger.info("PUBLIC_WS_BAR_DUPLICATE %s", log_payload)
+                except Exception:
+                    pass
             try:
                 self._q.put_nowait(bar)
             except queue.Full:
@@ -180,3 +224,13 @@ def timeframe_to_ms(tf: str) -> int:
 def binance_tf(tf: str) -> str:
     tf = ensure_timeframe(tf)
     return tf.lower()
+
+
+def _format_utc(ts_ms: int | None) -> str | None:
+    if ts_ms is None:
+        return None
+    return (
+        datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )

@@ -19,8 +19,8 @@ class DummyFeaturePipe:
     def warmup(self) -> None:
         return None
 
-    def update(self, bar: Bar) -> dict[str, float]:
-        if self.metrics is not None:
+    def update(self, bar: Bar, *, skip_metrics: bool = False) -> dict[str, float]:
+        if self.metrics is not None and not skip_metrics:
             snapshot = self.metrics.update(bar.symbol, bar)
             self.signal_quality[bar.symbol] = snapshot
             self.signal_quality[bar.symbol.upper()] = snapshot
