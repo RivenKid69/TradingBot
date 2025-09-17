@@ -31,6 +31,9 @@ class TradingState:
     config_snapshot: Dict[str, Any] = field(default_factory=dict)
     signal_states: Dict[str, Any] = field(default_factory=dict)
     entry_limits: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    last_prices: Dict[str, float] = field(default_factory=dict)
+    exposure_state: Dict[str, Any] = field(default_factory=dict)
+    total_notional: float = 0.0
     git_hash: str | None = None
     version: int = 1
 
@@ -46,6 +49,9 @@ class TradingState:
                 config_snapshot=data.get("config_snapshot", {}) or {},
                 signal_states=data.get("signal_states", {}) or {},
                 entry_limits=data.get("entry_limits", {}) or {},
+                last_prices=data.get("last_prices", {}) or {},
+                exposure_state=data.get("exposure_state", {}) or {},
+                total_notional=float(data.get("total_notional", 0.0) or 0.0),
                 git_hash=data.get("git_hash"),
                 version=data.get("version", 1) or 1,
             )
@@ -122,6 +128,9 @@ class SQLiteBackend:
         "config_snapshot TEXT,"
         "signal_states TEXT,"
         "entry_limits TEXT,"
+        "last_prices TEXT,"
+        "exposure_state TEXT,"
+        "total_notional REAL,"
         "git_hash TEXT,"
         "version INTEGER"
         ")"
@@ -159,6 +168,19 @@ class SQLiteBackend:
                 (row["entry_limits"] if "entry_limits" in row.keys() else "{}")
                 or "{}"
             ),
+            "last_prices": json.loads(
+                (row["last_prices"] if "last_prices" in row.keys() else "{}")
+                or "{}"
+            ),
+            "exposure_state": json.loads(
+                (row["exposure_state"] if "exposure_state" in row.keys() else "{}")
+                or "{}"
+            ),
+            "total_notional": float(
+                row["total_notional"]
+                if "total_notional" in row.keys() and row["total_notional"] is not None
+                else 0.0
+            ),
             "git_hash": row["git_hash"],
             "version": row["version"] or 1,
         }
@@ -189,10 +211,17 @@ class SQLiteBackend:
                 cur.execute("ALTER TABLE state ADD COLUMN signal_states TEXT")
             if "entry_limits" not in columns:
                 cur.execute("ALTER TABLE state ADD COLUMN entry_limits TEXT")
+            if "last_prices" not in columns:
+                cur.execute("ALTER TABLE state ADD COLUMN last_prices TEXT")
+            if "exposure_state" not in columns:
+                cur.execute("ALTER TABLE state ADD COLUMN exposure_state TEXT")
+            if "total_notional" not in columns:
+                cur.execute("ALTER TABLE state ADD COLUMN total_notional REAL")
             cur.execute(
                 "REPLACE INTO state (id, positions, open_orders, cash, last_processed_bar_ms,"
-                " seen_signals, config_snapshot, signal_states, entry_limits, git_hash, version)"
-                " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " seen_signals, config_snapshot, signal_states, entry_limits, last_prices,"
+                " exposure_state, total_notional, git_hash, version)"
+                " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     json.dumps(state.positions, separators=(",", ":")),
                     json.dumps(state.open_orders, separators=(",", ":")),
@@ -202,6 +231,9 @@ class SQLiteBackend:
                     json.dumps(state.config_snapshot, separators=(",", ":")),
                     json.dumps(state.signal_states, separators=(",", ":")),
                     json.dumps(state.entry_limits, separators=(",", ":")),
+                    json.dumps(state.last_prices, separators=(",", ":")),
+                    json.dumps(state.exposure_state, separators=(",", ":")),
+                    state.total_notional,
                     state.git_hash,
                     state.version,
                 ),

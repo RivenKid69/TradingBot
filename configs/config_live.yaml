@@ -74,6 +74,10 @@ risk:
   pause_seconds_on_violation: 300
   daily_reset_utc_hour: 0  # Час начала нового дня в UTC для PnL и дневных лимитов
   max_entries_per_day: null  # Максимум новых входов за день; null/-1 = без лимита (счёт по daily_reset_utc_hour, UTC)
+  # Aggregate exposure controls (optional; null/0 disables)
+  max_total_notional: null        # Hard cap on total net notional across instruments
+  max_total_exposure_pct: null    # Hard cap on exposure as a fraction of equity
+  exposure_buffer_frac: 0.0       # Fractional buffer applied before tripping the caps
 quantizer:
   filters_path: "binance_filters.json"
   strict: true

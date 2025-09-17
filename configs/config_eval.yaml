@@ -40,6 +40,21 @@ latency:
   timeout_ms: 2500
   retries: 1
   seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
+risk:
+  enabled: true
+  max_abs_position_qty: 0.0
+  max_abs_position_notional: 0.0
+  max_order_notional: 0.0
+  max_orders_per_min: 60
+  max_orders_window_s: 60
+  daily_loss_limit: 0.0
+  pause_seconds_on_violation: 300
+  daily_reset_utc_hour: 0
+  max_entries_per_day: null
+  # Aggregate exposure controls (optional; null/0 disables)
+  max_total_notional: null        # Hard cap on total net notional across instruments
+  max_total_exposure_pct: null    # Hard cap on exposure as a fraction of equity
+  exposure_buffer_frac: 0.0       # Fractional buffer applied before tripping the caps
 components:
   market_data:
     target: impl_offline_data:OfflineCSVBarSource

@@ -1,0 +1,5 @@
+# Live risk overrides loaded by runtime tooling. Values are disabled by default.
+# Set these to tighten aggregate exposure controls without editing the main config.
+max_total_notional: null        # e.g. 250000.0 to cap total notional in quote currency
+max_total_exposure_pct: null    # e.g. 0.50 to cap exposure at 50% of equity
+exposure_buffer_frac: 0.0       # e.g. 0.05 to stop new exposure once 95% of the cap is reached

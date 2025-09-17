@@ -73,7 +73,7 @@ class SimExecutor(TradeExecutor):
         self._ctx = _SimCtx(symbol=str(symbol), max_position_abs_base=float(max_position_abs_base))
 
         rc_quantizer = getattr(run_config, "quantizer", {}) if run_config else {}
-        rc_risk = getattr(run_config, "risk", {}) if run_config else {}
+        rc_risk = getattr(run_config, "risk", None) if run_config else None
         rc_latency = getattr(run_config, "latency", {}) if run_config else {}
         rc_slippage = getattr(run_config, "slippage", {}) if run_config else {}
         rc_fees = getattr(run_config, "fees", {}) if run_config else {}
@@ -152,7 +152,7 @@ class SimExecutor(TradeExecutor):
         l_cfg = dict(getattr(run_config, "latency", {}) or {})
         l_cfg.setdefault("symbol", symbol)
         l_impl = LatencyImpl.from_dict(l_cfg)
-        r_impl = RiskBasicImpl.from_dict(getattr(run_config, "risk", {}) or {})
+        r_impl = RiskBasicImpl.from_dict(getattr(run_config, "risk", None))
         d_impl = DataDegradationConfig.from_dict(
             getattr(run_config, "data_degradation", {}) or {}
         )
