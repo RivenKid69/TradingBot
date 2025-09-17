@@ -273,6 +273,7 @@ class _Worker:
         pipeline_cfg: PipelineConfig | None = None,
         signal_quality_cfg: SignalQualityConfig | None = None,
         zero_signal_alert: int = 0,
+        state_enabled: bool = False,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -290,6 +291,7 @@ class _Worker:
         self._signal_quality_cfg = signal_quality_cfg or SignalQualityConfig()
         self._zero_signal_alert = int(zero_signal_alert)
         self._zero_signal_streak = 0
+        self._state_enabled = bool(state_enabled)
         self._global_bucket = None
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
@@ -1403,6 +1405,18 @@ class _Worker:
             signal_quality_cfg=self._signal_quality_cfg,
             precomputed_features=precomputed_feats,
         )
+        if self._state_enabled:
+            consumer = getattr(self._policy, "consume_dirty_signal_state", None)
+            if callable(consumer):
+                try:
+                    exported = consumer()
+                except Exception:
+                    exported = None
+                if exported:
+                    try:
+                        state_storage.update_state(signal_states=exported)
+                    except Exception:
+                        pass
         if pol_res.action == "drop":
             try:
                 self._logger.info(
@@ -1769,6 +1783,12 @@ class ServiceSignalRunner:
                     lock_path=self.cfg.state.lock_path,
                     backup_keep=self.cfg.state.backup_keep,
                 )
+                loader = getattr(self.policy, "load_signal_state", None)
+                if callable(loader):
+                    try:
+                        loader(getattr(loaded_state, "signal_states", {}) or {})
+                    except Exception:
+                        pass
                 if self.ws_dedup_enabled:
                     try:
                         seen = dict(getattr(loaded_state, "seen_signals", {}) or {})
@@ -1886,6 +1906,7 @@ class ServiceSignalRunner:
             zero_signal_alert=getattr(
                 self.monitoring_cfg.thresholds, "zero_signals", 0
             ),
+            state_enabled=self.cfg.state.enabled,
         )
 
         def _resolve_history_source(source: Any) -> Any:
