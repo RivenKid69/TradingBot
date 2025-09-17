@@ -5,14 +5,27 @@ This document explains the available fields, dataset masking options, and runtim
 
 ## Configuration fields
 
-| Field | Type | Description |
-|------|------|-------------|
-| `funding_buffer_min` | int | Minutes before and after funding events (00:00, 08:00, 16:00 UTC) where trading is blocked. |
-| `daily_utc` | list[str] | Daily repeating windows in `HH:MM-HH:MM` (UTC). Windows should not cross midnight. |
-| `custom_ms` | list[dict] | One-off windows with explicit start and end timestamps in milliseconds since epoch. |
-| `dynamic_guard` | dict | Optional dynamic guard that can pause trading based on volatility/spread metrics (see [`configs/no_trade.yaml`](../configs/no_trade.yaml) for a tuned example). |
+The `no_trade` section is split into two structured blocks:
 
-### `dynamic_guard` fields
+* `maintenance` – static windows around funding, maintenance, or custom events.
+* `dynamic` – runtime guard that can pause trading based on market anomalies.
+
+`NoTradeConfig` keeps backwards-compatible accessors (`funding_buffer_min`,
+`daily_utc`, `custom_ms`, `dynamic_guard`), but new configuration files should
+prefer the nested structure described below.
+
+### `maintenance` block
+
+| Field | Type | Default | Description |
+|------|------|---------|-------------|
+| `format` | str | `HH:MM-HH:MM` | Format for entries inside `daily_utc`. Values are stored as `HH:MM-HH:MM` ranges in UTC. |
+| `funding_buffer_min` | int | `0` | Minutes before and after funding events (00:00, 08:00, 16:00 UTC) that should be blocked. |
+| `daily_utc` | list[str] | `[]` | Daily repeating windows expressed using the format above. Windows should not cross midnight. |
+| `custom_ms` | list[dict] | `[]` | One-off windows with explicit start and end timestamps in milliseconds since epoch. |
+
+### `dynamic` block
+
+#### `dynamic.guard` fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -23,32 +36,65 @@ This document explains the available fields, dataset masking options, and runtim
 | `vol_pctile` | float or null | `null` | Percentile threshold (0-1) for volatility. |
 | `spread_abs_bps` | float or null | `null` | Absolute spread threshold in basis points. |
 | `spread_pctile` | float or null | `null` | Percentile threshold (0-1) for spread. |
-| `hysteresis` | float or null | `null` | Relative buffer before the guard re-enables trading. |
-| `cooldown_bars` | int | `0` | Bars to wait after the guard condition clears. |
 | `log_reason` | bool | `false` | Emit a log entry when the guard blocks trades. |
 
-Example YAML (see [`configs/no_trade.yaml`](../configs/no_trade.yaml) for a ready-to-use template):
+#### `dynamic.hysteresis`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ratio` | float or null | `null` | Relative buffer before the guard re-enables trading. |
+| `cooldown_bars` | int | `0` | Bars to wait after the guard condition clears. |
+
+#### `dynamic.next_bars_block`
+
+Dictionary mapping anomaly reasons to the number of bars that should remain
+blocked after the trigger clears (e.g. `{anomaly: 20}`). The map is optional and
+defaults to an empty dictionary.
+
+Example YAML (see [`configs/no_trade.yaml`](../configs/no_trade.yaml) for a
+ready-to-use template):
 
 ```yaml
 no_trade:
-  funding_buffer_min: 5
-  daily_utc:
-    - "00:00-00:05"
-    - "08:00-08:05"
-    - "16:00-16:05"
-  custom_ms:
-    - {start_ts_ms: 1696118400000, end_ts_ms: 1696122000000}
-  dynamic_guard:
-    enable: false
-    sigma_window: 120
-    atr_window: 14
-    vol_abs: null
-    vol_pctile: 0.99
-    spread_abs_bps: null
-    spread_pctile: 0.99
-    hysteresis: 0.1
-    cooldown_bars: 10
-    log_reason: true
+  maintenance:
+    format: "HH:MM-HH:MM"
+    funding_buffer_min: 5
+    daily_utc:
+      - "00:00-00:05"
+      - "08:00-08:05"
+      - "16:00-16:05"
+    custom_ms:
+      - {start_ts_ms: 1696118400000, end_ts_ms: 1696122000000}
+  dynamic:
+    guard:
+      enable: false
+      sigma_window: 120
+      atr_window: 14
+      vol_abs: null
+      vol_pctile: 0.99
+      spread_abs_bps: null
+      spread_pctile: 0.99
+      log_reason: true
+    hysteresis:
+      ratio: 0.1
+      cooldown_bars: 10
+    next_bars_block:
+      anomaly: 20
+```
+
+## Runtime state file
+
+Online services may persist anomaly-driven windows in `state/no_trade_state.json`.
+The file contains an object with a single key `anomaly_block_until_ts` mapping
+symbols to UNIX timestamps in milliseconds. Missing or empty files are treated
+as `{}` during loading.
+
+```json
+{
+  "anomaly_block_until_ts": {
+    "BTCUSDT": 1696406400000
+  }
+}
 ```
 
 ## Applying the mask to datasets
@@ -98,7 +144,7 @@ if mask.iloc[0]:
 
 ## Activating the dynamic guard
 
-1. Start from a run configuration that already includes the `no_trade.dynamic_guard`
+1. Start from a run configuration that already includes the `no_trade.dynamic.guard`
    block (all templates ship with `enable: false`).
 2. Copy the thresholds from [`configs/no_trade.yaml`](../configs/no_trade.yaml) or
    customise them per market.  Conservative defaults use long windows and 99.5th
@@ -145,7 +191,8 @@ Additional one-off windows can be specified with `custom_ms`:
 
 ```yaml
 no_trade:
-  custom_ms:
-    - {start_ts_ms: 1700000000000, end_ts_ms: 1700001800000}  # 2023-11-14 00:00-00:30 UTC
+  maintenance:
+    custom_ms:
+      - {start_ts_ms: 1700000000000, end_ts_ms: 1700001800000}  # 2023-11-14 00:00-00:30 UTC
 ```
 
