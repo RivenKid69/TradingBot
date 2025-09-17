@@ -378,16 +378,45 @@ def get_no_trade_config(path: str) -> NoTradeConfig:
     normalised = _normalise_no_trade_payload(raw_cfg)
     config = NoTradeConfig(**normalised)
 
+    config_path = Path(path)
+    try:
+        resolved_config_path = config_path.resolve()
+    except Exception:  # pragma: no cover - defensive
+        resolved_config_path = config_path
+    base_dir = resolved_config_path.parent
+
+    try:
+        config.__dict__["_config_path"] = str(resolved_config_path)
+        config.__dict__["_config_base_dir"] = str(base_dir)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
     maintenance_cfg = config.maintenance
+    try:
+        maintenance_cfg.__dict__["_config_path"] = str(resolved_config_path)
+        maintenance_cfg.__dict__["_config_base_dir"] = str(base_dir)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
     if maintenance_cfg.path:
         try:
-            base_dir = Path(path).resolve().parent
-            resolved = Path(maintenance_cfg.path)
+            maintenance_cfg.__dict__["_path_source"] = str(maintenance_cfg.path)
+        except Exception:  # pragma: no cover - defensive
+            maintenance_cfg.__dict__["_path_source"] = maintenance_cfg.path
+        try:
+            resolved = Path(str(maintenance_cfg.path))
             if not resolved.is_absolute():
-                resolved = (base_dir / resolved).resolve()
+                resolved = (base_dir / resolved).resolve(strict=False)
+            else:
+                resolved = resolved.resolve(strict=False)
             maintenance_cfg.path = str(resolved)
         except Exception:  # pragma: no cover - defensive
             maintenance_cfg.path = str(maintenance_cfg.path)
+    else:
+        try:
+            maintenance_cfg.__dict__["_path_source"] = None
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     if maintenance_cfg.max_age_sec is None and maintenance_cfg.max_age_hours is not None:
         try:
