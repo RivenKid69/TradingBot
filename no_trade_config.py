@@ -8,7 +8,7 @@ consumers should use this function so that the configuration is loaded from a
 single source of truth.
 """
 
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import json
 from pathlib import Path
@@ -75,6 +75,15 @@ class NoTradeState(BaseModel):
     """Persisted state for online anomaly-driven no-trade rules."""
 
     anomaly_block_until_ts: Dict[str, int] = Field(default_factory=dict)
+
+
+def _coerce_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return str(value)
+    except Exception:  # pragma: no cover - defensive branch
+        return None
 
 
 def _ensure_mapping(value: Any) -> Dict[str, Any]:
@@ -217,6 +226,64 @@ def get_no_trade_config(path: str) -> NoTradeConfig:
     return config
 
 
+def _iter_anomaly_entries(raw: Any) -> Iterable[Tuple[str, int]]:
+    """Yield ``(symbol, timestamp)`` pairs from *raw* state payload."""
+
+    if isinstance(raw, Mapping):
+        for key, value in raw.items():
+            ts = _coerce_int(value)
+            symbol = _coerce_str(key)
+            if symbol and ts is not None:
+                yield symbol, ts
+        return
+
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            symbol = _coerce_str(
+                item.get("symbol")
+                or item.get("pair")
+                or item.get("instrument")
+            )
+            if not symbol:
+                continue
+            ts = (
+                _coerce_int(item.get("block_until_ts"))
+                or _coerce_int(item.get("ts"))
+                or _coerce_int(item.get("timestamp"))
+                or _coerce_int(item.get("timestamp_ms"))
+            )
+            if ts is None:
+                continue
+            yield symbol, ts
+
+
+def _parse_anomaly_state(payload: Mapping[str, Any]) -> Dict[str, int]:
+    """Normalise anomaly state from multiple legacy layouts."""
+
+    candidates: List[Any] = []
+    for key in (
+        "anomaly_block_until_ts",
+        "anomaly_block_until_ts_ms",
+        "anomaly_block_until",
+        "anomaly_state",
+    ):
+        if key in payload:
+            candidates.append(payload[key])
+
+    if not candidates:
+        # Legacy format stored the map at the top level: ``{"BTCUSDT": 123}``.
+        if all(_coerce_int(v) is not None for v in payload.values()):
+            candidates.append(payload)
+
+    result: Dict[str, int] = {}
+    for candidate in candidates:
+        for symbol, ts in _iter_anomaly_entries(candidate):
+            result[symbol] = ts
+    return result
+
+
 def load_no_trade_state(path: str | Path = DEFAULT_NO_TRADE_STATE_PATH) -> NoTradeState:
     """Load persisted no-trade state returning empty defaults on errors."""
 
@@ -240,12 +307,20 @@ def load_no_trade_state(path: str | Path = DEFAULT_NO_TRADE_STATE_PATH) -> NoTra
     if not isinstance(payload, Mapping):
         return NoTradeState()
 
-    anomaly_raw = payload.get("anomaly_block_until_ts", {})
-    anomaly_map: Dict[str, int] = {}
-    if isinstance(anomaly_raw, Mapping):
-        for symbol, value in anomaly_raw.items():
-            ts = _coerce_int(value)
-            if ts is not None:
-                anomaly_map[str(symbol)] = ts
-
+    anomaly_map = _parse_anomaly_state(payload)
     return NoTradeState(anomaly_block_until_ts=anomaly_map)
+
+
+def save_no_trade_state(
+    state: NoTradeState,
+    path: str | Path = DEFAULT_NO_TRADE_STATE_PATH,
+) -> None:
+    """Persist :class:`NoTradeState` to *path* in the canonical format."""
+
+    data = {
+        "anomaly_block_until_ts": dict(state.anomaly_block_until_ts or {}),
+    }
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(payload + "\n", encoding="utf-8")

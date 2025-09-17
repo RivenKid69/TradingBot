@@ -1,14 +1,21 @@
+import json
+import os
+import sys
+
 import numpy as np
 import pandas as pd
 import pytest
-import os
-import sys
 import yaml
 
 sys.path.append(os.getcwd())
 
 from no_trade import compute_no_trade_mask, estimate_block_ratio
-from no_trade_config import get_no_trade_config
+from no_trade_config import (
+    NoTradeState,
+    get_no_trade_config,
+    load_no_trade_state,
+    save_no_trade_state,
+)
 
 
 def test_blocked_share_matches_legacy_config():
@@ -56,18 +63,37 @@ def test_dynamic_guard_blocks_and_logs_reasons(tmp_path):
     reasons = mask.attrs.get("reasons")
     assert isinstance(reasons, pd.DataFrame)
     assert reasons.index.equals(df.index)
-    for col in ["window", "dynamic_guard", "dyn_vol_abs", "dyn_guard_raw", "dyn_guard_hold"]:
-        assert col in reasons.columns
+    expected_cols = {
+        "window",
+        "dynamic_guard",
+        "dyn_vol_abs",
+        "dyn_ret_anomaly",
+        "dyn_guard_raw",
+        "dyn_guard_hold",
+        "dyn_guard_next_block",
+        "dyn_guard_state",
+    }
+    assert expected_cols.issubset(set(reasons.columns))
     assert reasons["window"].sum() == 0
     assert reasons["dynamic_guard"].tolist() == expected_mask
     assert bool(reasons.loc[df.index[2], "dyn_vol_abs"])
+    assert bool(reasons.loc[df.index[2], "dyn_ret_anomaly"])
     assert bool(reasons.loc[df.index[2], "dyn_guard_raw"])
     assert bool(reasons.loc[df.index[3], "dyn_guard_hold"])
     assert not bool(reasons.loc[df.index[2], "dyn_guard_hold"])
+    assert not reasons["dyn_guard_next_block"].any()
+    assert not reasons["dyn_guard_state"].any()
 
     labels = mask.attrs.get("reason_labels")
     assert isinstance(labels, dict)
-    assert "dynamic_guard" in labels
+    for key in ["dynamic_guard", "dyn_ret_anomaly", "dyn_guard_next_block"]:
+        assert key in labels
+
+    state = mask.attrs.get("state")
+    assert isinstance(state, dict)
+    anomaly_state = state.get("anomaly_block_until_ts")
+    assert isinstance(anomaly_state, dict)
+    assert anomaly_state.get("BTC") == int(df["ts_ms"].iloc[3])
 
     cfg = get_no_trade_config(str(cfg_path))
     ratio = estimate_block_ratio(df, cfg)
@@ -106,3 +132,109 @@ def test_dynamic_guard_skipped_when_data_missing(tmp_path):
     assert isinstance(dyn_meta, dict)
     assert dyn_meta.get("skipped")
     assert "volatility" in dyn_meta.get("missing", [])
+
+
+def test_next_bars_block_extends_mask_and_state(tmp_path):
+    cfg_data = {
+        "no_trade": {
+            "funding_buffer_min": 0,
+            "daily_utc": [],
+            "custom_ms": [],
+            "dynamic_guard": {
+                "enable": True,
+                "sigma_window": 2,
+                "atr_window": 2,
+                "vol_abs": 0.2,
+                "hysteresis": 0.0,
+                "cooldown_bars": 0,
+                "next_bars_block": {"anomaly": 2},
+            },
+        }
+    }
+    cfg_path = tmp_path / "sandbox.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_data), encoding="utf-8")
+
+    df = pd.DataFrame(
+        {
+            "ts_ms": np.arange(7, dtype=np.int64) * 60_000,
+            "symbol": ["BTC"] * 7,
+            "close": [100.0, 150.0, 152.0, 152.5, 152.6, 152.7, 152.8],
+        }
+    )
+
+    mask = compute_no_trade_mask(df, sandbox_yaml_path=str(cfg_path))
+    expected_mask = [False, False, True, True, True, False, False]
+    assert mask.tolist() == expected_mask
+
+    reasons = mask.attrs.get("reasons")
+    assert isinstance(reasons, pd.DataFrame)
+    assert list(reasons.loc[df.index, "dyn_guard_next_block"]) == [False, False, False, True, True, False, False]
+
+    state = mask.attrs.get("state")
+    assert isinstance(state, dict)
+    anomaly_state = state.get("anomaly_block_until_ts")
+    assert anomaly_state.get("BTC") == int(df["ts_ms"].iloc[4])
+    dyn_state = state.get("dynamic_guard") or {}
+    assert int(dyn_state["BTC"]["block_until_ts"]) == int(df["ts_ms"].iloc[4])
+    assert dyn_state["BTC"]["next_block_left"] == 0
+
+
+def test_state_blocks_rows_without_guard(tmp_path):
+    cfg_data = {
+        "no_trade": {
+            "funding_buffer_min": 0,
+            "daily_utc": [],
+            "custom_ms": [],
+            "dynamic_guard": {"enable": False},
+        }
+    }
+    cfg_path = tmp_path / "sandbox.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_data), encoding="utf-8")
+
+    df = pd.DataFrame(
+        {
+            "ts_ms": np.arange(4, dtype=np.int64) * 60_000,
+            "symbol": ["BTC"] * 4,
+        }
+    )
+
+    state = {"anomaly_block_until_ts": {"BTC": int(df["ts_ms"].iloc[1])}}
+    mask = compute_no_trade_mask(df, sandbox_yaml_path=str(cfg_path), state=state)
+    expected_mask = [True, True, False, False]
+    assert mask.tolist() == expected_mask
+
+    reasons = mask.attrs.get("reasons")
+    assert isinstance(reasons, pd.DataFrame)
+    assert list(reasons.loc[df.index, "dyn_guard_state"]) == expected_mask
+
+    cfg = get_no_trade_config(str(cfg_path))
+    ratio = estimate_block_ratio(df, cfg, state=state)
+    assert ratio == pytest.approx(sum(expected_mask) / len(expected_mask))
+
+
+def test_no_trade_state_migration_and_save(tmp_path):
+    legacy_payloads = [
+        ({"BTCUSDT": 123}, {"BTCUSDT": 123}),
+        ({"anomaly_block_until_ts_ms": {"ETHUSDT": "456"}}, {"ETHUSDT": 456}),
+        (
+            {
+                "anomaly_block_until_ts": [
+                    {"symbol": "XRPUSDT", "ts": 789},
+                    {"pair": "LTCUSDT", "timestamp_ms": "1000"},
+                ]
+            },
+            {"XRPUSDT": 789, "LTCUSDT": 1000},
+        ),
+    ]
+
+    for payload, expected in legacy_payloads:
+        path = tmp_path / "legacy_state.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        state = load_no_trade_state(path)
+        assert state.anomaly_block_until_ts == expected
+
+    state = NoTradeState(anomaly_block_until_ts={"BTCUSDT": 123})
+    out_path = tmp_path / "saved_state.json"
+    save_no_trade_state(state, out_path)
+    saved = json.loads(out_path.read_text(encoding="utf-8"))
+    assert saved == {"anomaly_block_until_ts": {"BTCUSDT": 123}}

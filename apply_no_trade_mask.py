@@ -104,7 +104,10 @@ def main():
     config_path = (args.no_trade_config or "").strip() or args.sandbox_config
     cfg = get_no_trade_config(config_path)
     mask_nt = compute_no_trade_mask(
-        df, sandbox_yaml_path=config_path, ts_col=args.ts_col
+        df,
+        sandbox_yaml_path=config_path,
+        ts_col=args.ts_col,
+        config=cfg,
     )
     est_ratio = estimate_block_ratio(df, cfg, ts_col=args.ts_col)
     actual_nt_ratio = float(mask_nt.mean())
