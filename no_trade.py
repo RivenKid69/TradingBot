@@ -753,6 +753,7 @@ def _dynamic_guard_mask(
     ts_valid: np.ndarray,
     symbol_col: str = "symbol",
     state_map: Optional[Mapping[str, int]] = None,
+    prev_symbol_states: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Tuple[pd.Series, pd.DataFrame, Dict[str, Any]]:
     symbols = _symbol_series(df, symbol_col)
 
@@ -788,6 +789,10 @@ def _dynamic_guard_mask(
             "dyn_spread_pctile",
             "dyn_ret_anomaly",
             "dyn_spread_anomaly",
+            "dyn_vol_extreme",
+            "dyn_spread_wide",
+            "dyn_guard_warmup",
+            "dyn_cooldown",
             "dyn_guard_raw",
             "dyn_guard_hold",
             "dyn_guard_next_block",
@@ -796,6 +801,9 @@ def _dynamic_guard_mask(
     )
     reasons.attrs["meta"] = {}
 
+    vol_cfg = getattr(dyn_cfg, "volatility", None)
+    spread_cfg = getattr(dyn_cfg, "spread", None)
+
     thresholds_defined = any(
         x is not None
         for x in (
@@ -803,6 +811,8 @@ def _dynamic_guard_mask(
             dyn_cfg.vol_pctile,
             dyn_cfg.spread_abs_bps,
             dyn_cfg.spread_pctile,
+            getattr(vol_cfg, "upper_multiplier", None) if vol_cfg is not None else None,
+            getattr(spread_cfg, "upper_pctile", None) if spread_cfg is not None else None,
         )
     )
 
@@ -814,27 +824,118 @@ def _dynamic_guard_mask(
         return dyn_mask, reasons, {"anomaly_block_until_ts": {}}
 
     required_metrics: List[str] = []
-    if dyn_cfg.vol_abs is not None or dyn_cfg.vol_pctile is not None:
+    if (
+        dyn_cfg.vol_abs is not None
+        or dyn_cfg.vol_pctile is not None
+        or (vol_cfg is not None and getattr(vol_cfg, "upper_multiplier", None) is not None)
+    ):
         required_metrics.append("volatility")
-    if dyn_cfg.spread_abs_bps is not None or dyn_cfg.spread_pctile is not None:
+    if (
+        dyn_cfg.spread_abs_bps is not None
+        or dyn_cfg.spread_pctile is not None
+        or (spread_cfg is not None and getattr(spread_cfg, "upper_pctile", None) is not None)
+    ):
         required_metrics.append("spread")
 
     close = price.replace(0, np.nan)
     returns = price.groupby(symbols).pct_change()
 
-    sigma_window = dyn_cfg.sigma_window or 120
-    atr_window = dyn_cfg.atr_window or 14
+    sigma_window = _coerce_positive_int(
+        getattr(vol_cfg, "window", None) or getattr(dyn_cfg, "sigma_window", None)
+    )
+    if sigma_window <= 1:
+        sigma_window = 120
+    sigma_min_periods = _coerce_positive_int(
+        getattr(vol_cfg, "min_periods", None) or getattr(dyn_cfg, "sigma_min_periods", None)
+    )
+    if sigma_min_periods <= 0:
+        sigma_min_periods = min(sigma_window, max(2, sigma_window // 2))
 
-    sigma = _rolling_sigma(returns, symbols, sigma_window)
-    atr = _rolling_atr(high, low, close, symbols, atr_window)
+    sigma = _rolling_sigma(returns, symbols, sigma_window, min_periods=sigma_min_periods)
+    if sigma_window > 1:
+        sigma_ready = (
+            returns.notna()
+            .astype(float)
+            .groupby(symbols)
+            .rolling(window=sigma_window, min_periods=1)
+            .sum()
+            .reset_index(level=0, drop=True)
+        )
+        sigma_ready = sigma_ready.reindex(returns.index).fillna(0.0) >= float(sigma_min_periods)
+    else:
+        sigma_ready = pd.Series(False, index=returns.index, dtype=bool)
+
+    atr_window = _coerce_positive_int(
+        getattr(dyn_cfg, "atr_window", None) or getattr(spread_cfg, "window", None)
+    )
+    if atr_window <= 1:
+        atr_window = 14
+    atr_min_periods = _coerce_positive_int(
+        getattr(dyn_cfg, "atr_min_periods", None) or getattr(spread_cfg, "min_periods", None)
+    )
+    if atr_min_periods <= 0:
+        atr_min_periods = min(atr_window, max(1, atr_window // 2))
+
+    atr = _rolling_atr(high, low, close, symbols, atr_window, min_periods=atr_min_periods)
     atr_pct = atr / close.abs()
     spread_proxy = spread
     if spread_proxy.isna().all() and atr_pct.notna().any():
         spread_proxy = atr_pct * 10000.0
 
     vol_metric = sigma.fillna(atr_pct)
-    vol_pctile = _rolling_percentile(vol_metric, symbols, sigma_window)
-    spread_pctile = _rolling_percentile(spread_proxy, symbols, atr_window)
+
+    vol_pctile_window = _coerce_positive_int(
+        getattr(vol_cfg, "pctile_window", None) or getattr(dyn_cfg, "vol_pctile_window", None)
+    )
+    if vol_pctile_window <= 1:
+        vol_pctile_window = sigma_window
+    vol_pctile_min_periods = _coerce_positive_int(
+        getattr(vol_cfg, "pctile_min_periods", None)
+        or getattr(dyn_cfg, "vol_pctile_min_periods", None)
+    )
+    if vol_pctile_min_periods <= 0:
+        vol_pctile_min_periods = min(vol_pctile_window, sigma_min_periods)
+
+    vol_pctile = _rolling_percentile(
+        vol_metric,
+        symbols,
+        vol_pctile_window,
+        min_periods=vol_pctile_min_periods,
+    )
+
+    spread_pctile_window = _coerce_positive_int(
+        getattr(spread_cfg, "pctile_window", None) or getattr(dyn_cfg, "spread_pctile_window", None)
+    )
+    if spread_pctile_window <= 1:
+        spread_pctile_window = atr_window
+    spread_pctile_min_periods = _coerce_positive_int(
+        getattr(spread_cfg, "pctile_min_periods", None)
+        or getattr(dyn_cfg, "spread_pctile_min_periods", None)
+    )
+    if spread_pctile_min_periods <= 0:
+        spread_pctile_min_periods = min(spread_pctile_window, atr_min_periods)
+
+    spread_pctile = _rolling_percentile(
+        spread_proxy,
+        symbols,
+        spread_pctile_window,
+        min_periods=spread_pctile_min_periods,
+    )
+
+    if spread_pctile_window > 1:
+        spread_ready = (
+            spread_proxy.notna()
+            .astype(float)
+            .groupby(symbols)
+            .rolling(window=spread_pctile_window, min_periods=1)
+            .sum()
+            .reset_index(level=0, drop=True)
+        )
+        spread_ready = spread_ready.reindex(spread_proxy.index).fillna(0.0) >= float(
+            spread_pctile_min_periods
+        )
+    else:
+        spread_ready = pd.Series(False, index=spread_proxy.index, dtype=bool)
 
     missing_requirements: List[str] = []
     if thresholds_defined:
@@ -859,9 +960,17 @@ def _dynamic_guard_mask(
     hysteresis = float(dyn_cfg.hysteresis or 0.0)
     if hysteresis < 0:
         hysteresis = 0.0
-    cooldown = max(0, int(dyn_cfg.cooldown_bars or 0))
+    cooldown_candidates = [
+        int(dyn_cfg.cooldown_bars or 0),
+    ]
+    if vol_cfg is not None:
+        cooldown_candidates.append(int(getattr(vol_cfg, "cooldown_bars", 0) or 0))
+    if spread_cfg is not None:
+        cooldown_candidates.append(int(getattr(spread_cfg, "cooldown_bars", 0) or 0))
+    cooldown = max(0, max(cooldown_candidates))
     next_block_cfg: Mapping[str, Any] = getattr(dyn_cfg, "next_bars_block", {}) or {}
 
+    prev_symbol_states = {str(k): dict(v) for k, v in (prev_symbol_states or {}).items()}
     anomaly_state: Dict[str, int] = dict(state_map)
     symbol_states: Dict[str, Dict[str, Any]] = {}
 
@@ -875,12 +984,17 @@ def _dynamic_guard_mask(
         diffs = diffs[diffs > 0]
         median_delta = float(np.median(diffs)) if diffs.size > 0 else 0.0
 
-        blocked = False
-        cooldown_left = 0
-        next_block_left = 0
-        last_trigger: Tuple[str, ...] = ()
-        last_snapshot: Dict[str, Any] = {}
-        block_deadline = anomaly_state.get(symbol, -1)
+        previous_state = prev_symbol_states.get(str(symbol), {})
+
+        blocked = bool(previous_state.get("blocked", False))
+        cooldown_left = max(0, int(previous_state.get("cooldown_left", 0)))
+        next_block_left = max(0, int(previous_state.get("next_block_left", 0)))
+        last_trigger: Tuple[str, ...] = tuple(previous_state.get("last_trigger", []) or [])
+        last_snapshot: Dict[str, Any] = dict(previous_state.get("last_snapshot", {}) or {})
+        block_deadline = max(
+            anomaly_state.get(symbol, -1),
+            _coerce_positive_int(previous_state.get("block_until_ts")) if previous_state else -1,
+        )
         last_valid_ts = block_deadline if block_deadline is not None else -1
 
         for label in idx:
@@ -891,30 +1005,94 @@ def _dynamic_guard_mask(
             blocked_by_next = next_block_left > 0
 
             triggered_reasons: List[str] = []
+            guard_ready = True
+            vol_trigger = False
+            spread_trigger = False
+
+            vol_upper_mult = getattr(vol_cfg, "upper_multiplier", None) if vol_cfg is not None else None
+            vol_lower_mult = getattr(vol_cfg, "lower_multiplier", None) if vol_cfg is not None else None
+
+            spread_upper_pct = getattr(spread_cfg, "upper_pctile", None) if spread_cfg is not None else None
+            spread_lower_pct = getattr(spread_cfg, "lower_pctile", None) if spread_cfg is not None else None
+            if spread_lower_pct is None and spread_upper_pct is not None and hysteresis > 0:
+                spread_lower_pct = max(0.0, float(spread_upper_pct) - hysteresis)
+
             if thresholds_defined:
-                if dyn_cfg.vol_abs is not None:
-                    val = vol_metric.loc[label]
-                    if not np.isnan(val) and val >= float(dyn_cfg.vol_abs):
-                        reasons.at[label, "dyn_vol_abs"] = True
-                        triggered_reasons.append("dyn_vol_abs")
 
-                if dyn_cfg.vol_pctile is not None:
-                    val = vol_pctile.loc[label]
-                    if not np.isnan(val) and val >= float(dyn_cfg.vol_pctile):
-                        reasons.at[label, "dyn_vol_pctile"] = True
-                        triggered_reasons.append("dyn_vol_pctile")
+                vol_checks = (
+                    dyn_cfg.vol_abs is not None
+                    or dyn_cfg.vol_pctile is not None
+                    or vol_upper_mult is not None
+                )
+                spread_checks = (
+                    dyn_cfg.spread_abs_bps is not None
+                    or dyn_cfg.spread_pctile is not None
+                    or spread_upper_pct is not None
+                )
 
-                if dyn_cfg.spread_abs_bps is not None:
-                    val = spread_proxy.loc[label]
-                    if not np.isnan(val) and val >= float(dyn_cfg.spread_abs_bps):
-                        reasons.at[label, "dyn_spread_abs"] = True
-                        triggered_reasons.append("dyn_spread_abs")
+                vol_ready_row = True
+                spread_ready_row = True
+                if vol_checks:
+                    vol_ready_row = bool(sigma_ready.loc[label])
+                if spread_checks:
+                    spread_ready_row = bool(spread_ready.loc[label])
+                guard_ready = bool(vol_ready_row and spread_ready_row)
 
-                if dyn_cfg.spread_pctile is not None:
-                    val = spread_pctile.loc[label]
-                    if not np.isnan(val) and val >= float(dyn_cfg.spread_pctile):
-                        reasons.at[label, "dyn_spread_pctile"] = True
-                        triggered_reasons.append("dyn_spread_pctile")
+                if not guard_ready:
+                    reasons.at[label, "dyn_guard_warmup"] = True
+                else:
+                    ret_val = returns.loc[label]
+                    sigma_val = sigma.loc[label]
+                    abs_ret = abs(ret_val) if not np.isnan(ret_val) else np.nan
+
+                    if dyn_cfg.vol_abs is not None:
+                        val = vol_metric.loc[label]
+                        if not np.isnan(val) and val >= float(dyn_cfg.vol_abs):
+                            reasons.at[label, "dyn_vol_abs"] = True
+                            triggered_reasons.append("dyn_vol_abs")
+                            vol_trigger = True
+
+                    if dyn_cfg.vol_pctile is not None:
+                        val = vol_pctile.loc[label]
+                        if not np.isnan(val) and val >= float(dyn_cfg.vol_pctile):
+                            reasons.at[label, "dyn_vol_pctile"] = True
+                            triggered_reasons.append("dyn_vol_pctile")
+                            vol_trigger = True
+
+                    if (
+                        vol_upper_mult is not None
+                        and not np.isnan(abs_ret)
+                        and not np.isnan(sigma_val)
+                        and float(sigma_val) > 0
+                    ):
+                        if abs_ret >= float(vol_upper_mult) * float(sigma_val):
+                            reasons.at[label, "dyn_vol_extreme"] = True
+                            triggered_reasons.append("dyn_vol_extreme")
+                            vol_trigger = True
+
+                    if dyn_cfg.spread_abs_bps is not None:
+                        val = spread_proxy.loc[label]
+                        if not np.isnan(val) and val >= float(dyn_cfg.spread_abs_bps):
+                            reasons.at[label, "dyn_spread_abs"] = True
+                            triggered_reasons.append("dyn_spread_abs")
+                            spread_trigger = True
+
+                    if dyn_cfg.spread_pctile is not None:
+                        val = spread_pctile.loc[label]
+                        if not np.isnan(val) and val >= float(dyn_cfg.spread_pctile):
+                            reasons.at[label, "dyn_spread_pctile"] = True
+                            triggered_reasons.append("dyn_spread_pctile")
+                            spread_trigger = True
+
+                    if spread_upper_pct is None and dyn_cfg.spread_pctile is not None:
+                        spread_upper_pct = float(dyn_cfg.spread_pctile)
+
+                    if spread_upper_pct is not None:
+                        val = spread_pctile.loc[label]
+                        if not np.isnan(val) and val >= float(spread_upper_pct):
+                            reasons.at[label, "dyn_spread_wide"] = True
+                            triggered_reasons.append("dyn_spread_wide")
+                            spread_trigger = True
 
             if triggered_reasons:
                 reasons.at[label, "dyn_guard_raw"] = True
@@ -932,42 +1110,64 @@ def _dynamic_guard_mask(
                 guard_block = True
                 last_trigger = tuple(triggered_reasons)
             elif blocked:
-                release_ready = True
-
-                if dyn_cfg.vol_abs is not None:
-                    val = vol_metric.loc[label]
-                    release_thr = float(dyn_cfg.vol_abs) * (1.0 - hysteresis)
-                    if not np.isnan(val) and val > release_thr:
-                        release_ready = False
-
-                if dyn_cfg.vol_pctile is not None:
-                    val = vol_pctile.loc[label]
-                    release_thr = max(0.0, float(dyn_cfg.vol_pctile) - hysteresis)
-                    if not np.isnan(val) and val > release_thr:
-                        release_ready = False
-
-                if dyn_cfg.spread_abs_bps is not None:
-                    val = spread_proxy.loc[label]
-                    release_thr = float(dyn_cfg.spread_abs_bps) * (1.0 - hysteresis)
-                    if not np.isnan(val) and val > release_thr:
-                        release_ready = False
-
-                if dyn_cfg.spread_pctile is not None:
-                    val = spread_pctile.loc[label]
-                    release_thr = max(0.0, float(dyn_cfg.spread_pctile) - hysteresis)
-                    if not np.isnan(val) and val > release_thr:
-                        release_ready = False
-
-                if not release_ready:
-                    guard_block = True
-                    hold_reason = True
-                elif cooldown_left > 0:
-                    guard_block = True
-                    hold_reason = True
-                    cooldown_left -= 1
-                else:
+                if not guard_ready:
                     blocked = False
                     cooldown_left = 0
+                else:
+                    release_ready = True
+                    sigma_val = sigma.loc[label]
+                    ret_val = returns.loc[label]
+                    abs_ret = abs(ret_val) if not np.isnan(ret_val) else np.nan
+
+                    if dyn_cfg.vol_abs is not None:
+                        val = vol_metric.loc[label]
+                        release_thr = float(dyn_cfg.vol_abs) * (1.0 - hysteresis)
+                        if not np.isnan(val) and val > release_thr:
+                            release_ready = False
+
+                    if dyn_cfg.vol_pctile is not None:
+                        val = vol_pctile.loc[label]
+                        release_thr = max(0.0, float(dyn_cfg.vol_pctile) - hysteresis)
+                        if not np.isnan(val) and val > release_thr:
+                            release_ready = False
+
+                    if (
+                        vol_lower_mult is not None
+                        and not np.isnan(abs_ret)
+                        and not np.isnan(sigma_val)
+                        and float(sigma_val) > 0
+                    ):
+                        if abs_ret > float(vol_lower_mult) * float(sigma_val):
+                            release_ready = False
+
+                    if dyn_cfg.spread_abs_bps is not None:
+                        val = spread_proxy.loc[label]
+                        release_thr = float(dyn_cfg.spread_abs_bps) * (1.0 - hysteresis)
+                        if not np.isnan(val) and val > release_thr:
+                            release_ready = False
+
+                    if dyn_cfg.spread_pctile is not None:
+                        val = spread_pctile.loc[label]
+                        release_thr = max(0.0, float(dyn_cfg.spread_pctile) - hysteresis)
+                        if not np.isnan(val) and val > release_thr:
+                            release_ready = False
+
+                    if spread_lower_pct is not None:
+                        val = spread_pctile.loc[label]
+                        if not np.isnan(val) and val > float(spread_lower_pct):
+                            release_ready = False
+
+                    if not release_ready:
+                        guard_block = True
+                        hold_reason = True
+                    elif cooldown_left > 0:
+                        guard_block = True
+                        hold_reason = True
+                        cooldown_left -= 1
+                        reasons.at[label, "dyn_cooldown"] = True
+                    else:
+                        blocked = False
+                        cooldown_left = 0
 
             if hold_reason:
                 reasons.at[label, "dyn_guard_hold"] = True
@@ -997,6 +1197,8 @@ def _dynamic_guard_mask(
                 "vol_metric": float(vol_metric.loc[label])
                 if not np.isnan(vol_metric.loc[label])
                 else None,
+                "sigma": float(sigma.loc[label]) if not np.isnan(sigma.loc[label]) else None,
+                "ret_last": float(returns.loc[label]) if not np.isnan(returns.loc[label]) else None,
                 "vol_pctile": float(vol_pctile.loc[label])
                 if not np.isnan(vol_pctile.loc[label])
                 else None,
@@ -1007,6 +1209,7 @@ def _dynamic_guard_mask(
                 if not np.isnan(spread_pctile.loc[label])
                 else None,
                 "ts": int(ts_val) if ts_ok else None,
+                "ready": bool(guard_ready),
             }
 
             if blocked_by_next:
@@ -1071,6 +1274,24 @@ def _extract_anomaly_state(state: Optional[Any]) -> Dict[str, int]:
     return result
 
 
+def _extract_dynamic_guard_state(state: Optional[Any]) -> Dict[str, Dict[str, Any]]:
+    if state is None:
+        return {}
+    if isinstance(state, NoTradeState):
+        raw = state.dynamic_guard or {}
+    elif isinstance(state, Mapping):
+        raw = state.get("dynamic_guard") if isinstance(state, Mapping) else {}
+    else:
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw, Mapping):
+        for symbol, payload in raw.items():
+            if isinstance(payload, Mapping):
+                result[str(symbol)] = dict(payload)
+    return result
+
+
 def _compute_no_trade_components(
     df: pd.DataFrame,
     cfg: NoTradeConfig,
@@ -1080,6 +1301,7 @@ def _compute_no_trade_components(
 ) -> Tuple[pd.Series, pd.DataFrame, Dict[str, Any], Dict[str, Any], Dict[str, str]]:
     ts_int, ts_valid = _prepare_ts(df, ts_col)
     state_map = _extract_anomaly_state(state)
+    prev_dynamic_state = _extract_dynamic_guard_state(state)
 
     symbols = _symbol_series(df)
     calendar, calendar_meta = _load_maintenance_calendar(cfg)
@@ -1108,19 +1330,24 @@ def _compute_no_trade_components(
         "dyn_spread_pctile",
         "dyn_ret_anomaly",
         "dyn_spread_anomaly",
+        "dyn_vol_extreme",
+        "dyn_spread_wide",
+        "dyn_guard_warmup",
+        "dyn_cooldown",
         "dyn_guard_raw",
         "dyn_guard_hold",
         "dyn_guard_next_block",
         "dyn_guard_state",
     ]
 
-    if dyn_cfg and (getattr(dyn_cfg, "enable", False) or state_map):
+    if dyn_cfg and (getattr(dyn_cfg, "enable", False) or state_map or prev_dynamic_state):
         dyn_mask, dyn_reasons, dyn_state = _dynamic_guard_mask(
             df,
             dyn_cfg,
             ts_int=ts_int,
             ts_valid=ts_valid,
             state_map=state_map,
+            prev_symbol_states=prev_dynamic_state,
         )
         dyn_state = dict(dyn_state or {})
         dyn_state.setdefault("anomaly_block_until_ts", dict(state_map))
@@ -1128,7 +1355,7 @@ def _compute_no_trade_components(
         dyn_meta = getattr(dyn_reasons, "attrs", {}).get("meta") if isinstance(dyn_reasons, pd.DataFrame) else None
         if dyn_meta:
             meta["dynamic_guard"] = dyn_meta
-    elif state_map:
+    elif state_map or prev_dynamic_state:
         dyn_reasons = pd.DataFrame(False, index=df.index, columns=expected_dyn_cols)
         ts_series = pd.Series(ts_int, index=df.index, dtype=np.int64)
         for label in df.index:
@@ -1137,15 +1364,22 @@ def _compute_no_trade_components(
             if symbol in state_map and ts_val >= 0 and ts_val <= state_map[symbol]:
                 dyn_mask.loc[label] = True
                 dyn_reasons.at[label, "dyn_guard_state"] = True
+            prev_info = (
+                prev_dynamic_state.get(str(symbol))
+                if isinstance(prev_dynamic_state, Mapping)
+                else None
+            )
+            if prev_info and bool(prev_info.get("blocked")):
+                dyn_reasons.at[label, "dyn_guard_hold"] = True
         dyn_state = {
             "anomaly_block_until_ts": dict(state_map),
-            "dynamic_guard": {},
+            "dynamic_guard": dict(prev_dynamic_state or {}),
         }
     else:
         dyn_reasons = pd.DataFrame(False, index=df.index, columns=expected_dyn_cols)
         dyn_state = {
             "anomaly_block_until_ts": dict(state_map),
-            "dynamic_guard": {},
+            "dynamic_guard": dict(prev_dynamic_state or {}),
         }
 
     if not dyn_reasons.empty:
@@ -1191,6 +1425,10 @@ def _compute_no_trade_components(
         "dyn_spread_pctile": "Dynamic guard: spread percentile",
         "dyn_ret_anomaly": "Dynamic guard: return anomaly",
         "dyn_spread_anomaly": "Dynamic guard: spread anomaly",
+        "dyn_vol_extreme": "Dynamic guard: return vs sigma",
+        "dyn_spread_wide": "Dynamic guard: spread percentile high",
+        "dyn_guard_warmup": "Dynamic guard warm-up",
+        "dyn_cooldown": "Dynamic guard cooldown",
         "dyn_guard_raw": "Dynamic guard triggered",
         "dyn_guard_hold": "Dynamic guard hold",
         "dyn_guard_next_block": "Dynamic guard next-bar block",

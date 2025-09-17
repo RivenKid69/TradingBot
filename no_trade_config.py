@@ -29,6 +29,11 @@ class DynamicGuardMetricConfig(BaseModel):
     pctile_min_periods: Optional[int] = None
     abs: Optional[float] = None
     pctile: Optional[float] = None
+    upper_multiplier: Optional[float] = None
+    lower_multiplier: Optional[float] = None
+    upper_pctile: Optional[float] = None
+    lower_pctile: Optional[float] = None
+    cooldown_bars: Optional[int] = None
 
 
 class DynamicGuardSpreadConfig(DynamicGuardMetricConfig):
@@ -112,6 +117,7 @@ class NoTradeState(BaseModel):
     """Persisted state for online anomaly-driven no-trade rules."""
 
     anomaly_block_until_ts: Dict[str, int] = Field(default_factory=dict)
+    dynamic_guard: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _coerce_str(value: Any) -> Optional[str]:
@@ -200,7 +206,15 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
         abs_key: str,
         abs_alias: Optional[str] = None,
         pctile_key: str,
-    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[float], Optional[float]]:
+    ) -> Tuple[
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[float],
+        Optional[float],
+        Dict[str, Any],
+    ]:
         window_val = _coerce_int(block.get("window"))
         if window_val is None:
             window_val = _coerce_int(guard_data.get(window_key))
@@ -229,6 +243,54 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
         if pctile_val is None:
             pctile_val = _coerce_float(guard_data.get(pctile_key))
 
+        extras: Dict[str, Any] = {}
+
+        def _pick_float(*keys: str) -> Optional[float]:
+            for key in keys:
+                if key in block and block.get(key) is not None:
+                    val = _coerce_float(block.get(key))
+                    if val is not None:
+                        return val
+            for key in keys:
+                if key in guard_data and guard_data.get(key) is not None:
+                    val = _coerce_float(guard_data.get(key))
+                    if val is not None:
+                        return val
+            return None
+
+        def _pick_int(*keys: str) -> Optional[int]:
+            for key in keys:
+                if key in block and block.get(key) is not None:
+                    val = _coerce_int(block.get(key))
+                    if val is not None:
+                        return val
+            for key in keys:
+                if key in guard_data and guard_data.get(key) is not None:
+                    val = _coerce_int(guard_data.get(key))
+                    if val is not None:
+                        return val
+            return None
+
+        upper_mult = _pick_float("upper_multiplier", "upper_mult")
+        if upper_mult is not None:
+            extras["upper_multiplier"] = upper_mult
+
+        lower_mult = _pick_float("lower_multiplier", "lower_mult")
+        if lower_mult is not None:
+            extras["lower_multiplier"] = lower_mult
+
+        cooldown_override = _pick_int("cooldown_bars")
+        if cooldown_override is not None:
+            extras["cooldown_bars"] = cooldown_override
+
+        upper_pct = _pick_float("upper_pctile", "upper_percentile")
+        if upper_pct is not None:
+            extras["upper_pctile"] = upper_pct
+
+        lower_pct = _pick_float("lower_pctile", "lower_percentile")
+        if lower_pct is not None:
+            extras["lower_pctile"] = lower_pct
+
         return (
             window_val,
             min_periods_val,
@@ -236,6 +298,7 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
             pctile_min_val,
             abs_val,
             pctile_val,
+            extras,
         )
 
     (
@@ -245,6 +308,7 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
         vol_pctile_min_periods,
         vol_abs,
         vol_pctile,
+        vol_extras,
     ) = _extract_metric(
         block=volatility_cfg,
         window_key="sigma_window",
@@ -262,6 +326,7 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
         spread_pctile_min_periods,
         spread_abs,
         spread_pctile,
+        spread_extras,
     ) = _extract_metric(
         block=spread_cfg,
         window_key="atr_window",
@@ -295,6 +360,7 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
         "abs": vol_abs,
         "pctile": vol_pctile,
     }
+    guard_data["volatility"].update(vol_extras)
     guard_data["spread"] = {
         "window": atr_window,
         "min_periods": atr_min_periods,
@@ -304,6 +370,7 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
         "abs_bps": spread_abs,
         "pctile": spread_pctile,
     }
+    guard_data["spread"].update(spread_extras)
 
     # Extract hysteresis configuration
     hysteresis_cfg = _ensure_mapping(dynamic.get("hysteresis"))
@@ -601,6 +668,44 @@ def _parse_anomaly_state(payload: Mapping[str, Any]) -> Dict[str, int]:
     return result
 
 
+def _parse_dynamic_guard_state(payload: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Extract persisted dynamic guard metadata."""
+
+    raw = payload.get("dynamic_guard") if isinstance(payload, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for symbol, entry in raw.items():
+        if not isinstance(entry, Mapping):
+            continue
+        symbol_key = _coerce_str(symbol)
+        if not symbol_key:
+            continue
+        parsed: Dict[str, Any] = {}
+        if "blocked" in entry:
+            parsed["blocked"] = bool(entry.get("blocked"))
+        if "cooldown_left" in entry:
+            value = _coerce_int(entry.get("cooldown_left"))
+            if value is not None:
+                parsed["cooldown_left"] = value
+        if "next_block_left" in entry:
+            value = _coerce_int(entry.get("next_block_left"))
+            if value is not None:
+                parsed["next_block_left"] = value
+        if "block_until_ts" in entry:
+            value = _coerce_int(entry.get("block_until_ts"))
+            if value is not None:
+                parsed["block_until_ts"] = value
+        if "last_trigger" in entry and isinstance(entry.get("last_trigger"), list):
+            parsed["last_trigger"] = [str(x) for x in entry.get("last_trigger", [])]
+        if "last_snapshot" in entry and isinstance(entry.get("last_snapshot"), Mapping):
+            parsed["last_snapshot"] = dict(entry.get("last_snapshot", {}))
+        if parsed:
+            result[symbol_key] = parsed
+    return result
+
+
 def load_no_trade_state(path: str | Path = DEFAULT_NO_TRADE_STATE_PATH) -> NoTradeState:
     """Load persisted no-trade state returning empty defaults on errors."""
 
@@ -625,7 +730,11 @@ def load_no_trade_state(path: str | Path = DEFAULT_NO_TRADE_STATE_PATH) -> NoTra
         return NoTradeState()
 
     anomaly_map = _parse_anomaly_state(payload)
-    return NoTradeState(anomaly_block_until_ts=anomaly_map)
+    dynamic_state = _parse_dynamic_guard_state(payload)
+    return NoTradeState(
+        anomaly_block_until_ts=anomaly_map,
+        dynamic_guard=dynamic_state,
+    )
 
 
 def save_no_trade_state(
@@ -636,6 +745,7 @@ def save_no_trade_state(
 
     data = {
         "anomaly_block_until_ts": dict(state.anomaly_block_until_ts or {}),
+        "dynamic_guard": dict(state.dynamic_guard or {}),
     }
     payload = json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2)
     p = Path(path)
