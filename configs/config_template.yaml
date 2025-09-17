@@ -73,6 +73,13 @@ latency:
   timeout_ms: 2500
   retries: 1
   seed: 0  # RNG seed; seasonality multipliers do not affect RNG state
+  vol_metric: sigma          # Rolling volatility input used to scale latency adjustments
+  vol_window: 120            # Window (bars) for the volatility metric
+  volatility_gamma: 0.0      # Power/exponent applied to the normalised volatility factor
+  zscore_clip: 3.0           # Clip z-score used when normalising volatility
+  min_ms: 0                  # Lower bound applied after adjustments
+  max_ms: 10000              # Upper bound applied after adjustments
+  debug_log: false           # Emit detailed latency sampling logs
 
 risk:
   enabled: true
