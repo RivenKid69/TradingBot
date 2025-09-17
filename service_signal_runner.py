@@ -85,6 +85,16 @@ class RiskGuards(Protocol):
 
 
 @dataclass
+class SignalQualityConfig:
+    enabled: bool = False
+    sigma_window: int = 0
+    sigma_threshold: float = 0.0
+    vol_median_window: int = 0
+    vol_floor_frac: float = 0.0
+    log_reason: str = ""
+
+
+@dataclass
 class SignalRunnerConfig:
     snapshot_config_path: Optional[str] = None
     artifacts_dir: Optional[str] = None
@@ -644,6 +654,7 @@ class ServiceSignalRunner:
         clock_sync_cfg: ClockSyncConfig | None = None,
         throttle_cfg: ThrottleConfig | None = None,
         no_trade_cfg: NoTradeConfig | None = None,
+        signal_quality_cfg: SignalQualityConfig | None = None,
         pipeline_cfg: PipelineConfig | None = None,
         shutdown_cfg: Dict[str, Any] | None = None,
         monitoring_cfg: MonitoringConfig | None = None,
@@ -662,6 +673,7 @@ class ServiceSignalRunner:
         self.clock_sync_cfg = clock_sync_cfg
         self.throttle_cfg = throttle_cfg
         self.no_trade_cfg = no_trade_cfg
+        self.signal_quality_cfg = signal_quality_cfg or SignalQualityConfig()
         self.pipeline_cfg = pipeline_cfg
         self.shutdown_cfg = shutdown_cfg or {}
         self.monitoring_cfg = monitoring_cfg or MonitoringConfig()
@@ -687,6 +699,17 @@ class ServiceSignalRunner:
             except Exception:
                 self.alerts = None
                 self.monitoring_agg = None
+
+        if self.signal_quality_cfg.enabled:
+            self.logger.info(
+                "signal quality guard: enabled sigma_window=%s sigma_threshold=%s "
+                "vol_median_window=%s vol_floor_frac=%s log_reason=%s",
+                self.signal_quality_cfg.sigma_window,
+                self.signal_quality_cfg.sigma_threshold,
+                self.signal_quality_cfg.vol_median_window,
+                self.signal_quality_cfg.vol_floor_frac,
+                self.signal_quality_cfg.log_reason,
+            )
 
         if self.throttle_cfg is not None:
             self.logger.info(
@@ -1236,6 +1259,60 @@ def from_config(
         except Exception:
             rt_cfg = {}
 
+    # Load signal quality configuration
+    signal_quality_cfg = SignalQualityConfig()
+    sq_cfg_path = Path("configs/signal_quality.yaml")
+    sq_data: Dict[str, Any] = {}
+    if sq_cfg_path.exists():
+        try:
+            with sq_cfg_path.open("r", encoding="utf-8") as f:
+                sq_data = yaml.safe_load(f) or {}
+        except Exception:
+            sq_data = {}
+
+    def _apply_signal_quality(data: Dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        if "enabled" in data:
+            signal_quality_cfg.enabled = bool(data.get("enabled", signal_quality_cfg.enabled))
+        if "sigma_window" in data:
+            try:
+                value = data.get("sigma_window")
+                if value is not None:
+                    signal_quality_cfg.sigma_window = int(value)
+            except (TypeError, ValueError):
+                pass
+        if "sigma_threshold" in data:
+            try:
+                value = data.get("sigma_threshold")
+                if value is not None:
+                    signal_quality_cfg.sigma_threshold = float(value)
+            except (TypeError, ValueError):
+                pass
+        if "vol_median_window" in data:
+            try:
+                value = data.get("vol_median_window")
+                if value is not None:
+                    signal_quality_cfg.vol_median_window = int(value)
+            except (TypeError, ValueError):
+                pass
+        if "vol_floor_frac" in data:
+            try:
+                value = data.get("vol_floor_frac")
+                if value is not None:
+                    signal_quality_cfg.vol_floor_frac = float(value)
+            except (TypeError, ValueError):
+                pass
+        if "log_reason" in data:
+            value = data.get("log_reason")
+            if value is None:
+                signal_quality_cfg.log_reason = ""
+            else:
+                signal_quality_cfg.log_reason = str(value)
+
+    _apply_signal_quality(sq_data)
+    _apply_signal_quality(rt_cfg.get("signal_quality", {}) or {})
+
     # Queue configuration for the asynchronous event bus
     queue_cfg = rt_cfg.get("queue", {})
     queue_capacity = int(queue_cfg.get("capacity", 0))
@@ -1455,6 +1532,7 @@ def from_config(
         cfg.clock_sync,
         cfg.throttle,
         NoTradeConfig(**(cfg.no_trade or {})),
+        signal_quality_cfg=signal_quality_cfg,
         pipeline_cfg=pipeline_cfg,
         shutdown_cfg=shutdown_cfg,
         monitoring_cfg=monitoring_cfg,
@@ -1466,4 +1544,10 @@ def from_config(
     return service.run()
 
 
-__all__ = ["SignalRunnerConfig", "RunnerConfig", "ServiceSignalRunner", "from_config"]
+__all__ = [
+    "SignalQualityConfig",
+    "SignalRunnerConfig",
+    "RunnerConfig",
+    "ServiceSignalRunner",
+    "from_config",
+]
