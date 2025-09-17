@@ -89,6 +89,52 @@ class TTLConfig(BaseModel):
     dedup_persist: Optional[str] = Field(default=None)
 
 
+class RiskConfigSection(BaseModel):
+    """Top-level risk configuration shared across run modes."""
+
+    max_total_notional: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Maximum aggregate notional exposure across all symbols; ``None`` disables the limit."
+        ),
+    )
+    max_total_exposure_pct: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Maximum aggregate exposure expressed as a fraction of equity; ``None`` disables the limit."
+        ),
+    )
+    exposure_buffer_frac: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Fractional buffer applied when evaluating aggregate exposure limits.",
+    )
+
+    class Config:
+        extra = "allow"
+
+    def component_params(self) -> Dict[str, Any]:
+        """Return component-specific parameters excluding aggregate exposure limits."""
+
+        data = self.dict(exclude_unset=False)
+        data.pop("max_total_notional", None)
+        data.pop("max_total_exposure_pct", None)
+        data.pop("exposure_buffer_frac", None)
+        return data
+
+    @property
+    def exposure_limits(self) -> Dict[str, Optional[float]]:
+        """Expose aggregate exposure limit knobs for downstream consumers."""
+
+        return {
+            "max_total_notional": self.max_total_notional,
+            "max_total_exposure_pct": self.max_total_exposure_pct,
+            "exposure_buffer_frac": self.exposure_buffer_frac,
+        }
+
+
 class TokenBucketConfig(BaseModel):
     """Token bucket limiter settings."""
 
@@ -234,6 +280,7 @@ class CommonRunConfig(BaseModel):
     kill_switch_ops: OpsKillSwitchConfig = Field(default_factory=OpsKillSwitchConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     state: StateConfig = Field(default_factory=StateConfig)
+    risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
     components: Components
 
 
@@ -271,7 +318,7 @@ class SimulationConfig(CommonRunConfig):
     fees: Dict[str, Any] = Field(default_factory=dict)
     slippage: Dict[str, Any] = Field(default_factory=dict)
     latency: Dict[str, Any] = Field(default_factory=dict)
-    risk: Dict[str, Any] = Field(default_factory=dict)
+    risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
     no_trade: Dict[str, Any] = Field(default_factory=dict)
     data: SimulationDataConfig
     limits: Dict[str, Any] = Field(default_factory=dict)
@@ -336,7 +383,7 @@ class TrainConfig(CommonRunConfig):
     fees: Dict[str, Any] = Field(default_factory=dict)
     slippage: Dict[str, Any] = Field(default_factory=dict)
     latency: Dict[str, Any] = Field(default_factory=dict)
-    risk: Dict[str, Any] = Field(default_factory=dict)
+    risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
     no_trade: Dict[str, Any] = Field(default_factory=dict)
     data: TrainDataConfig
     model: ModelConfig
@@ -395,6 +442,25 @@ def _inject_quantizer_config(cfg: CommonRunConfig, data: Dict[str, Any]) -> None
     existing.update(q_dict)
 
 
+def _inject_risk_config(cfg: CommonRunConfig, data: Dict[str, Any]) -> None:
+    """Populate ``cfg.risk`` with structured configuration if present."""
+
+    r_raw = data.get("risk")
+    if r_raw is None:
+        return
+    if isinstance(r_raw, RiskConfigSection):
+        risk_cfg = r_raw
+    else:
+        try:
+            risk_cfg = RiskConfigSection.parse_obj(r_raw)
+        except Exception:
+            risk_cfg = RiskConfigSection()
+    try:
+        setattr(cfg, "risk", risk_cfg)
+    except Exception:
+        object.__setattr__(cfg, "risk", risk_cfg)
+
+
 def load_config(path: str) -> CommonRunConfig:
     """Загрузить конфигурацию запуска из YAML-файла."""
     with open(path, "r", encoding="utf-8") as f:
@@ -414,6 +480,7 @@ def load_config(path: str) -> CommonRunConfig:
     cfg = cfg_cls.parse_obj(data)
     _set_seasonality_log_level(cfg)
     _inject_quantizer_config(cfg, data)
+    _inject_risk_config(cfg, data)
     return cfg
 
 
@@ -434,6 +501,7 @@ def load_config_from_str(content: str) -> CommonRunConfig:
     cfg = cfg_cls.parse_obj(data)
     _set_seasonality_log_level(cfg)
     _inject_quantizer_config(cfg, data)
+    _inject_risk_config(cfg, data)
     return cfg
 
 
@@ -458,6 +526,7 @@ __all__ = [
     "WSDedupConfig",
     "TTLConfig",
     "ThrottleConfig",
+    "RiskConfigSection",
     "KillSwitchConfig",
     "OpsKillSwitchConfig",
     "MonitoringThresholdsConfig",
