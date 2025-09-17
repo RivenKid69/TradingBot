@@ -76,52 +76,292 @@ def _in_custom_window(ts_ms: np.ndarray, windows: List[Dict[str, int]]) -> np.nd
     return mask
 
 
+def _prepare_ts(df: pd.DataFrame, ts_col: str) -> Tuple[np.ndarray, np.ndarray]:
+    ts_series = pd.to_numeric(df[ts_col], errors="coerce")
+    valid = ts_series.notna().to_numpy(dtype=bool)
+    ts_int = ts_series.fillna(-1).astype(np.int64).to_numpy()
+    return ts_int, valid
+
+
+def _window_mask(ts_ms: np.ndarray, cfg: NoTradeConfig) -> np.ndarray:
+    """Return mask for schedule-based no-trade windows."""
+
+    daily_min = _parse_daily_windows_min(cfg.daily_utc or [])
+    m_daily = _in_daily_window(ts_ms, daily_min)
+    m_funding = _in_funding_buffer(ts_ms, int(cfg.funding_buffer_min or 0))
+    m_custom = _in_custom_window(ts_ms, cfg.custom_ms or [])
+    return m_daily | m_funding | m_custom
+
+
+def _symbol_series(df: pd.DataFrame, column: str = "symbol") -> pd.Series:
+    if column in df.columns:
+        return df[column].fillna("__nan__")
+    return pd.Series("__global__", index=df.index)
+
+
+def _numeric_series(df: pd.DataFrame, candidates: List[str]) -> pd.Series:
+    for col in candidates:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce").astype(float)
+    return pd.Series(np.nan, index=df.index, dtype=float)
+
+
+def _rolling_sigma(
+    values: pd.Series,
+    symbols: pd.Series,
+    window: Optional[int],
+    *,
+    min_periods: Optional[int] = None,
+) -> pd.Series:
+    if window is None or window <= 1:
+        return pd.Series(np.nan, index=values.index, dtype=float)
+    if min_periods is None:
+        min_periods = min(window, max(2, window // 2))
+    result = (
+        values.groupby(symbols)
+        .rolling(window=window, min_periods=min_periods)
+        .std()
+        .reset_index(level=0, drop=True)
+    )
+    return result.reindex(values.index)
+
+
+def _rolling_atr(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    symbols: pd.Series,
+    window: Optional[int],
+    *,
+    min_periods: Optional[int] = None,
+) -> pd.Series:
+    if window is None or window <= 1:
+        return pd.Series(np.nan, index=close.index, dtype=float)
+    if min_periods is None:
+        min_periods = min(window, max(1, window // 2))
+    prev_close = close.groupby(symbols).shift(1)
+    tr_components = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    )
+    tr = tr_components.max(axis=1, skipna=True)
+    atr = (
+        tr.groupby(symbols)
+        .rolling(window=window, min_periods=min_periods)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+    return atr.reindex(close.index)
+
+
+def _rolling_percentile(
+    values: pd.Series,
+    symbols: pd.Series,
+    window: Optional[int],
+    *,
+    min_periods: Optional[int] = None,
+) -> pd.Series:
+    if window is None or window <= 1:
+        return pd.Series(np.nan, index=values.index, dtype=float)
+    if min_periods is None:
+        min_periods = min(window, max(1, window // 5))
+
+    def _percentile(arr: np.ndarray) -> float:
+        if arr.size == 0:
+            return np.nan
+        val = arr[-1]
+        if np.isnan(val):
+            return np.nan
+        valid = arr[~np.isnan(arr)]
+        if valid.size == 0:
+            return np.nan
+        return float((valid <= val).sum()) / float(valid.size)
+
+    result = (
+        values.groupby(symbols)
+        .rolling(window=window, min_periods=min_periods)
+        .apply(_percentile, raw=True)
+        .reset_index(level=0, drop=True)
+    )
+    return result.reindex(values.index)
+
+
+def _dynamic_guard_mask(
+    df: pd.DataFrame, dyn_cfg: Any, symbol_col: str = "symbol"
+) -> Tuple[pd.Series, pd.DataFrame]:
+    symbols = _symbol_series(df, symbol_col)
+
+    price = _numeric_series(df, ["close", "price", "mid", "mid_price", "last_price"])
+    high = _numeric_series(df, ["high", "high_price", "max_price"])
+    low = _numeric_series(df, ["low", "low_price", "min_price"])
+    spread = _numeric_series(df, ["spread_bps", "half_spread_bps"])
+    if "half_spread_bps" in df.columns and "spread_bps" not in df.columns:
+        spread = spread * 2.0
+    if "bid" in df.columns and "ask" in df.columns:
+        bid = pd.to_numeric(df["bid"], errors="coerce").astype(float)
+        ask = pd.to_numeric(df["ask"], errors="coerce").astype(float)
+        mid = (bid + ask) * 0.5
+        with np.errstate(divide="ignore", invalid="ignore"):
+            derived_spread = (ask - bid) / mid * 10000.0
+        spread = spread.fillna(derived_spread)
+    elif "bid_price" in df.columns and "ask_price" in df.columns:
+        bid = pd.to_numeric(df["bid_price"], errors="coerce").astype(float)
+        ask = pd.to_numeric(df["ask_price"], errors="coerce").astype(float)
+        mid = (bid + ask) * 0.5
+        with np.errstate(divide="ignore", invalid="ignore"):
+            derived_spread = (ask - bid) / mid * 10000.0
+        spread = spread.fillna(derived_spread)
+
+    close = price.replace(0, np.nan)
+    returns = price.groupby(symbols).pct_change()
+
+    sigma_window = dyn_cfg.sigma_window or 120
+    atr_window = dyn_cfg.atr_window or 14
+
+    sigma = _rolling_sigma(returns, symbols, sigma_window)
+    atr = _rolling_atr(high, low, close, symbols, atr_window)
+    atr_pct = atr / close.abs()
+    spread_proxy = spread
+    if spread_proxy.isna().all() and atr_pct.notna().any():
+        spread_proxy = atr_pct * 10000.0
+
+    vol_metric = sigma.fillna(atr_pct)
+    vol_pctile = _rolling_percentile(vol_metric, symbols, sigma_window)
+    spread_pctile = _rolling_percentile(spread_proxy, symbols, atr_window)
+
+    dyn_mask = pd.Series(False, index=df.index, dtype=bool)
+    reasons = pd.DataFrame(False, index=df.index, columns=[
+        "dyn_vol_abs",
+        "dyn_vol_pctile",
+        "dyn_spread_abs",
+        "dyn_spread_pctile",
+        "dyn_guard_raw",
+        "dyn_guard_hold",
+    ])
+
+    thresholds_defined = any(
+        x is not None
+        for x in (
+            dyn_cfg.vol_abs,
+            dyn_cfg.vol_pctile,
+            dyn_cfg.spread_abs_bps,
+            dyn_cfg.spread_pctile,
+        )
+    )
+    if not thresholds_defined:
+        return dyn_mask, reasons
+
+    hysteresis = float(dyn_cfg.hysteresis or 0.0)
+    if hysteresis < 0:
+        hysteresis = 0.0
+    cooldown = max(0, int(dyn_cfg.cooldown_bars or 0))
+
+    for _, group in df.groupby(symbols, sort=False):
+        blocked = False
+        cooldown_left = 0
+        for label in group.index:
+            trigger = False
+
+            if dyn_cfg.vol_abs is not None:
+                val = vol_metric.loc[label]
+                if not np.isnan(val) and val >= float(dyn_cfg.vol_abs):
+                    reasons.at[label, "dyn_vol_abs"] = True
+                    trigger = True
+
+            if dyn_cfg.vol_pctile is not None:
+                val = vol_pctile.loc[label]
+                if not np.isnan(val) and val >= float(dyn_cfg.vol_pctile):
+                    reasons.at[label, "dyn_vol_pctile"] = True
+                    trigger = True
+
+            if dyn_cfg.spread_abs_bps is not None:
+                val = spread_proxy.loc[label]
+                if not np.isnan(val) and val >= float(dyn_cfg.spread_abs_bps):
+                    reasons.at[label, "dyn_spread_abs"] = True
+                    trigger = True
+
+            if dyn_cfg.spread_pctile is not None:
+                val = spread_pctile.loc[label]
+                if not np.isnan(val) and val >= float(dyn_cfg.spread_pctile):
+                    reasons.at[label, "dyn_spread_pctile"] = True
+                    trigger = True
+
+            reasons.at[label, "dyn_guard_raw"] = trigger
+
+            if trigger:
+                dyn_mask.loc[label] = True
+                blocked = True
+                cooldown_left = max(cooldown_left, cooldown)
+                continue
+
+            if not blocked:
+                continue
+
+            release_ready = True
+
+            if dyn_cfg.vol_abs is not None:
+                val = vol_metric.loc[label]
+                release_thr = float(dyn_cfg.vol_abs) * (1.0 - hysteresis)
+                if not np.isnan(val) and val > release_thr:
+                    release_ready = False
+
+            if dyn_cfg.vol_pctile is not None:
+                val = vol_pctile.loc[label]
+                release_thr = max(0.0, float(dyn_cfg.vol_pctile) - hysteresis)
+                if not np.isnan(val) and val > release_thr:
+                    release_ready = False
+
+            if dyn_cfg.spread_abs_bps is not None:
+                val = spread_proxy.loc[label]
+                release_thr = float(dyn_cfg.spread_abs_bps) * (1.0 - hysteresis)
+                if not np.isnan(val) and val > release_thr:
+                    release_ready = False
+
+            if dyn_cfg.spread_pctile is not None:
+                val = spread_pctile.loc[label]
+                release_thr = max(0.0, float(dyn_cfg.spread_pctile) - hysteresis)
+                if not np.isnan(val) and val > release_thr:
+                    release_ready = False
+
+            if not release_ready:
+                dyn_mask.loc[label] = True
+                reasons.at[label, "dyn_guard_hold"] = True
+                continue
+
+            if cooldown_left > 0:
+                dyn_mask.loc[label] = True
+                reasons.at[label, "dyn_guard_hold"] = True
+                cooldown_left -= 1
+                continue
+
+            blocked = False
+
+    return dyn_mask, reasons
+
+
 def estimate_block_ratio(
     df: pd.DataFrame,
     cfg: NoTradeConfig,
     ts_col: str = "ts_ms",
 ) -> float:
-    """Оценивает ожидаемую долю блокированных меток времени.
+    """Estimate share of rows blocked by schedule and dynamic guard."""
 
-    Окна из ``daily_utc`` и ``funding_buffer_min`` трактуются как
-    периодически повторяющиеся по дням. ``custom_ms`` рассматриваются как
-    разовые интервалы поверх них. Возвращает значение в диапазоне [0, 1].
-    """
-
-    ts = (
-        pd.to_numeric(df[ts_col], errors="coerce")
-        .astype("Int64")
-        .dropna()
-        .astype("float")
-        .astype("int64")
-        .to_numpy()
-    )
+    ts, ts_valid = _prepare_ts(df, ts_col)
     if ts.size == 0:
         return 0.0
 
-    # Строим дискретную маску минут суток
-    minutes = np.zeros(1440, dtype=bool)
-    for s, e in _parse_daily_windows_min(cfg.daily_utc or []):
-        minutes[s:e] = True
+    window_mask = _window_mask(ts, cfg) & ts_valid
 
-    buf = int(cfg.funding_buffer_min or 0)
-    if buf > 0:
-        for m in (0, 8 * 60, 16 * 60):
-            s = max(0, m - buf)
-            e = min(1439, m + buf)
-            minutes[s : e + 1] = True  # включаем обе границы
-
-    ratio_daily = minutes.mean()
-
-    if cfg.custom_ms:
-        mins_idx = ((ts // 60000) % 1440).astype(int)
-        mask_df = minutes[mins_idx]
-        m_custom = _in_custom_window(ts, cfg.custom_ms)
-        ratio = ratio_daily + np.mean(~mask_df & m_custom)
-    else:
-        ratio = ratio_daily
-
-    return float(min(max(ratio, 0.0), 1.0))
+    dyn_cfg = cfg.dynamic_guard or None
+    if dyn_cfg and dyn_cfg.enable:
+        dyn_mask, _ = _dynamic_guard_mask(df, dyn_cfg)
+        combined = window_mask | dyn_mask.to_numpy(dtype=bool)
+        return float(np.mean(combined))
+    return float(np.mean(window_mask))
 
 
 def compute_no_trade_mask(
@@ -136,11 +376,24 @@ def compute_no_trade_mask(
       False — строку можно использовать в train/val.
     """
     cfg = get_no_trade_config(sandbox_yaml_path)
-    ts = pd.to_numeric(df[ts_col], errors="coerce").astype("Int64").astype("float").astype("int64")
+    ts, ts_valid = _prepare_ts(df, ts_col)
 
-    daily_min = _parse_daily_windows_min(cfg.daily_utc or [])
-    m_daily = _in_daily_window(ts, daily_min)
-    m_funding = _in_funding_buffer(ts, int(cfg.funding_buffer_min or 0))
-    m_custom = _in_custom_window(ts, cfg.custom_ms or [])
-    blocked = m_daily | m_funding | m_custom
-    return pd.Series(blocked, index=df.index, name="no_trade_block")
+    window_mask = _window_mask(ts, cfg) & ts_valid
+
+    reasons = pd.DataFrame(index=df.index, data={"window": window_mask})
+
+    dyn_cfg = cfg.dynamic_guard or None
+    dyn_mask = pd.Series(False, index=df.index, dtype=bool)
+    dyn_reasons: Optional[pd.DataFrame] = None
+    if dyn_cfg and dyn_cfg.enable:
+        dyn_mask, dyn_reasons = _dynamic_guard_mask(df, dyn_cfg)
+        reasons = pd.concat([reasons, dyn_reasons], axis=1).fillna(False)
+        window_mask = window_mask | dyn_mask.to_numpy(dtype=bool)
+
+    result = pd.Series(window_mask, index=df.index, name="no_trade_block")
+    if dyn_cfg and dyn_cfg.enable:
+        reasons["dynamic_guard"] = dyn_mask.astype(bool)
+    else:
+        reasons["dynamic_guard"] = False
+    result.attrs["reasons"] = reasons.astype(bool)
+    return result
