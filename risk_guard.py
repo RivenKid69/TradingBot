@@ -39,6 +39,9 @@ class RiskConfig:
     # Прямые жёсткие лимиты
     max_abs_position: float = 1e12
     max_notional: float = 2e12
+    max_total_notional: float = 0.0
+    max_total_exposure_pct: float = 0.0
+    exposure_buffer_frac: float = 0.0
 
     # Дроудаун/устойчивость
     max_drawdown_pct: float = 1.00        # разрешённая просадка (0.30 => 30%)
@@ -483,18 +486,18 @@ class PortfolioLimitGuard:
         return value
 
     def _effective_limits(self) -> tuple[float | None, float | None]:
-        buffer = max(0.0, min(float(self._cfg.exposure_buffer_frac or 0.0), 0.95))
-        def _apply_buffer(limit: float | None) -> float | None:
+        def _sanitize(limit: float | None) -> float | None:
             if limit is None:
                 return None
-            if limit <= 0.0:
+            try:
+                value = float(limit)
+            except (TypeError, ValueError):
                 return None
-            effective = limit * (1.0 - buffer)
-            if effective <= 0.0:
+            if not math.isfinite(value) or value <= 0.0:
                 return None
-            return effective
+            return value
 
-        notional_limit = _apply_buffer(self._cfg.max_total_notional)
+        notional_limit = _sanitize(self._cfg.max_total_notional)
         equity_limit: float | None = None
         pct = self._cfg.max_total_exposure_pct
         if pct is not None and pct > 0.0:
@@ -508,7 +511,7 @@ class PortfolioLimitGuard:
                 except (TypeError, ValueError):
                     equity_val = None
                 if equity_val is not None and math.isfinite(equity_val) and equity_val > 0.0:
-                    equity_limit = _apply_buffer(equity_val * pct)
+                    equity_limit = _sanitize(equity_val * pct)
         return notional_limit, equity_limit
 
     def _classify_orders(
@@ -566,6 +569,10 @@ class PortfolioLimitGuard:
         notional_limit, equity_limit = self._effective_limits()
         if notional_limit is None and equity_limit is None:
             return orders, None
+        buffer_raw = float(self._cfg.exposure_buffer_frac or 0.0)
+        if not math.isfinite(buffer_raw) or buffer_raw < 0.0:
+            buffer_raw = 0.0
+        buffer_mult = 1.0 + buffer_raw
         infos = self._classify_orders(orders, symbol)
         accepted: set[int] = set()
         blocked: set[int] = set()
@@ -586,6 +593,8 @@ class PortfolioLimitGuard:
             price = info.get("price")
             if price is not None:
                 current_total += (abs(new) - abs(prev)) * float(price)
+                if current_total < 0.0:
+                    current_total = 0.0
 
         def _within_limits(total: float) -> bool:
             if notional_limit is not None and total > notional_limit + self._EPS:
@@ -616,17 +625,24 @@ class PortfolioLimitGuard:
                 working_positions[sym] = new
                 if price is not None:
                     current_total += exposure_delta * float(price)
+                    if current_total < 0.0:
+                        current_total = 0.0
                 continue
             if price is None:
                 blocked.add(idx)
                 continue
-            prospective_total = current_total + exposure_delta * float(price)
+            buffered_delta = exposure_delta
+            if buffered_delta > self._EPS or buffered_delta < -self._EPS:
+                buffered_delta *= buffer_mult
+            prospective_total = current_total + buffered_delta * float(price)
             if not _within_limits(prospective_total):
                 blocked.add(idx)
                 continue
             accepted.add(idx)
             working_positions[sym] = new
-            current_total = prospective_total
+            current_total += exposure_delta * float(price)
+            if current_total < 0.0:
+                current_total = 0.0
 
         approved: list[Any] = []
         for idx, order in enumerate(orders):

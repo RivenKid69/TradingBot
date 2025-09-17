@@ -69,7 +69,17 @@ class DummyRisk:
         self.events = []
         self.paused_until_ms = 0
 
-    def pre_trade_adjust(self, *, ts_ms, side, intended_qty, price, position_qty):
+    def pre_trade_adjust(
+        self,
+        *,
+        ts_ms,
+        side,
+        intended_qty,
+        price,
+        position_qty,
+        total_notional=None,
+        equity=None,
+    ):
         return float(intended_qty)
 
     def pop_events(self):
