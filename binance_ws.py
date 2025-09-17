@@ -5,8 +5,9 @@ import asyncio
 import json
 import logging
 import random
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 from clock import now_ms
 
 from decimal import Decimal
@@ -34,6 +35,16 @@ def _interval_to_ms(iv: str) -> int:
     if iv[-1] not in mult:
         raise ValueError(f"Unsupported interval: {iv}")
     return int(iv[:-1]) * mult[iv[-1]]
+
+
+def _format_utc(ts_ms: int | None) -> str | None:
+    if ts_ms is None:
+        return None
+    return (
+        datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 class BinanceWS:
@@ -131,6 +142,7 @@ class BinanceWS:
         self._stop = False
         self._last_close_ms = 0
         self._interval_ms = _interval_to_ms(self.interval)
+        self._last_open_ts: Dict[str, int] = {}
 
     async def _check_rate_limit(self) -> bool:
         if self._rate_limiter is None:
@@ -290,6 +302,47 @@ class BinanceWS:
                                         self._dd_delay += 1
                                         await asyncio.sleep(delay_ms / 1000.0)
                                 bar_close_ms = int(k.get("T", 0))
+                                bar_open_ms = int(bar.ts)
+                                prev_open = self._last_open_ts.get(bar.symbol)
+                                gap_ms = None
+                                duplicate_ts = False
+                                if prev_open is not None:
+                                    delta = bar_open_ms - prev_open
+                                    if delta <= 0:
+                                        duplicate_ts = True
+                                    elif (
+                                        self._interval_ms > 0
+                                        and delta > self._interval_ms
+                                    ):
+                                        gap_ms = delta
+                                if prev_open is None or bar_open_ms >= prev_open:
+                                    self._last_open_ts[bar.symbol] = bar_open_ms
+                                if gap_ms is not None:
+                                    try:
+                                        log_payload = {
+                                            "symbol": bar.symbol,
+                                            "previous_open_ms": prev_open,
+                                            "previous_open_at": _format_utc(prev_open),
+                                            "current_open_ms": bar_open_ms,
+                                            "current_open_at": _format_utc(bar_open_ms),
+                                            "gap_ms": gap_ms,
+                                            "interval_ms": self._interval_ms,
+                                        }
+                                        logger.warning("WS_BAR_GAP %s", log_payload)
+                                    except Exception:
+                                        pass
+                                if duplicate_ts and prev_open is not None:
+                                    try:
+                                        log_payload = {
+                                            "symbol": bar.symbol,
+                                            "previous_open_ms": prev_open,
+                                            "previous_open_at": _format_utc(prev_open),
+                                            "current_open_ms": bar_open_ms,
+                                            "current_open_at": _format_utc(bar_open_ms),
+                                        }
+                                        logger.info("WS_BAR_DUPLICATE %s", log_payload)
+                                    except Exception:
+                                        pass
                                 if self._ws_dedup_enabled:
                                     try:
                                         if signal_bus.should_skip(bar.symbol, bar_close_ms):
