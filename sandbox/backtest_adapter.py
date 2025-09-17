@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -122,7 +121,6 @@ class BacktestAdapter:
         self._guards = GuardsConfig.from_dict(guards_config or {})
         self._no_trade = NoTradeConfig.from_dict(no_trade_config or {})
         self._timing = TimingConfig.from_dict(timing_config or {})
-        self._last_ref_by_symbol: Dict[str, float] = {}
 
         # спецификации биржи
         self._specs, self._specs_meta = load_specs(exchange_specs_path or "")
@@ -144,24 +142,41 @@ class BacktestAdapter:
     # --------------------- helpers: spread, liquidity ---------------------
 
     def _compute_vol_factor(self, row: pd.Series, *, ref: float, has_hl: bool) -> float:
-        try:
-            if self._dyn.vol_mode.lower() == "hl" and has_hl and ("high" in row.index) and ("low" in row.index):
-                hi = float(row["high"])
-                lo = float(row["low"])
-                if ref > 0:
-                    return max(0.0, (hi - lo) / float(ref))
-            if "ret_1m" in row.index:
-                return abs(float(row["ret_1m"]))
-        except Exception:
-            pass
-        sym = str(row.get("symbol", self.sim.symbol)).upper()
-        last = self._last_ref_by_symbol.get(sym)
-        if last is None or last <= 0 or ref <= 0:
-            self._last_ref_by_symbol[sym] = float(ref)
+        estimator = getattr(self.sim, "vol_estimator", None)
+        if estimator is None:
             return 0.0
-        v = abs(math.log(float(ref) / float(last)))
-        self._last_ref_by_symbol[sym] = float(ref)
-        return float(v)
+
+        sym = str(row.get("symbol", self.sim.symbol)).upper()
+        hi = None
+        lo = None
+        if has_hl:
+            try:
+                if "high" in row.index:
+                    hi = float(row["high"])
+                if "low" in row.index:
+                    lo = float(row["low"])
+            except Exception:
+                hi = None
+                lo = None
+
+        close_val = ref
+        if "close" in row.index:
+            try:
+                close_val = float(row["close"])
+            except Exception:
+                close_val = ref
+
+        estimator.observe(symbol=sym, high=hi, low=lo, close=close_val)
+
+        vol_mode = str(getattr(self._dyn, "vol_mode", "")).lower()
+        metric = "atr" if vol_mode == "hl" else "sigma"
+        value = estimator.value(sym, metric=metric)
+        if value is None:
+            last = estimator.last(sym, metric=metric)
+            if last is not None:
+                return float(last)
+            return 0.0
+        return float(value)
 
     def _compute_liquidity(self, row: pd.Series) -> float:
         try:

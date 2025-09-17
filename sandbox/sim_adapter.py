@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence, Tuple, Iterator, Protocol
+from collections import deque
+from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Tuple, Protocol
 
 from execution_sim import ExecutionSimulator  # type: ignore
 from action_proto import ActionProto, ActionType
@@ -12,6 +13,140 @@ from event_bus import log_trade_exec as _bus_log_trade_exec
 from core_contracts import MarketDataSource
 from core_config import CommonRunConfig
 from services.monitoring import skipped_incomplete_bars
+
+
+class _VolEstimator:
+    """Rolling volatility estimator used by simulation and backtests.
+
+    Tracks both logarithmic returns and true range (normalised by price)
+    per symbol.  The configured ``vol_metric`` controls which series is
+    exposed via :meth:`observe`, while the other series is still
+    maintained for potential fallbacks.  The window is a simple rolling
+    window with equal weights.
+    """
+
+    def __init__(self, *, vol_metric: str = "sigma", vol_window: int = 120) -> None:
+        self._metric = str(vol_metric or "sigma").lower()
+        if self._metric not in {"sigma", "atr", "atr_pct", "atr/price"}:
+            self._metric = "sigma"
+        self._window = max(1, int(vol_window or 1))
+        self._returns: Dict[str, Deque[float]] = {}
+        self._ret_sumsq: Dict[str, float] = {}
+        self._tranges: Dict[str, Deque[float]] = {}
+        self._tr_sum: Dict[str, float] = {}
+        self._last_close: Dict[str, float] = {}
+        self._last_value: Dict[str, Optional[float]] = {}
+
+    @staticmethod
+    def _to_float(val: Any) -> Optional[float]:
+        try:
+            out = float(val)
+        except (TypeError, ValueError):
+            return None
+        if math.isfinite(out):
+            return out
+        return None
+
+    def _append_return(self, symbol: str, value: float) -> None:
+        dq = self._returns.get(symbol)
+        if dq is None:
+            dq = deque(maxlen=self._window)
+            self._returns[symbol] = dq
+        total = self._ret_sumsq.get(symbol, 0.0)
+        if dq.maxlen is not None and len(dq) == dq.maxlen:
+            old = dq.popleft()
+            total -= old * old
+        dq.append(value)
+        total += value * value
+        self._ret_sumsq[symbol] = total
+
+    def _append_trange(self, symbol: str, value: float) -> None:
+        dq = self._tranges.get(symbol)
+        if dq is None:
+            dq = deque(maxlen=self._window)
+            self._tranges[symbol] = dq
+        total = self._tr_sum.get(symbol, 0.0)
+        if dq.maxlen is not None and len(dq) == dq.maxlen:
+            old = dq.popleft()
+            total -= old
+        dq.append(value)
+        total += value
+        self._tr_sum[symbol] = total
+
+    def _compute(self, symbol: str, metric: Optional[str] = None) -> Optional[float]:
+        metric_key = (metric or self._metric or "").lower()
+        metric = metric_key
+        if metric == "sigma":
+            dq = self._returns.get(symbol)
+            if dq:
+                total = max(0.0, self._ret_sumsq.get(symbol, 0.0))
+                return math.sqrt(total / len(dq))
+        elif metric in {"atr", "atr_pct", "atr/price"}:
+            dq = self._tranges.get(symbol)
+            if dq:
+                total = self._tr_sum.get(symbol, 0.0)
+                return max(0.0, total / len(dq))
+
+        # Fallbacks: try sigma first, then ATR, whichever has data.
+        dq_ret = self._returns.get(symbol)
+        if dq_ret:
+            total = max(0.0, self._ret_sumsq.get(symbol, 0.0))
+            return math.sqrt(total / len(dq_ret))
+        dq_tr = self._tranges.get(symbol)
+        if dq_tr:
+            total = self._tr_sum.get(symbol, 0.0)
+            return max(0.0, total / len(dq_tr))
+        return None
+
+    def observe(
+        self,
+        *,
+        symbol: str,
+        high: Any,
+        low: Any,
+        close: Any,
+    ) -> Optional[float]:
+        sym = str(symbol).upper()
+        prev_close = self._last_close.get(sym)
+        hi = self._to_float(high)
+        lo = self._to_float(low)
+        cl = self._to_float(close)
+
+        if prev_close is not None and cl is not None and prev_close > 0.0 and cl > 0.0:
+            try:
+                log_ret = math.log(cl / prev_close)
+            except ValueError:
+                log_ret = None
+            if log_ret is not None and math.isfinite(log_ret):
+                self._append_return(sym, log_ret)
+
+        if (
+            prev_close is not None
+            and hi is not None
+            and lo is not None
+            and prev_close > 0.0
+        ):
+            tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
+            if prev_close != 0.0:
+                tr_pct = tr / prev_close
+                if math.isfinite(tr_pct):
+                    self._append_trange(sym, max(0.0, tr_pct))
+
+        if cl is not None:
+            self._last_close[sym] = cl
+
+        value = self._compute(sym)
+        self._last_value[sym] = value
+        return value
+
+    def value(self, symbol: str, *, metric: Optional[str] = None) -> Optional[float]:
+        return self._compute(str(symbol).upper(), metric)
+
+    def last(self, symbol: str, metric: Optional[str] = None) -> Optional[float]:
+        sym = str(symbol).upper()
+        if metric is None or metric.lower() == self._metric:
+            return self._last_value.get(sym)
+        return self._compute(sym, metric)
 
 _TF_MS = {
     "1s": 1_000,
@@ -71,6 +206,27 @@ class SimAdapter:
             run_config.timing.enforce_closed_bars if run_config is not None else True
         )
 
+        latency_cfg = getattr(run_config, "latency", None) if run_config is not None else None
+        metric = "sigma"
+        window = 120
+        if latency_cfg is not None:
+            if isinstance(latency_cfg, dict):
+                metric = latency_cfg.get("vol_metric", metric) or metric
+                window = latency_cfg.get("vol_window", window) or window
+            else:
+                metric = getattr(latency_cfg, "vol_metric", metric) or metric
+                window = getattr(latency_cfg, "vol_window", window) or window
+        try:
+            window_int = int(window)
+        except (TypeError, ValueError):
+            window_int = 120
+        self._vol_estimator = _VolEstimator(vol_metric=metric, vol_window=window_int)
+
+
+    @property
+    def vol_estimator(self) -> _VolEstimator:
+        return self._vol_estimator
+
 
     def _to_actions(self, orders: Sequence[Order]) -> List[Tuple[ActionType, ActionProto]]:
         actions: List[Tuple[ActionType, ActionProto]] = []
@@ -129,8 +285,6 @@ class SimAdapter:
           - выполняем шаг симуляции через self.step(...)
           - возвращаем отчёт симулятора, расширенный служебными полями
         """
-        prev_close: Optional[float] = None
-
         try:
             for bar in self.source.stream_bars([self.symbol], self.interval_ms):
                 if bar.symbol != self.symbol:
@@ -148,15 +302,12 @@ class SimAdapter:
                 low = float(bar.low)
                 close = float(bar.close)
 
-                vol_factor: Optional[float] = None
-                if prev_close is not None and prev_close > 0.0:
-                    tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-                    atr_pct = tr / prev_close if prev_close != 0.0 else None
-                    log_ret = abs(math.log(close / prev_close)) if close > 0.0 else None
-                    if atr_pct is not None and log_ret is not None:
-                        vol_factor = max(atr_pct, log_ret)
-                    else:
-                        vol_factor = atr_pct if atr_pct is not None else log_ret
+                vol_factor = self._vol_estimator.observe(
+                    symbol=bar.symbol,
+                    high=high,
+                    low=low,
+                    close=close,
+                )
 
                 liquidity: Optional[float] = None
                 if bar.volume_base is not None:
@@ -178,7 +329,6 @@ class SimAdapter:
                 rep["ts_ms"] = int(bar.ts)
                 rep["core_orders"] = ([as_dict(o) for o in orders] or [])
 
-                prev_close = close
                 yield rep
         except ValueError as e:
             raise ValueError(f"Market data error: {e}") from e
