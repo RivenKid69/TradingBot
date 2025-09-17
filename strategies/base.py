@@ -1,6 +1,7 @@
 # strategies/base.py
 from __future__ import annotations
 
+from collections import deque
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Sequence
@@ -64,6 +65,7 @@ class BaseSignalPolicy(SignalPolicy):
         self.params: Dict[str, Any] = dict(params)
         self._signal_state: dict[str, SignalPosition] = {}
         self._dirty_signal_state: set[str] = set()
+        self._pending_transitions: dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Utilities
@@ -93,19 +95,32 @@ class BaseSignalPolicy(SignalPolicy):
         self, symbol: str, state: SignalPosition | str | int
     ) -> SignalPosition:
         normalized = self._normalize_signal_state(state)
-        previous = self._signal_state.get(symbol)
+        previous = self.get_signal_state(symbol)
+        if previous == normalized:
+            return normalized
+
         if normalized is SignalPosition.FLAT:
             if symbol in self._signal_state:
                 del self._signal_state[symbol]
         else:
             self._signal_state[symbol] = normalized
-        if previous != normalized:
-            self._dirty_signal_state.add(symbol)
+        self._dirty_signal_state.add(symbol)
+
+        steps = self._build_transition_steps(previous, normalized)
+        entry_steps = steps.count("entry")
+        self._pending_transitions[symbol] = {
+            "prev": previous,
+            "new": normalized,
+            "steps": deque(steps),
+            "entry_steps": entry_steps,
+            "complete": not steps,
+        }
         return normalized
 
     def load_signal_state(self, states: Mapping[str, Any]) -> None:
         self._signal_state.clear()
         self._dirty_signal_state.clear()
+        self._pending_transitions.clear()
         for symbol, state in states.items():
             normalized = self._normalize_signal_state(state)
             if normalized is SignalPosition.FLAT:
@@ -122,6 +137,25 @@ class BaseSignalPolicy(SignalPolicy):
             symbol: self.get_signal_state(symbol).value
             for symbol in dirty_symbols
         }
+
+    def consume_signal_transitions(self) -> List[Dict[str, Any]]:
+        ready: List[Dict[str, Any]] = []
+        consumed: List[str] = []
+        for symbol, data in self._pending_transitions.items():
+            if not data.get("complete"):
+                continue
+            ready.append(
+                {
+                    "symbol": symbol,
+                    "prev": data["prev"],
+                    "new": data["new"],
+                    "entry_steps": data["entry_steps"],
+                }
+            )
+            consumed.append(symbol)
+        for symbol in consumed:
+            self._pending_transitions.pop(symbol, None)
+        return ready
 
     def _normalize_signal_state(self, state: SignalPosition | str | int) -> SignalPosition:
         if isinstance(state, SignalPosition):
@@ -147,6 +181,45 @@ class BaseSignalPolicy(SignalPolicy):
             return SignalPosition.SHORT
         raise TypeError(f"unsupported signal state type: {type(state)!r}")
 
+    def revert_signal_state(
+        self, symbol: str, previous: SignalPosition | str | int
+    ) -> SignalPosition:
+        normalized = self._normalize_signal_state(previous)
+        current = self.get_signal_state(symbol)
+        if normalized is SignalPosition.FLAT:
+            self._signal_state.pop(symbol, None)
+        else:
+            self._signal_state[symbol] = normalized
+        if current != normalized:
+            self._dirty_signal_state.add(symbol)
+        self._pending_transitions.pop(symbol, None)
+        return normalized
+
+    def _build_transition_steps(
+        self, previous: SignalPosition, new: SignalPosition
+    ) -> List[str]:
+        steps: List[str] = []
+        if previous is not SignalPosition.FLAT:
+            steps.append("exit")
+        if new is not SignalPosition.FLAT and new is not previous:
+            steps.append("entry")
+        return steps
+
+    def _pull_signal_leg(self, symbol: str | None) -> str:
+        if not symbol:
+            return "unknown"
+        data = self._pending_transitions.get(symbol)
+        if not data:
+            return "unknown"
+        steps = data.get("steps")
+        if not steps:
+            data["complete"] = True
+            return "unknown"
+        leg = steps.popleft()
+        if not steps:
+            data["complete"] = True
+        return leg
+
     # Helper methods to construct orders
     def market_order(
         self,
@@ -158,7 +231,7 @@ class BaseSignalPolicy(SignalPolicy):
         client_tag: str | None = None,
     ) -> Order:
         quantity = to_decimal(qty)
-        return Order(
+        order = Order(
             ts=ctx.ts,
             symbol=ctx.symbol,
             side=side,
@@ -168,6 +241,8 @@ class BaseSignalPolicy(SignalPolicy):
             time_in_force=tif,
             client_order_id=client_tag or "",
         )
+        order.meta["signal_leg"] = self._pull_signal_leg(ctx.symbol)
+        return order
 
     def limit_order(
         self,
@@ -181,7 +256,7 @@ class BaseSignalPolicy(SignalPolicy):
     ) -> Order:
         quantity = to_decimal(qty)
         price_dec = to_decimal(price)
-        return Order(
+        order = Order(
             ts=ctx.ts,
             symbol=ctx.symbol,
             side=side,
@@ -191,6 +266,8 @@ class BaseSignalPolicy(SignalPolicy):
             time_in_force=tif,
             client_order_id=client_tag or "",
         )
+        order.meta["signal_leg"] = self._pull_signal_leg(ctx.symbol)
+        return order
 
 
 __all__ = ["SignalPosition", "BaseStrategy", "BaseSignalPolicy"]
