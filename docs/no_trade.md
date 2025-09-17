@@ -10,7 +10,7 @@ This document explains the available fields, dataset masking options, and runtim
 | `funding_buffer_min` | int | Minutes before and after funding events (00:00, 08:00, 16:00 UTC) where trading is blocked. |
 | `daily_utc` | list[str] | Daily repeating windows in `HH:MM-HH:MM` (UTC). Windows should not cross midnight. |
 | `custom_ms` | list[dict] | One-off windows with explicit start and end timestamps in milliseconds since epoch. |
-| `dynamic_guard` | dict | Optional dynamic guard that can pause trading based on volatility/spread metrics. |
+| `dynamic_guard` | dict | Optional dynamic guard that can pause trading based on volatility/spread metrics (see [`configs/no_trade.yaml`](../configs/no_trade.yaml) for a tuned example). |
 
 ### `dynamic_guard` fields
 
@@ -27,7 +27,7 @@ This document explains the available fields, dataset masking options, and runtim
 | `cooldown_bars` | int | `0` | Bars to wait after the guard condition clears. |
 | `log_reason` | bool | `false` | Emit a log entry when the guard blocks trades. |
 
-Example YAML:
+Example YAML (see [`configs/no_trade.yaml`](../configs/no_trade.yaml) for a ready-to-use template):
 
 ```yaml
 no_trade:
@@ -95,6 +95,35 @@ def skip_action():
 if mask.iloc[0]:
     skip_action()  # no orders are sent; step is counted as blocked
 ```
+
+## Activating the dynamic guard
+
+1. Start from a run configuration that already includes the `no_trade.dynamic_guard`
+   block (all templates ship with `enable: false`).
+2. Copy the thresholds from [`configs/no_trade.yaml`](../configs/no_trade.yaml) or
+   customise them per market.  Conservative defaults use long windows and 99.5th
+   percentiles so that the guard only trips in extreme conditions.
+3. Flip `enable: true` and, if required, set `log_reason: true` to emit detailed
+   reasons when the guard blocks trading.
+
+When enabled, `service_signal_runner` logs the guard state during startup:
+
+```
+dynamic guard: enabled sigma_window=180 atr_window=21 vol_abs=0.015 ...
+```
+
+Every block generates structured `DROP` log entries with
+`{"stage": "WINDOWS", "reason": "DYNAMIC_GUARD", "detail": ...}` so you can
+audit why orders were skipped.  The monitoring layer increments the usual
+pipeline counters:
+
+* `monitoring.inc_stage(Stage.WINDOWS)` and
+  `monitoring.inc_reason("DYNAMIC_GUARD")` contribute to aggregated alerts.
+* `pipeline_stage_drop_count{stage="WINDOWS", reason="DYNAMIC_GUARD"}` tracks
+  per-symbol drop counts for dashboards.
+
+Offline tooling (`apply_no_trade_mask.py`) also propagates dynamic guard reasons
+into the exported mask so dataset jobs can report the same triggers.
 
 ## Typical schedule
 

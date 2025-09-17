@@ -28,17 +28,17 @@ no_trade:
     - "08:00-08:05"
     - "16:00-16:05"
   custom_ms: []   # список явных окон [{start_ts_ms: ..., end_ts_ms: ...}]
-  # dynamic_guard:
-  #   enable: false                 # turn on dynamic guard when ready
-  #   sigma_window: 120             # rolling window (bars) for volatility sigma
-  #   atr_window: 14                # ATR window (bars) for spread guard
-  #   vol_abs: null                 # absolute volatility threshold; null to skip
-  #   vol_pctile: 0.99              # trigger when rolling volatility above percentile
-  #   spread_abs_bps: null          # absolute spread threshold in bps
-  #   spread_pctile: 0.99           # percentile-based spread trigger
-  #   hysteresis: 0.1               # relative buffer before re-enabling trading
-  #   cooldown_bars: 10             # bars to wait after trigger clears
-  #   log_reason: true              # emit log message when guard blocks trading
+  dynamic_guard:
+    enable: false                # turn on dynamic guard when ready
+    sigma_window: 120            # rolling window (bars) for volatility sigma
+    atr_window: 14               # ATR window (bars) for spread guard
+    vol_abs: null                # absolute volatility threshold; null to skip
+    vol_pctile: 0.99             # trigger when rolling volatility above percentile
+    spread_abs_bps: null         # absolute spread threshold in bps
+    spread_pctile: 0.99          # percentile-based spread trigger
+    hysteresis: 0.1              # relative buffer before re-enabling trading
+    cooldown_bars: 10            # bars to wait after trigger clears
+    log_reason: true             # emit log message when guard blocks trading
 
 policy:
   module: "strategies.momentum"

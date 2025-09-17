@@ -1,0 +1,19 @@
+# Recommended no-trade configuration with dynamic guard defaults.
+no_trade:
+  funding_buffer_min: 5
+  daily_utc:
+    - "00:00-00:05"
+    - "08:00-08:05"
+    - "16:00-16:05"
+  custom_ms: []
+  dynamic_guard:
+    enable: false
+    sigma_window: 180           # use a longer history for volatility stability
+    atr_window: 21              # align ATR window with 3 weeks of 1m bars
+    vol_abs: 0.015              # block if 1m returns stddev exceeds 1.5%
+    vol_pctile: 0.995           # or when volatility in top 0.5% of history
+    spread_abs_bps: 15.0        # block if spreads widen beyond 15 bps
+    spread_pctile: 0.995        # or top 0.5% widest spreads
+    hysteresis: 0.2             # require 20% improvement before unblocking
+    cooldown_bars: 20           # keep guard active for 20 bars after recovery
+    log_reason: true            # emit guard reason to logs when triggered

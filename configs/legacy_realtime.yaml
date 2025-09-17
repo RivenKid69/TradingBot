@@ -21,6 +21,17 @@ no_trade:
     - "08:00-08:05"
     - "16:00-16:05"
   custom_ms: []
+  dynamic_guard:
+    enable: false
+    sigma_window: 120
+    atr_window: 14
+    vol_abs: null
+    vol_pctile: 0.99
+    spread_abs_bps: null
+    spread_pctile: 0.99
+    hysteresis: 0.1
+    cooldown_bars: 10
+    log_reason: true
 
 guards:
   min_history_bars: 180
