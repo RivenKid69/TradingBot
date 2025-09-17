@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from math import sqrt
+from decimal import InvalidOperation
+from math import sqrt, isfinite
 from typing import Iterable, Mapping, Optional, Any, Deque, Dict
 import copy
 
@@ -60,21 +61,30 @@ class SignalQualityMetrics:
         self.sigma_window = int(sigma_window)
         self.vol_median_window = int(vol_median_window)
         self._state: Dict[str, _SymbolMetricsState] = {}
+        self._latest: Dict[str, SignalQualitySnapshot] = {}
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
         """Reset internal state for all symbols."""
 
         self._state.clear()
+        self._latest.clear()
 
     # ------------------------------------------------------------------
-    def update(self, bar: Bar) -> SignalQualitySnapshot:
+    def update(self, symbol: str, bar: Bar) -> SignalQualitySnapshot:
         """Update metrics with a new bar and return current values."""
 
-        symbol = bar.symbol.upper()
-        state = self._state.setdefault(symbol, _SymbolMetricsState())
+        sym = str(symbol).upper()
+        state = self._state.setdefault(sym, _SymbolMetricsState())
 
-        close = float(bar.close)
+        try:
+            close = float(bar.close)
+        except (TypeError, ValueError, InvalidOperation):
+            return self._snapshot(sym, state)
+
+        if not isfinite(close):
+            return self._snapshot(sym, state)
+
         if state.prev_close not in (None, 0.0):
             ret = close / state.prev_close - 1.0
             self._append_return(state, ret)
@@ -83,20 +93,16 @@ class SignalQualityMetrics:
 
         volume_source = bar.volume_quote if bar.volume_quote is not None else bar.volume_base
         if volume_source is not None:
-            self._append_volume(state, float(volume_source))
+            try:
+                volume_value = float(volume_source)
+            except (TypeError, ValueError, InvalidOperation):
+                volume_value = None
+            if volume_value is not None and isfinite(volume_value):
+                self._append_volume(state, float(volume_value))
 
-        sigma = self._compute_sigma(state)
-        vol_median = self._compute_volume_median(state)
-        window_ready = (
-            len(state.returns) >= self.sigma_window
-            and len(state.volumes) >= self.vol_median_window
-        )
-
-        return SignalQualitySnapshot(
-            current_sigma=sigma,
-            current_vol_median=vol_median,
-            window_ready=window_ready,
-        )
+        snapshot = self._snapshot(sym, state)
+        self._latest[sym] = snapshot
+        return snapshot
 
     # ------------------------------------------------------------------
     def _append_return(self, state: _SymbolMetricsState, value: float) -> None:
@@ -136,6 +142,27 @@ class SignalQualityMetrics:
             return sorted_volumes[mid]
         return 0.5 * (sorted_volumes[mid - 1] + sorted_volumes[mid])
 
+    def _snapshot(self, symbol: str, state: _SymbolMetricsState) -> SignalQualitySnapshot:
+        sigma = self._compute_sigma(state)
+        vol_median = self._compute_volume_median(state)
+        window_ready = (
+            len(state.returns) >= self.sigma_window
+            and len(state.volumes) >= self.vol_median_window
+        )
+        snapshot = SignalQualitySnapshot(
+            current_sigma=sigma,
+            current_vol_median=vol_median,
+            window_ready=window_ready,
+        )
+        self._latest[symbol] = snapshot
+        return snapshot
+
+    @property
+    def latest(self) -> Mapping[str, SignalQualitySnapshot]:
+        """Expose latest computed snapshots for all symbols."""
+
+        return dict(self._latest)
+
 
 
 
@@ -158,6 +185,10 @@ class FeaturePipe:
     spec: FeatureSpec
     price_col: str = "price"
     label_col: Optional[str] = None
+    metrics: Optional[SignalQualityMetrics] = None
+    signal_quality: Dict[str, SignalQualitySnapshot] = field(
+        init=False, default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         # Initialize transformer for online mode.
@@ -170,6 +201,12 @@ class FeaturePipe:
     def reset(self) -> None:
         """Reset internal state of the transformer."""
         self._tr = OnlineFeatureTransformer(self.spec)
+        self.signal_quality.clear()
+        if self.metrics is not None:
+            try:
+                self.metrics.reset()
+            except Exception:
+                pass
 
     def set_read_only(self, flag: bool = True) -> None:
         """Enable or disable read-only mode for normalization stats."""
@@ -183,21 +220,40 @@ class FeaturePipe:
 
     def update(self, bar: Bar) -> Mapping[str, Any]:
         """Process a single bar and return computed features."""
+        try:
+            close_value = float(bar.close)
+        except (TypeError, ValueError, InvalidOperation):
+            return {}
+
+        if not isfinite(close_value):
+            return {}
+
+        symbol = bar.symbol.upper()
+        ts_ms = int(bar.ts)
+
         if not self._read_only:
             feats = self._tr.update(
-                symbol=bar.symbol.upper(),
-                ts_ms=int(bar.ts),
-                close=float(bar.close),
+                symbol=symbol,
+                ts_ms=ts_ms,
+                close=close_value,
             )
-            return feats
+        else:
+            state_backup = copy.deepcopy(self._tr._state)
+            feats = self._tr.update(
+                symbol=symbol,
+                ts_ms=ts_ms,
+                close=close_value,
+            )
+            self._tr._state = state_backup
 
-        state_backup = copy.deepcopy(self._tr._state)
-        feats = self._tr.update(
-            symbol=bar.symbol.upper(),
-            ts_ms=int(bar.ts),
-            close=float(bar.close),
-        )
-        self._tr._state = state_backup
+        if self.metrics is not None:
+            try:
+                snapshot = self.metrics.update(symbol, bar)
+            except Exception:
+                snapshot = None
+            if snapshot is not None:
+                self.signal_quality[symbol] = snapshot
+
         return feats
 
     # ``core_contracts.FeaturePipe`` historically exposes ``on_bar``.  Keep
