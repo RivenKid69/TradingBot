@@ -30,6 +30,7 @@ class TradingState:
     seen_signals: Iterable[Any] = field(default_factory=list)
     config_snapshot: Dict[str, Any] = field(default_factory=dict)
     signal_states: Dict[str, Any] = field(default_factory=dict)
+    entry_limits: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     git_hash: str | None = None
     version: int = 1
 
@@ -44,6 +45,7 @@ class TradingState:
                 seen_signals=data.get("seen_signals", []) or [],
                 config_snapshot=data.get("config_snapshot", {}) or {},
                 signal_states=data.get("signal_states", {}) or {},
+                entry_limits=data.get("entry_limits", {}) or {},
                 git_hash=data.get("git_hash"),
                 version=data.get("version", 1) or 1,
             )
@@ -119,6 +121,7 @@ class SQLiteBackend:
         "seen_signals TEXT,"
         "config_snapshot TEXT,"
         "signal_states TEXT,"
+        "entry_limits TEXT,"
         "git_hash TEXT,"
         "version INTEGER"
         ")"
@@ -152,6 +155,10 @@ class SQLiteBackend:
                 (row["signal_states"] if "signal_states" in row.keys() else "{}")
                 or "{}"
             ),
+            "entry_limits": json.loads(
+                (row["entry_limits"] if "entry_limits" in row.keys() else "{}")
+                or "{}"
+            ),
             "git_hash": row["git_hash"],
             "version": row["version"] or 1,
         }
@@ -180,10 +187,12 @@ class SQLiteBackend:
                 columns = set()
             if "signal_states" not in columns:
                 cur.execute("ALTER TABLE state ADD COLUMN signal_states TEXT")
+            if "entry_limits" not in columns:
+                cur.execute("ALTER TABLE state ADD COLUMN entry_limits TEXT")
             cur.execute(
                 "REPLACE INTO state (id, positions, open_orders, cash, last_processed_bar_ms,"
-                " seen_signals, config_snapshot, signal_states, git_hash, version)"
-                " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " seen_signals, config_snapshot, signal_states, entry_limits, git_hash, version)"
+                " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     json.dumps(state.positions, separators=(",", ":")),
                     json.dumps(state.open_orders, separators=(",", ":")),
@@ -192,6 +201,7 @@ class SQLiteBackend:
                     json.dumps(list(state.seen_signals), separators=(",", ":")),
                     json.dumps(state.config_snapshot, separators=(",", ":")),
                     json.dumps(state.signal_states, separators=(",", ":")),
+                    json.dumps(state.entry_limits, separators=(",", ":")),
                     state.git_hash,
                     state.version,
                 ),
