@@ -206,12 +206,17 @@ def policy_decide(
     bar: Bar,
     *,
     stage_cfg: PipelineStageConfig | None = None,
+    signal_quality_cfg: Any | None = None,
 ) -> PipelineResult:
     inc_stage(Stage.POLICY)
     if stage_cfg is not None and not stage_cfg.enabled:
         return PipelineResult(action="pass", stage=Stage.POLICY, decision=[])
     feats = fp.update(bar)
-    ctx = PolicyCtx(ts=int(bar.ts), symbol=bar.symbol)
+    ctx = PolicyCtx(
+        ts=int(bar.ts),
+        symbol=bar.symbol,
+        signal_quality_cfg=signal_quality_cfg,
+    )
     decisions = list(policy.decide({**feats}, ctx) or [])
     return PipelineResult(action="pass", stage=Stage.POLICY, decision=decisions)
 
