@@ -138,6 +138,13 @@ class DynamicNoTradeGuard:
         if spread_upper is None:
             spread_upper = _finite_float(getattr(cfg, "spread_pctile", None))
 
+        spread_abs_upper = _finite_float(getattr(spread_cfg, "abs_bps", None))
+        if spread_abs_upper is None:
+            spread_abs_upper = _finite_float(getattr(cfg, "spread_abs_bps", None))
+        spread_abs_lower = _finite_float(getattr(spread_cfg, "abs_release_bps", None))
+        if spread_abs_lower is None:
+            spread_abs_lower = _finite_float(getattr(cfg, "spread_abs_release_bps", None))
+
         hysteresis_ratio = _finite_float(getattr(cfg, "hysteresis", None))
         if hysteresis_ratio is not None and hysteresis_ratio < 0:
             hysteresis_ratio = 0.0
@@ -146,6 +153,13 @@ class DynamicNoTradeGuard:
             sigma_lower = max(0.0, sigma_upper * (1.0 - hysteresis_ratio))
         if spread_lower is None and spread_upper is not None and hysteresis_ratio is not None:
             spread_lower = max(0.0, spread_upper - hysteresis_ratio)
+
+        if (
+            spread_abs_lower is None
+            and spread_abs_upper is not None
+            and hysteresis_ratio is not None
+        ):
+            spread_abs_lower = max(0.0, spread_abs_upper * (1.0 - hysteresis_ratio))
 
         cooldown_candidates = [int(cfg.cooldown_bars or 0)]
         if vol_cfg is not None:
@@ -162,21 +176,37 @@ class DynamicNoTradeGuard:
         self._sigma_lower = sigma_lower
         self._spread_upper = spread_upper
         self._spread_lower = spread_lower
+        self._spread_abs_upper = spread_abs_upper
+        self._spread_abs_lower = spread_abs_lower
         self._cooldown_bars = cooldown_bars
 
         self._needs_sigma = sigma_upper is not None
-        self._needs_spread = spread_upper is not None
+        self._needs_spread = spread_upper is not None or spread_abs_upper is not None
         self._states: Dict[str, _SymbolState] = {}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def prewarm(self, symbol: str, bars: Sequence[Bar]) -> None:
-        """Seed rolling windows with historical ``bars``."""
+    def prewarm(self, symbol: str, bars: Sequence[object]) -> None:
+        """Seed rolling windows with historical ``bars`` and optional spreads."""
 
         state = self._get_state(symbol)
-        for bar in bars:
-            self._update_from_bar(state, bar, spread=None, evaluate=False)
+        for entry in bars:
+            bar_obj: Bar | None = None
+            spread_val: float | None = None
+            if isinstance(entry, Bar):
+                bar_obj = entry
+            elif isinstance(entry, tuple) and len(entry) == 2:
+                first, second = entry
+                if isinstance(first, Bar):
+                    bar_obj = first
+                    spread_val = _finite_float(second)
+                elif isinstance(second, Bar):
+                    bar_obj = second
+                    spread_val = _finite_float(first)
+            if bar_obj is None:
+                continue
+            self._update_from_bar(state, bar_obj, spread=spread_val, evaluate=False)
 
     def update(self, symbol: str, bar: Bar, spread: float | None) -> None:
         """Update guard state with the latest ``bar`` and optional ``spread``."""
@@ -234,6 +264,27 @@ class DynamicNoTradeGuard:
         spread_val = float("nan")
         if spread is not None:
             spread_val = _to_float(spread)
+        if not math.isfinite(spread_val):
+            alt = getattr(bar, "spread_bps", None)
+            if alt is not None:
+                spread_val = _to_float(alt)
+        if not math.isfinite(spread_val):
+            try:
+                high_val = float(getattr(bar, "high", float("nan")))
+                low_val = float(getattr(bar, "low", float("nan")))
+            except Exception:
+                high_val = low_val = float("nan")
+            if math.isfinite(high_val) and math.isfinite(low_val):
+                span = high_val - low_val
+                if span > 0.0:
+                    mid_val = (high_val + low_val) * 0.5
+                    if not math.isfinite(mid_val) or mid_val == 0.0:
+                        try:
+                            mid_val = float(getattr(bar, "close", float("nan")))
+                        except Exception:
+                            mid_val = float("nan")
+                    if math.isfinite(mid_val) and mid_val != 0.0:
+                        spread_val = span / abs(mid_val) * 10000.0
         state.spread.append(spread_val if math.isfinite(spread_val) else float("nan"))
 
         sigma = _deque_std(state.returns, self._sigma_min)
@@ -267,6 +318,12 @@ class DynamicNoTradeGuard:
                 and spread_pct >= self._spread_upper
             ):
                 trigger_reasons.append("spread_wide")
+            if (
+                self._spread_abs_upper is not None
+                and math.isfinite(spread_val)
+                and spread_val >= self._spread_abs_upper
+            ):
+                trigger_reasons.append("spread_abs")
 
         if evaluate and guard_ready and trigger_reasons:
             state.blocked = True
@@ -274,6 +331,8 @@ class DynamicNoTradeGuard:
             state.last_trigger = tuple(trigger_reasons)
             if "vol_extreme" in trigger_reasons:
                 state.reason = "vol_extreme"
+            elif "spread_abs" in trigger_reasons:
+                state.reason = "spread_abs"
             else:
                 state.reason = "spread_wide"
         elif evaluate and guard_ready and state.blocked:
@@ -302,10 +361,26 @@ class DynamicNoTradeGuard:
                     and spread_pct <= release_thr
                 ):
                     release_ready = False
+            if "spread_abs" in state.last_trigger and self._spread_abs_upper is not None:
+                release_thr = (
+                    self._spread_abs_lower
+                    if self._spread_abs_lower is not None
+                    else self._spread_abs_upper
+                )
+                if not (
+                    math.isfinite(spread_val)
+                    and release_thr is not None
+                    and spread_val <= release_thr
+                ):
+                    release_ready = False
 
             if release_ready:
                 if state.cooldown > 0:
                     state.cooldown -= 1
+                    if state.reason:
+                        state.reason = f"{state.reason}_cooldown"
+                    else:
+                        state.reason = "cooldown"
                 else:
                     state.blocked = False
                     state.reason = None
@@ -316,6 +391,13 @@ class DynamicNoTradeGuard:
                     state.reason = "vol_extreme"
                 elif "spread_wide" in state.last_trigger:
                     state.reason = "spread_wide"
+                elif "spread_abs" in state.last_trigger:
+                    state.reason = "spread_abs"
+                if state.cooldown > 0:
+                    if state.reason:
+                        state.reason = f"{state.reason}_cooldown"
+                    else:
+                        state.reason = "cooldown"
         elif evaluate and not guard_ready:
             state.blocked = False
             state.cooldown = 0
@@ -335,6 +417,7 @@ class DynamicNoTradeGuard:
             "abs_return": abs_ret if math.isfinite(abs_ret) else None,
             "sigma_k": sigma_ratio if math.isfinite(sigma_ratio) else None,
             "spread_bps": spread_val if math.isfinite(spread_val) else None,
+            "spread": spread_val if math.isfinite(spread_val) else None,
             "spread_ready": spread_ready,
             "spread_percentile": spread_pct if math.isfinite(spread_pct) else None,
             "blocked": state.blocked,

@@ -50,6 +50,7 @@ class _FeatureStatsState:
     sigma: Optional[float] = None
     spread_bps: Optional[float] = None
     spread_ts_ms: Optional[int] = None
+    spread_valid_until_ms: Optional[int] = None
     last_bar_ts: Optional[int] = None
 
 
@@ -62,6 +63,7 @@ class MarketMetricsSnapshot:
     bar_count: int
     last_bar_ts: Optional[int]
     spread_ts: Optional[int]
+    spread_valid_until: Optional[int]
 
 
 class SignalQualityMetrics:
@@ -321,6 +323,10 @@ class FeaturePipe:
         bid: Optional[Union[float, int, Decimal]] = None,
         ask: Optional[Union[float, int, Decimal]] = None,
         ts_ms: Optional[int] = None,
+        high: Optional[Union[float, int, Decimal]] = None,
+        low: Optional[Union[float, int, Decimal]] = None,
+        mid: Optional[Union[float, int, Decimal]] = None,
+        ttl_ms: Optional[int] = None,
     ) -> None:
         sym = str(symbol).upper()
         if not sym:
@@ -329,6 +335,8 @@ class FeaturePipe:
         spread_value = self._coerce_float(spread_bps)
         if spread_value is None:
             spread_value = self._compute_spread_from_quotes(bid, ask)
+        if spread_value is None:
+            spread_value = self._compute_spread_from_range(high, low, mid)
         if spread_value is None or not isfinite(spread_value) or spread_value <= 0:
             return
         state.spread_bps = spread_value
@@ -339,6 +347,11 @@ class FeaturePipe:
                 pass
         elif state.last_bar_ts is not None:
             state.spread_ts_ms = state.last_bar_ts
+        ttl = self._spread_ttl_ms if ttl_ms is None else max(0, int(ttl_ms))
+        if ttl > 0 and state.spread_ts_ms is not None:
+            state.spread_valid_until_ms = state.spread_ts_ms + ttl
+        else:
+            state.spread_valid_until_ms = None
         self._publish_market_snapshot(sym, state, state.last_bar_ts)
 
     def _get_symbol_state(self, symbol: str) -> _FeatureStatsState:
@@ -395,6 +408,12 @@ class FeaturePipe:
         )
         ready = state.bar_count >= self._sigma_window and sigma is not None
         state.last_bar_ts = ts_ms if ts_ms is not None else state.last_bar_ts
+        spread_valid_until = state.spread_valid_until_ms
+        if spread_valid_until is not None:
+            try:
+                spread_valid_until = int(spread_valid_until)
+            except Exception:
+                spread_valid_until = None
         snapshot = MarketMetricsSnapshot(
             ret_last=ret_last,
             sigma=sigma,
@@ -403,6 +422,7 @@ class FeaturePipe:
             bar_count=state.bar_count,
             last_bar_ts=state.last_bar_ts,
             spread_ts=state.spread_ts_ms,
+            spread_valid_until=spread_valid_until,
         )
         self.market_state[symbol] = snapshot
 
@@ -430,20 +450,24 @@ class FeaturePipe:
     ) -> Optional[float]:
         spread = None
         if state.spread_bps is not None:
-            if self._spread_ttl_ms <= 0 or state.spread_ts_ms is None:
+            if self._spread_ttl_ms <= 0 or state.spread_valid_until_ms is None:
                 spread = state.spread_bps
             else:
-                age = ts_ms - state.spread_ts_ms
-                if age <= self._spread_ttl_ms:
+                if ts_ms <= state.spread_valid_until_ms:
                     spread = state.spread_bps
                 else:
                     state.spread_bps = None
                     state.spread_ts_ms = None
+                    state.spread_valid_until_ms = None
         if spread is None:
             spread = self._extract_spread_from_bar(bar)
             if spread is not None and isfinite(spread) and spread > 0:
                 state.spread_bps = spread
                 state.spread_ts_ms = ts_ms
+                if self._spread_ttl_ms > 0:
+                    state.spread_valid_until_ms = ts_ms + self._spread_ttl_ms
+                else:
+                    state.spread_valid_until_ms = None
         return spread
 
     def _extract_spread_from_bar(self, bar: Bar) -> Optional[float]:
@@ -462,22 +486,18 @@ class FeaturePipe:
         spread = self._compute_spread_from_quotes(bid, ask)
         if spread is not None:
             return spread
-        high = self._coerce_float(getattr(bar, "high", None))
-        low = self._coerce_float(getattr(bar, "low", None))
-        close = self._coerce_float(getattr(bar, "close", None))
-        if (
-            high is not None
-            and low is not None
-            and close is not None
-            and isfinite(high)
-            and isfinite(low)
-            and isfinite(close)
-            and close != 0.0
-        ):
-            span = high - low
-            if span > 0.0:
-                return span / abs(close) * 10000.0
-        return None
+        high = getattr(bar, "high", None)
+        low = getattr(bar, "low", None)
+        mid = None
+        try:
+            if high is not None and low is not None:
+                high_val = float(high)
+                low_val = float(low)
+                if isfinite(high_val) and isfinite(low_val):
+                    mid = (high_val + low_val) * 0.5
+        except Exception:
+            mid = None
+        return self._compute_spread_from_range(high, low, mid)
 
     def _compute_spread_from_quotes(
         self,
@@ -500,6 +520,31 @@ class FeaturePipe:
             return None
         spread = (ask_val - bid_val) / mid * 10000.0
         if spread <= 0 or not isfinite(spread):
+            return None
+        return spread
+
+    def _compute_spread_from_range(
+        self,
+        high: Optional[Union[float, int, Decimal]],
+        low: Optional[Union[float, int, Decimal]],
+        mid: Optional[Union[float, int, Decimal]] = None,
+    ) -> Optional[float]:
+        high_val = self._coerce_float(high)
+        low_val = self._coerce_float(low)
+        mid_val = self._coerce_float(mid)
+        if high_val is None or low_val is None:
+            return None
+        if not (isfinite(high_val) and isfinite(low_val)):
+            return None
+        span = high_val - low_val
+        if span <= 0.0:
+            return None
+        if mid_val is None or not isfinite(mid_val) or mid_val <= 0.0:
+            mid_val = (high_val + low_val) * 0.5
+        if mid_val == 0.0 or not isfinite(mid_val):
+            return None
+        spread = span / abs(mid_val) * 10000.0
+        if spread <= 0.0 or not isfinite(spread):
             return None
         return spread
 
