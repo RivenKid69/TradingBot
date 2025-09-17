@@ -110,10 +110,11 @@ def test_signal_quality_filter_blocks_low_volume_before_policy() -> None:
     assert policy.call_count == 1
     assert logger.messages
     msg, args, _ = logger.messages[-1]
-    assert msg == "DROP %s"
-    payload = args[0]
-    assert payload["reason"] == cfg.log_reason
-    assert payload["detail"] == "VOLUME_FLOOR"
+    assert args == ()
+    assert "DROP" in msg
+    assert f"reason={cfg.log_reason}" in msg
+    assert "detail=VOLUME_FLOOR" in msg
+    assert "bar_close_at=" in msg
 
 
 def test_signal_quality_filter_blocks_high_sigma() -> None:
@@ -139,9 +140,10 @@ def test_signal_quality_filter_blocks_high_sigma() -> None:
 
     assert policy.call_count == 0
     assert logger.messages
-    payload = logger.messages[-1][1][0]
-    assert payload["reason"] == cfg.log_reason
-    assert payload["detail"] == "SIGMA_THRESHOLD"
+    msg, args, _ = logger.messages[-1]
+    assert args == ()
+    assert f"reason={cfg.log_reason}" in msg
+    assert "detail=SIGMA_THRESHOLD" in msg
 
 
 def test_signal_quality_filter_disabled_keeps_policy_path() -> None:
@@ -157,6 +159,36 @@ def test_signal_quality_filter_disabled_keeps_policy_path() -> None:
     worker, _fp, policy, logger = _make_worker(cfg, metrics)
 
     worker.process(_make_bar(1, 100.0, 100.0))
+
+    assert policy.call_count == 1
+    assert logger.messages == []
+
+
+def test_signal_quality_filter_skips_logging_when_disabled_flag() -> None:
+    metrics = SignalQualityMetrics(sigma_window=2, vol_median_window=2)
+    cfg = SignalQualityConfig(
+        enabled=True,
+        sigma_window=2,
+        sigma_threshold=10.0,
+        vol_median_window=2,
+        vol_floor_frac=0.5,
+        log_reason=False,
+    )
+    worker, _fp, policy, logger = _make_worker(cfg, metrics)
+
+    bars = [
+        _make_bar(1, 100.0, 100.0),
+        _make_bar(2, 101.0, 110.0),
+        _make_bar(3, 102.0, 120.0),
+        _make_bar(4, 103.0, 1.0),
+    ]
+
+    for bar in bars[:-1]:
+        worker.process(bar)
+
+    assert policy.call_count == 1
+
+    worker.process(bars[-1])
 
     assert policy.call_count == 1
     assert logger.messages == []
