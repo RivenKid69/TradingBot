@@ -75,3 +75,12 @@ logging:
   trades_path: "logs/log_trades_<runid>.csv"
   reports_path: "logs/report_equity_<runid>.csv"
   flush_every: 1000
+
+policy:
+  module: "strategies.momentum"
+  class: "MomentumStrategy"
+  params:
+    lookback: 5
+    enter_threshold: 0.0  # enter >= exit; falls back to legacy ``threshold`` when set
+    exit_threshold: 0.0   # exit hysteresis threshold; uses ``threshold`` as fallback
+    order_qty: 0.1  # доля позиции

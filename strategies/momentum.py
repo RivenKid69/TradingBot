@@ -6,16 +6,25 @@ from typing import Any, Dict, List, Mapping
 
 from core_contracts import PolicyCtx
 from core_models import Order, Side, TimeInForce
-from .base import BaseSignalPolicy
+from .base import BaseSignalPolicy, SignalPosition
 
 
 class MomentumStrategy(BaseSignalPolicy):
     """
-    Простейшая стратегия импульса по цене ref_price:
-      - считаем среднее за lookback
-      - если ref_price > avg + threshold → BUY с фиксированным qty
-      - если ref_price < avg - threshold → SELL с фиксированным qty
-    В проде ты заменишь логику на свою ML/сигналы — контракт тот же.
+    Простейшая стратегия импульса по цене ``ref_price`` с гистерезисом.
+
+    - считаем среднее за ``lookback`` и сигнал ``ref - avg``;
+    - держим состояние по каждому символу (:class:`SignalPosition`) в
+      :class:`BaseSignalPolicy` и обновляем его только при переходах;
+    - если сигнал ≥ ``enter_threshold`` → входим в LONG (покупка);
+    - если сигнал ≤ ``-enter_threshold`` → входим в SHORT (продажа);
+    - из LONG выходим при сигнале ≤ ``exit_threshold``, из SHORT — при
+      сигнале ≥ ``-exit_threshold``;
+    - при развороте LONG↔SHORT отправляем *два* рыночных ордера фиксированного
+      размера: первый закрывает предыдущую сторону, второй открывает новую.
+
+    По умолчанию ``enter_threshold`` и ``exit_threshold`` наследуют старый
+    ``threshold`` для обратной совместимости.
     """
     required_features = ("ref_price",)
 
@@ -23,6 +32,8 @@ class MomentumStrategy(BaseSignalPolicy):
         super().__init__()
         self.lookback = 5
         self.threshold = 0.0
+        self.enter_threshold = self.threshold
+        self.exit_threshold = self.threshold
         self.order_qty = 0.001  # абсолютное количество
         self.tif = TimeInForce.GTC
         self.client_tag: str | None = None
@@ -30,7 +41,17 @@ class MomentumStrategy(BaseSignalPolicy):
 
     def setup(self, config: Dict[str, Any]) -> None:
         self.lookback = int(config.get("lookback", self.lookback))
-        self.threshold = float(config.get("threshold", self.threshold))
+        fallback_threshold = float(config.get("threshold", self.threshold))
+        enter_threshold = float(config.get("enter_threshold", fallback_threshold))
+        exit_threshold = float(config.get("exit_threshold", fallback_threshold))
+        if enter_threshold < exit_threshold:
+            raise ValueError(
+                "enter_threshold must be greater than or equal to exit_threshold"
+            )
+        self.enter_threshold = enter_threshold
+        self.exit_threshold = exit_threshold
+        # ``threshold`` сохраняем для обратной совместимости со старыми конфигами
+        self.threshold = exit_threshold
         self.order_qty = float(config.get("order_qty", self.order_qty))
         self.tif = TimeInForce(str(config.get("tif", self.tif.value)))
         self.client_tag = config.get("client_tag", self.client_tag)
@@ -44,8 +65,35 @@ class MomentumStrategy(BaseSignalPolicy):
         if len(self._window) < maxlen:
             return []
         avg = sum(self._window) / float(len(self._window))
-        if ref > avg + self.threshold:
-            return [
+        signal = ref - avg
+        symbol = ctx.symbol
+        state = self.get_signal_state(symbol)
+        new_state = state
+
+        if state is SignalPosition.FLAT:
+            if signal >= self.enter_threshold:
+                new_state = SignalPosition.LONG
+            elif signal <= -self.enter_threshold:
+                new_state = SignalPosition.SHORT
+        elif state is SignalPosition.LONG:
+            if signal <= -self.enter_threshold:
+                new_state = SignalPosition.SHORT
+            elif signal <= self.exit_threshold:
+                new_state = SignalPosition.FLAT
+        else:  # SHORT
+            if signal >= self.enter_threshold:
+                new_state = SignalPosition.LONG
+            elif signal >= -self.exit_threshold:
+                new_state = SignalPosition.FLAT
+
+        if new_state is state:
+            return []
+
+        self.update_signal_state(symbol, new_state)
+
+        orders: List[Order] = []
+        if state is SignalPosition.FLAT and new_state is SignalPosition.LONG:
+            orders.append(
                 self.market_order(
                     side=Side.BUY,
                     qty=self.order_qty,
@@ -53,9 +101,9 @@ class MomentumStrategy(BaseSignalPolicy):
                     tif=self.tif,
                     client_tag=self.client_tag,
                 )
-            ]
-        if ref < avg - self.threshold:
-            return [
+            )
+        elif state is SignalPosition.FLAT and new_state is SignalPosition.SHORT:
+            orders.append(
                 self.market_order(
                     side=Side.SELL,
                     qty=self.order_qty,
@@ -63,5 +111,64 @@ class MomentumStrategy(BaseSignalPolicy):
                     tif=self.tif,
                     client_tag=self.client_tag,
                 )
-            ]
-        return []
+            )
+        elif state is SignalPosition.LONG and new_state is SignalPosition.FLAT:
+            orders.append(
+                self.market_order(
+                    side=Side.SELL,
+                    qty=self.order_qty,
+                    ctx=ctx,
+                    tif=self.tif,
+                    client_tag=self.client_tag,
+                )
+            )
+        elif state is SignalPosition.SHORT and new_state is SignalPosition.FLAT:
+            orders.append(
+                self.market_order(
+                    side=Side.BUY,
+                    qty=self.order_qty,
+                    ctx=ctx,
+                    tif=self.tif,
+                    client_tag=self.client_tag,
+                )
+            )
+        elif state is SignalPosition.LONG and new_state is SignalPosition.SHORT:
+            orders.extend(
+                [
+                    self.market_order(
+                        side=Side.SELL,
+                        qty=self.order_qty,
+                        ctx=ctx,
+                        tif=self.tif,
+                        client_tag=self.client_tag,
+                    ),
+                    self.market_order(
+                        side=Side.SELL,
+                        qty=self.order_qty,
+                        ctx=ctx,
+                        tif=self.tif,
+                        client_tag=self.client_tag,
+                    ),
+                ]
+            )
+        elif state is SignalPosition.SHORT and new_state is SignalPosition.LONG:
+            orders.extend(
+                [
+                    self.market_order(
+                        side=Side.BUY,
+                        qty=self.order_qty,
+                        ctx=ctx,
+                        tif=self.tif,
+                        client_tag=self.client_tag,
+                    ),
+                    self.market_order(
+                        side=Side.BUY,
+                        qty=self.order_qty,
+                        ctx=ctx,
+                        tif=self.tif,
+                        client_tag=self.client_tag,
+                    ),
+                ]
+            )
+
+        return orders
