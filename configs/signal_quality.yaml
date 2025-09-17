@@ -1,0 +1,6 @@
+enabled: false
+sigma_window: 50
+sigma_threshold: 3.0
+vol_median_window: 100
+vol_floor_frac: 0.05
+log_reason: "OTHER"
