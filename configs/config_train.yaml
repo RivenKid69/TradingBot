@@ -77,7 +77,8 @@ risk:
   max_orders_window_s: 60
   daily_loss_limit: 0.0
   pause_seconds_on_violation: 300
-  daily_reset_utc_hour: 0
+  daily_reset_utc_hour: 0  # Час начала нового дня в UTC для PnL и дневных лимитов
+  max_entries_per_day: null  # Максимум новых входов за день; null/-1 = без лимита (счёт по daily_reset_utc_hour, UTC)
 
 # See ../docs/no_trade.md for details
 no_trade:

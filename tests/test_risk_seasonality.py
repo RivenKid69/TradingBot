@@ -24,3 +24,58 @@ def test_latency_multiplier_scales_order_rate():
         assert rm.can_send_order(ts_ms=i * 1000, latency_mult=2.0)
         rm.on_new_order(i * 1000)
     assert not rm.can_send_order(ts_ms=5000, latency_mult=2.0)
+
+
+def test_daily_entry_limit_blocks_after_threshold():
+    cfg = RiskConfig(enabled=True, max_entries_per_day=2)
+    rm = RiskManager(cfg)
+
+    qty = rm.pre_trade_adjust(
+        ts_ms=0,
+        side="BUY",
+        intended_qty=1.0,
+        price=100.0,
+        position_qty=0.0,
+    )
+    assert qty == 1.0
+    rm.pop_events()
+
+    qty = rm.pre_trade_adjust(
+        ts_ms=1,
+        side="SELL",
+        intended_qty=1.0,
+        price=100.0,
+        position_qty=1.0,
+    )
+    assert qty == 1.0
+    rm.pop_events()
+
+    qty = rm.pre_trade_adjust(
+        ts_ms=2,
+        side="SELL",
+        intended_qty=1.0,
+        price=100.0,
+        position_qty=0.0,
+    )
+    assert qty == 1.0
+    rm.pop_events()
+
+    blocked = rm.pre_trade_adjust(
+        ts_ms=3,
+        side="BUY",
+        intended_qty=2.0,
+        price=100.0,
+        position_qty=-1.0,
+    )
+    assert blocked == 0.0
+    events = rm.pop_events()
+    assert any(ev.code == "ENTRY_LIMIT_BLOCK" for ev in events)
+
+    allowed_next_day = rm.pre_trade_adjust(
+        ts_ms=86_400_000,
+        side="BUY",
+        intended_qty=1.0,
+        price=100.0,
+        position_qty=0.0,
+    )
+    assert allowed_next_day == 1.0

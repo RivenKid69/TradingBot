@@ -27,7 +27,8 @@ class RiskConfig:
       - max_orders_window_s: длина окна для лимита интенсивности (сек). Обычно 60.
       - daily_loss_limit: лимит дневного убытка (в котируемой валюте). Если equity - equity_at_day_start <= -limit → пауза.
       - pause_seconds_on_violation: сколько секунд держать торговлю на паузе при нарушении правил/лимитов.
-      - daily_reset_utc_hour: час UTC, когда начинается новый «торговый день» (пересчёт equity_at_day_start).
+      - daily_reset_utc_hour: час UTC, когда начинается новый «торговый день» (пересчёт equity_at_day_start и дневных лимитов).
+      - max_entries_per_day: максимум на количество новых входов в позицию за «торговый день». ``None``/``-1`` = без лимита.
       - enabled: общий флаг.
     """
     enabled: bool = True
@@ -39,9 +40,18 @@ class RiskConfig:
     daily_loss_limit: float = 0.0
     pause_seconds_on_violation: int = 300
     daily_reset_utc_hour: int = 0
+    max_entries_per_day: Optional[int] = None
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RiskConfig":
+        raw_entries = d.get("max_entries_per_day")
+        entries_per_day: Optional[int]
+        if raw_entries is None:
+            entries_per_day = None
+        else:
+            entries_per_day = int(raw_entries)
+            if entries_per_day < 0:
+                entries_per_day = None
         return cls(
             enabled=bool(d.get("enabled", True)),
             max_abs_position_qty=float(d.get("max_abs_position_qty", 0.0)),
@@ -52,6 +62,7 @@ class RiskConfig:
             daily_loss_limit=float(d.get("daily_loss_limit", 0.0)),
             pause_seconds_on_violation=int(d.get("pause_seconds_on_violation", 300)),
             daily_reset_utc_hour=int(d.get("daily_reset_utc_hour", 0)),
+            max_entries_per_day=entries_per_day,
         )
 
 
@@ -71,11 +82,18 @@ class RiskManager:
     """
     def __init__(self, cfg: Optional[RiskConfig] = None):
         self.cfg = cfg or RiskConfig()
+        self._max_entries_per_day: Optional[int] = self._normalize_entries_limit(
+            getattr(self.cfg, "max_entries_per_day", None)
+        )
+        # нормализованное значение прокинем обратно в конфиг для консистентности
+        self.cfg.max_entries_per_day = self._max_entries_per_day
         self._paused_until_ms: int = 0
         self._orders_ts: deque[int] = deque()
         self._day_key: Optional[str] = None
         self._equity_day_start: Optional[float] = None
         self._events: List[RiskEvent] = []
+        self._entries_day_key: Optional[str] = None
+        self._entries_day_count: int = 0
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RiskManager":
@@ -93,6 +111,18 @@ class RiskManager:
     def _emit(self, ts_ms: int, code: str, message: str, **data: Any) -> None:
         self._events.append(RiskEvent(ts_ms=int(ts_ms), code=str(code), message=str(message), data=dict(data)))
 
+    @staticmethod
+    def _normalize_entries_limit(value: Optional[Any]) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return None
+        if limit < 0:
+            return None
+        return limit
+
     def _day_bucket(self, ts_ms: int) -> str:
         # Ключ «дня» по UTC с учётом смещения начала дня (daily_reset_utc_hour)
         h = int(self.cfg.daily_reset_utc_hour)
@@ -102,6 +132,27 @@ class RiskManager:
         if dt < adj:
             adj = adj.replace(day=(adj.day - 1))
         return adj.strftime("%Y-%m-%dT%H")
+
+    def _ensure_entry_day(self, ts_ms: int) -> None:
+        key = self._day_bucket(ts_ms)
+        if key != self._entries_day_key:
+            self._entries_day_key = key
+            self._entries_day_count = 0
+
+    def _is_entry(self, side: str, position_qty: float, qty: float) -> bool:
+        eps = 1e-9
+        q = float(qty)
+        if q <= 0.0:
+            return False
+        pos_before = float(position_qty)
+        side_up = str(side).upper()
+        if side_up == "BUY":
+            pos_after = pos_before + q
+            return pos_after > eps and pos_before <= eps
+        if side_up == "SELL":
+            pos_after = pos_before - q
+            return pos_after < -eps and pos_before >= -eps
+        return False
 
     def is_paused(self, ts_ms: int) -> bool:
         if not self.cfg.enabled:
@@ -117,6 +168,8 @@ class RiskManager:
             else:
                 # если equity неизвестен, старт примем за 0 до следующего обновления on_mark
                 self._equity_day_start = 0.0
+            self._entries_day_key = key
+            self._entries_day_count = 0
 
     def on_mark(self, ts_ms: int, equity: Optional[float]) -> None:
         if not self.cfg.enabled:
@@ -188,6 +241,9 @@ class RiskManager:
             self._emit(ts_ms, "PAUSED", "Trading paused by risk manager", paused_until_ms=int(self._paused_until_ms))
             return 0.0
 
+        if self._max_entries_per_day is not None:
+            self._ensure_entry_day(ts_ms)
+
         q = max(0.0, float(intended_qty))
         if q == 0.0:
             return 0.0
@@ -245,6 +301,20 @@ class RiskManager:
                                requested_qty=float(q), allowed_qty=float(allowed), limit=max_pos_notional, position=float(position_qty), price=float(price))
                     q = float(allowed)
 
+        if self._max_entries_per_day is not None and q > 0.0:
+            if self._is_entry(side, position_qty, q):
+                if self._entries_day_count >= int(self._max_entries_per_day):
+                    self._emit(
+                        ts_ms,
+                        "ENTRY_LIMIT_BLOCK",
+                        "daily entry limit reached",
+                        limit=int(self._max_entries_per_day),
+                        entries_today=int(self._entries_day_count),
+                        day_key=str(self._entries_day_key),
+                    )
+                    return 0.0
+                self._entries_day_count += 1
+
         return float(q)
 
     def reset(self) -> None:
@@ -253,3 +323,5 @@ class RiskManager:
         self._day_key = None
         self._equity_day_start = None
         self._events.clear()
+        self._entries_day_key = None
+        self._entries_day_count = 0
