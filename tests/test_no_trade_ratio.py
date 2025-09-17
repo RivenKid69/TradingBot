@@ -75,6 +75,10 @@ def test_dynamic_guard_blocks_and_logs_reasons(tmp_path):
         "dyn_guard_hold",
         "dyn_guard_next_block",
         "dyn_guard_state",
+        "dyn_vol_extreme",
+        "dyn_spread_wide",
+        "dyn_guard_warmup",
+        "dyn_cooldown",
     }
     assert expected_cols.issubset(set(reasons.columns))
     assert "maintenance_calendar" in reasons.columns
@@ -85,6 +89,8 @@ def test_dynamic_guard_blocks_and_logs_reasons(tmp_path):
     assert bool(reasons.loc[df.index[2], "dyn_guard_raw"])
     assert bool(reasons.loc[df.index[3], "dyn_guard_hold"])
     assert not bool(reasons.loc[df.index[2], "dyn_guard_hold"])
+    assert list(reasons.loc[df.index[:2], "dyn_guard_warmup"]) == [True, True]
+    assert bool(reasons.loc[df.index[3], "dyn_cooldown"])
     assert not reasons["dyn_guard_next_block"].any()
     assert not reasons["dyn_guard_state"].any()
 
@@ -456,9 +462,13 @@ def test_no_trade_state_migration_and_save(tmp_path):
         path.write_text(json.dumps(payload), encoding="utf-8")
         state = load_no_trade_state(path)
         assert state.anomaly_block_until_ts == expected
+        assert state.dynamic_guard == {}
 
     state = NoTradeState(anomaly_block_until_ts={"BTCUSDT": 123})
     out_path = tmp_path / "saved_state.json"
     save_no_trade_state(state, out_path)
     saved = json.loads(out_path.read_text(encoding="utf-8"))
-    assert saved == {"anomaly_block_until_ts": {"BTCUSDT": 123}}
+    assert saved == {
+        "anomaly_block_until_ts": {"BTCUSDT": 123},
+        "dynamic_guard": {},
+    }
