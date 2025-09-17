@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from enum import IntEnum
-from typing import Optional, Deque, Tuple, Dict, Any, TYPE_CHECKING, Sequence
+import math
+from typing import Optional, Deque, Tuple, Dict, Any, TYPE_CHECKING, Sequence, Callable, Mapping
 from collections import deque
 from collections.abc import Mapping as MappingABC
 from clock import now_ms
@@ -305,5 +306,335 @@ class SimpleRiskGuard:
         st.last_ts = int(ts_ms)
         st.exposure += exp
         return checked, None
+
+
+@dataclass
+class PortfolioLimitConfig:
+    """Configuration for aggregate portfolio exposure limits."""
+
+    max_total_notional: float | None = None
+    max_total_exposure_pct: float | None = None
+    exposure_buffer_frac: float = 0.0
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "PortfolioLimitConfig":
+        payload: Dict[str, Any] = {}
+        if isinstance(data, Mapping):
+            payload.update(data)
+        return cls(
+            max_total_notional=cls._coerce_float(payload.get("max_total_notional")),
+            max_total_exposure_pct=cls._coerce_float(payload.get("max_total_exposure_pct")),
+            exposure_buffer_frac=cls._coerce_float(
+                payload.get("exposure_buffer_frac"), default=0.0, minimum=0.0
+            )
+            or 0.0,
+        )
+
+    @staticmethod
+    def _coerce_float(
+        value: Any,
+        *,
+        default: float | None = None,
+        minimum: float | None = None,
+    ) -> float | None:
+        if value is None:
+            return default
+        try:
+            coerced = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(coerced):
+            return default
+        if minimum is not None and coerced < minimum:
+            return default
+        return coerced
+
+    @property
+    def enabled(self) -> bool:
+        return any(
+            v is not None and v > 0.0
+            for v in (self.max_total_notional, self.max_total_exposure_pct)
+        )
+
+
+class PortfolioLimitGuard:
+    """Guard enforcing aggregate portfolio exposure limits."""
+
+    _EPS = 1e-12
+
+    def __init__(
+        self,
+        *,
+        config: PortfolioLimitConfig,
+        get_positions: Callable[[], Mapping[str, Any]],
+        get_total_notional: Callable[[], float | None] | None = None,
+        get_price: Callable[[str], float | None],
+        get_equity: Callable[[], float | None] | None = None,
+        leg_getter: Callable[[Any], str] | None = None,
+    ) -> None:
+        self._cfg = config
+        self._get_positions = get_positions
+        self._get_total_notional = get_total_notional
+        self._get_price = get_price
+        self._get_equity = get_equity or (lambda: None)
+        self._leg_getter = leg_getter or self._default_leg_getter
+
+    @staticmethod
+    def _default_leg_getter(order: Any) -> str:
+        meta = getattr(order, "meta", None)
+        value: Any = None
+        if isinstance(meta, MappingABC):
+            value = meta.get("signal_leg")
+        elif meta is not None:
+            getter = getattr(meta, "get", None)
+            if callable(getter):
+                try:
+                    value = getter("signal_leg")
+                except Exception:
+                    value = None
+        return str(value or "").lower()
+
+    @staticmethod
+    def _normalize_symbol(symbol: Any, fallback: str | None = None) -> str:
+        if symbol is None and fallback is not None:
+            symbol = fallback
+        if symbol is None:
+            return ""
+        return str(symbol).upper()
+
+    @staticmethod
+    def _extract_side(order: Any) -> str:
+        side = getattr(order, "side", "")
+        if hasattr(side, "value"):
+            try:
+                side = side.value
+            except Exception:
+                pass
+        return str(side or "").upper()
+
+    @staticmethod
+    def _extract_quantity(order: Any) -> float | None:
+        candidates = (
+            getattr(order, "quantity", None),
+            getattr(order, "volume", None),
+            getattr(order, "size", None),
+        )
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                value = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                return value
+        return None
+
+    def _snapshot_positions(self) -> Dict[str, float]:
+        snapshot: Dict[str, float] = {}
+        try:
+            positions = self._get_positions()
+        except Exception:
+            positions = {}
+        if not isinstance(positions, MappingABC):
+            return snapshot
+        for sym, qty in positions.items():
+            try:
+                value = float(qty)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            if math.isclose(value, 0.0, abs_tol=self._EPS):
+                continue
+            snapshot[str(sym).upper()] = value
+        return snapshot
+
+    def _base_total_notional(self, positions: Mapping[str, float]) -> float:
+        if self._get_total_notional is not None:
+            try:
+                value = self._get_total_notional()
+            except Exception:
+                value = None
+            else:
+                if value is not None and math.isfinite(float(value)):
+                    return max(0.0, float(value))
+        total = 0.0
+        for sym, qty in positions.items():
+            price = self._safe_price(sym)
+            if price is None:
+                continue
+            total += abs(float(qty)) * price
+        return total
+
+    def _safe_price(self, symbol: str) -> float | None:
+        try:
+            price = self._get_price(symbol)
+        except Exception:
+            return None
+        if price is None:
+            return None
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value <= 0.0:
+            return None
+        return value
+
+    def _effective_limits(self) -> tuple[float | None, float | None]:
+        buffer = max(0.0, min(float(self._cfg.exposure_buffer_frac or 0.0), 0.95))
+        def _apply_buffer(limit: float | None) -> float | None:
+            if limit is None:
+                return None
+            if limit <= 0.0:
+                return None
+            effective = limit * (1.0 - buffer)
+            if effective <= 0.0:
+                return None
+            return effective
+
+        notional_limit = _apply_buffer(self._cfg.max_total_notional)
+        equity_limit: float | None = None
+        pct = self._cfg.max_total_exposure_pct
+        if pct is not None and pct > 0.0:
+            try:
+                equity = self._get_equity()
+            except Exception:
+                equity = None
+            if equity is not None:
+                try:
+                    equity_val = float(equity)
+                except (TypeError, ValueError):
+                    equity_val = None
+                if equity_val is not None and math.isfinite(equity_val) and equity_val > 0.0:
+                    equity_limit = _apply_buffer(equity_val * pct)
+        return notional_limit, equity_limit
+
+    def _classify_orders(
+        self,
+        orders: Sequence[Any],
+        default_symbol: str,
+    ) -> list[Dict[str, Any]]:
+        infos: list[Dict[str, Any]] = []
+        for idx, order in enumerate(orders):
+            sym = self._normalize_symbol(getattr(order, "symbol", None), default_symbol)
+            leg = self._leg_getter(order)
+            reduce_only = bool(getattr(order, "reduce_only", False))
+            qty = self._extract_quantity(order)
+            side = self._extract_side(order)
+            delta: float | None
+            if qty is None:
+                delta = None
+            elif side == "BUY":
+                delta = qty
+            elif side == "SELL":
+                delta = -qty
+            else:
+                delta = None
+            infos.append(
+                {
+                    "index": idx,
+                    "order": order,
+                    "symbol": sym,
+                    "delta": delta,
+                    "price": self._safe_price(sym) if sym else None,
+                    "leg": leg,
+                    "reduce_only": reduce_only,
+                }
+            )
+        return infos
+
+    @staticmethod
+    def _is_exit(info: Mapping[str, Any]) -> bool:
+        if bool(info.get("reduce_only")):
+            return True
+        leg = str(info.get("leg") or "").lower()
+        return leg == "exit"
+
+    def apply(
+        self, ts_ms: int, symbol: str, decisions: Sequence[Any]
+    ) -> tuple[list[Any], str | None]:
+        orders = list(decisions or [])
+        if not orders:
+            return [], None
+        if not self._cfg.enabled:
+            return orders, None
+        positions = self._snapshot_positions()
+        working_positions = dict(positions)
+        current_total = self._base_total_notional(working_positions)
+        notional_limit, equity_limit = self._effective_limits()
+        if notional_limit is None and equity_limit is None:
+            return orders, None
+        infos = self._classify_orders(orders, symbol)
+        accepted: set[int] = set()
+        blocked: set[int] = set()
+
+        # Process exits first to free up capacity.
+        for info in infos:
+            if not self._is_exit(info):
+                continue
+            idx = int(info["index"])
+            accepted.add(idx)
+            sym = info.get("symbol") or ""
+            delta = info.get("delta")
+            if not sym or delta is None:
+                continue
+            prev = working_positions.get(sym, 0.0)
+            new = prev + float(delta)
+            working_positions[sym] = new
+            price = info.get("price")
+            if price is not None:
+                current_total += (abs(new) - abs(prev)) * float(price)
+
+        def _within_limits(total: float) -> bool:
+            if notional_limit is not None and total > notional_limit + self._EPS:
+                return False
+            if equity_limit is not None and total > equity_limit + self._EPS:
+                return False
+            return True
+
+        # Process remaining orders.
+        for info in infos:
+            idx = int(info["index"])
+            if idx in accepted or idx in blocked:
+                continue
+            sym = info.get("symbol") or ""
+            delta = info.get("delta")
+            price = info.get("price")
+            if not sym:
+                blocked.add(idx)
+                continue
+            if delta is None:
+                blocked.add(idx)
+                continue
+            prev = working_positions.get(sym, 0.0)
+            new = prev + float(delta)
+            exposure_delta = abs(new) - abs(prev)
+            if exposure_delta <= self._EPS:
+                accepted.add(idx)
+                working_positions[sym] = new
+                if price is not None:
+                    current_total += exposure_delta * float(price)
+                continue
+            if price is None:
+                blocked.add(idx)
+                continue
+            prospective_total = current_total + exposure_delta * float(price)
+            if not _within_limits(prospective_total):
+                blocked.add(idx)
+                continue
+            accepted.add(idx)
+            working_positions[sym] = new
+            current_total = prospective_total
+
+        approved: list[Any] = []
+        for idx, order in enumerate(orders):
+            if idx in accepted:
+                approved.append(order)
+
+        if approved:
+            return approved, None
+        return [], "RISK_PORTFOLIO_LIMIT"
 
 
