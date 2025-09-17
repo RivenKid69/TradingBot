@@ -14,7 +14,7 @@ from decimal import Decimal
 
 import websockets
 
-from core_models import Bar
+from core_models import Bar, Tick
 from core_events import EventType, MarketEvent
 from services.event_bus import EventBus
 from config import DataDegradationConfig
@@ -75,6 +75,7 @@ class BinanceWS:
         ws_dedup_log_skips: bool = False,
         ws_dedup_persist_path: str | Path | None = None,
         monitoring_agg: MonitoringAggregator | None = None,
+        subscribe_book_ticker: bool = False,
     ) -> None:
         self.symbols = [s.strip().upper() for s in symbols if s.strip()]
         self.interval = str(interval)
@@ -135,7 +136,14 @@ class BinanceWS:
         if not self.symbols:
             raise ValueError("Не задан список symbols для подписки")
 
-        self._streams = [f"{s.lower()}@kline_{self.interval}" for s in self.symbols]
+        self._subscribe_book_ticker = bool(subscribe_book_ticker)
+        self._kline_streams = [f"{s.lower()}@kline_{self.interval}" for s in self.symbols]
+        self._book_streams = (
+            [f"{s.lower()}@bookTicker" for s in self.symbols]
+            if self._subscribe_book_ticker
+            else []
+        )
+        self._streams = self._kline_streams + self._book_streams
         self.ws_url = f"{self.base_url}/ws"
 
         self._ws: websockets.WebSocketClientProtocol | None = None
@@ -203,6 +211,35 @@ class BinanceWS:
         except Exception:
             pass
 
+    async def _emit_tick(self, tick: Tick) -> None:
+        """Send book ticker event to the bus."""
+
+        feed_lag_ms = 0
+        try:
+            feed_lag_ms = max(0, now_ms() - int(getattr(tick, "ts", 0) or 0))
+        except Exception:
+            feed_lag_ms = 0
+        event = MarketEvent(
+            etype=EventType.MARKET_DATA_TICK,
+            ts=now_ms(),
+            tick=tick,
+            meta={"feed_lag_ms": feed_lag_ms},
+        )
+        accepted = await self._bus.put(event)
+        if not accepted:
+            try:
+                logger.info(
+                    "BACKPRESSURE_DROP %s",
+                    {"symbol": tick.symbol, "depth": self._bus.depth},
+                )
+            except Exception:
+                pass
+            try:
+                monitoring.ws_backpressure_drop_count.labels(tick.symbol).inc()
+                monitoring.report_ws_failure(tick.symbol)
+            except Exception:
+                pass
+
     async def _connect_once(self) -> websockets.WebSocketClientProtocol:
         ws = await websockets.connect(self.ws_url, ping_interval=None, close_timeout=5)
         await ws.send(
@@ -262,6 +299,32 @@ class BinanceWS:
                             data = payload.get("data")
                             if not isinstance(data, dict):
                                 continue
+                            event_type = str(data.get("e", "")).lower()
+                            if event_type == "bookticker" and self._subscribe_book_ticker:
+                                try:
+                                    tick = Tick(
+                                        ts=int(data.get("E") or data.get("T") or now_ms()),
+                                        symbol=str(data.get("s", "")).upper(),
+                                        bid=Decimal(str(data.get("b")))
+                                        if data.get("b") is not None
+                                        else None,
+                                        ask=Decimal(str(data.get("a")))
+                                        if data.get("a") is not None
+                                        else None,
+                                        bid_qty=Decimal(str(data.get("B")))
+                                        if data.get("B") is not None
+                                        else None,
+                                        ask_qty=Decimal(str(data.get("A")))
+                                        if data.get("A") is not None
+                                        else None,
+                                        is_final=True,
+                                    )
+                                except Exception:
+                                    continue
+                                if tick.symbol:
+                                    await self._emit_tick(tick)
+                                continue
+
                             k = data.get("k")
                             if not isinstance(k, dict):
                                 continue

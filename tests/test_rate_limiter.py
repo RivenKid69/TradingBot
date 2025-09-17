@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 import logging
 
 from unittest.mock import MagicMock
+from decimal import Decimal
 import pytest
 
 from utils import SignalRateLimiter, TokenBucket
@@ -156,6 +157,60 @@ def test_binance_public_uses_rest_session_budget(
         assert json.loads(params["symbols"]) == ["BTCUSDT"]
     else:
         assert params["symbol"] == "BTCUSDT"
+
+
+def test_get_book_ticker_uses_budget_and_cache():
+    session = MagicMock()
+    session.get.return_value = {
+        "symbol": "BTCUSDT",
+        "bidPrice": "100.0",
+        "askPrice": "101.0",
+    }
+    client = binance_public.BinancePublicClient(session=session)
+
+    bid, ask = client.get_book_ticker("btcusdt")
+    assert isinstance(bid, (Decimal, float))
+    assert isinstance(ask, (Decimal, float))
+    assert bid == Decimal("100.0")
+    assert ask == Decimal("101.0")
+    assert session.get.call_count == 1
+    args, kwargs = session.get.call_args
+    assert args == ("https://api.binance.com/api/v3/ticker/bookTicker",)
+    assert kwargs["budget"] == "bookTicker"
+    assert kwargs["params"]["symbol"] == "BTCUSDT"
+
+    # Second call should hit the cache and avoid a REST request
+    session.get.return_value = {
+        "symbol": "BTCUSDT",
+        "bidPrice": "999.0",
+        "askPrice": "999.1",
+    }
+    bid2, ask2 = client.get_book_ticker("btcusdt")
+    assert session.get.call_count == 1
+    assert bid2 == bid and ask2 == ask
+
+
+def test_get_book_ticker_multiple_symbols():
+    session = MagicMock()
+    session.get.return_value = [
+        {"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"},
+        {"symbol": "ETHUSDT", "bidPrice": "10", "askPrice": "11"},
+    ]
+    client = binance_public.BinancePublicClient(session=session)
+
+    quotes = client.get_book_ticker(["btcusdt", "ethusdt"])
+    assert set(quotes.keys()) == {"BTCUSDT", "ETHUSDT"}
+    assert quotes["BTCUSDT"] == (Decimal("100"), Decimal("101"))
+    assert quotes["ETHUSDT"] == (Decimal("10"), Decimal("11"))
+    args, kwargs = session.get.call_args
+    params = kwargs["params"]
+    assert json.loads(params["symbols"]) == ["BTCUSDT", "ETHUSDT"]
+
+    # Cached result should satisfy subsequent single-symbol calls without REST
+    session.get.reset_mock()
+    single = client.get_book_ticker("ethusdt")
+    assert session.get.call_count == 0
+    assert single == quotes["ETHUSDT"]
 
 
 # --- BinanceWS limiter inclusion and counters ---

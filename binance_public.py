@@ -4,13 +4,15 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from core_config import RetryConfig
 from services.rest_budget import RestBudgetSession
 
 
 DEFAULT_RETRY_CFG = RetryConfig(max_attempts=5, backoff_base_s=0.5, max_backoff_s=60.0)
+_BOOK_TICKER_TTL_S = 1.0
 
 
 @dataclass
@@ -45,6 +47,10 @@ class BinancePublicClient:
             self.session = RestBudgetSession(session_cfg)
         else:
             self.session = session
+        self._book_ticker_cache: Dict[
+            str,
+            Tuple[float, Tuple[Optional[Union[Decimal, float]], Optional[Union[Decimal, float]]]],
+        ] = {}
 
     def close(self) -> None:
         """Release owned REST session resources."""
@@ -212,3 +218,106 @@ class BinancePublicClient:
                 if sym and d:
                     out[sym] = d
         return out
+
+    @staticmethod
+    def _to_number(value: Any) -> Optional[Union[Decimal, float]]:
+        if value is None:
+            return None
+        if isinstance(value, Decimal):
+            return value
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            try:
+                return float(value)
+            except Exception:
+                return None
+
+    def get_book_ticker(
+        self, symbols: List[str] | str
+    ) -> Union[
+        Tuple[Optional[Union[Decimal, float]], Optional[Union[Decimal, float]]],
+        Dict[str, Tuple[Optional[Union[Decimal, float]], Optional[Union[Decimal, float]]]],
+    ]:
+        """Return latest best bid/ask quotes for ``symbols``.
+
+        The Binance REST ``bookTicker`` endpoint is queried with lightweight
+        caching to avoid repeated requests within the same bar.  Results are
+        returned as either a tuple ``(bid, ask)`` for a single symbol or a
+        mapping ``symbol -> (bid, ask)`` for multiple symbols.  Values are
+        ``Decimal`` where possible with a float fallback when conversion
+        fails.
+        """
+
+        if isinstance(symbols, str):
+            symbol_list = [symbols.upper()]
+            single = True
+        else:
+            symbol_list = [s.upper() for s in symbols]
+            single = len(symbol_list) == 1
+        if not symbol_list:
+            raise ValueError("symbols must be non-empty")
+
+        now = time.monotonic()
+        results: Dict[str, Tuple[Optional[Union[Decimal, float]], Optional[Union[Decimal, float]]]] = {}
+        missing: List[str] = []
+        for sym in symbol_list:
+            cache_entry = self._book_ticker_cache.get(sym)
+            if cache_entry is None or cache_entry[0] <= now:
+                missing.append(sym)
+            else:
+                results[sym] = cache_entry[1]
+
+        if missing:
+            url = f"{self.e.spot_base}/api/v3/ticker/bookTicker"
+            params: Dict[str, Any]
+            if len(missing) == 1:
+                params = {"symbol": missing[0]}
+            else:
+                params = {"symbols": json.dumps(missing)}
+            data = self.session.get(
+                url,
+                params=params,
+                timeout=self.timeout,
+                budget="bookTicker",
+            )
+            parsed: Dict[
+                str,
+                Tuple[Optional[Union[Decimal, float]], Optional[Union[Decimal, float]]],
+            ] = {}
+
+            def _handle_entry(entry: Any) -> None:
+                if not isinstance(entry, dict):
+                    return
+                sym = str(entry.get("symbol", "")).upper()
+                if not sym:
+                    return
+                bid = self._to_number(entry.get("bidPrice"))
+                ask = self._to_number(entry.get("askPrice"))
+                parsed[sym] = (bid, ask)
+
+            if isinstance(data, list):
+                for item in data:
+                    _handle_entry(item)
+            elif isinstance(data, dict):
+                _handle_entry(data)
+            else:
+                raise RuntimeError(f"Unexpected bookTicker response: {data}")
+
+            if not parsed:
+                raise RuntimeError(f"Unexpected bookTicker response: {data}")
+
+            expires_at = now + _BOOK_TICKER_TTL_S
+            for sym, quote in parsed.items():
+                self._book_ticker_cache[sym] = (expires_at, quote)
+                if sym in symbol_list:
+                    results[sym] = quote
+
+        if single:
+            sym = symbol_list[0]
+            if sym not in results:
+                raise RuntimeError(
+                    f"Missing bookTicker data for {sym}. Cached keys: {list(results)}"
+                )
+            return results[sym]
+        return results
