@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable, Mapping, Tuple
+from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
 import os
 import logging
 import math
@@ -203,6 +204,92 @@ class _Worker:
         if dyn_cfg and getattr(dyn_cfg, "enable", False):
             self._dynamic_guard = DynamicNoTradeGuard(dyn_cfg)
         self._spread_injections: Dict[str, Tuple[float, int]] = {}
+
+    # ------------------------------------------------------------------
+    # Dynamic guard helpers
+    # ------------------------------------------------------------------
+    def prewarm_dynamic_guard(
+        self,
+        history: Mapping[str, Sequence[Bar]]
+        | Sequence[Bar]
+        | Sequence[tuple[str, Sequence[Bar]]]
+        | None,
+    ) -> None:
+        """Seed the dynamic guard with historical bars if available."""
+
+        if self._dynamic_guard is None or not history:
+            return
+
+        grouped: Dict[str, list[Bar]] = {}
+
+        try:
+            if isinstance(history, MappingABC):
+                iterable = history.items()
+            elif isinstance(history, SequenceABC) and not isinstance(history, (str, bytes)):
+                iterable = history  # type: ignore[assignment]
+            else:
+                iterable = list(history)  # type: ignore[arg-type]
+
+            for item in iterable:
+                if isinstance(item, tuple) and len(item) == 2:
+                    symbol, bars = item
+                    sym = str(symbol).upper()
+                    seq = list(bars or [])
+                elif isinstance(item, Bar):
+                    sym = str(getattr(item, "symbol", "")).upper()
+                    if not sym:
+                        continue
+                    seq = [item]
+                else:
+                    seq = []
+                    sym = ""
+                    if isinstance(item, MappingABC):
+                        keys = {str(k).lower() for k in item.keys()}
+                        if {"ts", "symbol", "open", "high", "low", "close"}.issubset(keys):
+                            try:
+                                bar_obj = Bar.from_dict(item)  # type: ignore[arg-type]
+                            except Exception:
+                                bar_obj = None
+                            if bar_obj is not None:
+                                sym = str(getattr(bar_obj, "symbol", "")).upper()
+                                if sym:
+                                    grouped.setdefault(sym, []).append(bar_obj)
+                                continue
+                        for symbol, bars in item.items():
+                            sym = str(symbol).upper()
+                            seq = [bar for bar in list(bars or []) if isinstance(bar, Bar)]
+                            if not seq:
+                                continue
+                            grouped.setdefault(sym, []).extend(seq)
+                        continue
+                if not sym or not seq:
+                    continue
+                valid = [bar for bar in seq if isinstance(bar, Bar)]
+                if not valid:
+                    continue
+                grouped.setdefault(sym, []).extend(valid)
+        except Exception:
+            return
+
+        if not grouped:
+            return
+
+        counts: Dict[str, int] = {}
+        for sym, bars in grouped.items():
+            if not bars:
+                continue
+            try:
+                self._dynamic_guard.prewarm(sym, bars)
+            except Exception:
+                continue
+            counts[sym] = len(bars)
+
+        if counts:
+            try:
+                ordered = {k: counts[k] for k in sorted(counts)}
+                self._logger.info("dynamic guard prewarm complete %s", ordered)
+            except Exception:
+                pass
 
     def _acquire_tokens(self, symbol: str) -> tuple[bool, str | None]:
         if self._global_bucket is None:
@@ -819,6 +906,21 @@ class _Worker:
             self._dynamic_guard.update(symbol, bar, spread=spread_bps)
             blocked, reason, snapshot = self._dynamic_guard.should_block(symbol)
             if blocked and dyn_stage_enabled:
+                metrics: Dict[str, object] = {}
+                if snapshot:
+                    metrics = {
+                        k: snapshot.get(k)
+                        for k in (
+                            "sigma",
+                            "atr_pct",
+                            "vol_metric",
+                            "vol_pctile",
+                            "spread",
+                            "spread_pctile",
+                            "cooldown",
+                            "trigger_reasons",
+                        )
+                    }
                 try:
                     detail: Dict[str, object] = {
                         "stage": Stage.WINDOWS.name,
@@ -827,21 +929,19 @@ class _Worker:
                     }
                     if reason:
                         detail["detail"] = reason
-                    if snapshot:
-                        detail["snapshot"] = {
-                            k: snapshot.get(k)
-                            for k in (
-                                "sigma",
-                                "atr_pct",
-                                "vol_metric",
-                                "vol_pctile",
-                                "spread",
-                                "spread_pctile",
-                                "cooldown",
-                                "trigger_reasons",
-                            )
-                        }
+                    if metrics:
+                        detail["metrics"] = metrics
+                    bar_ts = getattr(bar, "ts", None)
+                    try:
+                        if bar_ts is not None:
+                            detail["bar_open_ms"] = int(bar_ts)
+                    except Exception:
+                        pass
                     self._logger.info("DROP %s", detail)
+                except Exception:
+                    pass
+                try:
+                    monitoring.inc_stage(Stage.WINDOWS)
                 except Exception:
                     pass
                 try:
@@ -1127,6 +1227,27 @@ class ServiceSignalRunner:
                 self.throttle_cfg.mode,
             )
 
+        dyn_cfg = getattr(self.no_trade_cfg, "dynamic_guard", None) if self.no_trade_cfg else None
+        if dyn_cfg is not None:
+            enabled = bool(getattr(dyn_cfg, "enable", False))
+            if enabled:
+                self.logger.info(
+                    "dynamic guard: enabled sigma_window=%s atr_window=%s vol_abs=%s vol_pctile=%s spread_abs_bps=%s spread_pctile=%s hysteresis=%s cooldown_bars=%s log_reason=%s",
+                    getattr(dyn_cfg, "sigma_window", None),
+                    getattr(dyn_cfg, "atr_window", None),
+                    getattr(dyn_cfg, "vol_abs", None),
+                    getattr(dyn_cfg, "vol_pctile", None),
+                    getattr(dyn_cfg, "spread_abs_bps", None),
+                    getattr(dyn_cfg, "spread_pctile", None),
+                    getattr(dyn_cfg, "hysteresis", None),
+                    getattr(dyn_cfg, "cooldown_bars", None),
+                    getattr(dyn_cfg, "log_reason", None),
+                )
+            else:
+                self.logger.info("dynamic guard: disabled")
+        else:
+            self.logger.info("dynamic guard: not configured")
+
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
         sim = getattr(self.adapter, "sim", None) or getattr(self.adapter, "_sim", None)
@@ -1286,6 +1407,71 @@ class ServiceSignalRunner:
                 self.monitoring_cfg.thresholds, "zero_signals", 0
             ),
         )
+
+        def _resolve_history_source(source: Any) -> Any:
+            if source is None:
+                return None
+            attr_candidates = (
+                "history",
+                "history_bars",
+                "recent_bars",
+                "warmup_bars",
+                "initial_bars",
+                "cached_bars",
+            )
+            for name in attr_candidates:
+                if not hasattr(source, name):
+                    continue
+                value = getattr(source, name)
+                if callable(value):
+                    try:
+                        value = value()
+                    except Exception:
+                        continue
+                if value in (None, False):
+                    continue
+                if isinstance(value, (str, bytes)):
+                    continue
+                if isinstance(value, MappingABC) and value:
+                    return value
+                try:
+                    length = len(value)  # type: ignore[arg-type]
+                except Exception:
+                    length = None
+                if length and length > 0:
+                    return value
+                if length == 0:
+                    continue
+                if length is None:
+                    try:
+                        materialized = list(value)  # type: ignore[arg-type]
+                    except TypeError:
+                        continue
+                    if materialized:
+                        return materialized
+            getter = getattr(source, "get_history", None)
+            if callable(getter):
+                try:
+                    value = getter()
+                except Exception:
+                    value = None
+                if value:
+                    return value
+            return None
+
+        seen_candidates: set[int] = set()
+        for candidate in (
+            _resolve_history_source(self.adapter),
+            _resolve_history_source(getattr(self.adapter, "source", None)),
+            _resolve_history_source(self.feature_pipe),
+        ):
+            if not candidate:
+                continue
+            ident = id(candidate)
+            if ident in seen_candidates:
+                continue
+            seen_candidates.add(ident)
+            worker.prewarm_dynamic_guard(candidate)
 
         out_csv = getattr(signal_bus, "OUT_CSV", None)
         if out_csv:
