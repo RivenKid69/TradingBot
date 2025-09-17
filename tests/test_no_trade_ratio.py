@@ -1,6 +1,10 @@
 import json
+import json
+import logging
 import os
 import sys
+import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -74,6 +78,7 @@ def test_dynamic_guard_blocks_and_logs_reasons(tmp_path):
         "dyn_guard_state",
     }
     assert expected_cols.issubset(set(reasons.columns))
+    assert "maintenance_calendar" in reasons.columns
     assert reasons["window"].sum() == 0
     assert reasons["dynamic_guard"].tolist() == expected_mask
     assert bool(reasons.loc[df.index[2], "dyn_vol_abs"])
@@ -94,6 +99,11 @@ def test_dynamic_guard_blocks_and_logs_reasons(tmp_path):
     anomaly_state = state.get("anomaly_block_until_ts")
     assert isinstance(anomaly_state, dict)
     assert anomaly_state.get("BTC") == int(df["ts_ms"].iloc[3])
+    maintenance_state = state.get("maintenance")
+    assert isinstance(maintenance_state, dict)
+    assert maintenance_state.get("funding_buffer_min") == 0
+    assert maintenance_state.get("daily_utc") == []
+    assert "calendar" not in maintenance_state
 
     cfg = get_no_trade_config(str(cfg_path))
     ratio = estimate_block_ratio(df, cfg)
@@ -168,6 +178,7 @@ def test_next_bars_block_extends_mask_and_state(tmp_path):
 
     reasons = mask.attrs.get("reasons")
     assert isinstance(reasons, pd.DataFrame)
+    assert "maintenance_calendar" in reasons.columns
     assert list(reasons.loc[df.index, "dyn_guard_next_block"]) == [False, False, False, True, True, False, False]
 
     state = mask.attrs.get("state")
@@ -177,6 +188,8 @@ def test_next_bars_block_extends_mask_and_state(tmp_path):
     dyn_state = state.get("dynamic_guard") or {}
     assert int(dyn_state["BTC"]["block_until_ts"]) == int(df["ts_ms"].iloc[4])
     assert dyn_state["BTC"]["next_block_left"] == 0
+    maintenance_state = state.get("maintenance")
+    assert isinstance(maintenance_state, dict)
 
 
 def test_state_blocks_rows_without_guard(tmp_path):
@@ -207,9 +220,146 @@ def test_state_blocks_rows_without_guard(tmp_path):
     assert isinstance(reasons, pd.DataFrame)
     assert list(reasons.loc[df.index, "dyn_guard_state"]) == expected_mask
 
+    state_payload = mask.attrs.get("state")
+    assert isinstance(state_payload, dict)
+    maintenance_state = state_payload.get("maintenance")
+    assert isinstance(maintenance_state, dict)
+
     cfg = get_no_trade_config(str(cfg_path))
     ratio = estimate_block_ratio(df, cfg, state=state)
     assert ratio == pytest.approx(sum(expected_mask) / len(expected_mask))
+
+
+def test_maintenance_calendar_blocks_rows(tmp_path):
+    calendar_df = pd.DataFrame(
+        [
+            {"start_ts_ms": 60_000, "end_ts_ms": 180_000, "symbol": "BTC"},
+            {"start_ts_ms": 300_000, "end_ts_ms": 360_000},
+        ]
+    )
+    calendar_path = tmp_path / "maintenance.csv"
+    calendar_df.to_csv(calendar_path, index=False)
+
+    cfg_data = {
+        "no_trade": {
+            "maintenance": {
+                "path": "maintenance.csv",
+                "daily_utc": [],
+                "custom_ms": [],
+                "funding_buffer_min": 0,
+            },
+            "dynamic_guard": {"enable": False},
+        }
+    }
+    cfg_path = tmp_path / "sandbox.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_data), encoding="utf-8")
+
+    df = pd.DataFrame(
+        {
+            "ts_ms": [0, 60_000, 120_000, 240_000, 320_000],
+            "symbol": ["BTC", "BTC", "ETH", "BTC", "ETH"],
+        }
+    )
+
+    mask = compute_no_trade_mask(df, sandbox_yaml_path=str(cfg_path))
+    expected_mask = [False, True, False, False, True]
+    actual_mask = mask.tolist()
+
+    reasons = mask.attrs.get("reasons")
+    assert isinstance(reasons, pd.DataFrame)
+    actual_calendar = reasons["maintenance_calendar"].tolist()
+
+    state_payload = mask.attrs.get("state")
+    assert isinstance(state_payload, dict)
+    maintenance_state = state_payload.get("maintenance") or {}
+    calendar_state = maintenance_state.get("calendar") or {}
+    assert calendar_state.get("exists") is True
+    assert Path(calendar_state.get("path")).name == "maintenance.csv"
+    windows = calendar_state.get("windows") or []
+    assert any(entry.get("symbol") == "BTC" for entry in windows)
+    assert any(entry.get("symbol") is None for entry in windows), windows
+
+    assert actual_mask == expected_mask == actual_calendar, (
+        actual_mask,
+        actual_calendar,
+        windows,
+    )
+
+    meta = mask.attrs.get("meta") or {}
+    maintenance_meta = meta.get("maintenance_calendar") or {}
+    assert maintenance_meta.get("exists") is True
+
+
+def test_missing_maintenance_calendar_logs_warning(tmp_path, caplog):
+    cfg_data = {
+        "no_trade": {
+            "maintenance": {
+                "path": "missing.json",
+                "daily_utc": [],
+                "custom_ms": [],
+                "funding_buffer_min": 0,
+            },
+            "dynamic_guard": {"enable": False},
+        }
+    }
+    cfg_path = tmp_path / "sandbox.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_data), encoding="utf-8")
+
+    df = pd.DataFrame({"ts_ms": [0, 60_000]})
+
+    with caplog.at_level(logging.WARNING):
+        mask = compute_no_trade_mask(df, sandbox_yaml_path=str(cfg_path))
+
+    assert any("Maintenance calendar file not found" in rec.getMessage() for rec in caplog.records)
+
+    state_payload = mask.attrs.get("state")
+    maintenance_state = state_payload.get("maintenance") or {}
+    calendar_state = maintenance_state.get("calendar") or {}
+    assert calendar_state.get("exists") is False
+
+    meta = mask.attrs.get("meta") or {}
+    maintenance_meta = meta.get("maintenance_calendar") or {}
+    assert maintenance_meta.get("exists") is False
+
+
+def test_stale_maintenance_calendar_emits_warning(tmp_path, caplog):
+    calendar_path = tmp_path / "maintenance.json"
+    calendar_payload = [{"start_ts_ms": 0, "end_ts_ms": 60_000}]
+    calendar_path.write_text(json.dumps(calendar_payload), encoding="utf-8")
+    old_time = time.time() - 10.0
+    os.utime(calendar_path, (old_time, old_time))
+
+    cfg_data = {
+        "no_trade": {
+            "maintenance": {
+                "path": str(calendar_path),
+                "daily_utc": [],
+                "custom_ms": [],
+                "funding_buffer_min": 0,
+                "max_age_sec": 1,
+            },
+            "dynamic_guard": {"enable": False},
+        }
+    }
+    cfg_path = tmp_path / "sandbox.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_data), encoding="utf-8")
+
+    df = pd.DataFrame({"ts_ms": [0, 120_000]})
+
+    with caplog.at_level(logging.WARNING):
+        mask = compute_no_trade_mask(df, sandbox_yaml_path=str(cfg_path))
+
+    assert any("looks stale" in rec.getMessage() for rec in caplog.records)
+    reasons = mask.attrs.get("reasons")
+    assert reasons["maintenance_calendar"].tolist() == [True, False]
+
+    state_payload = mask.attrs.get("state")
+    calendar_state = (state_payload.get("maintenance") or {}).get("calendar") or {}
+    assert calendar_state.get("stale") is True
+
+    meta = mask.attrs.get("meta") or {}
+    maintenance_meta = meta.get("maintenance_calendar") or {}
+    assert maintenance_meta.get("stale") is True
 
 
 def test_no_trade_state_migration_and_save(tmp_path):

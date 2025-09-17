@@ -55,6 +55,9 @@ class MaintenanceConfig(BaseModel):
     """Time windows for scheduled maintenance."""
 
     format: str = "HH:MM-HH:MM"
+    path: Optional[str] = None
+    max_age_sec: Optional[int] = None
+    max_age_hours: Optional[float] = None
     funding_buffer_min: int = 0
     daily_utc: List[str] = Field(default_factory=list)
     custom_ms: List[Dict[str, int]] = Field(default_factory=list)
@@ -116,7 +119,7 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
     else:
         maintenance["format"] = "HH:MM-HH:MM"
 
-    for key in ("funding_buffer_min", "daily_utc", "custom_ms"):
+    for key in ("funding_buffer_min", "daily_utc", "custom_ms", "path", "max_age_sec", "max_age_hours"):
         if key not in maintenance and raw.get(key) is not None:
             maintenance[key] = raw[key]
 
@@ -126,6 +129,15 @@ def _normalise_no_trade_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
     maintenance.setdefault("custom_ms", [])
     maintenance["daily_utc"] = list(maintenance.get("daily_utc") or [])
     maintenance["custom_ms"] = list(maintenance.get("custom_ms") or [])
+    if maintenance.get("path"):
+        maintenance["path"] = str(maintenance.get("path"))
+    else:
+        maintenance["path"] = None
+
+    max_age_sec = _coerce_int(maintenance.get("max_age_sec"))
+    max_age_hours = _coerce_float(maintenance.get("max_age_hours"))
+    maintenance["max_age_sec"] = max_age_sec
+    maintenance["max_age_hours"] = max_age_hours
 
     dynamic = _ensure_mapping(raw.get("dynamic"))
     legacy_guard = _ensure_mapping(raw.get("dynamic_guard"))
@@ -199,6 +211,28 @@ def get_no_trade_config(path: str) -> NoTradeConfig:
     raw_cfg = _ensure_mapping(data.get("no_trade"))
     normalised = _normalise_no_trade_payload(raw_cfg)
     config = NoTradeConfig(**normalised)
+
+    maintenance_cfg = config.maintenance
+    if maintenance_cfg.path:
+        try:
+            base_dir = Path(path).resolve().parent
+            resolved = Path(maintenance_cfg.path)
+            if not resolved.is_absolute():
+                resolved = (base_dir / resolved).resolve()
+            maintenance_cfg.path = str(resolved)
+        except Exception:  # pragma: no cover - defensive
+            maintenance_cfg.path = str(maintenance_cfg.path)
+
+    if maintenance_cfg.max_age_sec is None and maintenance_cfg.max_age_hours is not None:
+        try:
+            maintenance_cfg.max_age_sec = int(float(maintenance_cfg.max_age_hours) * 3600)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            maintenance_cfg.max_age_sec = None
+    elif maintenance_cfg.max_age_hours is None and maintenance_cfg.max_age_sec is not None:
+        try:
+            maintenance_cfg.max_age_hours = float(maintenance_cfg.max_age_sec) / 3600.0
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            maintenance_cfg.max_age_hours = None
 
     guard = config.dynamic.guard
     hysteresis_cfg = config.dynamic.hysteresis
