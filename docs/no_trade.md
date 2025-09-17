@@ -10,6 +10,22 @@ This document explains the available fields, dataset masking options, and runtim
 | `funding_buffer_min` | int | Minutes before and after funding events (00:00, 08:00, 16:00 UTC) where trading is blocked. |
 | `daily_utc` | list[str] | Daily repeating windows in `HH:MM-HH:MM` (UTC). Windows should not cross midnight. |
 | `custom_ms` | list[dict] | One-off windows with explicit start and end timestamps in milliseconds since epoch. |
+| `dynamic_guard` | dict | Optional dynamic guard that can pause trading based on volatility/spread metrics. |
+
+### `dynamic_guard` fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable` | bool | `false` | Enable the dynamic guard when `true`. |
+| `sigma_window` | int or null | `null` | Rolling window (bars) for computing price sigma; guard ignores this trigger when `null`. |
+| `atr_window` | int or null | `null` | Rolling window (bars) for ATR-based spread checks; ignored when `null`. |
+| `vol_abs` | float or null | `null` | Absolute volatility threshold. Leave `null` to disable. |
+| `vol_pctile` | float or null | `null` | Percentile threshold (0-1) for volatility. |
+| `spread_abs_bps` | float or null | `null` | Absolute spread threshold in basis points. |
+| `spread_pctile` | float or null | `null` | Percentile threshold (0-1) for spread. |
+| `hysteresis` | float or null | `null` | Relative buffer before the guard re-enables trading. |
+| `cooldown_bars` | int | `0` | Bars to wait after the guard condition clears. |
+| `log_reason` | bool | `false` | Emit a log entry when the guard blocks trades. |
 
 Example YAML:
 
@@ -22,6 +38,17 @@ no_trade:
     - "16:00-16:05"
   custom_ms:
     - {start_ts_ms: 1696118400000, end_ts_ms: 1696122000000}
+  dynamic_guard:
+    enable: false
+    sigma_window: 120
+    atr_window: 14
+    vol_abs: null
+    vol_pctile: 0.99
+    spread_abs_bps: null
+    spread_pctile: 0.99
+    hysteresis: 0.1
+    cooldown_bars: 10
+    log_reason: true
 ```
 
 ## Applying the mask to datasets
