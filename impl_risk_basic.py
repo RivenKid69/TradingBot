@@ -10,7 +10,7 @@ impl_risk_basic.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 try:
     from risk import RiskManager, RiskConfig
@@ -30,6 +30,7 @@ class RiskBasicCfg:
     daily_loss_limit: float = 0.0
     pause_seconds_on_violation: int = 300
     daily_reset_utc_hour: int = 0
+    max_entries_per_day: Optional[int] = None
 
 
 class RiskBasicImpl:
@@ -45,6 +46,9 @@ class RiskBasicImpl:
             "daily_loss_limit": float(cfg.daily_loss_limit),
             "pause_seconds_on_violation": int(cfg.pause_seconds_on_violation),
             "daily_reset_utc_hour": int(cfg.daily_reset_utc_hour),
+            "max_entries_per_day": (
+                None if cfg.max_entries_per_day is None else int(cfg.max_entries_per_day)
+            ),
         })) if (RiskManager is not None and RiskConfig is not None) else None
 
     @property
@@ -67,4 +71,9 @@ class RiskBasicImpl:
             daily_loss_limit=float(d.get("daily_loss_limit", 0.0)),
             pause_seconds_on_violation=int(d.get("pause_seconds_on_violation", 300)),
             daily_reset_utc_hour=int(d.get("daily_reset_utc_hour", 0)),
+            max_entries_per_day=(
+                None
+                if d.get("max_entries_per_day") is None
+                else int(d.get("max_entries_per_day"))
+            ),
         ))
