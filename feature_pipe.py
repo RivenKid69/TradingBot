@@ -9,8 +9,10 @@ deterministic ``apply_offline_features`` routine for batch processing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable, Mapping, Optional, Any
+from collections import deque
+from dataclasses import dataclass, field
+from math import sqrt
+from typing import Iterable, Mapping, Optional, Any, Deque, Dict
 import copy
 
 import pandas as pd
@@ -18,6 +20,123 @@ import pandas as pd
 from transformers import FeatureSpec, OnlineFeatureTransformer, apply_offline_features
 from core_models import Bar
 from core_contracts import FeaturePipe as FeaturePipeProtocol  # noqa: F401
+
+
+@dataclass(frozen=True)
+class SignalQualitySnapshot:
+    """Current quality metrics produced by :class:`SignalQualityMetrics`."""
+
+    current_sigma: Optional[float]
+    current_vol_median: Optional[float]
+    window_ready: bool
+
+
+@dataclass
+class _SymbolMetricsState:
+    prev_close: Optional[float] = None
+    returns: Deque[float] = field(default_factory=deque)
+    volumes: Deque[float] = field(default_factory=deque)
+    sum_returns: float = 0.0
+    sum_sq_returns: float = 0.0
+
+
+class SignalQualityMetrics:
+    """Maintain rolling statistics for bar quality checks.
+
+    Parameters
+    ----------
+    sigma_window:
+        Window size used to compute the standard deviation of returns.
+    vol_median_window:
+        Window size used to compute the rolling median of volumes.
+    """
+
+    def __init__(self, sigma_window: int, vol_median_window: int) -> None:
+        if sigma_window <= 0:
+            raise ValueError("sigma_window must be positive")
+        if vol_median_window <= 0:
+            raise ValueError("vol_median_window must be positive")
+
+        self.sigma_window = int(sigma_window)
+        self.vol_median_window = int(vol_median_window)
+        self._state: Dict[str, _SymbolMetricsState] = {}
+
+    # ------------------------------------------------------------------
+    def reset(self) -> None:
+        """Reset internal state for all symbols."""
+
+        self._state.clear()
+
+    # ------------------------------------------------------------------
+    def update(self, bar: Bar) -> SignalQualitySnapshot:
+        """Update metrics with a new bar and return current values."""
+
+        symbol = bar.symbol.upper()
+        state = self._state.setdefault(symbol, _SymbolMetricsState())
+
+        close = float(bar.close)
+        if state.prev_close not in (None, 0.0):
+            ret = close / state.prev_close - 1.0
+            self._append_return(state, ret)
+
+        state.prev_close = close
+
+        volume_source = bar.volume_quote if bar.volume_quote is not None else bar.volume_base
+        if volume_source is not None:
+            self._append_volume(state, float(volume_source))
+
+        sigma = self._compute_sigma(state)
+        vol_median = self._compute_volume_median(state)
+        window_ready = (
+            len(state.returns) >= self.sigma_window
+            and len(state.volumes) >= self.vol_median_window
+        )
+
+        return SignalQualitySnapshot(
+            current_sigma=sigma,
+            current_vol_median=vol_median,
+            window_ready=window_ready,
+        )
+
+    # ------------------------------------------------------------------
+    def _append_return(self, state: _SymbolMetricsState, value: float) -> None:
+        if len(state.returns) == self.sigma_window:
+            removed = state.returns.popleft()
+            state.sum_returns -= removed
+            state.sum_sq_returns -= removed * removed
+
+        state.returns.append(value)
+        state.sum_returns += value
+        state.sum_sq_returns += value * value
+
+    def _append_volume(self, state: _SymbolMetricsState, value: float) -> None:
+        if len(state.volumes) == self.vol_median_window:
+            state.volumes.popleft()
+
+        state.volumes.append(value)
+
+    def _compute_sigma(self, state: _SymbolMetricsState) -> Optional[float]:
+        count = len(state.returns)
+        if count == 0:
+            return None
+
+        mean = state.sum_returns / count
+        variance = state.sum_sq_returns / count - mean * mean
+        if variance < 0.0:
+            variance = 0.0
+        return sqrt(variance)
+
+    def _compute_volume_median(self, state: _SymbolMetricsState) -> Optional[float]:
+        if not state.volumes:
+            return None
+
+        sorted_volumes = sorted(state.volumes)
+        mid = len(sorted_volumes) // 2
+        if len(sorted_volumes) % 2:
+            return sorted_volumes[mid]
+        return 0.5 * (sorted_volumes[mid - 1] + sorted_volumes[mid])
+
+
 
 
 @dataclass
@@ -125,5 +244,5 @@ class FeaturePipe:
         return target.rename("target")
 
 
-__all__ = ["FeaturePipe"]
+__all__ = ["FeaturePipe", "SignalQualityMetrics", "SignalQualitySnapshot"]
 
