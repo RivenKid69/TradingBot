@@ -445,6 +445,14 @@ class _Worker:
         self._zero_signal_alert = int(zero_signal_alert)
         self._zero_signal_streak = 0
         self._state_enabled = bool(state_enabled)
+        self._positions: Dict[str, float] = {}
+        self._pending_exposure: Dict[int, Dict[str, Any]] = {}
+        self._exposure_state: Dict[str, Any] = {
+            "positions": {},
+            "pending": {},
+            "updated_at_ms": 0,
+            "total_notional": 0.0,
+        }
         self._global_bucket = None
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
@@ -513,6 +521,7 @@ class _Worker:
         self._rest_backoff_step: Dict[str, float] = {}
         if self._state_enabled:
             self._seed_last_prices_from_state()
+            self._load_exposure_state()
 
     # ------------------------------------------------------------------
     # Dynamic guard helpers
@@ -570,6 +579,55 @@ class _Worker:
             if symbol and price is not None:
                 self._last_prices[symbol] = price
 
+    def _load_exposure_state(self) -> None:
+        try:
+            st = state_storage.get_state()
+        except Exception:
+            st = None
+        self._positions = {}
+        self._pending_exposure = {}
+        stored_state: Mapping[str, Any]
+        stored_state = {}
+        if st is not None:
+            raw_state = getattr(st, "exposure_state", {}) or {}
+            if isinstance(raw_state, MappingABC):
+                stored_state = dict(raw_state)
+        raw_positions = stored_state.get("positions", {}) if isinstance(stored_state, MappingABC) else {}
+        if isinstance(raw_positions, MappingABC):
+            for symbol, qty in raw_positions.items():
+                try:
+                    qty_val = float(qty)
+                except (TypeError, ValueError):
+                    continue
+                if math.isclose(qty_val, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                    continue
+                sym = str(symbol).upper()
+                if not sym:
+                    continue
+                self._positions[sym] = qty_val
+        total_notional = 0.0
+        updated_at_ms = 0
+        if isinstance(stored_state, MappingABC):
+            try:
+                total_notional = float(stored_state.get("total_notional", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                total_notional = 0.0
+            try:
+                updated_at_ms = int(stored_state.get("updated_at_ms", 0) or 0)
+            except (TypeError, ValueError):
+                updated_at_ms = 0
+        if st is not None and not total_notional:
+            try:
+                total_notional = float(getattr(st, "total_notional", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                total_notional = 0.0
+        self._exposure_state = {
+            "positions": dict(self._positions),
+            "pending": {},
+            "updated_at_ms": updated_at_ms,
+            "total_notional": total_notional,
+        }
+
     @staticmethod
     def _coerce_price(value: Any) -> float | None:
         try:
@@ -624,6 +682,188 @@ class _Worker:
         self._set_last_price(sym, coerced)
         self._rest_backoff_until[sym] = now + 0.0
         self._rest_backoff_step[sym] = 1.0
+
+    @staticmethod
+    def _coerce_quantity(order: Any) -> float | None:
+        try:
+            qty = getattr(order, "quantity")
+        except Exception:
+            return None
+        if qty is None:
+            return None
+        try:
+            value = float(qty)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    @staticmethod
+    def _order_side(order: Any) -> str:
+        side = getattr(order, "side", "")
+        if hasattr(side, "value"):
+            try:
+                side = side.value
+            except Exception:
+                side = ""
+        return str(side or "").upper()
+
+    def _persist_exposure_state(self, ts_ms: int | None = None) -> None:
+        timestamp = int(ts_ms if ts_ms is not None else clock.now_ms())
+        positions_snapshot: Dict[str, float] = {}
+        for symbol, qty in self._positions.items():
+            if math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                continue
+            positions_snapshot[symbol] = float(qty)
+        pending_summary: Dict[str, Dict[str, float]] = {}
+        for data in self._pending_exposure.values():
+            symbol = str(data.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            leg = str(data.get("leg", "unknown") or "unknown")
+            try:
+                delta = float(data.get("delta", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            summary = pending_summary.setdefault(symbol, {})
+            summary[leg] = summary.get(leg, 0.0) + delta
+        total_notional = 0.0
+        for symbol, qty in positions_snapshot.items():
+            price = self._last_prices.get(symbol)
+            if price is None:
+                continue
+            try:
+                total_notional += abs(float(qty)) * float(price)
+            except Exception:
+                continue
+        self._exposure_state = {
+            "positions": positions_snapshot,
+            "pending": pending_summary,
+            "updated_at_ms": timestamp,
+            "total_notional": total_notional,
+        }
+        if self._state_enabled:
+            try:
+                state_storage.update_state(
+                    exposure_state=dict(self._exposure_state),
+                    total_notional=float(total_notional),
+                )
+            except Exception:
+                pass
+
+    def _register_pending_exposure(self, order: Any, ts_ms: int) -> bool:
+        key = id(order)
+        if key in self._pending_exposure:
+            return False
+        symbol = str(getattr(order, "symbol", "") or "").upper()
+        if not symbol:
+            return False
+        qty = self._coerce_quantity(order)
+        if qty is None or math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            return False
+        side = self._order_side(order)
+        if side == "BUY":
+            delta = qty
+        elif side == "SELL":
+            delta = -qty
+        else:
+            return False
+        prev = self._positions.get(symbol, 0.0)
+        new = prev + delta
+        if math.isclose(new, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            self._positions.pop(symbol, None)
+        else:
+            self._positions[symbol] = new
+        leg = self._signal_leg(order) or ("exit" if delta < 0.0 else "entry")
+        self._pending_exposure[key] = {
+            "symbol": symbol,
+            "delta": float(delta),
+            "leg": leg,
+            "ts_ms": int(ts_ms),
+        }
+        return True
+
+    def _stage_exposure_adjustments(
+        self, orders: Sequence[Any], ts_ms: int
+    ) -> None:
+        if not orders:
+            return
+        exit_orders: list[Any] = []
+        entry_orders: list[Any] = []
+        other_orders: list[Any] = []
+        for order in orders:
+            leg = self._signal_leg(order)
+            if leg == "exit":
+                exit_orders.append(order)
+            elif leg == "entry":
+                entry_orders.append(order)
+            else:
+                other_orders.append(order)
+        changed = False
+        for order in (*exit_orders, *entry_orders, *other_orders):
+            if self._register_pending_exposure(order, ts_ms):
+                changed = True
+        if changed:
+            self._persist_exposure_state(ts_ms)
+
+    def _rollback_exposure(self, order: Any) -> None:
+        key = id(order)
+        data = self._pending_exposure.pop(key, None)
+        if not data:
+            return
+        symbol = str(data.get("symbol", "")).upper()
+        try:
+            delta = float(data.get("delta", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            delta = 0.0
+        if symbol:
+            prev = self._positions.get(symbol, 0.0)
+            new = prev - delta
+            if math.isclose(new, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                self._positions.pop(symbol, None)
+            else:
+                self._positions[symbol] = new
+        self._persist_exposure_state(clock.now_ms())
+
+    def _commit_exposure(self, order: Any) -> None:
+        key = id(order)
+        if key not in self._pending_exposure:
+            return
+        self._pending_exposure.pop(key, None)
+        self._persist_exposure_state(clock.now_ms())
+
+    def _rollback_pending_exposure_for_symbol(
+        self, symbol: str, *, legs: set[str] | None = None
+    ) -> None:
+        sym = str(symbol).upper()
+        if not sym:
+            return
+        keys: list[int] = []
+        for key, data in list(self._pending_exposure.items()):
+            if str(data.get("symbol", "")).upper() != sym:
+                continue
+            leg = str(data.get("leg", "unknown") or "unknown")
+            if legs is not None and leg not in legs:
+                continue
+            keys.append(key)
+        if not keys:
+            return
+        for key in keys:
+            data = self._pending_exposure.pop(key, None)
+            if not data:
+                continue
+            try:
+                delta = float(data.get("delta", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                delta = 0.0
+            prev = self._positions.get(sym, 0.0)
+            new = prev - delta
+            if math.isclose(new, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                self._positions.pop(sym, None)
+            else:
+                self._positions[sym] = new
+        self._persist_exposure_state(clock.now_ms())
 
     @staticmethod
     def _extract_entry_config_candidate(obj: Any) -> tuple[int | None, int | None]:
@@ -736,6 +976,7 @@ class _Worker:
         *,
         entry_steps: int,
         removed_count: int,
+        removed_orders: Sequence[Any] | None = None,
     ) -> None:
         prev_state = transition.get("prev")
         new_state = transition.get("new")
@@ -786,6 +1027,13 @@ class _Worker:
             ).inc()
         except Exception:
             pass
+        if removed_orders:
+            for order in removed_orders:
+                try:
+                    self._rollback_exposure(order)
+                except Exception:
+                    continue
+        self._rollback_pending_exposure_for_symbol(symbol, legs={"entry"})
 
     def _apply_entry_limiter(
         self,
@@ -841,6 +1089,7 @@ class _Worker:
                 snapshot,
                 entry_steps=steps,
                 removed_count=len(removed),
+                removed_orders=removed,
             )
         return filtered
 
@@ -1562,6 +1811,7 @@ class _Worker:
     ) -> PipelineResult:
         """Final pipeline stage: throttle and emit order."""
         if stage_cfg is not None and not stage_cfg.enabled:
+            self._commit_exposure(o)
             return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
         if self._throttle_cfg and self._throttle_cfg.enabled:
             ok, reason = self._acquire_tokens(symbol)
@@ -1576,6 +1826,7 @@ class _Worker:
                     except Exception:
                         pass
                     return PipelineResult(action="queue", stage=Stage.PUBLISH)
+                self._rollback_exposure(o)
                 try:
                     log_drop(symbol, bar_close_ms, o, reason or "")
                     monitoring.throttle_dropped_count.labels(symbol, reason or "").inc()
@@ -1586,9 +1837,11 @@ class _Worker:
                 )
         if not self._emit(o, symbol, bar_close_ms):
             self._refund_tokens(symbol)
+            self._rollback_exposure(o)
             return PipelineResult(
                 action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER
             )
+        self._commit_exposure(o)
         return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
 
     def _drain_queue(self) -> list[Any]:
@@ -1600,6 +1853,10 @@ class _Worker:
             exp, symbol, bar_close_ms, order = self._queue[0]
             if exp <= now:
                 self._queue.popleft()
+                try:
+                    self._rollback_exposure(order)
+                except Exception:
+                    pass
                 try:
                     log_drop(symbol, bar_close_ms, order, "QUEUE_EXPIRED")
                     monitoring.throttle_queue_expired_count.labels(symbol).inc()
@@ -1615,8 +1872,13 @@ class _Worker:
             self._queue.popleft()
             if not self._emit(order, symbol, bar_close_ms):
                 self._refund_tokens(symbol)
+                try:
+                    self._rollback_exposure(order)
+                except Exception:
+                    pass
             else:
                 emitted.append(order)
+                self._commit_exposure(order)
         return emitted
 
     def process(self, bar: Bar):
@@ -2007,6 +2269,7 @@ class _Worker:
         orders = list(risk_res.decision or [])
 
         created_ts_ms = clock.now_ms()
+        self._stage_exposure_adjustments(orders, created_ts_ms)
         checked_orders = []
         for o in orders:
             ok, expires_at_ms, _ = check_ttl(
@@ -2032,6 +2295,7 @@ class _Worker:
                     monitoring.signal_boundary_count.labels(bar.symbol).inc()
                 except Exception:
                     pass
+                self._rollback_exposure(o)
                 continue
 
             setattr(o, "created_ts_ms", created_ts_ms)
