@@ -111,7 +111,9 @@ components:
     params: {}
   policy:
     target: strategies.momentum:MomentumStrategy
-    params: {}
+    params:
+      enter_threshold: 0.0  # enter >= exit; defaults to legacy ``threshold`` if omitted
+      exit_threshold: 0.0   # fallback when only ``threshold`` is provided
   risk_guards:
     target: impl_risk_basic:RiskBasicImpl
     params: {}

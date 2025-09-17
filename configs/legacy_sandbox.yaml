@@ -45,7 +45,8 @@ policy:
   class: "MomentumStrategy"
   params:
     lookback: 5
-    threshold: 0.0
+    enter_threshold: 0.0  # enter >= exit; falls back to legacy ``threshold`` when set
+    exit_threshold: 0.0   # exit hysteresis threshold; uses ``threshold`` as fallback
     order_qty: 0.1  # доля позиции
 
 data:
