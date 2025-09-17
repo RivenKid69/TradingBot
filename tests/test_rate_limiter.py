@@ -129,6 +129,14 @@ def test_exponential_backoff():
             "fundingRate",
             [{"symbol": "BTCUSDT"}],
         ),
+        (
+            "get_last_price",
+            {"symbol": "btcusdt"},
+            {"symbol": "BTCUSDT", "price": "123.45"},
+            "https://api.binance.com/api/v3/ticker/price",
+            "tickerPrice",
+            Decimal("123.45"),
+        ),
     ],
 )
 def test_binance_public_uses_rest_session_budget(
@@ -212,6 +220,26 @@ def test_get_book_ticker_multiple_symbols():
     single = client.get_book_ticker("ethusdt")
     assert session.get.call_count == 0
     assert single == quotes["ETHUSDT"]
+
+
+def test_get_last_price_uses_cache():
+    session = MagicMock()
+    session.get.return_value = {"symbol": "BTCUSDT", "price": "101.5"}
+    client = binance_public.BinancePublicClient(session=session)
+
+    price = client.get_last_price("btcusdt")
+    assert isinstance(price, (Decimal, float))
+    assert price == Decimal("101.5")
+    assert session.get.call_count == 1
+    args, kwargs = session.get.call_args
+    assert args == ("https://api.binance.com/api/v3/ticker/price",)
+    assert kwargs["budget"] == "tickerPrice"
+    assert kwargs["params"]["symbol"] == "BTCUSDT"
+
+    session.get.return_value = {"symbol": "BTCUSDT", "price": "999"}
+    price2 = client.get_last_price("btcusdt")
+    assert session.get.call_count == 1
+    assert price2 == price
 
 
 def test_get_spread_bps_prefers_book_ticker():

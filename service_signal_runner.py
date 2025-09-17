@@ -426,6 +426,7 @@ class _Worker:
         signal_quality_cfg: SignalQualityConfig | None = None,
         zero_signal_alert: int = 0,
         state_enabled: bool = False,
+        rest_candidates: Sequence[Any] | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -504,10 +505,126 @@ class _Worker:
             cache_ttl = 60_000
         self._spread_cache_max_ms = cache_ttl
         self._spread_injections: Dict[str, Dict[str, float | int | None]] = {}
+        self._last_prices: Dict[str, float] = {}
+        self._rest_helper = self._resolve_rest_helper(
+            rest_candidates or ()
+        )
+        self._rest_backoff_until: Dict[str, float] = {}
+        self._rest_backoff_step: Dict[str, float] = {}
+        if self._state_enabled:
+            self._seed_last_prices_from_state()
 
     # ------------------------------------------------------------------
     # Dynamic guard helpers
     # ------------------------------------------------------------------
+    def _resolve_rest_helper(self, candidates: Sequence[Any]) -> Any | None:
+        seen: set[int] = set()
+        queue: deque[Any] = deque()
+        for base in (self._fp, self._policy, self._executor, self._guards):
+            if base is not None:
+                queue.append(base)
+        for obj in candidates:
+            if obj is not None:
+                queue.append(obj)
+        attr_names = (
+            "rest_helper",
+            "rest_client",
+            "rest",
+            "client",
+            "public",
+            "api",
+            "source",
+            "adapter",
+            "market_data",
+        )
+        while queue:
+            obj = queue.popleft()
+            ident = id(obj)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            getter = getattr(obj, "get_last_price", None)
+            if callable(getter):
+                return obj
+            for name in attr_names:
+                try:
+                    attr = getattr(obj, name)
+                except Exception:
+                    attr = None
+                if attr is None or id(attr) in seen:
+                    continue
+                queue.append(attr)
+        return None
+
+    def _seed_last_prices_from_state(self) -> None:
+        try:
+            st = state_storage.get_state()
+        except Exception:
+            return
+        raw = getattr(st, "last_prices", {}) or {}
+        if not isinstance(raw, MappingABC):
+            return
+        for sym, value in raw.items():
+            symbol = str(sym).upper()
+            price = self._coerce_price(value)
+            if symbol and price is not None:
+                self._last_prices[symbol] = price
+
+    @staticmethod
+    def _coerce_price(value: Any) -> float | None:
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(price) or price <= 0.0:
+            return None
+        return price
+
+    def _set_last_price(self, symbol: str, price: Any) -> None:
+        sym = str(symbol).upper()
+        if not sym:
+            return
+        val = self._coerce_price(price)
+        if val is None:
+            return
+        prev = self._last_prices.get(sym)
+        if prev is not None and math.isclose(prev, val, rel_tol=1e-9, abs_tol=1e-12):
+            return
+        self._last_prices[sym] = val
+        if self._state_enabled:
+            try:
+                state_storage.update_state(last_prices=dict(self._last_prices))
+            except Exception:
+                pass
+
+    def _maybe_fetch_rest_price(self, symbol: str) -> None:
+        sym = str(symbol).upper()
+        if not sym:
+            return
+        if sym in self._last_prices:
+            return
+        if self._rest_helper is None:
+            return
+        now = time.monotonic()
+        next_allowed = self._rest_backoff_until.get(sym, 0.0)
+        if now < next_allowed:
+            return
+        step = self._rest_backoff_step.get(sym, 1.0)
+        try:
+            price = self._rest_helper.get_last_price(sym)
+        except Exception:
+            self._rest_backoff_until[sym] = now + step
+            self._rest_backoff_step[sym] = min(step * 2.0, 300.0)
+            return
+        coerced = self._coerce_price(price)
+        if coerced is None:
+            self._rest_backoff_until[sym] = now + step
+            self._rest_backoff_step[sym] = min(step * 2.0, 300.0)
+            return
+        self._set_last_price(sym, coerced)
+        self._rest_backoff_until[sym] = now + 0.0
+        self._rest_backoff_step[sym] = 1.0
+
     @staticmethod
     def _extract_entry_config_candidate(obj: Any) -> tuple[int | None, int | None]:
         if obj is None:
@@ -1086,9 +1203,14 @@ class _Worker:
         symbol = str(getattr(tick, "symbol", "")).upper()
         if not symbol:
             return
+        price_val = self._coerce_price(getattr(tick, "price", None))
         bid = getattr(tick, "bid", None)
         ask = getattr(tick, "ask", None)
         if bid is None or ask is None:
+            if price_val is not None:
+                self._set_last_price(symbol, price_val)
+            else:
+                self._maybe_fetch_rest_price(symbol)
             return
         try:
             bid_val = float(bid)
@@ -1102,18 +1224,32 @@ class _Worker:
             and ask_val > 0
         ):
             return
+        mid_val: float | None = None
+        mid_candidate = (bid_val + ask_val) * 0.5
+        if math.isfinite(mid_candidate) and mid_candidate > 0:
+            mid_val = mid_candidate
+        if price_val is None and mid_val is not None:
+            price_val = mid_val
         spread_val = getattr(tick, "spread_bps", None)
         try:
             spread_bps = float(spread_val) if spread_val is not None else None
         except Exception:
             spread_bps = None
         if spread_bps is None:
-            mid = (bid_val + ask_val) * 0.5
-            if mid <= 0:
+            if mid_val is None or mid_val <= 0:
+                self._maybe_fetch_rest_price(symbol)
                 return
-            spread_bps = (ask_val - bid_val) / mid * 10000.0
+            spread_bps = (ask_val - bid_val) / mid_val * 10000.0
         if spread_bps is None or not math.isfinite(spread_bps) or spread_bps <= 0:
+            if price_val is not None:
+                self._set_last_price(symbol, price_val)
+            else:
+                self._maybe_fetch_rest_price(symbol)
             return
+        if price_val is not None:
+            self._set_last_price(symbol, price_val)
+        else:
+            self._maybe_fetch_rest_price(symbol)
         ts_ms = int(getattr(tick, "ts", 0) or clock.now_ms())
         ttl_ms = self._spread_ttl_ms if self._spread_ttl_ms > 0 else self._spread_cache_max_ms
         expiry = ts_ms + ttl_ms if ttl_ms > 0 else None
@@ -1498,6 +1634,11 @@ class _Worker:
 
         symbol = bar.symbol.upper()
         ts_ms = int(bar.ts)
+        close_val = self._coerce_price(getattr(bar, "close", None))
+        if close_val is not None:
+            self._set_last_price(symbol, close_val)
+        else:
+            self._maybe_fetch_rest_price(symbol)
         prev_ts = self._last_bar_ts.get(symbol)
         gap_ms: int | None = None
         duplicate_ts = False
@@ -2296,6 +2437,13 @@ class ServiceSignalRunner:
             shutdown.on_flush(self.monitoring_agg.flush)
             shutdown.on_finalize(lambda: monitoring_thread.join(timeout=1.0))
 
+        rest_candidates = [
+            getattr(self.adapter, "rest_helper", None),
+            getattr(self.adapter, "client", None),
+            getattr(self.adapter, "rest_client", None),
+            getattr(self.adapter, "rest", None),
+        ]
+
         worker = _Worker(
             self.feature_pipe,
             self.policy,
@@ -2317,6 +2465,7 @@ class ServiceSignalRunner:
                 self.monitoring_cfg.thresholds, "zero_signals", 0
             ),
             state_enabled=self.cfg.state.enabled,
+            rest_candidates=rest_candidates,
         )
         if entry_limits_state is not None:
             try:
