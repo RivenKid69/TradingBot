@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable, Mapping
 import os
 import logging
+import math
 import threading
 import signal
 from pathlib import Path
@@ -73,6 +74,7 @@ from core_config import (
     StateConfig,
 )
 from no_trade_config import NoTradeConfig
+from dynamic_no_trade_guard import DynamicNoTradeGuard
 from utils import TokenBucket
 import di_registry
 import ws_dedup_state as signal_bus
@@ -196,6 +198,10 @@ class _Worker:
             self._symbol_buckets = defaultdict(self._symbol_bucket_factory)
             self._queue = deque(maxlen=throttle_cfg.queue.max_items)
         self._last_bar_ts: Dict[str, int] = {}
+        self._dynamic_guard: DynamicNoTradeGuard | None = None
+        dyn_cfg = getattr(self._no_trade_cfg, "dynamic_guard", None)
+        if dyn_cfg and getattr(dyn_cfg, "enable", False):
+            self._dynamic_guard = DynamicNoTradeGuard(dyn_cfg)
 
     def _acquire_tokens(self, symbol: str) -> tuple[bool, str | None]:
         if self._global_bucket is None:
@@ -229,6 +235,37 @@ class _Worker:
                 return abs(float(value))
             except Exception:
                 continue
+        return None
+
+    def _extract_spread_bps(self, bar: Bar) -> float | None:
+        """Best-effort extraction of spread information from ``bar``."""
+
+        for attr, multiplier in (("spread_bps", 1.0), ("half_spread_bps", 2.0)):
+            raw = getattr(bar, attr, None)
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except Exception:
+                continue
+            if math.isfinite(val):
+                return val * multiplier
+
+        bid = getattr(bar, "bid", None)
+        ask = getattr(bar, "ask", None)
+        if bid is None or ask is None:
+            bid = getattr(bar, "bid_price", None)
+            ask = getattr(bar, "ask_price", None)
+        try:
+            bid_val = float(bid) if bid is not None else float("nan")
+            ask_val = float(ask) if ask is not None else float("nan")
+        except Exception:
+            bid_val = float("nan")
+            ask_val = float("nan")
+        if math.isfinite(bid_val) and math.isfinite(ask_val) and bid_val > 0 and ask_val > 0:
+            mid = (bid_val + ask_val) * 0.5
+            if mid > 0:
+                return (ask_val - bid_val) / mid * 10000.0
         return None
 
     def _log_signal_quality_drop(
@@ -713,6 +750,52 @@ class _Worker:
                         bar.symbol,
                         win_res.stage.name,
                         win_res.reason.name if win_res.reason else "",
+                    ).inc()
+                except Exception:
+                    pass
+                return _finalize()
+
+        dyn_stage_cfg = self._pipeline_cfg.get("dynamic_guard") if self._pipeline_cfg else None
+        dyn_stage_enabled = dyn_stage_cfg is None or dyn_stage_cfg.enabled
+        if self._dynamic_guard is not None:
+            spread_bps = self._extract_spread_bps(bar)
+            self._dynamic_guard.update(symbol, bar, spread=spread_bps)
+            blocked, reason, snapshot = self._dynamic_guard.should_block(symbol)
+            if blocked and dyn_stage_enabled:
+                try:
+                    detail: Dict[str, object] = {
+                        "stage": Stage.WINDOWS.name,
+                        "reason": "DYNAMIC_GUARD",
+                        "symbol": bar.symbol,
+                    }
+                    if reason:
+                        detail["detail"] = reason
+                    if snapshot:
+                        detail["snapshot"] = {
+                            k: snapshot.get(k)
+                            for k in (
+                                "sigma",
+                                "atr_pct",
+                                "vol_metric",
+                                "vol_pctile",
+                                "spread",
+                                "spread_pctile",
+                                "cooldown",
+                                "trigger_reasons",
+                            )
+                        }
+                    self._logger.info("DROP %s", detail)
+                except Exception:
+                    pass
+                try:
+                    monitoring.inc_reason("DYNAMIC_GUARD")
+                except Exception:
+                    pass
+                try:
+                    pipeline_stage_drop_count.labels(
+                        bar.symbol,
+                        Stage.WINDOWS.name,
+                        "DYNAMIC_GUARD",
                     ).inc()
                 except Exception:
                     pass
