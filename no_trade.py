@@ -3,14 +3,21 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+import json
+import logging
+import re
+import time
+from collections import defaultdict
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-from no_trade_config import (
-    NoTradeConfig,
-    NoTradeState,
-    get_no_trade_config,
-)
+from no_trade_config import NoTradeConfig, NoTradeState, get_no_trade_config
+
+
+LOGGER = logging.getLogger(__name__)
+DEFAULT_MAINTENANCE_MAX_AGE_SEC = 24 * 3600
 
 
 def _parse_daily_windows_min(windows: List[str]) -> List[Tuple[int, int]]:
@@ -87,32 +94,70 @@ def _prepare_ts(df: pd.DataFrame, ts_col: str) -> Tuple[np.ndarray, np.ndarray]:
     return ts_int, valid
 
 
-def _window_reasons(ts_ms: np.ndarray, cfg: NoTradeConfig) -> pd.DataFrame:
+def _window_reasons(
+    ts_ms: np.ndarray,
+    cfg: NoTradeConfig,
+    *,
+    symbols: Optional[pd.Series] = None,
+    calendar: Optional[Dict[str, Any]] = None,
+    calendar_meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
     """Return per-reason mask for schedule-based no-trade windows."""
 
+    maintenance_state: Dict[str, Any] = {
+        "funding_buffer_min": int(getattr(cfg, "funding_buffer_min", 0) or 0),
+        "daily_utc": list(getattr(cfg, "daily_utc", []) or []),
+        "custom_ms": [],
+    }
+    for item in getattr(cfg, "custom_ms", []) or []:
+        if isinstance(item, Mapping):
+            start = _coerce_timestamp_ms(item.get("start_ts_ms"))
+            end = _coerce_timestamp_ms(item.get("end_ts_ms"))
+            if start is not None and end is not None and start < end:
+                payload = {"start_ts_ms": int(start), "end_ts_ms": int(end)}
+                if "symbol" in item:
+                    symbol = _coerce_str_or_none(item.get("symbol"))
+                    if symbol:
+                        payload["symbol"] = symbol
+                maintenance_state["custom_ms"].append(payload)
+
+    calendar_state: Dict[str, Any] = {}
+    if calendar_meta:
+        for key in ("path", "exists", "mtime", "age_sec", "stale", "error", "total", "discarded"):
+            if key in calendar_meta and calendar_meta[key] is not None:
+                calendar_state[key] = calendar_meta[key]
+    if calendar and calendar.get("windows"):
+        calendar_state["windows"] = calendar.get("windows")
+    if calendar_state:
+        maintenance_state["calendar"] = calendar_state
+
     if ts_ms.size == 0:
-        return pd.DataFrame(
+        df = pd.DataFrame(
             {
                 "maintenance_daily": [],
                 "maintenance_funding": [],
                 "maintenance_custom": [],
+                "maintenance_calendar": [],
                 "window": [],
             }
         )
+        return df.astype(bool), maintenance_state, calendar_meta or {}
 
     daily_min = _parse_daily_windows_min(cfg.daily_utc or [])
     m_daily = _in_daily_window(ts_ms, daily_min)
     m_funding = _in_funding_buffer(ts_ms, int(cfg.funding_buffer_min or 0))
     m_custom = _in_custom_window(ts_ms, cfg.custom_ms or [])
+    m_calendar = _apply_calendar_windows(ts_ms, calendar, symbols)
 
     data = {
         "maintenance_daily": m_daily,
         "maintenance_funding": m_funding,
         "maintenance_custom": m_custom,
+        "maintenance_calendar": m_calendar,
     }
     df = pd.DataFrame(data)
     df["window"] = df.any(axis=1)
-    return df.astype(bool)
+    return df.astype(bool), maintenance_state, calendar_meta or {}
 
 
 def _symbol_series(df: pd.DataFrame, column: str = "symbol") -> pd.Series:
@@ -141,6 +186,354 @@ def _coerce_int_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_timestamp_ms(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            ts = _coerce_timestamp_ms(item)
+            if ts is not None:
+                return ts
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        if np.isnan(value):
+            return None
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text, 10)
+        except ValueError:
+            try:
+                parsed = float(text)
+            except ValueError:
+                return None
+            if np.isnan(parsed):
+                return None
+            return int(parsed)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if np.isnan(parsed):
+            return None
+        return int(parsed)
+
+
+def _coerce_str_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (float, np.floating)):
+        if np.isnan(value):
+            return None
+    try:
+        if isinstance(value, pd.Series):  # defensive guard
+            value = value.iloc[0]
+    except Exception:  # pragma: no cover - defensive
+        pass
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        if lowered in {"nan", "none", "null"}:
+            return None
+        return text
+    try:
+        text = str(value)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in {"nan", "none", "null"}:
+        return None
+    return text
+
+
+def _parse_symbol_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        result: List[str] = []
+        for item in value:
+            result.extend(_parse_symbol_list(item))
+        return result
+    text = _coerce_str_or_none(value)
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            loaded = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, list):
+            return [sym for sym in (_coerce_str_or_none(item) for item in loaded) if sym]
+    parts = [part.strip() for part in re.split(r"[;,\\s/]+", text) if part.strip()]
+    if parts:
+        return parts
+    return [text]
+
+
+def _flatten_calendar_payload(payload: Any) -> List[Mapping[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, Mapping)]
+    if isinstance(payload, Mapping):
+        if isinstance(payload.get("windows"), list):
+            return [item for item in payload.get("windows", []) if isinstance(item, Mapping)]
+        if isinstance(payload.get("data"), list):
+            return [item for item in payload.get("data", []) if isinstance(item, Mapping)]
+
+        flattened: List[Mapping[str, Any]] = []
+        for key, value in payload.items():
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, Mapping):
+                        entry = dict(item)
+                        entry.setdefault("symbol", key)
+                        flattened.append(entry)
+            elif isinstance(value, Mapping):
+                entry = dict(value)
+                entry.setdefault("symbol", key)
+                flattened.append(entry)
+
+        if flattened:
+            return flattened
+        return [payload]
+    return []
+
+
+def _normalise_calendar_records(records: Iterable[Mapping[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    normalised: List[Dict[str, Any]] = []
+    total = 0
+    discarded = 0
+
+    start_keys = (
+        "start_ts_ms",
+        "start_ts",
+        "start_ms",
+        "start",
+        "from_ts_ms",
+        "from_ts",
+    )
+    end_keys = (
+        "end_ts_ms",
+        "end_ts",
+        "end_ms",
+        "end",
+        "to_ts_ms",
+        "to_ts",
+        "finish_ts_ms",
+    )
+
+    for item in records:
+        if not isinstance(item, Mapping):
+            continue
+
+        total += 1
+
+        start_ts: Optional[int] = None
+        end_ts: Optional[int] = None
+
+        for key in start_keys:
+            if key in item:
+                start_ts = _coerce_timestamp_ms(item.get(key))
+                if start_ts is not None:
+                    break
+
+        for key in end_keys:
+            if key in item:
+                end_ts = _coerce_timestamp_ms(item.get(key))
+                if end_ts is not None:
+                    break
+
+        if start_ts is None or end_ts is None or start_ts >= end_ts:
+            discarded += 1
+            continue
+
+        reason: Optional[str] = None
+        for key in ("reason", "label", "tag", "description", "title"):
+            reason = _coerce_str_or_none(item.get(key))
+            if reason:
+                break
+
+        symbols: List[str] = []
+        for key in ("symbol", "symbols", "pair", "pairs", "instrument"):
+            if key in item:
+                symbols = _parse_symbol_list(item.get(key))
+                if symbols:
+                    break
+
+        base_payload: Dict[str, Any] = {
+            "start_ts_ms": int(start_ts),
+            "end_ts_ms": int(end_ts),
+        }
+        if reason:
+            base_payload["reason"] = reason
+
+        if not symbols:
+            normalised.append(dict(base_payload))
+        else:
+            for symbol in symbols:
+                entry = dict(base_payload)
+                entry["symbol"] = symbol
+                normalised.append(entry)
+
+    meta = {"total": total, "discarded": discarded}
+    return normalised, meta
+
+
+def _build_calendar_structure(windows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    per_symbol: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    global_windows: List[Tuple[int, int]] = []
+
+    for entry in windows:
+        start = int(entry["start_ts_ms"])
+        end = int(entry["end_ts_ms"])
+        symbol = _coerce_str_or_none(entry.get("symbol"))
+        if symbol:
+            per_symbol[symbol].append((start, end))
+        else:
+            global_windows.append((start, end))
+
+    for key, items in per_symbol.items():
+        items.sort()
+        per_symbol[key] = items
+    global_windows.sort()
+
+    return {
+        "global": global_windows,
+        "per_symbol": dict(per_symbol),
+        "windows": windows,
+    }
+
+
+def _apply_calendar_windows(
+    ts_ms: np.ndarray,
+    calendar: Optional[Dict[str, Any]],
+    symbols: Optional[pd.Series] = None,
+) -> np.ndarray:
+    if ts_ms.size == 0:
+        return np.zeros_like(ts_ms, dtype=bool)
+    if not calendar:
+        return np.zeros_like(ts_ms, dtype=bool)
+
+    mask = np.zeros_like(ts_ms, dtype=bool)
+
+    for start, end in calendar.get("global", []) or []:
+        mask |= (ts_ms >= int(start)) & (ts_ms <= int(end))
+
+    if symbols is not None and calendar.get("per_symbol"):
+        symbol_values = symbols.to_numpy(dtype=object)
+        for symbol, windows in calendar.get("per_symbol", {}).items():
+            if not windows:
+                continue
+            symbol_mask = symbol_values == symbol
+            if not symbol_mask.any():
+                continue
+            symbol_mask = symbol_mask.astype(bool)
+            for start, end in windows:
+                mask |= symbol_mask & (ts_ms >= int(start)) & (ts_ms <= int(end))
+
+    return mask
+
+
+def _load_maintenance_calendar(cfg: NoTradeConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    maintenance_cfg = getattr(cfg, "maintenance", None)
+    if maintenance_cfg is None:
+        return {"global": [], "per_symbol": {}, "windows": []}, {}
+
+    path_value = getattr(maintenance_cfg, "path", None)
+    if not path_value:
+        return {"global": [], "per_symbol": {}, "windows": []}, {}
+
+    path = Path(path_value)
+    meta: Dict[str, Any] = {"path": str(path)}
+
+    if not path.exists():
+        LOGGER.warning("Maintenance calendar file not found: path=%s", path)
+        meta["exists"] = False
+        return {"global": [], "per_symbol": {}, "windows": []}, meta
+
+    meta["exists"] = True
+
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        LOGGER.warning("Failed to stat maintenance calendar file %s: %s", path, exc)
+        stat = None
+    if stat is not None:
+        mtime = stat.st_mtime
+        meta["mtime"] = mtime
+        age_sec = max(0.0, time.time() - mtime)
+        meta["age_sec"] = age_sec
+
+        max_age_sec = getattr(maintenance_cfg, "max_age_sec", None)
+        if max_age_sec is None:
+            max_age_hours = getattr(maintenance_cfg, "max_age_hours", None)
+            if max_age_hours is not None:
+                try:
+                    max_age_sec = float(max_age_hours) * 3600.0
+                except (TypeError, ValueError):
+                    max_age_sec = None
+        if max_age_sec is None:
+            max_age_sec = DEFAULT_MAINTENANCE_MAX_AGE_SEC
+
+        try:
+            threshold = float(max_age_sec) if max_age_sec is not None else None
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            threshold = None
+
+        if threshold is not None and age_sec > threshold:
+            meta["stale"] = True
+            LOGGER.warning(
+                "Maintenance calendar file looks stale: path=%s age_sec=%.0f max_age_sec=%s",
+                path,
+                age_sec,
+                threshold,
+            )
+        else:
+            meta["stale"] = False
+
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".json":
+            text = path.read_text(encoding="utf-8")
+            if text.strip():
+                payload = json.loads(text)
+                records = _flatten_calendar_payload(payload)
+            else:
+                records = []
+        elif suffix == ".csv":
+            df = pd.read_csv(path)
+            records = df.to_dict(orient="records")
+        else:
+            LOGGER.warning(
+                "Unsupported maintenance calendar format: path=%s suffix=%s",
+                path,
+                suffix or "<none>",
+            )
+            meta["error"] = "unsupported_format"
+            return {"global": [], "per_symbol": {}, "windows": []}, meta
+    except Exception as exc:  # pragma: no cover - parsing errors
+        LOGGER.warning("Failed to read maintenance calendar file %s: %s", path, exc)
+        meta["error"] = str(exc)
+        return {"global": [], "per_symbol": {}, "windows": []}, meta
+
+    windows, stats = _normalise_calendar_records(records)
+    meta.update(stats)
+    calendar = _build_calendar_structure(windows)
+    return calendar, meta
 
 
 def _reason_categories(reason: str) -> List[str]:
@@ -595,7 +988,15 @@ def _compute_no_trade_components(
     ts_int, ts_valid = _prepare_ts(df, ts_col)
     state_map = _extract_anomaly_state(state)
 
-    window_reasons = _window_reasons(ts_int, cfg)
+    symbols = _symbol_series(df)
+    calendar, calendar_meta = _load_maintenance_calendar(cfg)
+    window_reasons, maintenance_state, maintenance_meta = _window_reasons(
+        ts_int,
+        cfg,
+        symbols=symbols,
+        calendar=calendar,
+        calendar_meta=calendar_meta,
+    )
     window_reasons.index = df.index
     window_reasons = window_reasons.astype(bool)
     valid_series = pd.Series(ts_valid, index=df.index, dtype=bool)
@@ -605,10 +1006,6 @@ def _compute_no_trade_components(
     dyn_cfg = cfg.dynamic_guard if hasattr(cfg, "dynamic_guard") else None
     dyn_mask = pd.Series(False, index=df.index, dtype=bool)
     dyn_reasons = pd.DataFrame(index=df.index)
-    dyn_state: Dict[str, Any] = {
-        "anomaly_block_until_ts": dict(state_map),
-        "dynamic_guard": {},
-    }
     meta: Dict[str, Any] = {}
 
     expected_dyn_cols = [
@@ -632,12 +1029,14 @@ def _compute_no_trade_components(
             ts_valid=ts_valid,
             state_map=state_map,
         )
+        dyn_state = dict(dyn_state or {})
+        dyn_state.setdefault("anomaly_block_until_ts", dict(state_map))
+        dyn_state.setdefault("dynamic_guard", {})
         dyn_meta = getattr(dyn_reasons, "attrs", {}).get("meta") if isinstance(dyn_reasons, pd.DataFrame) else None
         if dyn_meta:
             meta["dynamic_guard"] = dyn_meta
     elif state_map:
         dyn_reasons = pd.DataFrame(False, index=df.index, columns=expected_dyn_cols)
-        symbols = _symbol_series(df)
         ts_series = pd.Series(ts_int, index=df.index, dtype=np.int64)
         for label in df.index:
             symbol = symbols.loc[label]
@@ -645,8 +1044,16 @@ def _compute_no_trade_components(
             if symbol in state_map and ts_val >= 0 and ts_val <= state_map[symbol]:
                 dyn_mask.loc[label] = True
                 dyn_reasons.at[label, "dyn_guard_state"] = True
+        dyn_state = {
+            "anomaly_block_until_ts": dict(state_map),
+            "dynamic_guard": {},
+        }
     else:
         dyn_reasons = pd.DataFrame(False, index=df.index, columns=expected_dyn_cols)
+        dyn_state = {
+            "anomaly_block_until_ts": dict(state_map),
+            "dynamic_guard": {},
+        }
 
     if not dyn_reasons.empty:
         for col in expected_dyn_cols:
@@ -656,6 +1063,17 @@ def _compute_no_trade_components(
         dyn_reasons = dyn_reasons.reindex(df.index).fillna(False).astype(bool)
     else:
         dyn_reasons = pd.DataFrame(False, index=df.index, columns=expected_dyn_cols)
+
+    dyn_state["maintenance"] = maintenance_state
+
+    if maintenance_meta:
+        filtered_meta = {
+            key: value
+            for key, value in maintenance_meta.items()
+            if key not in {"windows"} and value is not None
+        }
+        if filtered_meta:
+            meta["maintenance_calendar"] = filtered_meta
 
     reasons = pd.concat([window_reasons, dyn_reasons], axis=1)
     if not dyn_reasons.empty:
@@ -672,6 +1090,7 @@ def _compute_no_trade_components(
         "maintenance_daily": "Maintenance: daily schedule",
         "maintenance_funding": "Maintenance: funding buffer",
         "maintenance_custom": "Maintenance: custom window",
+        "maintenance_calendar": "Maintenance: calendar schedule",
         "dynamic_guard": "Dynamic guard",  # aggregated column
         "dyn_vol_abs": "Dynamic guard: volatility >= abs",
         "dyn_vol_pctile": "Dynamic guard: volatility percentile",
