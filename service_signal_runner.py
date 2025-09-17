@@ -19,7 +19,7 @@ for report in from_config(cfg):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable, Mapping
+from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable, Mapping, Tuple
 import os
 import logging
 import math
@@ -60,7 +60,7 @@ from services.signal_csv_writer import SignalCSVWriter
 from adapters.binance_spot_private import reconcile_state
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
-from core_models import Bar
+from core_models import Bar, Tick
 from core_contracts import FeaturePipe, SignalPolicy
 from services.utils_config import (
     snapshot_config,
@@ -202,6 +202,7 @@ class _Worker:
         dyn_cfg = getattr(self._no_trade_cfg, "dynamic_guard", None)
         if dyn_cfg and getattr(dyn_cfg, "enable", False):
             self._dynamic_guard = DynamicNoTradeGuard(dyn_cfg)
+        self._spread_injections: Dict[str, Tuple[float, int]] = {}
 
     def _acquire_tokens(self, symbol: str) -> tuple[bool, str | None]:
         if self._global_bucket is None:
@@ -240,6 +241,18 @@ class _Worker:
     def _extract_spread_bps(self, bar: Bar) -> float | None:
         """Best-effort extraction of spread information from ``bar``."""
 
+        symbol = str(getattr(bar, "symbol", "")).upper()
+        now = clock.now_ms()
+        injected = self._spread_injections.get(symbol)
+        if injected is not None:
+            spread_bps, tick_ts = injected
+            max_age_ms = self._ws_dedup_timeframe_ms if self._ws_dedup_timeframe_ms > 0 else 60_000
+            age = max(0, now - int(tick_ts)) if tick_ts else 0
+            if age <= max_age_ms and spread_bps > 0.0 and math.isfinite(spread_bps):
+                return spread_bps
+            if age > max_age_ms * 4:
+                self._spread_injections.pop(symbol, None)
+
         for attr, multiplier in (("spread_bps", 1.0), ("half_spread_bps", 2.0)):
             raw = getattr(bar, attr, None)
             if raw is None:
@@ -266,7 +279,51 @@ class _Worker:
             mid = (bid_val + ask_val) * 0.5
             if mid > 0:
                 return (ask_val - bid_val) / mid * 10000.0
+        high = getattr(bar, "high", None)
+        low = getattr(bar, "low", None)
+        close = getattr(bar, "close", None)
+        try:
+            high_val = float(high) if high is not None else float("nan")
+            low_val = float(low) if low is not None else float("nan")
+            close_val = float(close) if close is not None else float("nan")
+        except Exception:
+            return None
+        if (
+            math.isfinite(high_val)
+            and math.isfinite(low_val)
+            and math.isfinite(close_val)
+            and close_val != 0.0
+        ):
+            span = high_val - low_val
+            if span > 0.0:
+                return span / abs(close_val) * 10000.0
         return None
+
+    def on_tick(self, tick: Tick) -> None:
+        """Inject spread estimates from real-time book ticker events."""
+
+        symbol = str(getattr(tick, "symbol", "")).upper()
+        if not symbol:
+            return
+        bid = getattr(tick, "bid", None)
+        ask = getattr(tick, "ask", None)
+        if bid is None or ask is None:
+            return
+        try:
+            bid_val = float(bid)
+            ask_val = float(ask)
+        except Exception:
+            return
+        if not (math.isfinite(bid_val) and math.isfinite(ask_val) and bid_val > 0 and ask_val > 0):
+            return
+        mid = (bid_val + ask_val) * 0.5
+        if mid <= 0:
+            return
+        spread_bps = (ask_val - bid_val) / mid * 10000.0
+        if not math.isfinite(spread_bps) or spread_bps <= 0:
+            return
+        ts_ms = int(getattr(tick, "ts", 0) or clock.now_ms())
+        self._spread_injections[symbol] = (float(spread_bps), ts_ms)
 
     def _log_signal_quality_drop(
         self,
@@ -967,10 +1024,12 @@ async def worker_loop(bus: "EventBus", worker: _Worker) -> None:
             event = await bus.get()
             if event is None:
                 break
+            tick = getattr(event, "tick", None)
+            if tick is not None:
+                worker.on_tick(tick)
             bar = getattr(event, "bar", None)
-            if bar is None:
-                continue
-            worker.process(bar)
+            if bar is not None:
+                worker.process(bar)
     except asyncio.CancelledError:
         # Drain remaining events best-effort before shutting down
         try:
@@ -978,6 +1037,9 @@ async def worker_loop(bus: "EventBus", worker: _Worker) -> None:
                 ev = bus._queue.get_nowait()  # type: ignore[attr-defined]
                 if ev is None:
                     break
+                tick = getattr(ev, "tick", None)
+                if tick is not None:
+                    worker.on_tick(tick)
                 bar = getattr(ev, "bar", None)
                 if bar is not None:
                     worker.process(bar)
