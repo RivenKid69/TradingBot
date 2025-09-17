@@ -5,6 +5,7 @@ from dataclasses import dataclass, asdict
 from enum import IntEnum
 from typing import Optional, Deque, Tuple, Dict, Any, TYPE_CHECKING, Sequence
 from collections import deque
+from collections.abc import Mapping as MappingABC
 from clock import now_ms
 
 if TYPE_CHECKING:
@@ -272,9 +273,28 @@ class SimpleRiskGuard:
             # Reject stale timestamps outright
             return [], "RISK_STALE_TS"
 
+        def _signal_leg(order: Any) -> str:
+            meta = getattr(order, "meta", None)
+            if isinstance(meta, MappingABC):
+                return str(meta.get("signal_leg") or "").lower()
+            if meta is not None:
+                getter = getattr(meta, "get", None)
+                if callable(getter):
+                    try:
+                        value = getter("signal_leg")
+                    except Exception:
+                        value = None
+                    else:
+                        return str(value or "").lower()
+            return ""
+
         exp = 0.0
         checked: list[Any] = []
         for d in decisions:
+            leg = _signal_leg(d)
+            if leg == "exit":
+                checked.append(d)
+                continue
             vol = getattr(d, "volume_frac", getattr(d, "quantity", 0.0)) or 0.0
             try:
                 exp += abs(float(vol))

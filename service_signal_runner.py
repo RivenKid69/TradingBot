@@ -90,6 +90,8 @@ from utils import TokenBucket
 import di_registry
 import ws_dedup_state as signal_bus
 from services import state_storage
+from strategies.base import SignalPosition
+from utils.time import daily_reset_key
 
 
 class RiskGuards(Protocol):
@@ -107,6 +109,87 @@ class SignalQualityConfig:
     vol_floor_frac: float = 0.0
     log_reason: bool | str = ""
 
+
+@dataclass
+class _EntryLimiterConfig:
+    limit: int | None = None
+    reset_hour: int = 0
+
+
+class DailyEntryLimiter:
+    """Limit the number of entry transitions within a trading day."""
+
+    def __init__(self, limit: Any = None, reset_hour: Any = 0) -> None:
+        self._limit: int | None = self.normalize_limit(limit)
+        self._reset_hour: int = self.normalize_hour(reset_hour)
+        self._day_key: str | None = None
+        self._count: int = 0
+
+    @staticmethod
+    def normalize_limit(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return None
+        if limit <= 0:
+            return None
+        return limit
+
+    @staticmethod
+    def normalize_hour(value: Any) -> int:
+        if value is None:
+            return 0
+        try:
+            hour = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return hour % 24
+
+    @property
+    def enabled(self) -> bool:
+        return self._limit is not None
+
+    @property
+    def limit(self) -> int | None:
+        return self._limit
+
+    @property
+    def reset_hour(self) -> int:
+        return self._reset_hour
+
+    def allow(self, symbol: str, ts_ms: int, *, entry_steps: Any = 1) -> bool:
+        if not self.enabled:
+            return True
+        try:
+            steps = int(entry_steps)
+        except (TypeError, ValueError):
+            steps = 1
+        if steps <= 0:
+            steps = 1
+        try:
+            ts_val = int(ts_ms)
+        except (TypeError, ValueError):
+            ts_val = 0
+        day_key = daily_reset_key(ts_val, self._reset_hour)
+        if day_key != self._day_key:
+            self._day_key = day_key
+            self._count = 0
+        if self._limit is None:
+            return True
+        if self._count + steps > self._limit:
+            return False
+        self._count += steps
+        return True
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "limit": self._limit,
+            "entries_today": self._count,
+            "day_key": self._day_key,
+            "reset_hour": self._reset_hour,
+        }
 
 class _ScheduleNoTradeChecker:
     """Evaluate maintenance-based no-trade windows for individual bars."""
@@ -296,6 +379,20 @@ class _Worker:
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
         self._queue = None
+        entry_cfg = self._resolve_entry_limiter_config(executor)
+        self._entry_limiter = DailyEntryLimiter(
+            entry_cfg.limit, entry_cfg.reset_hour
+        )
+        self._entry_lock = threading.Lock()
+        if self._entry_limiter.enabled:
+            try:
+                self._logger.info(
+                    "daily entry limiter enabled: limit=%s reset_hour=%s",
+                    self._entry_limiter.limit,
+                    self._entry_limiter.reset_hour,
+                )
+            except Exception:
+                pass
         if throttle_cfg is not None and throttle_cfg.enabled:
             self._global_bucket = TokenBucket(
                 rps=throttle_cfg.global_.rps, burst=throttle_cfg.global_.burst
@@ -342,6 +439,213 @@ class _Worker:
     # ------------------------------------------------------------------
     # Dynamic guard helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_entry_config_candidate(obj: Any) -> tuple[int | None, int | None]:
+        if obj is None:
+            return None, None
+        limit: Any = None
+        reset: Any = None
+        if isinstance(obj, Mapping):
+            limit = obj.get("max_entries_per_day")
+            reset = obj.get("daily_reset_utc_hour")
+        else:
+            if hasattr(obj, "max_entries_per_day"):
+                limit = getattr(obj, "max_entries_per_day")
+            if hasattr(obj, "daily_reset_utc_hour"):
+                reset = getattr(obj, "daily_reset_utc_hour")
+        if limit is None and reset is None:
+            return None, None
+        return (
+            DailyEntryLimiter.normalize_limit(limit),
+            DailyEntryLimiter.normalize_hour(reset),
+        )
+
+    def _resolve_entry_limiter_config(self, executor: Any) -> _EntryLimiterConfig:
+        cfg = _EntryLimiterConfig()
+        seen: set[int] = set()
+        stack: list[Any] = [executor]
+        while stack:
+            obj = stack.pop()
+            if obj is None:
+                continue
+            obj_id = id(obj)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            for candidate in (
+                obj,
+                getattr(obj, "cfg", None),
+                getattr(obj, "config", None),
+            ):
+                limit_val, reset_val = self._extract_entry_config_candidate(candidate)
+                if limit_val is not None and cfg.limit is None:
+                    cfg.limit = limit_val
+                if reset_val is not None:
+                    cfg.reset_hour = reset_val
+                if cfg.limit is not None:
+                    break
+            if cfg.limit is not None:
+                break
+            for name in ("risk", "_risk", "manager", "_manager", "sim", "_sim"):
+                try:
+                    attr_val = getattr(obj, name)
+                except Exception:
+                    attr_val = None
+                if attr_val is None:
+                    continue
+                if id(attr_val) in seen:
+                    continue
+                stack.append(attr_val)
+        return cfg
+
+    @staticmethod
+    def _signal_leg(order: Any) -> str:
+        meta = getattr(order, "meta", None)
+        value: Any = None
+        if isinstance(meta, Mapping):
+            value = meta.get("signal_leg")
+        elif meta is not None:
+            getter = getattr(meta, "get", None)
+            if callable(getter):
+                try:
+                    value = getter("signal_leg")
+                except Exception:
+                    value = None
+        return str(value or "").lower()
+
+    @staticmethod
+    def _format_signal_state(state: Any) -> str:
+        if isinstance(state, SignalPosition):
+            return state.value
+        if state is None:
+            return ""
+        return str(state)
+
+    def _remove_entry_orders(
+        self, orders: Sequence[Any], symbol: str
+    ) -> tuple[list[Any], list[Any]]:
+        remaining: list[Any] = []
+        removed: list[Any] = []
+        for order in orders:
+            try:
+                order_symbol = getattr(order, "symbol", None)
+            except Exception:
+                order_symbol = None
+            if str(order_symbol or "") != symbol:
+                remaining.append(order)
+                continue
+            leg = self._signal_leg(order)
+            if leg == "entry":
+                removed.append(order)
+                continue
+            remaining.append(order)
+        return remaining, removed
+
+    def _handle_entry_limit_refusal(
+        self,
+        symbol: str,
+        ts_ms: int,
+        transition: Mapping[str, Any],
+        snapshot: Mapping[str, Any],
+        *,
+        entry_steps: int,
+        removed_count: int,
+    ) -> None:
+        prev_state = transition.get("prev")
+        new_state = transition.get("new")
+        revert_target: Any = prev_state
+        if (
+            prev_state not in (None, SignalPosition.FLAT)
+            and new_state not in (None, SignalPosition.FLAT)
+            and self._format_signal_state(prev_state)
+            != self._format_signal_state(new_state)
+        ):
+            # For reversals we keep the exit leg to flatten the position but block the
+            # subsequent entry, thus the signal state is rolled back to flat.
+            revert_target = SignalPosition.FLAT
+        if revert_target is None:
+            revert_target = SignalPosition.FLAT
+        try:
+            self._policy.revert_signal_state(symbol, revert_target)
+        except Exception:
+            pass
+        payload = {
+            "symbol": symbol,
+            "ts_ms": int(ts_ms),
+            "prev": self._format_signal_state(prev_state),
+            "new": self._format_signal_state(new_state),
+            "revert_to": self._format_signal_state(revert_target),
+            "entry_steps": int(entry_steps),
+            "removed_orders": int(removed_count),
+        }
+        try:
+            for key in ("limit", "entries_today", "day_key", "reset_hour"):
+                if key in snapshot:
+                    payload[key] = snapshot[key]
+        except Exception:
+            pass
+        try:
+            self._logger.info("ENTRY_LIMIT %s", payload)
+        except Exception:
+            pass
+        try:
+            monitoring.entry_limiter_block_count.labels(symbol).inc()
+        except Exception:
+            pass
+        try:
+            pipeline_stage_drop_count.labels(
+                symbol,
+                Stage.RISK.name,
+                "ENTRY_LIMIT",
+            ).inc()
+        except Exception:
+            pass
+
+    def _apply_entry_limiter(
+        self,
+        orders: Sequence[Any],
+        transitions: Sequence[Mapping[str, Any]],
+        *,
+        default_symbol: str,
+        ts_ms: int,
+    ) -> list[Any]:
+        if not getattr(self._entry_limiter, "enabled", False):
+            return list(orders)
+        filtered = list(orders)
+        for transition in transitions:
+            try:
+                raw_steps = transition.get("entry_steps", 0)
+            except AttributeError:
+                raw_steps = 0
+            try:
+                steps = int(raw_steps)
+            except (TypeError, ValueError):
+                steps = 0
+            if steps <= 0:
+                continue
+            symbol = str(transition.get("symbol") or default_symbol or "")
+            if not symbol:
+                continue
+            with self._entry_lock:
+                allowed = self._entry_limiter.allow(
+                    symbol, ts_ms, entry_steps=steps
+                )
+                snapshot = (
+                    self._entry_limiter.snapshot() if not allowed else {}
+                )
+            if allowed:
+                continue
+            filtered, removed = self._remove_entry_orders(filtered, symbol)
+            self._handle_entry_limit_refusal(
+                symbol,
+                ts_ms,
+                transition,
+                snapshot,
+                entry_steps=steps,
+                removed_count=len(removed),
+            )
+        return filtered
+
     def prewarm_dynamic_guard(
         self,
         history: Mapping[str, Sequence[Bar]]
@@ -1438,6 +1742,18 @@ class _Worker:
                 pass
             return _finalize()
         orders = list(pol_res.decision or [])
+
+        try:
+            transitions = list(self._policy.consume_signal_transitions())
+        except Exception:
+            transitions = []
+        if transitions and self._entry_limiter.enabled:
+            orders = self._apply_entry_limiter(
+                orders,
+                transitions,
+                default_symbol=str(getattr(bar, "symbol", "")),
+                ts_ms=int(getattr(bar, "ts", 0)),
+            )
 
         risk_res = apply_risk(
             int(bar.ts),
