@@ -1,9 +1,9 @@
 """Stateful dynamic no-trade guard used by the live signal runner.
 
-The guard mirrors the behaviour of the historical helper in :mod:`no_trade`
-but works in an online, per-symbol fashion.  It keeps rolling statistics for
-returns, ATR and spreads, applies configurable trigger thresholds and enforces
-hysteresis/cooldown rules to avoid rapid toggling.
+The guard mirrors the structured configuration used by the historical helper
+in :mod:`no_trade`.  It keeps rolling volatility/spread statistics and applies
+``sigma_k`` / ``spread_percentile`` triggers with upper/lower hysteresis and a
+cooldown to avoid rapid toggling.
 """
 
 from __future__ import annotations
@@ -42,17 +42,6 @@ def _deque_std(values: Deque[float], min_periods: int) -> float:
     return math.sqrt(var / (n - 1))
 
 
-def _deque_mean(values: Deque[float], min_periods: int) -> float:
-    """Simple moving average of ``values`` ignoring ``nan`` entries."""
-
-    if min_periods <= 0:
-        return float("nan")
-    finite = [v for v in values if math.isfinite(v)]
-    if len(finite) < min_periods or not finite:
-        return float("nan")
-    return sum(finite) / float(len(finite))
-
-
 def _deque_percentile(values: Deque[float], min_periods: int) -> float:
     """Percentile of the latest value relative to the window."""
 
@@ -71,20 +60,36 @@ def _deque_percentile(values: Deque[float], min_periods: int) -> float:
     return float(less_or_equal) / float(total)
 
 
+def _finite_float(value: object | None) -> float | None:
+    """Return ``value`` as ``float`` when finite, otherwise ``None``."""
+
+    try:
+        result = float(value)
+    except Exception:
+        return None
+    if math.isfinite(result):
+        return result
+    return None
+
+
+def _deque_count_finite(values: Deque[float]) -> int:
+    """Number of finite entries in ``values``."""
+
+    return sum(1 for v in values if math.isfinite(v))
+
+
 @dataclass
 class _SymbolState:
     """Per-symbol rolling statistics and guard status."""
 
     returns: Deque[float] = field(default_factory=deque)
-    true_range: Deque[float] = field(default_factory=deque)
-    vol_metric: Deque[float] = field(default_factory=deque)
     spread: Deque[float] = field(default_factory=deque)
     last_close: float | None = None
     blocked: bool = False
     cooldown: int = 0
     reason: str | None = None
     last_trigger: Tuple[str, ...] = ()
-    last_snapshot: Dict[str, float | int | str | List[str] | None] = field(default_factory=dict)
+    last_snapshot: Dict[str, object] = field(default_factory=dict)
 
 
 class DynamicNoTradeGuard:
@@ -92,36 +97,75 @@ class DynamicNoTradeGuard:
 
     def __init__(self, cfg: DynamicGuardConfig) -> None:
         self._cfg = cfg
-        self._sigma_window = max(1, int(cfg.sigma_window or 120))
-        self._atr_window = max(1, int(cfg.atr_window or 14))
-        self._sigma_min = min(self._sigma_window, max(2, self._sigma_window // 2))
-        self._atr_min = min(self._atr_window, max(1, self._atr_window // 2))
-        self._vol_pct_min = min(self._sigma_window, max(1, self._sigma_window // 5))
-        self._spread_pct_min = min(self._atr_window, max(1, self._atr_window // 5))
 
-        self._vol_abs = float(cfg.vol_abs) if cfg.vol_abs is not None else None
-        self._vol_pctile = (
-            float(cfg.vol_pctile) if cfg.vol_pctile is not None else None
-        )
-        self._spread_abs = (
-            float(cfg.spread_abs_bps) if cfg.spread_abs_bps is not None else None
-        )
-        self._spread_pctile = (
-            float(cfg.spread_pctile) if cfg.spread_pctile is not None else None
-        )
-        self._hysteresis = max(0.0, float(cfg.hysteresis or 0.0))
-        self._cooldown_bars = max(0, int(cfg.cooldown_bars or 0))
+        vol_cfg = getattr(cfg, "volatility", None)
+        spread_cfg = getattr(cfg, "spread", None)
 
-        self._log_reason = bool(cfg.log_reason)
-        self._has_thresholds = any(
-            x is not None
-            for x in (
-                self._vol_abs,
-                self._vol_pctile,
-                self._spread_abs,
-                self._spread_pctile,
-            )
+        sigma_window = int(getattr(vol_cfg, "window", None) or cfg.sigma_window or 120)
+        if sigma_window <= 1:
+            sigma_window = 120
+        sigma_min = int(
+            getattr(vol_cfg, "min_periods", None)
+            or cfg.sigma_min_periods
+            or min(sigma_window, max(2, sigma_window // 2))
         )
+        if sigma_min <= 1:
+            sigma_min = min(sigma_window, max(2, sigma_window // 2))
+
+        spread_window = int(
+            getattr(spread_cfg, "pctile_window", None)
+            or cfg.spread_pctile_window
+            or sigma_window
+        )
+        if spread_window <= 1:
+            spread_window = max(2, sigma_window // 2)
+        spread_min = int(
+            getattr(spread_cfg, "pctile_min_periods", None)
+            or cfg.spread_pctile_min_periods
+            or min(spread_window, max(1, spread_window // 2))
+        )
+        if spread_min <= 0:
+            spread_min = min(spread_window, max(1, spread_window // 2))
+
+        sigma_upper = _finite_float(getattr(vol_cfg, "upper_multiplier", None))
+        sigma_lower = _finite_float(getattr(vol_cfg, "lower_multiplier", None))
+        if sigma_upper is None:
+            sigma_upper = _finite_float(getattr(cfg, "sigma_k", None))
+        spread_upper = _finite_float(getattr(spread_cfg, "upper_pctile", None))
+        spread_lower = _finite_float(getattr(spread_cfg, "lower_pctile", None))
+        if spread_upper is None:
+            spread_upper = _finite_float(getattr(cfg, "spread_percentile", None))
+        if spread_upper is None:
+            spread_upper = _finite_float(getattr(cfg, "spread_pctile", None))
+
+        hysteresis_ratio = _finite_float(getattr(cfg, "hysteresis", None))
+        if hysteresis_ratio is not None and hysteresis_ratio < 0:
+            hysteresis_ratio = 0.0
+
+        if sigma_lower is None and sigma_upper is not None and hysteresis_ratio is not None:
+            sigma_lower = max(0.0, sigma_upper * (1.0 - hysteresis_ratio))
+        if spread_lower is None and spread_upper is not None and hysteresis_ratio is not None:
+            spread_lower = max(0.0, spread_upper - hysteresis_ratio)
+
+        cooldown_candidates = [int(cfg.cooldown_bars or 0)]
+        if vol_cfg is not None:
+            cooldown_candidates.append(int(getattr(vol_cfg, "cooldown_bars", 0) or 0))
+        if spread_cfg is not None:
+            cooldown_candidates.append(int(getattr(spread_cfg, "cooldown_bars", 0) or 0))
+        cooldown_bars = max(0, max(cooldown_candidates))
+
+        self._sigma_window = sigma_window
+        self._sigma_min = min(sigma_window, max(2, sigma_min))
+        self._spread_window = spread_window
+        self._spread_min = min(spread_window, max(1, spread_min))
+        self._sigma_upper = sigma_upper
+        self._sigma_lower = sigma_lower
+        self._spread_upper = spread_upper
+        self._spread_lower = spread_lower
+        self._cooldown_bars = cooldown_bars
+
+        self._needs_sigma = sigma_upper is not None
+        self._needs_spread = spread_upper is not None
         self._states: Dict[str, _SymbolState] = {}
 
     # ------------------------------------------------------------------
@@ -157,9 +201,7 @@ class DynamicNoTradeGuard:
         if state is None:
             state = _SymbolState(
                 returns=deque(maxlen=self._sigma_window),
-                true_range=deque(maxlen=self._atr_window),
-                vol_metric=deque(maxlen=self._sigma_window),
-                spread=deque(maxlen=self._atr_window),
+                spread=deque(maxlen=self._spread_window),
             )
             self._states[symbol] = state
         return state
@@ -173,132 +215,133 @@ class DynamicNoTradeGuard:
         evaluate: bool,
     ) -> None:
         close = _to_float(bar.close)
-        high = _to_float(bar.high)
-        low = _to_float(bar.low)
-
-        if math.isfinite(close) and state.last_close is not None and math.isfinite(state.last_close) and state.last_close != 0.0:
-            ret = (close - state.last_close) / state.last_close
-            if math.isfinite(ret):
-                state.returns.append(ret)
+        ret = float("nan")
+        if math.isfinite(close) and state.last_close is not None:
+            prev_close = float(state.last_close)
+            if math.isfinite(prev_close) and prev_close != 0.0:
+                ret = (close - prev_close) / prev_close
         elif state.last_close is None and math.isfinite(close):
-            # no return yet but keep window aligned by appending nan placeholder
-            state.returns.append(float("nan"))
-
-        if math.isfinite(high) and math.isfinite(low):
-            tr = high - low
-            if state.last_close is not None and math.isfinite(state.last_close):
-                tr = max(tr, abs(high - state.last_close), abs(low - state.last_close))
-            if math.isfinite(tr):
-                state.true_range.append(tr)
-            else:
-                state.true_range.append(float("nan"))
-        else:
-            state.true_range.append(float("nan"))
+            ret = float("nan")
 
         if math.isfinite(close):
             state.last_close = close
 
-        sigma = _deque_std(state.returns, self._sigma_min)
-        atr = _deque_mean(state.true_range, self._atr_min)
-        atr_pct = float("nan")
-        if math.isfinite(atr) and math.isfinite(close) and close != 0.0:
-            atr_pct = atr / abs(close)
-
-        vol_metric = sigma if math.isfinite(sigma) else atr_pct
-        if math.isfinite(vol_metric):
-            state.vol_metric.append(vol_metric)
+        if math.isfinite(ret):
+            state.returns.append(ret)
         else:
-            state.vol_metric.append(float("nan"))
+            state.returns.append(float("nan"))
 
         spread_val = float("nan")
         if spread is not None:
             spread_val = _to_float(spread)
-        elif math.isfinite(atr_pct):
-            spread_val = atr_pct * 10000.0
         state.spread.append(spread_val if math.isfinite(spread_val) else float("nan"))
 
-        vol_pctile = _deque_percentile(state.vol_metric, self._vol_pct_min)
-        spread_pctile = _deque_percentile(state.spread, self._spread_pct_min)
+        sigma = _deque_std(state.returns, self._sigma_min)
+        spread_pct = _deque_percentile(state.spread, self._spread_min)
 
-        snapshot = {
-            "sigma": sigma,
-            "atr": atr,
-            "atr_pct": atr_pct,
-            "vol_metric": vol_metric,
-            "vol_pctile": vol_pctile,
-            "spread": spread_val,
-            "spread_pctile": spread_pctile,
-            "blocked": state.blocked,
-            "cooldown": state.cooldown,
-            "trigger_reasons": list(state.last_trigger),
-            "reason": state.reason,
-        }
+        sigma_ready = _deque_count_finite(state.returns) >= self._sigma_min
+        spread_ready = _deque_count_finite(state.spread) >= self._spread_min
 
-        if not evaluate or not self._has_thresholds:
-            state.last_snapshot = snapshot
-            return
+        abs_ret = abs(ret) if math.isfinite(ret) else float("nan")
+        sigma_ratio = float("nan")
+        if sigma_ready and math.isfinite(sigma) and sigma > 0.0 and math.isfinite(abs_ret):
+            sigma_ratio = abs_ret / sigma
+
+        guard_ready = True
+        if self._needs_sigma and not sigma_ready:
+            guard_ready = False
+        if self._needs_spread and not spread_ready:
+            guard_ready = False
 
         trigger_reasons: List[str] = []
-        if self._vol_abs is not None and math.isfinite(vol_metric) and vol_metric >= self._vol_abs:
-            trigger_reasons.append("vol_abs")
-        if self._vol_pctile is not None and math.isfinite(vol_pctile) and vol_pctile >= self._vol_pctile:
-            trigger_reasons.append("vol_pctile")
-        if self._spread_abs is not None and math.isfinite(spread_val) and spread_val >= self._spread_abs:
-            trigger_reasons.append("spread_abs")
-        if self._spread_pctile is not None and math.isfinite(spread_pctile) and spread_pctile >= self._spread_pctile:
-            trigger_reasons.append("spread_pctile")
+        if evaluate and guard_ready:
+            if (
+                self._sigma_upper is not None
+                and math.isfinite(sigma_ratio)
+                and sigma_ratio >= self._sigma_upper
+            ):
+                trigger_reasons.append("vol_extreme")
+            if (
+                self._spread_upper is not None
+                and math.isfinite(spread_pct)
+                and spread_pct >= self._spread_upper
+            ):
+                trigger_reasons.append("spread_wide")
 
-        if trigger_reasons:
+        if evaluate and guard_ready and trigger_reasons:
             state.blocked = True
             state.cooldown = max(state.cooldown, self._cooldown_bars)
             state.last_trigger = tuple(trigger_reasons)
-            base_reason = ",".join(trigger_reasons)
-            state.reason = f"trigger:{base_reason}"
-        elif state.blocked:
+            if "vol_extreme" in trigger_reasons:
+                state.reason = "vol_extreme"
+            else:
+                state.reason = "spread_wide"
+        elif evaluate and guard_ready and state.blocked:
             release_ready = True
-            if self._vol_abs is not None and math.isfinite(vol_metric):
-                release_thr = self._vol_abs * (1.0 - self._hysteresis)
-                if vol_metric > release_thr:
+            if "vol_extreme" in state.last_trigger and self._sigma_upper is not None:
+                release_thr = (
+                    self._sigma_lower
+                    if self._sigma_lower is not None
+                    else self._sigma_upper
+                )
+                if not (
+                    math.isfinite(sigma_ratio)
+                    and release_thr is not None
+                    and sigma_ratio <= release_thr
+                ):
                     release_ready = False
-            if self._vol_pctile is not None and math.isfinite(vol_pctile):
-                release_thr = max(0.0, self._vol_pctile - self._hysteresis)
-                if vol_pctile > release_thr:
-                    release_ready = False
-            if self._spread_abs is not None and math.isfinite(spread_val):
-                release_thr = self._spread_abs * (1.0 - self._hysteresis)
-                if spread_val > release_thr:
-                    release_ready = False
-            if self._spread_pctile is not None and math.isfinite(spread_pctile):
-                release_thr = max(0.0, self._spread_pctile - self._hysteresis)
-                if spread_pctile > release_thr:
+            if "spread_wide" in state.last_trigger and self._spread_upper is not None:
+                release_thr = (
+                    self._spread_lower
+                    if self._spread_lower is not None
+                    else self._spread_upper
+                )
+                if not (
+                    math.isfinite(spread_pct)
+                    and release_thr is not None
+                    and spread_pct <= release_thr
+                ):
                     release_ready = False
 
             if release_ready:
                 if state.cooldown > 0:
                     state.cooldown -= 1
-                    trigger = ",".join(state.last_trigger) if state.last_trigger else ""
-                    suffix = f"|trigger={trigger}" if trigger else ""
-                    state.reason = f"hold:cooldown{suffix}" if self._log_reason else "hold:cooldown"
                 else:
                     state.blocked = False
                     state.reason = None
                     state.last_trigger = ()
             else:
-                trigger = ",".join(state.last_trigger) if state.last_trigger else ""
-                suffix = f"|trigger={trigger}" if trigger and self._log_reason else ""
-                state.reason = f"hold:hysteresis{suffix}" if self._log_reason else "hold:hysteresis"
+                state.cooldown = max(0, state.cooldown)
+                if "vol_extreme" in state.last_trigger:
+                    state.reason = "vol_extreme"
+                elif "spread_wide" in state.last_trigger:
+                    state.reason = "spread_wide"
+        elif evaluate and not guard_ready:
+            state.blocked = False
+            state.cooldown = 0
+            state.reason = None
+            state.last_trigger = ()
+        elif not evaluate:
+            pass
         else:
+            state.blocked = False
             state.cooldown = 0
             state.reason = None
             state.last_trigger = ()
 
-        snapshot.update(
-            {
-                "blocked": state.blocked,
-                "cooldown": state.cooldown,
-                "trigger_reasons": list(state.last_trigger),
-                "reason": state.reason,
-            }
-        )
+        snapshot = {
+            "sigma": sigma if math.isfinite(sigma) else None,
+            "sigma_ready": sigma_ready,
+            "abs_return": abs_ret if math.isfinite(abs_ret) else None,
+            "sigma_k": sigma_ratio if math.isfinite(sigma_ratio) else None,
+            "spread_bps": spread_val if math.isfinite(spread_val) else None,
+            "spread_ready": spread_ready,
+            "spread_percentile": spread_pct if math.isfinite(spread_pct) else None,
+            "blocked": state.blocked,
+            "cooldown": state.cooldown,
+            "trigger_reasons": list(state.last_trigger),
+            "reason": state.reason,
+            "ready": guard_ready,
+        }
         state.last_snapshot = snapshot
 

@@ -80,7 +80,11 @@ from no_trade import (
     _in_funding_buffer,
     _in_custom_window,
 )
-from no_trade_config import NoTradeConfig, DEFAULT_NO_TRADE_STATE_PATH
+from no_trade_config import (
+    NoTradeConfig,
+    DEFAULT_NO_TRADE_STATE_PATH,
+    DynamicGuardConfig,
+)
 from dynamic_no_trade_guard import DynamicNoTradeGuard
 from utils import TokenBucket
 import di_registry
@@ -301,8 +305,23 @@ class _Worker:
             self._queue = deque(maxlen=throttle_cfg.queue.max_items)
         self._last_bar_ts: Dict[str, int] = {}
         self._dynamic_guard: DynamicNoTradeGuard | None = None
-        dyn_cfg = getattr(self._no_trade_cfg, "dynamic_guard", None)
-        if dyn_cfg and getattr(dyn_cfg, "enable", False):
+        dyn_cfg: DynamicGuardConfig | None = None
+        if self._no_trade_cfg is not None:
+            structured = getattr(self._no_trade_cfg, "dynamic", None)
+            if structured is not None:
+                dyn_enabled = getattr(structured, "enabled", None)
+                guard_cfg = getattr(structured, "guard", None)
+                if (
+                    guard_cfg is not None
+                    and getattr(guard_cfg, "enable", False)
+                    and (dyn_enabled is None or bool(dyn_enabled))
+                ):
+                    dyn_cfg = guard_cfg
+            if dyn_cfg is None:
+                legacy = getattr(self._no_trade_cfg, "dynamic_guard", None)
+                if legacy is not None and getattr(legacy, "enable", False):
+                    dyn_cfg = legacy
+        if dyn_cfg is not None:
             self._dynamic_guard = DynamicNoTradeGuard(dyn_cfg)
         self._schedule_checker = _ScheduleNoTradeChecker(self._no_trade_cfg)
         self._spread_injections: Dict[str, Tuple[float, int]] = {}
@@ -1054,6 +1073,10 @@ class _Worker:
             warmup_ready = True
             if fp_snapshot is not None:
                 warmup_ready = bool(getattr(fp_snapshot, "window_ready", True))
+            guard_ready = bool(snapshot.get("ready", True)) if snapshot else True
+            if not guard_ready:
+                blocked = False
+                reason = None
             if not warmup_ready:
                 blocked = False
                 reason = None
@@ -1061,30 +1084,36 @@ class _Worker:
                 metrics: Dict[str, object] = {}
                 if snapshot:
                     metrics = {
-                        k: snapshot.get(k)
-                        for k in (
-                            "sigma",
-                            "atr_pct",
-                            "vol_metric",
-                            "vol_pctile",
-                            "spread",
-                            "spread_pctile",
-                            "cooldown",
-                            "trigger_reasons",
-                        )
+                        "sigma": snapshot.get("sigma"),
+                        "sigma_k": snapshot.get("sigma_k"),
+                        "spread_bps": snapshot.get("spread_bps"),
+                        "spread_percentile": snapshot.get("spread_percentile"),
+                        "cooldown": snapshot.get("cooldown"),
+                        "trigger_reasons": snapshot.get("trigger_reasons"),
+                        "ready": snapshot.get("ready"),
                     }
                 if fp_snapshot is not None:
                     metrics.setdefault("warmup_ready", warmup_ready)
                     fp_spread = getattr(fp_snapshot, "spread_bps", None)
                     if fp_spread is not None:
-                        metrics.setdefault("spread", fp_spread)
+                        metrics.setdefault("spread_bps", fp_spread)
+                log_reason = reason
+                triggers = snapshot.get("trigger_reasons") if snapshot else None
+                if not log_reason and isinstance(triggers, SequenceABC):
+                    triggers = list(triggers)
+                    if "vol_extreme" in triggers:
+                        log_reason = "vol_extreme"
+                    elif "spread_wide" in triggers:
+                        log_reason = "spread_wide"
+                if not log_reason:
+                    log_reason = "vol_extreme"
                 try:
                     detail: Dict[str, object] = {
                         "stage": Stage.WINDOWS.name,
-                        "reason": "DYNAMIC_GUARD",
+                        "reason": log_reason,
                         "symbol": bar.symbol,
                     }
-                    if reason:
+                    if reason and reason != log_reason:
                         detail["detail"] = reason
                     if metrics:
                         detail["metrics"] = metrics
@@ -1102,14 +1131,18 @@ class _Worker:
                 except Exception:
                     pass
                 try:
-                    monitoring.inc_reason("DYNAMIC_GUARD")
+                    reason_label = {
+                        "vol_extreme": Reason.EXTREME_VOL,
+                        "spread_wide": Reason.EXTREME_SPREAD,
+                    }.get(log_reason, Reason.OTHER)
+                    monitoring.inc_reason(reason_label)
                 except Exception:
                     pass
                 try:
                     pipeline_stage_drop_count.labels(
                         bar.symbol,
                         Stage.WINDOWS.name,
-                        "DYNAMIC_GUARD",
+                        log_reason,
                     ).inc()
                 except Exception:
                     pass
@@ -1145,9 +1178,12 @@ class _Worker:
         )
         if win_res.action == "drop":
             try:
+                log_reason = "maintenance" if win_reason else getattr(
+                    win_res.reason, "name", ""
+                )
                 payload = {
                     "stage": win_res.stage.name,
-                    "reason": getattr(win_res.reason, "name", ""),
+                    "reason": log_reason,
                 }
                 if win_reason:
                     payload["detail"] = win_reason
@@ -1155,7 +1191,7 @@ class _Worker:
             except Exception:
                 pass
             try:
-                reason_label = win_reason or (
+                reason_label = "maintenance" if win_reason else (
                     win_res.reason.name if win_res.reason else ""
                 )
                 pipeline_stage_drop_count.labels(
