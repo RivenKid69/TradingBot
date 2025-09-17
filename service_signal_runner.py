@@ -324,7 +324,18 @@ class _Worker:
         if dyn_cfg is not None:
             self._dynamic_guard = DynamicNoTradeGuard(dyn_cfg)
         self._schedule_checker = _ScheduleNoTradeChecker(self._no_trade_cfg)
-        self._spread_injections: Dict[str, Tuple[float, int]] = {}
+        try:
+            ttl_attr = getattr(fp, "spread_ttl_ms", None)
+            if ttl_attr is None:
+                ttl_attr = getattr(fp, "_spread_ttl_ms", None)
+            self._spread_ttl_ms = max(0, int(ttl_attr or 0))
+        except Exception:
+            self._spread_ttl_ms = 0
+        cache_ttl = max(self._spread_ttl_ms, int(ws_dedup_timeframe_ms))
+        if cache_ttl <= 0:
+            cache_ttl = 60_000
+        self._spread_cache_max_ms = cache_ttl
+        self._spread_injections: Dict[str, Dict[str, float | int | None]] = {}
 
     # ------------------------------------------------------------------
     # Dynamic guard helpers
@@ -341,7 +352,67 @@ class _Worker:
         if self._dynamic_guard is None or not history:
             return
 
-        grouped: Dict[str, list[Bar]] = {}
+        grouped: Dict[str, list[tuple[Bar, float | None]]] = {}
+
+        def _coerce_spread(value: object) -> float | None:
+            try:
+                spread_val = float(value)
+            except Exception:
+                return None
+            if not math.isfinite(spread_val) or spread_val <= 0.0:
+                return None
+            return spread_val
+
+        def _infer_spread_from_bar(bar: Bar) -> float | None:
+            for attr, multiplier in (("spread_bps", 1.0), ("half_spread_bps", 2.0)):
+                raw = getattr(bar, attr, None)
+                if raw is None:
+                    continue
+                try:
+                    val = float(raw)
+                except Exception:
+                    continue
+                if math.isfinite(val) and val > 0.0:
+                    return val * multiplier
+            bid = getattr(bar, "bid", None) or getattr(bar, "bid_price", None)
+            ask = getattr(bar, "ask", None) or getattr(bar, "ask_price", None)
+            try:
+                if bid is not None and ask is not None:
+                    bid_val = float(bid)
+                    ask_val = float(ask)
+                    if (
+                        math.isfinite(bid_val)
+                        and math.isfinite(ask_val)
+                        and bid_val > 0.0
+                        and ask_val > 0.0
+                    ):
+                        mid = (bid_val + ask_val) * 0.5
+                        if mid > 0.0:
+                            spread = (ask_val - bid_val) / mid * 10000.0
+                            if math.isfinite(spread) and spread > 0.0:
+                                return spread
+            except Exception:
+                pass
+            try:
+                high_val = float(getattr(bar, "high", float("nan")))
+                low_val = float(getattr(bar, "low", float("nan")))
+            except Exception:
+                return None
+            if not (math.isfinite(high_val) and math.isfinite(low_val)):
+                return None
+            span = high_val - low_val
+            if span <= 0.0:
+                return None
+            mid = (high_val + low_val) * 0.5
+            if mid == 0.0 or not math.isfinite(mid):
+                return None
+            spread = span / abs(mid) * 10000.0
+            if spread <= 0.0 or not math.isfinite(spread):
+                return None
+            return spread
+
+        def _append(sym: str, bar: Bar, spread: float | None) -> None:
+            grouped.setdefault(sym, []).append((bar, spread))
 
         try:
             if isinstance(history, MappingABC):
@@ -374,21 +445,90 @@ class _Worker:
                             if bar_obj is not None:
                                 sym = str(getattr(bar_obj, "symbol", "")).upper()
                                 if sym:
-                                    grouped.setdefault(sym, []).append(bar_obj)
+                                    spread_val = _coerce_spread(
+                                        item.get("spread_bps")
+                                        if isinstance(item, MappingABC)
+                                        else None
+                                    )
+                                    if spread_val is None:
+                                        half_val = _coerce_spread(
+                                            item.get("half_spread_bps")
+                                            if isinstance(item, MappingABC)
+                                            else None
+                                        )
+                                        if half_val is not None:
+                                            spread_val = half_val * 2.0
+                                    if spread_val is None:
+                                        spread_val = _infer_spread_from_bar(bar_obj)
+                                    _append(sym, bar_obj, spread_val)
                                 continue
                         for symbol, bars in item.items():
                             sym = str(symbol).upper()
-                            seq = [bar for bar in list(bars or []) if isinstance(bar, Bar)]
+                            seq = list(bars or [])
                             if not seq:
                                 continue
-                            grouped.setdefault(sym, []).extend(seq)
+                            for entry in seq:
+                                if isinstance(entry, Bar):
+                                    spread_val = _infer_spread_from_bar(entry)
+                                    _append(sym, entry, spread_val)
+                                elif (
+                                    isinstance(entry, tuple)
+                                    and len(entry) == 2
+                                    and isinstance(entry[0], Bar)
+                                ):
+                                    spread_val = _coerce_spread(entry[1])
+                                    if spread_val is None:
+                                        spread_val = _infer_spread_from_bar(entry[0])
+                                    _append(sym, entry[0], spread_val)
                         continue
                 if not sym or not seq:
                     continue
-                valid = [bar for bar in seq if isinstance(bar, Bar)]
-                if not valid:
-                    continue
-                grouped.setdefault(sym, []).extend(valid)
+                for entry in seq:
+                    bar_obj = None
+                    spread_val: float | None = None
+                    if isinstance(entry, Bar):
+                        bar_obj = entry
+                        spread_val = _infer_spread_from_bar(entry)
+                    elif (
+                        isinstance(entry, tuple)
+                        and len(entry) == 2
+                        and isinstance(entry[0], Bar)
+                    ):
+                        bar_obj = entry[0]
+                        spread_val = _coerce_spread(entry[1])
+                        if spread_val is None:
+                            spread_val = _infer_spread_from_bar(bar_obj)
+                    elif (
+                        isinstance(entry, tuple)
+                        and len(entry) == 2
+                        and isinstance(entry[1], Bar)
+                    ):
+                        bar_obj = entry[1]
+                        spread_val = _coerce_spread(entry[0])
+                        if spread_val is None:
+                            spread_val = _infer_spread_from_bar(bar_obj)
+                    elif isinstance(entry, MappingABC):
+                        bar_candidate = entry.get("bar")
+                        if isinstance(bar_candidate, Bar):
+                            bar_obj = bar_candidate
+                        else:
+                            keys = {str(k).lower() for k in entry.keys()}
+                            if {"ts", "symbol", "open", "high", "low", "close"}.issubset(keys):
+                                try:
+                                    bar_obj = Bar.from_dict(entry)  # type: ignore[arg-type]
+                                except Exception:
+                                    bar_obj = None
+                        if bar_obj is not None:
+                            spread_val = _coerce_spread(entry.get("spread_bps"))
+                            if spread_val is None:
+                                half_val = _coerce_spread(entry.get("half_spread_bps"))
+                                if half_val is not None:
+                                    spread_val = half_val * 2.0
+                            if spread_val is None:
+                                spread_val = _infer_spread_from_bar(bar_obj)
+                    if bar_obj is None:
+                        continue
+                    _append(sym, bar_obj, spread_val)
         except Exception:
             return
 
@@ -396,14 +536,14 @@ class _Worker:
             return
 
         counts: Dict[str, int] = {}
-        for sym, bars in grouped.items():
-            if not bars:
+        for sym, entries in grouped.items():
+            if not entries:
                 continue
             try:
-                self._dynamic_guard.prewarm(sym, bars)
+                self._dynamic_guard.prewarm(sym, entries)
             except Exception:
                 continue
-            counts[sym] = len(bars)
+            counts[sym] = len(entries)
 
         if counts:
             try:
@@ -462,15 +602,48 @@ class _Worker:
         if metrics_snapshot is not None:
             spread = getattr(metrics_snapshot, "spread_bps", None)
             if spread is not None and math.isfinite(float(spread)) and float(spread) > 0:
-                return float(spread)
+                expiry = getattr(metrics_snapshot, "spread_valid_until", None)
+                try:
+                    expiry_int = int(expiry) if expiry is not None else None
+                except Exception:
+                    expiry_int = None
+                if expiry_int is None and self._spread_ttl_ms > 0:
+                    spread_ts = getattr(metrics_snapshot, "spread_ts", None)
+                    try:
+                        spread_ts_int = int(spread_ts)
+                    except Exception:
+                        spread_ts_int = None
+                    if spread_ts_int is not None:
+                        expiry_int = spread_ts_int + self._spread_ttl_ms
+                if expiry_int is None or now <= expiry_int:
+                    return float(spread)
         injected = self._spread_injections.get(symbol)
         if injected is not None:
-            spread_bps, tick_ts = injected
-            max_age_ms = self._ws_dedup_timeframe_ms if self._ws_dedup_timeframe_ms > 0 else 60_000
-            age = max(0, now - int(tick_ts)) if tick_ts else 0
-            if age <= max_age_ms and spread_bps > 0.0 and math.isfinite(spread_bps):
+            try:
+                spread_bps = float(injected.get("spread", float("nan")))
+            except Exception:
+                spread_bps = float("nan")
+            expiry_raw = injected.get("expiry")
+            try:
+                expiry_int = int(expiry_raw) if expiry_raw is not None else None
+            except Exception:
+                expiry_int = None
+            valid = True
+            if expiry_int is not None and now > expiry_int:
+                valid = False
+            if valid and math.isfinite(spread_bps) and spread_bps > 0.0:
                 return spread_bps
-            if age > max_age_ms * 4:
+            tick_ts_raw = injected.get("ts")
+            try:
+                tick_ts_int = int(tick_ts_raw) if tick_ts_raw is not None else None
+            except Exception:
+                tick_ts_int = None
+            max_age_ms = self._spread_cache_max_ms
+            if tick_ts_int is not None:
+                age = max(0, now - tick_ts_int)
+                if age > max_age_ms * 4:
+                    self._spread_injections.pop(symbol, None)
+            else:
                 self._spread_injections.pop(symbol, None)
 
         for attr, multiplier in (("spread_bps", 1.0), ("half_spread_bps", 2.0)):
@@ -501,22 +674,23 @@ class _Worker:
                 return (ask_val - bid_val) / mid * 10000.0
         high = getattr(bar, "high", None)
         low = getattr(bar, "low", None)
-        close = getattr(bar, "close", None)
         try:
             high_val = float(high) if high is not None else float("nan")
             low_val = float(low) if low is not None else float("nan")
-            close_val = float(close) if close is not None else float("nan")
         except Exception:
             return None
-        if (
-            math.isfinite(high_val)
-            and math.isfinite(low_val)
-            and math.isfinite(close_val)
-            and close_val != 0.0
-        ):
+        if math.isfinite(high_val) and math.isfinite(low_val):
             span = high_val - low_val
             if span > 0.0:
-                return span / abs(close_val) * 10000.0
+                mid_val = (high_val + low_val) * 0.5
+                if not math.isfinite(mid_val) or mid_val == 0.0:
+                    close = getattr(bar, "close", None)
+                    try:
+                        mid_val = float(close) if close is not None else float("nan")
+                    except Exception:
+                        mid_val = float("nan")
+                if math.isfinite(mid_val) and mid_val != 0.0:
+                    return span / abs(mid_val) * 10000.0
         return None
 
     def on_tick(self, tick: Tick) -> None:
@@ -534,16 +708,33 @@ class _Worker:
             ask_val = float(ask)
         except Exception:
             return
-        if not (math.isfinite(bid_val) and math.isfinite(ask_val) and bid_val > 0 and ask_val > 0):
+        if not (
+            math.isfinite(bid_val)
+            and math.isfinite(ask_val)
+            and bid_val > 0
+            and ask_val > 0
+        ):
             return
-        mid = (bid_val + ask_val) * 0.5
-        if mid <= 0:
-            return
-        spread_bps = (ask_val - bid_val) / mid * 10000.0
-        if not math.isfinite(spread_bps) or spread_bps <= 0:
+        spread_val = getattr(tick, "spread_bps", None)
+        try:
+            spread_bps = float(spread_val) if spread_val is not None else None
+        except Exception:
+            spread_bps = None
+        if spread_bps is None:
+            mid = (bid_val + ask_val) * 0.5
+            if mid <= 0:
+                return
+            spread_bps = (ask_val - bid_val) / mid * 10000.0
+        if spread_bps is None or not math.isfinite(spread_bps) or spread_bps <= 0:
             return
         ts_ms = int(getattr(tick, "ts", 0) or clock.now_ms())
-        self._spread_injections[symbol] = (float(spread_bps), ts_ms)
+        ttl_ms = self._spread_ttl_ms if self._spread_ttl_ms > 0 else self._spread_cache_max_ms
+        expiry = ts_ms + ttl_ms if ttl_ms > 0 else None
+        self._spread_injections[symbol] = {
+            "spread": float(spread_bps),
+            "ts": ts_ms,
+            "expiry": expiry,
+        }
         recorder = getattr(self._fp, "record_spread", None)
         if callable(recorder):
             try:
@@ -553,6 +744,7 @@ class _Worker:
                     bid=bid_val,
                     ask=ask_val,
                     ts_ms=ts_ms,
+                    ttl_ms=ttl_ms,
                 )
             except Exception:
                 pass
