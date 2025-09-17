@@ -1,8 +1,8 @@
 # Recommended no-trade configuration with structured dynamic guard defaults.
 no_trade:
   maintenance:
-    format: "HH:MM-HH:MM"      # daily UTC windows in HH:MM-HH:MM format
-    path: null                  # optional external calendar (relative paths are resolved)
+    format: "HH:MM-HH:MM"      # "HH:MM-HH:MM" for inline daily windows, use "json"/"csv"/"auto" for external files
+    path: null                  # optional external calendar (relative to this YAML); see data/maintenance/example_schedule.json
     funding_buffer_min: 5
     daily_utc:
       - "00:00-00:05"

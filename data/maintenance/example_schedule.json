@@ -1,0 +1,13 @@
+[
+  {
+    "start_ts_ms": 1704067200000,
+    "end_ts_ms": 1704070800000,
+    "reason": "Daily clearing window",
+    "symbol": "BTCUSDT"
+  },
+  {
+    "start_ts_ms": 1704153600000,
+    "end_ts_ms": 1704159000000,
+    "reason": "Exchange maintenance"
+  }
+]

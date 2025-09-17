@@ -123,11 +123,27 @@ def _window_reasons(
 
     calendar_state: Dict[str, Any] = {}
     if calendar_meta:
-        for key in ("path", "exists", "mtime", "age_sec", "stale", "error", "total", "discarded"):
+        for key in (
+            "path",
+            "source",
+            "format",
+            "exists",
+            "mtime",
+            "age_sec",
+            "stale",
+            "error",
+            "total",
+            "discarded",
+        ):
             if key in calendar_meta and calendar_meta[key] is not None:
                 calendar_state[key] = calendar_meta[key]
-    if calendar and calendar.get("windows"):
-        calendar_state["windows"] = calendar.get("windows")
+    if calendar:
+        if calendar.get("windows"):
+            calendar_state["windows"] = calendar.get("windows")
+        if calendar.get("global"):
+            calendar_state["global"] = calendar.get("global")
+        if calendar.get("per_symbol"):
+            calendar_state["per_symbol"] = calendar.get("per_symbol")
     if calendar_state:
         maintenance_state["calendar"] = calendar_state
 
@@ -148,6 +164,9 @@ def _window_reasons(
     m_funding = _in_funding_buffer(ts_ms, int(cfg.funding_buffer_min or 0))
     m_custom = _in_custom_window(ts_ms, cfg.custom_ms or [])
     m_calendar = _apply_calendar_windows(ts_ms, calendar, symbols)
+
+    m_daily = np.logical_or(m_daily, m_calendar)
+    m_custom = np.logical_or(m_custom, m_calendar)
 
     data = {
         "maintenance_daily": m_daily,
@@ -406,10 +425,22 @@ def _build_calendar_structure(windows: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             global_windows.append((start, end))
 
-    for key, items in per_symbol.items():
+    def _merge(items: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        if not items:
+            return []
         items.sort()
-        per_symbol[key] = items
-    global_windows.sort()
+        merged: List[Tuple[int, int]] = [items[0]]
+        for start, end in items[1:]:
+            last_start, last_end = merged[-1]
+            if start <= last_end:
+                merged[-1] = (last_start, max(last_end, end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    for key, items in list(per_symbol.items()):
+        per_symbol[key] = _merge(items)
+    global_windows = _merge(global_windows)
 
     return {
         "global": global_windows,
@@ -457,20 +488,66 @@ def _load_maintenance_calendar(cfg: NoTradeConfig) -> Tuple[Dict[str, Any], Dict
     if not path_value:
         return {"global": [], "per_symbol": {}, "windows": []}, {}
 
-    path = Path(path_value)
-    meta: Dict[str, Any] = {"path": str(path)}
+    path_hint = _coerce_str_or_none(path_value)
+    if not path_hint:
+        return {"global": [], "per_symbol": {}, "windows": []}, {}
+
+    base_dir = _coerce_str_or_none(getattr(maintenance_cfg, "_config_base_dir", None))
+    if not base_dir:
+        base_dir = _coerce_str_or_none(getattr(cfg, "_config_base_dir", None))
+    config_path_hint = _coerce_str_or_none(getattr(cfg, "_config_path", None))
+    if base_dir is None and config_path_hint:
+        try:
+            base_dir = str(Path(config_path_hint).resolve().parent)
+        except Exception:  # pragma: no cover - defensive
+            base_dir = None
+
+    raw_source = _coerce_str_or_none(getattr(maintenance_cfg, "_path_source", None))
+    if raw_source is None:
+        raw_source = path_hint
+
+    path = Path(path_hint).expanduser()
+    if not path.is_absolute() and base_dir:
+        try:
+            path = Path(base_dir) / path
+        except Exception:  # pragma: no cover - defensive
+            pass
+    try:
+        resolved_path = path.resolve(strict=False)
+    except Exception:  # pragma: no cover - defensive
+        resolved_path = path
+
+    meta: Dict[str, Any] = {"path": str(resolved_path)}
+    if raw_source and str(resolved_path) != str(raw_source):
+        meta["source"] = raw_source
+    if base_dir:
+        meta["base_dir"] = base_dir
+
+    format_hint = _coerce_str_or_none(getattr(maintenance_cfg, "format", None))
+    format_mode = "auto"
+    if format_hint:
+        lowered = format_hint.strip().lower()
+        if lowered in {"json", "csv"}:
+            format_mode = lowered
+        elif lowered in {"auto", ""} or "hh:mm" in lowered:
+            format_mode = "auto"
+        else:
+            LOGGER.warning(
+                "Unknown maintenance.format hint '%s', falling back to auto", format_hint
+            )
+    meta["format"] = format_mode
 
     if not path.exists():
-        LOGGER.warning("Maintenance calendar file not found: path=%s", path)
+        LOGGER.warning("Maintenance calendar file not found: path=%s", resolved_path)
         meta["exists"] = False
         return {"global": [], "per_symbol": {}, "windows": []}, meta
 
     meta["exists"] = True
 
     try:
-        stat = path.stat()
+        stat = resolved_path.stat()
     except OSError as exc:
-        LOGGER.warning("Failed to stat maintenance calendar file %s: %s", path, exc)
+        LOGGER.warning("Failed to stat maintenance calendar file %s: %s", resolved_path, exc)
         stat = None
     if stat is not None:
         mtime = stat.st_mtime
@@ -498,35 +575,51 @@ def _load_maintenance_calendar(cfg: NoTradeConfig) -> Tuple[Dict[str, Any], Dict
             meta["stale"] = True
             LOGGER.warning(
                 "Maintenance calendar file looks stale: path=%s age_sec=%.0f max_age_sec=%s",
-                path,
+                resolved_path,
                 age_sec,
                 threshold,
             )
         else:
             meta["stale"] = False
 
-    suffix = path.suffix.lower()
+    suffix = resolved_path.suffix.lower()
+    load_format = format_mode
+    if format_mode == "auto":
+        if suffix in {".json", ""}:
+            load_format = "json"
+        elif suffix == ".csv":
+            load_format = "csv"
+        else:
+            LOGGER.warning(
+                "Unsupported maintenance calendar format: path=%s suffix=%s", 
+                resolved_path,
+                suffix or "<none>",
+            )
+            meta["error"] = "unsupported_format"
+            return {"global": [], "per_symbol": {}, "windows": []}, meta
+    meta["format"] = load_format
+
     try:
-        if suffix == ".json":
-            text = path.read_text(encoding="utf-8")
+        if load_format == "json":
+            text = resolved_path.read_text(encoding="utf-8")
             if text.strip():
                 payload = json.loads(text)
                 records = _flatten_calendar_payload(payload)
             else:
                 records = []
-        elif suffix == ".csv":
-            df = pd.read_csv(path)
+        elif load_format == "csv":
+            df = pd.read_csv(resolved_path)
             records = df.to_dict(orient="records")
         else:
             LOGGER.warning(
-                "Unsupported maintenance calendar format: path=%s suffix=%s",
-                path,
-                suffix or "<none>",
+                "Unsupported maintenance calendar format hint: path=%s format=%s",
+                resolved_path,
+                load_format or "<none>",
             )
             meta["error"] = "unsupported_format"
             return {"global": [], "per_symbol": {}, "windows": []}, meta
     except Exception as exc:  # pragma: no cover - parsing errors
-        LOGGER.warning("Failed to read maintenance calendar file %s: %s", path, exc)
+        LOGGER.warning("Failed to read maintenance calendar file %s: %s", resolved_path, exc)
         meta["error"] = str(exc)
         return {"global": [], "per_symbol": {}, "windows": []}, meta
 

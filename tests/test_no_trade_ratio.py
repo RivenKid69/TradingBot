@@ -1,5 +1,4 @@
 import json
-import json
 import logging
 import os
 import sys
@@ -13,7 +12,7 @@ import yaml
 
 sys.path.append(os.getcwd())
 
-from no_trade import compute_no_trade_mask, estimate_block_ratio
+from no_trade import compute_no_trade_mask, estimate_block_ratio, _load_maintenance_calendar
 from no_trade_config import (
     NoTradeState,
     get_no_trade_config,
@@ -268,6 +267,8 @@ def test_maintenance_calendar_blocks_rows(tmp_path):
     reasons = mask.attrs.get("reasons")
     assert isinstance(reasons, pd.DataFrame)
     actual_calendar = reasons["maintenance_calendar"].tolist()
+    assert reasons["maintenance_daily"].tolist() == actual_calendar
+    assert reasons["maintenance_custom"].tolist() == actual_calendar
 
     state_payload = mask.attrs.get("state")
     assert isinstance(state_payload, dict)
@@ -275,6 +276,10 @@ def test_maintenance_calendar_blocks_rows(tmp_path):
     calendar_state = maintenance_state.get("calendar") or {}
     assert calendar_state.get("exists") is True
     assert Path(calendar_state.get("path")).name == "maintenance.csv"
+    assert calendar_state.get("source") == "maintenance.csv"
+    assert calendar_state.get("format") == "csv"
+    assert calendar_state.get("global") == [(300_000, 360_000)]
+    assert calendar_state.get("per_symbol", {}).get("BTC") == [(60_000, 180_000)]
     windows = calendar_state.get("windows") or []
     assert any(entry.get("symbol") == "BTC" for entry in windows)
     assert any(entry.get("symbol") is None for entry in windows), windows
@@ -288,6 +293,8 @@ def test_maintenance_calendar_blocks_rows(tmp_path):
     meta = mask.attrs.get("meta") or {}
     maintenance_meta = meta.get("maintenance_calendar") or {}
     assert maintenance_meta.get("exists") is True
+    assert maintenance_meta.get("format") == "csv"
+    assert maintenance_meta.get("source") == "maintenance.csv"
 
 
 def test_missing_maintenance_calendar_logs_warning(tmp_path, caplog):
@@ -316,10 +323,13 @@ def test_missing_maintenance_calendar_logs_warning(tmp_path, caplog):
     maintenance_state = state_payload.get("maintenance") or {}
     calendar_state = maintenance_state.get("calendar") or {}
     assert calendar_state.get("exists") is False
+    assert calendar_state.get("source") == "missing.json"
+    assert calendar_state.get("format") == "auto"
 
     meta = mask.attrs.get("meta") or {}
     maintenance_meta = meta.get("maintenance_calendar") or {}
     assert maintenance_meta.get("exists") is False
+    assert maintenance_meta.get("format") == "auto"
 
 
 def test_stale_maintenance_calendar_emits_warning(tmp_path, caplog):
@@ -356,10 +366,74 @@ def test_stale_maintenance_calendar_emits_warning(tmp_path, caplog):
     state_payload = mask.attrs.get("state")
     calendar_state = (state_payload.get("maintenance") or {}).get("calendar") or {}
     assert calendar_state.get("stale") is True
+    assert calendar_state.get("format") == "json"
 
     meta = mask.attrs.get("meta") or {}
     maintenance_meta = meta.get("maintenance_calendar") or {}
     assert maintenance_meta.get("stale") is True
+    assert maintenance_meta.get("format") == "json"
+
+
+def test_calendar_format_override_and_merge(tmp_path):
+    calendar_path = tmp_path / "schedule.data"
+    payload = [
+        {"start_ts_ms": 60_000, "end_ts_ms": 120_000, "symbol": "BTC"},
+        {"start_ts_ms": 90_000, "end_ts_ms": 150_000, "symbol": "BTC"},
+        {"start_ts_ms": 200_000, "end_ts_ms": 260_000},
+        {"start_ts_ms": 250_000, "end_ts_ms": 300_000},
+    ]
+    calendar_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    cfg_data = {
+        "no_trade": {
+            "maintenance": {
+                "path": "schedule.data",
+                "format": "json",
+                "daily_utc": [],
+                "custom_ms": [],
+                "funding_buffer_min": 0,
+            },
+            "dynamic_guard": {"enable": False},
+        }
+    }
+    cfg_path = tmp_path / "sandbox.yaml"
+    cfg_path.write_text(yaml.safe_dump(cfg_data), encoding="utf-8")
+
+    cfg = get_no_trade_config(str(cfg_path))
+    calendar, meta = _load_maintenance_calendar(cfg)
+
+    assert meta.get("format") == "json"
+    assert meta.get("source") == "schedule.data"
+    assert Path(meta.get("path")).name == "schedule.data"
+    assert calendar.get("per_symbol", {}).get("BTC") == [(60_000, 150_000)]
+    assert calendar.get("global") == [(200_000, 300_000)]
+
+    df = pd.DataFrame(
+        {
+            "ts_ms": [0, 60_000, 110_000, 210_000, 290_000],
+            "symbol": ["ETH", "BTC", "BTC", "ETH", "BTC"],
+        }
+    )
+
+    mask = compute_no_trade_mask(df, sandbox_yaml_path=str(cfg_path))
+    reasons = mask.attrs.get("reasons")
+    assert reasons is not None
+    expected = [False, True, True, True, True]
+    assert mask.tolist() == expected
+    assert reasons["maintenance_calendar"].tolist() == expected
+    assert reasons["maintenance_daily"].tolist() == expected
+    assert reasons["maintenance_custom"].tolist() == expected
+
+    state_payload = mask.attrs.get("state") or {}
+    calendar_state = (state_payload.get("maintenance") or {}).get("calendar") or {}
+    assert calendar_state.get("format") == "json"
+    assert calendar_state.get("per_symbol", {}).get("BTC") == [(60_000, 150_000)]
+    assert calendar_state.get("global") == [(200_000, 300_000)]
+
+    meta_payload = mask.attrs.get("meta") or {}
+    maintenance_meta = meta_payload.get("maintenance_calendar") or {}
+    assert maintenance_meta.get("format") == "json"
+    assert maintenance_meta.get("source") == "schedule.data"
 
 
 def test_no_trade_state_migration_and_save(tmp_path):
