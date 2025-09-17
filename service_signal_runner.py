@@ -34,6 +34,7 @@ import shlex
 
 import json
 import yaml
+import numpy as np
 import clock
 from services import monitoring, ops_kill_switch
 from services.monitoring import (
@@ -45,7 +46,6 @@ from services.alerts import AlertManager
 from pipeline import (
     check_ttl,
     closed_bar_guard,
-    apply_no_trade_windows,
     policy_decide,
     apply_risk,
     Stage,
@@ -74,7 +74,13 @@ from core_config import (
     MonitoringConfig,
     StateConfig,
 )
-from no_trade_config import NoTradeConfig
+from no_trade import (
+    _parse_daily_windows_min,
+    _in_daily_window,
+    _in_funding_buffer,
+    _in_custom_window,
+)
+from no_trade_config import NoTradeConfig, DEFAULT_NO_TRADE_STATE_PATH
 from dynamic_no_trade_guard import DynamicNoTradeGuard
 from utils import TokenBucket
 import di_registry
@@ -96,6 +102,101 @@ class SignalQualityConfig:
     vol_median_window: int = 0
     vol_floor_frac: float = 0.0
     log_reason: bool | str = ""
+
+
+class _ScheduleNoTradeChecker:
+    """Evaluate maintenance-based no-trade windows for individual bars."""
+
+    def __init__(self, cfg: NoTradeConfig | None) -> None:
+        self._enabled = False
+        self._daily_windows: list[tuple[int, int]] = []
+        self._funding_buffer_min = 0
+        self._custom_windows: list[dict[str, int]] = []
+
+        if cfg is None:
+            return
+
+        maintenance_cfg = getattr(cfg, "maintenance", None)
+        if maintenance_cfg is not None:
+            daily = list(getattr(maintenance_cfg, "daily_utc", []) or [])
+            buffer_min = getattr(maintenance_cfg, "funding_buffer_min", None)
+            custom = list(getattr(maintenance_cfg, "custom_ms", []) or [])
+        else:
+            daily = list(getattr(cfg, "daily_utc", []) or [])
+            buffer_min = getattr(cfg, "funding_buffer_min", 0)
+            custom = list(getattr(cfg, "custom_ms", []) or [])
+
+        if not daily:
+            daily = list(getattr(cfg, "daily_utc", []) or [])
+        if buffer_min is None:
+            buffer_min = getattr(cfg, "funding_buffer_min", 0)
+        if not custom:
+            custom = list(getattr(cfg, "custom_ms", []) or [])
+
+        try:
+            self._daily_windows = _parse_daily_windows_min(daily)
+        except Exception:
+            self._daily_windows = []
+        try:
+            self._funding_buffer_min = int(buffer_min or 0)
+        except Exception:
+            self._funding_buffer_min = 0
+        try:
+            self._custom_windows = list(custom or [])
+        except Exception:
+            self._custom_windows = []
+
+        self._enabled = bool(
+            self._daily_windows
+            or self._funding_buffer_min > 0
+            or self._custom_windows
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def evaluate(self, ts_ms: int, symbol: str | None = None) -> tuple[bool, str | None]:
+        """Return whether ``ts_ms`` falls inside a maintenance window."""
+
+        if not self._enabled:
+            return False, None
+
+        ts_arr = np.asarray([int(ts_ms)], dtype=np.int64)
+
+        daily_hit = False
+        if self._daily_windows:
+            try:
+                daily_hit = bool(_in_daily_window(ts_arr, self._daily_windows)[0])
+            except Exception:
+                daily_hit = False
+
+        funding_hit = False
+        if self._funding_buffer_min > 0:
+            try:
+                funding_hit = bool(
+                    _in_funding_buffer(ts_arr, self._funding_buffer_min)[0]
+                )
+            except Exception:
+                funding_hit = False
+
+        custom_hit = False
+        if self._custom_windows:
+            try:
+                custom_hit = bool(_in_custom_window(ts_arr, self._custom_windows)[0])
+            except Exception:
+                custom_hit = False
+
+        if not (daily_hit or funding_hit or custom_hit):
+            return False, None
+
+        if custom_hit:
+            return True, "MAINTENANCE_CUSTOM"
+        if daily_hit:
+            return True, "MAINTENANCE_DAILY"
+        if funding_hit:
+            return True, "MAINTENANCE_FUNDING"
+        return True, "WINDOW"
 
 
 def _format_signal_quality_log(payload: Mapping[str, Any]) -> str:
@@ -203,6 +304,7 @@ class _Worker:
         dyn_cfg = getattr(self._no_trade_cfg, "dynamic_guard", None)
         if dyn_cfg and getattr(dyn_cfg, "enable", False):
             self._dynamic_guard = DynamicNoTradeGuard(dyn_cfg)
+        self._schedule_checker = _ScheduleNoTradeChecker(self._no_trade_cfg)
         self._spread_injections: Dict[str, Tuple[float, int]] = {}
 
     # ------------------------------------------------------------------
@@ -506,17 +608,21 @@ class _Worker:
             except Exception:
                 pass
 
+    def _extract_features(
+        self, bar: Bar, *, skip_metrics: bool = False
+    ) -> dict[str, Any]:
+        raw_feats = self._fp.update(bar, skip_metrics=skip_metrics)
+        if isinstance(raw_feats, dict):
+            return dict(raw_feats)
+        try:
+            return dict(raw_feats or {})
+        except Exception:
+            return {}
+
     def _apply_signal_quality_filter(
         self, bar: Bar, *, skip_metrics: bool = False
     ) -> tuple[bool, dict[str, Any]]:
-        raw_feats = self._fp.update(bar, skip_metrics=skip_metrics)
-        if isinstance(raw_feats, dict):
-            feats = dict(raw_feats)
-        else:
-            try:
-                feats = dict(raw_feats or {})
-            except Exception:
-                feats = {}
+        feats = self._extract_features(bar, skip_metrics=skip_metrics)
 
         sigma_thr = float(self._signal_quality_cfg.sigma_threshold or 0.0)
         vol_frac = float(self._signal_quality_cfg.vol_floor_frac or 0.0)
@@ -566,6 +672,45 @@ class _Worker:
             return False, feats
 
         return True, feats
+
+    def _evaluate_no_trade_windows(
+        self,
+        ts_ms: int,
+        symbol: str,
+        *,
+        stage_cfg: PipelineStageConfig | None = None,
+    ) -> tuple[PipelineResult, str | None]:
+        try:
+            monitoring.inc_stage(Stage.WINDOWS)
+        except Exception:
+            pass
+
+        if stage_cfg is not None and not stage_cfg.enabled:
+            return PipelineResult(action="pass", stage=Stage.WINDOWS), None
+
+        if self._schedule_checker is None or not self._schedule_checker.enabled:
+            return PipelineResult(action="pass", stage=Stage.WINDOWS), None
+
+        blocked = False
+        reason_label: str | None = None
+        try:
+            blocked, reason_label = self._schedule_checker.evaluate(ts_ms, symbol)
+        except Exception:
+            blocked = False
+            reason_label = None
+
+        if not blocked:
+            return PipelineResult(action="pass", stage=Stage.WINDOWS), None
+
+        try:
+            monitoring.inc_reason(Reason.WINDOW)
+        except Exception:
+            pass
+
+        return (
+            PipelineResult(action="drop", stage=Stage.WINDOWS, reason=Reason.WINDOW),
+            reason_label,
+        )
 
     def _emit(self, o: Any, symbol: str, bar_close_ms: int) -> bool:
         if self._guards is not None:
@@ -893,36 +1038,6 @@ class _Worker:
                 pass
             return _finalize()
 
-        if self._no_trade_cfg is not None:
-            win_res = apply_no_trade_windows(
-                int(bar.ts),
-                bar.symbol,
-                self._no_trade_cfg,
-                stage_cfg=(
-                    self._pipeline_cfg.get("windows") if self._pipeline_cfg else None
-                ),
-            )
-            if win_res.action == "drop":
-                try:
-                    self._logger.info(
-                        "DROP %s",
-                        {
-                            "stage": win_res.stage.name,
-                            "reason": getattr(win_res.reason, "name", ""),
-                        },
-                    )
-                except Exception:
-                    pass
-                try:
-                    pipeline_stage_drop_count.labels(
-                        bar.symbol,
-                        win_res.stage.name,
-                        win_res.reason.name if win_res.reason else "",
-                    ).inc()
-                except Exception:
-                    pass
-                return _finalize()
-
         dyn_stage_cfg = self._pipeline_cfg.get("dynamic_guard") if self._pipeline_cfg else None
         dyn_stage_enabled = dyn_stage_cfg is None or dyn_stage_cfg.enabled
         if self._dynamic_guard is not None:
@@ -1003,17 +1118,54 @@ class _Worker:
         policy_stage_cfg = (
             self._pipeline_cfg.get("policy") if self._pipeline_cfg else None
         )
+        policy_stage_enabled = policy_stage_cfg is None or policy_stage_cfg.enabled
         precomputed_feats: dict[str, Any] | None = None
-        if (
-            (policy_stage_cfg is None or policy_stage_cfg.enabled)
-            and self._signal_quality_cfg.enabled
-        ):
+        if policy_stage_enabled and self._signal_quality_cfg.enabled:
             allowed, feats = self._apply_signal_quality_filter(
                 bar, skip_metrics=skip_metrics
             )
             precomputed_feats = feats
             if not allowed:
                 return _finalize()
+
+        if policy_stage_enabled and precomputed_feats is None:
+            precomputed_feats = self._extract_features(
+                bar, skip_metrics=skip_metrics
+            )
+        elif not policy_stage_enabled and precomputed_feats is None:
+            precomputed_feats = {}
+
+        windows_stage_cfg = (
+            self._pipeline_cfg.get("windows") if self._pipeline_cfg else None
+        )
+        win_res, win_reason = self._evaluate_no_trade_windows(
+            int(bar.ts),
+            bar.symbol,
+            stage_cfg=windows_stage_cfg,
+        )
+        if win_res.action == "drop":
+            try:
+                payload = {
+                    "stage": win_res.stage.name,
+                    "reason": getattr(win_res.reason, "name", ""),
+                }
+                if win_reason:
+                    payload["detail"] = win_reason
+                self._logger.info("DROP %s", payload)
+            except Exception:
+                pass
+            try:
+                reason_label = win_reason or (
+                    win_res.reason.name if win_res.reason else ""
+                )
+                pipeline_stage_drop_count.labels(
+                    bar.symbol,
+                    win_res.stage.name,
+                    reason_label,
+                ).inc()
+            except Exception:
+                pass
+            return _finalize()
 
         pol_res = policy_decide(
             self._fp,
@@ -1268,6 +1420,64 @@ class ServiceSignalRunner:
                 self.throttle_cfg.symbol.burst,
                 self.throttle_cfg.mode,
             )
+
+        if self.no_trade_cfg is not None:
+            try:
+                maintenance_cfg = getattr(self.no_trade_cfg, "maintenance", None)
+                if maintenance_cfg is not None:
+                    try:
+                        maintenance_payload = maintenance_cfg.dict()
+                    except Exception:
+                        maintenance_payload = {
+                            "funding_buffer_min": getattr(
+                                maintenance_cfg, "funding_buffer_min", None
+                            ),
+                            "daily_utc": list(
+                                getattr(maintenance_cfg, "daily_utc", []) or []
+                            ),
+                            "custom_ms": list(
+                                getattr(maintenance_cfg, "custom_ms", []) or []
+                            ),
+                        }
+                else:
+                    maintenance_payload = {
+                        "funding_buffer_min": getattr(
+                            self.no_trade_cfg, "funding_buffer_min", None
+                        ),
+                        "daily_utc": list(
+                            getattr(self.no_trade_cfg, "daily_utc", []) or []
+                        ),
+                        "custom_ms": list(
+                            getattr(self.no_trade_cfg, "custom_ms", []) or []
+                        ),
+                    }
+                self.logger.info(
+                    "no-trade maintenance config: %s", maintenance_payload
+                )
+            except Exception:
+                pass
+            try:
+                maintenance_path = Path(DEFAULT_NO_TRADE_STATE_PATH)
+                exists = maintenance_path.exists()
+                age_sec: float | None = None
+                if exists:
+                    try:
+                        age_sec = max(
+                            0.0, time.time() - maintenance_path.stat().st_mtime
+                        )
+                    except Exception:
+                        age_sec = None
+                age_repr = None
+                if age_sec is not None:
+                    age_repr = f"{age_sec:.0f}"
+                self.logger.info(
+                    "no-trade maintenance file: path=%s exists=%s age_sec=%s",
+                    str(maintenance_path),
+                    exists,
+                    age_repr,
+                )
+            except Exception:
+                pass
 
         dyn_cfg = getattr(self.no_trade_cfg, "dynamic_guard", None) if self.no_trade_cfg else None
         if dyn_cfg is not None:
