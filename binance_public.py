@@ -14,6 +14,7 @@ from services.rest_budget import RestBudgetSession
 
 DEFAULT_RETRY_CFG = RetryConfig(max_attempts=5, backoff_base_s=0.5, max_backoff_s=60.0)
 _BOOK_TICKER_TTL_S = 1.0
+_LAST_PRICE_TTL_S = 1.0
 
 
 @dataclass
@@ -52,6 +53,7 @@ class BinancePublicClient:
             str,
             Tuple[float, Tuple[Optional[Union[Decimal, float]], Optional[Union[Decimal, float]]]],
         ] = {}
+        self._last_price_cache: Dict[str, Tuple[float, Optional[Union[Decimal, float]]]] = {}
 
     def close(self) -> None:
         """Release owned REST session resources."""
@@ -322,6 +324,38 @@ class BinancePublicClient:
                 )
             return results[sym]
         return results
+
+    def get_last_price(
+        self, symbol: str, ttl_s: float = _LAST_PRICE_TTL_S
+    ) -> Optional[Union[Decimal, float]]:
+        """Return the latest trade price for ``symbol`` using ticker/price."""
+
+        sym = str(symbol).upper()
+        if not sym:
+            raise ValueError("symbol must be non-empty")
+
+        now = time.monotonic()
+        cache = self._last_price_cache.get(sym)
+        ttl = float(ttl_s)
+        if cache is not None and cache[0] > now:
+            return cache[1]
+
+        url = f"{self.e.spot_base}/api/v3/ticker/price"
+        params = {"symbol": sym}
+        data = self.session.get(
+            url,
+            params=params,
+            timeout=self.timeout,
+            budget="tickerPrice",
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected tickerPrice response: {data}")
+        price = self._to_number(data.get("price"))
+        if price is None:
+            raise RuntimeError(f"Unexpected tickerPrice response: {data}")
+        expires_at = now + ttl if ttl > 0 else now
+        self._last_price_cache[sym] = (expires_at, price)
+        return price
 
     def get_spread_bps(
         self,

@@ -226,6 +226,12 @@ class BinanceWS:
                 meta["spread_bps"] = float(spread)
             except Exception:
                 pass
+        price = getattr(tick, "price", None)
+        if price is not None:
+            try:
+                meta["price"] = float(price)
+            except Exception:
+                pass
         event = MarketEvent(
             etype=EventType.MARKET_DATA_TICK,
             ts=now_ms(),
@@ -318,6 +324,7 @@ class BinanceWS:
                                         Decimal(str(ask_raw)) if ask_raw is not None else None
                                     )
                                     spread_bps = None
+                                    mid: Decimal | None = None
                                     if (
                                         bid_val is not None
                                         and ask_val is not None
@@ -330,6 +337,7 @@ class BinanceWS:
                                     tick = Tick(
                                         ts=int(data.get("E") or data.get("T") or now_ms()),
                                         symbol=str(data.get("s", "")).upper(),
+                                        price=mid,
                                         bid=bid_val,
                                         ask=ask_val,
                                         bid_qty=Decimal(str(data.get("B")))
