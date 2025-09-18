@@ -89,9 +89,13 @@ class SimExecutor(TradeExecutor):
         if cfg is None:
             return False
         if isinstance(cfg, Mapping):
-            dyn_block = cfg.get("dynamic_spread")
+            dyn_block = cfg.get("dynamic")
+            if dyn_block is None:
+                dyn_block = cfg.get("dynamic_spread")
         else:
-            dyn_block = getattr(cfg, "dynamic_spread", None)
+            dyn_block = getattr(cfg, "dynamic", None)
+            if dyn_block is None:
+                dyn_block = getattr(cfg, "dynamic_spread", None)
         if dyn_block is None:
             return False
         if isinstance(dyn_block, Mapping):
