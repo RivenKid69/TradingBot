@@ -323,6 +323,10 @@ class SlippageImpl:
     def config(self):
         return self._cfg_obj
 
+    @property
+    def dynamic_profile(self) -> Optional[_DynamicSpreadProfile]:
+        return self._dynamic_profile
+
     def attach_to(self, sim) -> None:
         if self._cfg_obj is not None:
             setattr(sim, "slippage_cfg", self._cfg_obj)

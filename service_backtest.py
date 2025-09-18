@@ -152,10 +152,17 @@ class ServiceBacktest:
             run_config=self._run_config,
         )
 
+        dyn_spread_cfg = self.cfg.dynamic_spread_config
+        sim_spread_getter = getattr(self.sim, "get_spread_bps", None)
+        if not callable(sim_spread_getter):
+            sim_spread_getter = getattr(self.sim, "_slippage_get_spread", None)
+        if callable(sim_spread_getter):
+            dyn_spread_cfg = {}
+
         self._bt = BacktestAdapter(
             policy=self.policy,
             sim_bridge=self.sim_bridge,
-            dynamic_spread_config=self.cfg.dynamic_spread_config,
+            dynamic_spread_config=dyn_spread_cfg,
             exchange_specs_path=self.cfg.exchange_specs_path,
             guards_config=self.cfg.guards_config,
             signal_cooldown_s=self.cfg.signal_cooldown_s,
