@@ -1,0 +1,141 @@
+import datetime
+import importlib.util
+import json
+import pathlib
+import sys
+
+from typing import Optional
+
+import pytest
+
+
+BASE = pathlib.Path(__file__).resolve().parents[1]
+sys.path.append(str(BASE))
+
+spec_lat = importlib.util.spec_from_file_location("latency", BASE / "latency.py")
+lat_module = importlib.util.module_from_spec(spec_lat)
+sys.modules["latency"] = lat_module
+spec_lat.loader.exec_module(lat_module)
+
+spec_impl = importlib.util.spec_from_file_location("impl_latency", BASE / "impl_latency.py")
+impl_module = importlib.util.module_from_spec(spec_impl)
+sys.modules["impl_latency"] = impl_module
+spec_impl.loader.exec_module(impl_module)
+
+LatencyImpl = impl_module.LatencyImpl
+
+
+class DummyCache:
+    def __init__(self, multiplier: float, *, ready: bool = True):
+        self.multiplier = float(multiplier)
+        self.ready = ready
+        self.calls = []
+
+    def latency_multiplier(
+        self,
+        *,
+        symbol: str,
+        ts_ms: int,
+        metric: str,
+        window: int,
+        gamma: float,
+        clip: float,
+    ):
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "ts_ms": ts_ms,
+                "metric": metric,
+                "window": window,
+                "gamma": gamma,
+                "clip": clip,
+            }
+        )
+        return self.multiplier, {"source": "dummy"}
+
+
+class DummySim:
+    def __init__(self, *, cache: Optional[DummyCache] = None, symbol: str = "BTCUSDT"):
+        self.volatility_cache = cache
+        self.symbol = symbol
+
+
+def _make_impl(tmp_path, extra_cfg=None):
+    multipliers = [1.0] * 168
+    path = tmp_path / "latency.json"
+    path.write_text(json.dumps({"latency": multipliers}))
+    cfg = {
+        "base_ms": 100,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "seasonality_path": str(path),
+        "symbol": "BTCUSDT",
+    }
+    if extra_cfg:
+        cfg.update(extra_cfg)
+    return LatencyImpl.from_dict(cfg)
+
+
+def _sample_timestamp() -> int:
+    base_dt = datetime.datetime(2024, 1, 1, 0, 0, tzinfo=datetime.timezone.utc)
+    return int(base_dt.timestamp() * 1000)
+
+
+def test_latency_volatility_multiplier(tmp_path):
+    cache = DummyCache(1.5)
+    impl = _make_impl(tmp_path, {"volatility_gamma": 1.0, "debug_log": True})
+    sim = DummySim(cache=cache, symbol="ETHUSDT")
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    result = lat.sample(_sample_timestamp())
+    assert result["total_ms"] == 150
+    assert cache.calls and cache.calls[0]["symbol"] == "ETHUSDT"
+    debug = result.get("debug", {}).get("latency", {})
+    assert debug.get("volatility_multiplier") == pytest.approx(1.5)
+    assert debug.get("volatility_debug", {}).get("source") == "dummy"
+
+
+def test_latency_volatility_gamma_zero(tmp_path):
+    cache = DummyCache(2.0)
+    impl = _make_impl(tmp_path, {"volatility_gamma": 0.0})
+    sim = DummySim(cache=cache)
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    result = lat.sample(_sample_timestamp())
+    assert result["total_ms"] == 100
+    assert cache.calls == []
+
+
+def test_latency_volatility_cache_not_ready(tmp_path):
+    cache = DummyCache(2.0, ready=False)
+    impl = _make_impl(tmp_path, {"volatility_gamma": 1.0})
+    sim = DummySim(cache=cache)
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    result = lat.sample(_sample_timestamp())
+    assert result["total_ms"] == 100
+    assert cache.calls == []
+
+
+def test_latency_clamps_to_bounds(tmp_path):
+    cache = DummyCache(3.0)
+    impl = _make_impl(
+        tmp_path,
+        {
+            "volatility_gamma": 1.0,
+            "min_ms": 120,
+            "max_ms": 180,
+        },
+    )
+    sim = DummySim(cache=cache)
+    impl.attach_to(sim)
+    lat = sim.latency
+
+    result = lat.sample(_sample_timestamp())
+    assert result["total_ms"] == 180
+    assert not result["timeout"]
+
