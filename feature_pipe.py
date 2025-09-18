@@ -45,19 +45,23 @@ class _SymbolMetricsState:
 class _FeatureStatsState:
     prev_close: Optional[float] = None
     returns: Deque[float] = field(default_factory=deque)
+    tranges: Deque[float] = field(default_factory=deque)
     bar_count: int = 0
     ret_last: Optional[float] = None
     sigma: Optional[float] = None
+    atr_pct: Optional[float] = None
     spread_bps: Optional[float] = None
     spread_ts_ms: Optional[int] = None
     spread_valid_until_ms: Optional[int] = None
     last_bar_ts: Optional[int] = None
+    tr_sum: float = 0.0
 
 
 @dataclass(frozen=True)
 class MarketMetricsSnapshot:
     ret_last: Optional[float]
     sigma: Optional[float]
+    atr_pct: Optional[float]
     spread_bps: Optional[float]
     window_ready: bool
     bar_count: int
@@ -358,11 +362,17 @@ class FeaturePipe:
         sym = str(symbol).upper()
         state = self._symbol_state.get(sym)
         if state is None:
-            state = _FeatureStatsState(returns=deque(maxlen=self._sigma_window))
+            state = _FeatureStatsState(
+                returns=deque(maxlen=self._sigma_window),
+                tranges=deque(maxlen=self._sigma_window),
+            )
             self._symbol_state[sym] = state
         else:
             if state.returns.maxlen != self._sigma_window:
                 state.returns = deque(state.returns, maxlen=self._sigma_window)
+            if state.tranges.maxlen != self._sigma_window:
+                state.tranges = deque(state.tranges, maxlen=self._sigma_window)
+            state.tr_sum = sum(state.tranges)
         return state
 
     def _update_market_metrics(
@@ -376,8 +386,8 @@ class FeaturePipe:
         state.last_bar_ts = ts_ms
         state.bar_count += 1
         ret_last: Optional[float] = None
-        if state.prev_close not in (None, 0.0):
-            prev = state.prev_close
+        prev = state.prev_close
+        if prev not in (None, 0.0):
             if prev is not None and prev != 0.0:
                 try:
                     ret_last = close_value / prev - 1.0
@@ -386,6 +396,47 @@ class FeaturePipe:
         if ret_last is not None and isfinite(ret_last):
             state.ret_last = ret_last
             state.returns.append(ret_last)
+        atr_candidate: Optional[float] = None
+        high_val = self._coerce_float(getattr(bar, "high", None))
+        low_val = self._coerce_float(getattr(bar, "low", None))
+        if (
+            prev not in (None, 0.0)
+            and high_val is not None
+            and low_val is not None
+        ):
+            try:
+                prev_close_val = float(prev) if prev is not None else None
+                hi = float(high_val)
+                lo = float(low_val)
+            except (TypeError, ValueError):
+                prev_close_val = None
+                hi = lo = 0.0
+            if (
+                prev_close_val is not None
+                and prev_close_val != 0.0
+                and isfinite(prev_close_val)
+                and isfinite(hi)
+                and isfinite(lo)
+            ):
+                tr = max(hi - lo, abs(hi - prev_close_val), abs(lo - prev_close_val))
+                if tr >= 0.0 and isfinite(tr):
+                    atr_candidate = max(0.0, tr / abs(prev_close_val))
+        if atr_candidate is not None and isfinite(atr_candidate):
+            dq = state.tranges
+            if dq.maxlen != self._sigma_window:
+                dq = deque(dq, maxlen=self._sigma_window)
+                state.tranges = dq
+            if dq.maxlen is not None and len(dq) == dq.maxlen:
+                removed = dq.popleft()
+                state.tr_sum -= removed
+            dq.append(atr_candidate)
+            state.tr_sum += atr_candidate
+        if state.tranges:
+            count = len(state.tranges)
+            if count > 0:
+                state.atr_pct = max(0.0, state.tr_sum / count)
+            else:
+                state.atr_pct = None
         state.prev_close = close_value
         state.sigma = self._compute_sigma(state.returns)
         self._resolve_spread(symbol, state, bar, ts_ms)
@@ -399,6 +450,13 @@ class FeaturePipe:
     ) -> None:
         ret_last = state.ret_last if state.ret_last is not None and isfinite(state.ret_last) else None
         sigma = state.sigma if state.sigma is not None and isfinite(state.sigma) else None
+        atr_pct = (
+            state.atr_pct
+            if state.atr_pct is not None
+            and isfinite(state.atr_pct)
+            and state.atr_pct >= 0.0
+            else None
+        )
         spread = (
             state.spread_bps
             if state.spread_bps is not None
@@ -417,6 +475,7 @@ class FeaturePipe:
         snapshot = MarketMetricsSnapshot(
             ret_last=ret_last,
             sigma=sigma,
+            atr_pct=atr_pct,
             spread_bps=spread,
             window_ready=ready,
             bar_count=state.bar_count,

@@ -224,14 +224,33 @@ def test_execution_simulator_updates_latency():
 
     lat = _Lat()
     sim.latency = lat
+    cache = DummyCache(1.0)
+    sim.volatility_cache = cache
     sim._latency_symbol = "ADAUSDT"
 
     sim.set_market_snapshot(bid=1.0, ask=1.1, vol_factor=0.3, ts_ms=1_000)
     assert lat.calls
     assert lat.calls[-1] == ("ADAUSDT", 1000, 0.3)
+    assert cache.updates
+    cache_entry = cache.updates[-1]
+    assert cache_entry["symbol"] == "ADAUSDT"
+    assert cache_entry["ts_ms"] == 1000
+    assert cache_entry["value"] == pytest.approx(0.3)
 
     lat.calls.clear()
-    sim.run_step(ts=2_000, ref_price=1.05, vol_factor=0.5, liquidity=1.0)
+    cache.updates.clear()
+    sim.run_step(
+        ts=2_000,
+        ref_price=1.05,
+        vol_factor=0.5,
+        vol_raw={"sigma": 0.25},
+        liquidity=1.0,
+    )
     assert lat.calls
     assert lat.calls[-1] == ("ADAUSDT", 2000, 0.5)
+    assert cache.updates
+    cache_entry = cache.updates[-1]
+    assert cache_entry["symbol"] == "ADAUSDT"
+    assert cache_entry["ts_ms"] == 2000
+    assert cache_entry["value"] == pytest.approx(0.25)
 
