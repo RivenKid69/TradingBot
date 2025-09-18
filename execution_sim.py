@@ -24,6 +24,7 @@ ExecutionSimulator v2
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping
+import hashlib
 import math
 import os
 import logging
@@ -522,6 +523,8 @@ class ExecutionSimulator:
             except Exception:
                 self._rng = None  # type: ignore
         self._next_cli_id = 1
+        self._order_seq_counter: int = 0
+        self._intrabar_debug_logged: int = 0
         self.lob = lob
         self._last_ref_price: Optional[float] = None
         self._next_h1_open_price: Optional[float] = None
@@ -529,6 +532,7 @@ class ExecutionSimulator:
         self._last_bar_high: Optional[float] = None
         self._last_bar_low: Optional[float] = None
         self._last_bar_close: Optional[float] = None
+        self._last_bar_close_ts: Optional[int] = None
         self._intrabar_timeframe_ms: Optional[int] = None
         self.run_config = run_config
         self._run_config = run_config
@@ -650,6 +654,8 @@ class ExecutionSimulator:
         self._intrabar_log_warnings: bool = False
         self._intrabar_warn_next_log_ms: int = 0
         self._timing_timeframe_ms: Optional[int] = None
+        self._intrabar_seed_mode: str = "stable"
+        self._intrabar_debug_max_logs: int = 0
 
         if self._execution_intrabar_cfg:
             mode = self._execution_intrabar_cfg.get("intrabar_price_model")
@@ -695,6 +701,33 @@ class ExecutionSimulator:
                     )
                     if self._intrabar_log_warnings:
                         break
+
+            seed_mode_cfg = None
+            for _key in ("intrabar_seed_mode", "intrabar_price_seed_mode", "seed_mode"):
+                if _key in self._execution_intrabar_cfg:
+                    seed_mode_cfg = self._execution_intrabar_cfg.get(_key)
+                    break
+            if seed_mode_cfg is not None:
+                try:
+                    self._intrabar_seed_mode = str(seed_mode_cfg).strip().lower()
+                except Exception:
+                    self._intrabar_seed_mode = "stable"
+                if not self._intrabar_seed_mode:
+                    self._intrabar_seed_mode = "stable"
+
+            debug_limit_cfg = None
+            for _key in ("intrabar_debug_max_logs", "intrabar_debug_limit", "intrabar_debug_logs"):
+                if _key in self._execution_intrabar_cfg:
+                    debug_limit_cfg = self._execution_intrabar_cfg.get(_key)
+                    break
+            if debug_limit_cfg is not None:
+                try:
+                    dbg_val = int(debug_limit_cfg)
+                except (TypeError, ValueError):
+                    dbg_val = 0
+                if dbg_val < 0:
+                    dbg_val = 0
+                self._intrabar_debug_max_logs = dbg_val
 
         if run_config is not None:
             timing_cfg = getattr(run_config, "timing", None)
@@ -1260,23 +1293,148 @@ class ExecutionSimulator:
             ratio = 1.0
         return float(ratio)
 
-    def _intrabar_reference_price(self, side: str, time_fraction: float) -> Optional[float]:
-        """Вернуть референсную цену внутри бара по выбранной модели."""
+    def _next_order_seq(self) -> int:
+        """Return a monotonically increasing child order identifier."""
+
+        self._order_seq_counter += 1
+        return self._order_seq_counter
+
+    def _reset_intrabar_debug_counter(self) -> None:
+        """Reset per-step intrabar debug logging counter."""
+
+        self._intrabar_debug_logged = 0
+
+    def _intrabar_atr_hint(self) -> Optional[float]:
+        """Extract an ATR/volatility hint from the latest metrics."""
+
+        hint = 0.0
+        metrics = self._last_vol_raw
+        if isinstance(metrics, Mapping):
+            preferred_keys = (
+                "atr",
+                "atr_abs",
+                "atr_value",
+                "atr_price",
+                "atr_quote",
+                "atr_usd",
+                "atr_last",
+            )
+            for key in preferred_keys:
+                if key not in metrics:
+                    continue
+                try:
+                    val = float(metrics.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(val):
+                    continue
+                val = abs(val)
+                if val > hint:
+                    hint = val
+        if hint <= 0.0 and self._last_vol_factor is not None:
+            try:
+                ref_price = float(self._last_ref_price) if self._last_ref_price is not None else None
+            except (TypeError, ValueError):
+                ref_price = None
+            if ref_price is not None and math.isfinite(ref_price) and ref_price > 0.0:
+                try:
+                    percent = float(self._last_vol_factor)
+                except (TypeError, ValueError):
+                    percent = 0.0
+                if math.isfinite(percent):
+                    derived = abs(ref_price * percent / 100.0)
+                    if derived > hint:
+                        hint = derived
+        return hint if hint > 0.0 else None
+
+    def _intrabar_rng_seed(
+        self,
+        *,
+        bar_ts: Optional[int],
+        side: str,
+        order_seq: int,
+    ) -> int:
+        """Derive a deterministic RNG seed for intrabar price sampling."""
+
+        try:
+            ts_val = int(bar_ts) if bar_ts is not None else 0
+        except (TypeError, ValueError):
+            ts_val = 0
+        side_val = str(side).upper()
+        key = f"{self.symbol}|{ts_val}|{side_val}|{int(order_seq)}|{int(self.seed)}"
+        mode = (self._intrabar_seed_mode or "stable").strip().lower()
+        if mode in {"off", "none"}:
+            return int(self.seed)
+        if mode in {"python", "hash"}:
+            return hash(key)
+        if mode in {"xor", "mix"}:
+            return hash(key) ^ int(self.seed)
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big", signed=False)
+
+    def _clip_to_bar_range(self, price: float) -> tuple[float, bool]:
+        """Clip ``price`` to the latest bar range when available."""
+
+        try:
+            low = float(self._last_bar_low) if self._last_bar_low is not None else None
+        except (TypeError, ValueError):
+            low = None
+        try:
+            high = float(self._last_bar_high) if self._last_bar_high is not None else None
+        except (TypeError, ValueError):
+            high = None
+        if low is None or high is None or not math.isfinite(low) or not math.isfinite(high):
+            return float(price), False
+        if high < low:
+            low, high = high, low
+        clipped = float(price)
+        if clipped < low:
+            return low, True
+        if clipped > high:
+            return high, True
+        return clipped, False
+
+    def _compute_intrabar_price(
+        self,
+        *,
+        side: str,
+        time_fraction: float,
+        fallback_price: Optional[float],
+        bar_ts: Optional[int],
+        order_seq: Optional[int] = None,
+    ) -> tuple[Optional[float], bool, float]:
+        """Return intrabar reference price with clipping information."""
 
         mode_raw = self._intrabar_price_model
-        if not mode_raw:
-            return None
-        mode = str(mode_raw).strip().lower()
-        if not mode or mode in {"book", "none", "default"}:
-            return None
-
         try:
             frac = float(time_fraction)
         except (TypeError, ValueError):
-            return None
+            frac = 0.0
         if not math.isfinite(frac):
-            return None
-        frac = min(max(frac, 0.0), 1.0)
+            frac = 0.0
+        if frac < 0.0:
+            frac = 0.0
+        if frac > 1.0:
+            frac = 1.0
+
+        fallback: Optional[float]
+        if fallback_price is None:
+            fallback = None
+        else:
+            try:
+                fb = float(fallback_price)
+            except (TypeError, ValueError):
+                fallback = None
+            else:
+                fallback = fb if math.isfinite(fb) else None
+
+        if not mode_raw:
+            return fallback, False, frac
+        mode = str(mode_raw).strip().lower()
+        if not mode or mode in {"book", "none", "default"}:
+            return fallback, False, frac
+        if mode in {"off", "disabled"}:
+            return fallback, False, frac
 
         def _finite(value: Optional[float]) -> Optional[float]:
             if value is None:
@@ -1294,25 +1452,38 @@ class ExecutionSimulator:
         low_p = _finite(self._last_bar_low)
         close_p = _finite(self._last_bar_close)
 
+        linear_value: Optional[float] = None
+        if open_p is not None and close_p is not None:
+            linear_value = open_p + (close_p - open_p) * frac
+
         if mode in {"open"}:
-            return open_p
+            price = open_p if open_p is not None else fallback
+            return price, False, frac
         if mode in {"close"}:
-            return close_p
+            price = close_p if close_p is not None else fallback
+            return price, False, frac
         if mode in {"high"}:
-            return high_p
+            price = high_p if high_p is not None else fallback
+            return price, False, frac
         if mode in {"low"}:
-            return low_p
+            price = low_p if low_p is not None else fallback
+            return price, False, frac
         if mode in {"mid"}:
             bid = _finite(self._last_bid)
             ask = _finite(self._last_ask)
             if bid is not None and ask is not None:
-                return (bid + ask) / 2.0
-            mid_linear = None
-            if open_p is not None and close_p is not None:
-                mid_linear = open_p + (close_p - open_p) * frac
-            if mid_linear is not None:
-                return mid_linear
-            return _finite(self._last_ref_price)
+                mid = (bid + ask) / 2.0
+            else:
+                mid = None
+            price = mid
+            if price is None:
+                price = linear_value
+            if price is None:
+                price = fallback
+            if price is None:
+                return None, False, frac
+            clipped, clipped_flag = self._clip_to_bar_range(price)
+            return clipped, clipped_flag, frac
 
         linear_modes = {
             "linear",
@@ -1321,26 +1492,73 @@ class ExecutionSimulator:
             "oc_linear",
             "linear_oc",
         }
-        if mode in linear_modes:
-            if open_p is None or close_p is None:
-                return None
-            return open_p + (close_p - open_p) * frac
+        if mode in linear_modes and linear_value is not None:
+            clipped, clipped_flag = self._clip_to_bar_range(linear_value)
+            return clipped, clipped_flag, frac
 
         ohlc_modes = {"ohlc", "ohlc-linear", "ohlc_linear"}
-        if mode in ohlc_modes:
-            if open_p is None or close_p is None:
-                return None
+        if mode in ohlc_modes and open_p is not None and close_p is not None:
             side_u = str(side).upper()
             extreme = high_p if side_u == "BUY" else low_p
             if extreme is None:
                 extreme = high_p if high_p is not None else low_p
             if extreme is None:
-                return open_p + (close_p - open_p) * frac
+                price = linear_value if linear_value is not None else fallback
+                if price is None:
+                    return None, False, frac
+                clipped, clipped_flag = self._clip_to_bar_range(price)
+                return clipped, clipped_flag, frac
             if frac <= 0.5:
-                return open_p + (extreme - open_p) * (frac / 0.5)
-            return extreme + (close_p - extreme) * ((frac - 0.5) / 0.5)
+                price = open_p + (extreme - open_p) * (frac / 0.5)
+            else:
+                price = extreme + (close_p - extreme) * ((frac - 0.5) / 0.5)
+            clipped, clipped_flag = self._clip_to_bar_range(price)
+            return clipped, clipped_flag, frac
 
-        return None
+        if mode in {"bridge", "brownian", "brownian_bridge"}:
+            if linear_value is None:
+                if fallback is None:
+                    return None, False, frac
+                return fallback, False, frac
+            sigma = 0.0
+            if high_p is not None and low_p is not None:
+                sigma = abs(high_p - low_p)
+            atr_hint = self._intrabar_atr_hint()
+            if atr_hint is not None:
+                sigma = max(sigma, float(atr_hint))
+            if sigma <= 0.0 or frac <= 0.0 or frac >= 1.0:
+                clipped, clipped_flag = self._clip_to_bar_range(linear_value)
+                return clipped, clipped_flag, frac
+            seq = int(order_seq) if order_seq is not None else int(self._order_seq_counter)
+            rng_seed = self._intrabar_rng_seed(
+                bar_ts=bar_ts if bar_ts is not None else self._last_bar_close_ts,
+                side=side,
+                order_seq=seq,
+            )
+            rng = random.Random(rng_seed)
+            std = float(sigma) * math.sqrt(frac * (1.0 - frac))
+            noise = rng.gauss(0.0, std)
+            price = linear_value + noise
+            clipped, clipped_flag = self._clip_to_bar_range(price)
+            return clipped, clipped_flag, frac
+
+        # fallback to previous behaviour without additional logic
+        if linear_value is not None:
+            clipped, clipped_flag = self._clip_to_bar_range(linear_value)
+            return clipped, clipped_flag, frac
+        return fallback, False, frac
+
+    def _intrabar_reference_price(self, side: str, time_fraction: float) -> Optional[float]:
+        """Вернуть референсную цену внутри бара по выбранной модели."""
+
+        price, _, _ = self._compute_intrabar_price(
+            side=side,
+            time_fraction=time_fraction,
+            fallback_price=None,
+            bar_ts=self._last_bar_close_ts,
+            order_seq=None,
+        )
+        return price
 
     def get_hourly_liquidity_stats(self) -> dict:
         """Return averaged liquidity multiplier/value per hour of week."""
@@ -1885,6 +2103,11 @@ class ExecutionSimulator:
         the seeded RNGs.  No new randomness is introduced here, making repeated
         runs with identical inputs reproducible.
         """
+        try:
+            self._last_bar_close_ts = int(now_ts) if now_ts is not None else self._last_bar_close_ts
+        except (TypeError, ValueError):
+            pass
+        self._reset_intrabar_debug_counter()
         ready, timed_out = self._q.pop_ready()
         trades: List[ExecTrade] = []
         cancelled_ids: List[int] = list(self._cancelled_on_submit)
@@ -2057,14 +2280,22 @@ class ExecutionSimulator:
                     child_fraction = self._intrabar_time_fraction(
                         child_latency, child_timeframe
                     )
-                    ref_child_price = ref_market
-                    intrabar_child_ref = self._intrabar_reference_price(
-                        side, child_fraction
+                    order_seq = self._next_order_seq()
+                    intrabar_child_price, intrabar_clipped, intrabar_frac = (
+                        self._compute_intrabar_price(
+                            side=side,
+                            time_fraction=child_fraction,
+                            fallback_price=ref_market,
+                            bar_ts=self._last_bar_close_ts,
+                            order_seq=order_seq,
+                        )
                     )
-                    if intrabar_child_ref is not None and math.isfinite(
-                        float(intrabar_child_ref)
+                    ref_child_price = ref_market
+                    if intrabar_child_price is not None and math.isfinite(
+                        float(intrabar_child_price)
                     ):
-                        ref_child_price = float(intrabar_child_ref)
+                        ref_child_price = float(intrabar_child_price)
+                    intrabar_base_price = ref_child_price
 
                     # риск: рейт-лимит на отправку «детей»
                     if self.risk is not None:
@@ -2169,6 +2400,25 @@ class ExecutionSimulator:
                         filled_price = apply_slippage_price(
                             side=side, quote_price=filled_price, slippage_bps=slip_bps
                         )
+
+                    filled_price, final_clip = self._clip_to_bar_range(filled_price)
+
+                    if logger.isEnabledFor(logging.DEBUG):
+                        limit = int(self._intrabar_debug_max_logs)
+                        if limit <= 0 or self._intrabar_debug_logged < limit:
+                            logger.debug(
+                                "intrabar fill lat=%sms t=%.4f price=%.6f base_clip=%s final_clip=%s final=%.6f seq=%s",
+                                int(lat_ms),
+                                float(intrabar_frac),
+                                float(intrabar_base_price)
+                                if intrabar_base_price is not None
+                                else float(ref_child_price),
+                                bool(intrabar_clipped),
+                                bool(final_clip),
+                                float(filled_price),
+                                int(order_seq),
+                            )
+                            self._intrabar_debug_logged += 1
 
                     # комиссия
                     fee = 0.0
@@ -2302,19 +2552,32 @@ class ExecutionSimulator:
                 limit_fraction = self._intrabar_time_fraction(
                     limit_latency, limit_timeframe
                 )
-                ref_limit: Optional[float] = None
-                intrabar_limit_ref = self._intrabar_reference_price(
-                    side, limit_fraction
+                order_seq = self._next_order_seq()
+                limit_intrabar_price, limit_intrabar_clipped, limit_intrabar_frac = (
+                    self._compute_intrabar_price(
+                        side=side,
+                        time_fraction=limit_fraction,
+                        fallback_price=ref,
+                        bar_ts=self._last_bar_close_ts,
+                        order_seq=order_seq,
+                    )
                 )
-                if intrabar_limit_ref is not None and math.isfinite(
-                    float(intrabar_limit_ref)
+                ref_limit: Optional[float] = None
+                if limit_intrabar_price is not None and math.isfinite(
+                    float(limit_intrabar_price)
                 ):
-                    ref_limit = float(intrabar_limit_ref)
+                    ref_limit = float(limit_intrabar_price)
                 else:
                     try:
                         ref_limit = float(ref) if ref is not None else None
                     except (TypeError, ValueError):
                         ref_limit = None
+                intrabar_base_price = ref_limit
+                if intrabar_base_price is None and ref is not None:
+                    try:
+                        intrabar_base_price = float(ref)
+                    except (TypeError, ValueError):
+                        intrabar_base_price = None
 
                 # Определяем лимитную цену
                 abs_price = getattr(proto, "abs_price", None)
@@ -2369,6 +2632,23 @@ class ExecutionSimulator:
                     if tif == "FOK" and exec_qty + 1e-12 < qty_q:
                         _cancel(p.client_order_id, "FOK")
                         continue
+                    filled_price, final_clip = self._clip_to_bar_range(filled_price)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        limit = int(self._intrabar_debug_max_logs)
+                        if limit <= 0 or self._intrabar_debug_logged < limit:
+                            logger.debug(
+                                "intrabar fill lat=%sms t=%.4f price=%.6f base_clip=%s final_clip=%s final=%.6f seq=%s",
+                                int(limit_latency),
+                                float(limit_intrabar_frac),
+                                float(intrabar_base_price)
+                                if intrabar_base_price is not None
+                                else float(price_q),
+                                bool(limit_intrabar_clipped),
+                                bool(final_clip),
+                                float(filled_price),
+                                int(order_seq),
+                            )
+                            self._intrabar_debug_logged += 1
                     fee = 0.0
                     if self.fees is not None:
                         fee = self.fees.compute(
@@ -2423,6 +2703,23 @@ class ExecutionSimulator:
                     if tif in ("IOC", "FOK"):
                         _cancel(p.client_order_id, tif)
                         continue
+                    filled_price, final_clip = self._clip_to_bar_range(filled_price)
+                    if logger.isEnabledFor(logging.DEBUG):
+                        limit = int(self._intrabar_debug_max_logs)
+                        if limit <= 0 or self._intrabar_debug_logged < limit:
+                            logger.debug(
+                                "intrabar fill lat=%sms t=%.4f price=%.6f base_clip=%s final_clip=%s final=%.6f seq=%s",
+                                int(limit_latency),
+                                float(limit_intrabar_frac),
+                                float(intrabar_base_price)
+                                if intrabar_base_price is not None
+                                else float(price_q),
+                                bool(limit_intrabar_clipped),
+                                bool(final_clip),
+                                float(filled_price),
+                                int(order_seq),
+                            )
+                            self._intrabar_debug_logged += 1
                     fee = 0.0
                     if self.fees is not None:
                         fee = self.fees.compute(
@@ -2614,6 +2911,11 @@ class ExecutionSimulator:
           - Поддержан тип ActionType.MARKET. Другие типы будут отклонены.
           - proto должен иметь атрибут volume_frac (знак = направление).
         """
+        try:
+            self._last_bar_close_ts = int(ts)
+        except (TypeError, ValueError):
+            self._last_bar_close_ts = None
+        self._reset_intrabar_debug_counter()
         # --- обновить рыночный снапшот ---
         self._last_bid = float(bid) if bid is not None else None
         self._last_ask = float(ask) if ask is not None else None
@@ -2819,14 +3121,22 @@ class ExecutionSimulator:
                     child_fraction = self._intrabar_time_fraction(
                         child_latency, child_timeframe
                     )
-                    ref_child_price = ref_market
-                    intrabar_child_ref = self._intrabar_reference_price(
-                        side, child_fraction
+                    order_seq = self._next_order_seq()
+                    intrabar_child_price, intrabar_clipped, intrabar_frac = (
+                        self._compute_intrabar_price(
+                            side=side,
+                            time_fraction=child_fraction,
+                            fallback_price=ref_market,
+                            bar_ts=self._last_bar_close_ts,
+                            order_seq=order_seq,
+                        )
                     )
-                    if intrabar_child_ref is not None and math.isfinite(
-                        float(intrabar_child_ref)
+                    ref_child_price = ref_market
+                    if intrabar_child_price is not None and math.isfinite(
+                        float(intrabar_child_price)
                     ):
-                        ref_child_price = float(intrabar_child_ref)
+                        ref_child_price = float(intrabar_child_price)
+                    intrabar_base_price = ref_child_price
 
                     # квантайзер и minNotional
                     if self.quantizer is not None:
@@ -2894,6 +3204,25 @@ class ExecutionSimulator:
                         filled_price = apply_slippage_price(
                             side=side, quote_price=filled_price, slippage_bps=slip_bps
                         )
+
+                    filled_price, final_clip = self._clip_to_bar_range(filled_price)
+
+                    if logger.isEnabledFor(logging.DEBUG):
+                        limit = int(self._intrabar_debug_max_logs)
+                        if limit <= 0 or self._intrabar_debug_logged < limit:
+                            logger.debug(
+                                "intrabar fill lat=%sms t=%.4f price=%.6f base_clip=%s final_clip=%s final=%.6f seq=%s",
+                                int(lat_ms),
+                                float(intrabar_frac),
+                                float(intrabar_base_price)
+                                if intrabar_base_price is not None
+                                else float(ref_child_price),
+                                bool(intrabar_clipped),
+                                bool(final_clip),
+                                float(filled_price),
+                                int(order_seq),
+                            )
+                            self._intrabar_debug_logged += 1
 
                     # комиссия
                     fee = 0.0
