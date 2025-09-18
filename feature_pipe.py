@@ -50,6 +50,7 @@ class _FeatureStatsState:
     ret_last: Optional[float] = None
     sigma: Optional[float] = None
     atr_pct: Optional[float] = None
+    range_ratio: Optional[float] = None
     spread_bps: Optional[float] = None
     spread_ts_ms: Optional[int] = None
     spread_valid_until_ms: Optional[int] = None
@@ -68,6 +69,7 @@ class MarketMetricsSnapshot:
     last_bar_ts: Optional[int]
     spread_ts: Optional[int]
     spread_valid_until: Optional[int]
+    vol_metrics: Optional[Dict[str, float]]
 
 
 class SignalQualityMetrics:
@@ -399,6 +401,7 @@ class FeaturePipe:
         atr_candidate: Optional[float] = None
         high_val = self._coerce_float(getattr(bar, "high", None))
         low_val = self._coerce_float(getattr(bar, "low", None))
+        range_ratio: Optional[float] = None
         if (
             prev not in (None, 0.0)
             and high_val is not None
@@ -411,6 +414,23 @@ class FeaturePipe:
             except (TypeError, ValueError):
                 prev_close_val = None
                 hi = lo = 0.0
+            mid_value: Optional[float] = None
+            if isfinite(hi) and isfinite(lo):
+                span = hi - lo
+                if span < 0.0:
+                    span = abs(span)
+                mid_value = (hi + lo) * 0.5
+                if mid_value is not None and mid_value != 0.0 and isfinite(mid_value):
+                    try:
+                        ratio_candidate = span / abs(mid_value)
+                    except ZeroDivisionError:
+                        ratio_candidate = None
+                    if (
+                        ratio_candidate is not None
+                        and isfinite(ratio_candidate)
+                        and ratio_candidate >= 0.0
+                    ):
+                        range_ratio = max(0.0, ratio_candidate)
             if (
                 prev_close_val is not None
                 and prev_close_val != 0.0
@@ -421,6 +441,30 @@ class FeaturePipe:
                 tr = max(hi - lo, abs(hi - prev_close_val), abs(lo - prev_close_val))
                 if tr >= 0.0 and isfinite(tr):
                     atr_candidate = max(0.0, tr / abs(prev_close_val))
+        if range_ratio is None:
+            if high_val is not None and low_val is not None:
+                try:
+                    hi = float(high_val)
+                    lo = float(low_val)
+                except (TypeError, ValueError):
+                    hi = lo = 0.0
+                if isfinite(hi) and isfinite(lo):
+                    span = hi - lo
+                    if span < 0.0:
+                        span = abs(span)
+                    mid_value = (hi + lo) * 0.5
+                    if mid_value is not None and mid_value != 0.0 and isfinite(mid_value):
+                        try:
+                            ratio_candidate = span / abs(mid_value)
+                        except ZeroDivisionError:
+                            ratio_candidate = None
+                        if (
+                            ratio_candidate is not None
+                            and isfinite(ratio_candidate)
+                            and ratio_candidate >= 0.0
+                        ):
+                            range_ratio = max(0.0, ratio_candidate)
+        state.range_ratio = range_ratio
         if atr_candidate is not None and isfinite(atr_candidate):
             dq = state.tranges
             if dq.maxlen != self._sigma_window:
@@ -472,6 +516,25 @@ class FeaturePipe:
                 spread_valid_until = int(spread_valid_until)
             except Exception:
                 spread_valid_until = None
+        vol_metrics: Dict[str, float] = {}
+        if sigma is not None:
+            vol_metrics["sigma"] = sigma
+        if atr_pct is not None:
+            vol_metrics["atr_pct"] = atr_pct
+            vol_metrics.setdefault("atr", atr_pct)
+            vol_metrics.setdefault("atr/price", atr_pct)
+        range_ratio = (
+            state.range_ratio
+            if state.range_ratio is not None
+            and isfinite(state.range_ratio)
+            and state.range_ratio >= 0.0
+            else None
+        )
+        if range_ratio is not None:
+            vol_metrics["range"] = range_ratio
+            vol_metrics.setdefault("range_ratio", range_ratio)
+            vol_metrics["range_ratio_bps"] = range_ratio * 10000.0
+        metrics_payload = vol_metrics or None
         snapshot = MarketMetricsSnapshot(
             ret_last=ret_last,
             sigma=sigma,
@@ -482,6 +545,7 @@ class FeaturePipe:
             last_bar_ts=state.last_bar_ts,
             spread_ts=state.spread_ts_ms,
             spread_valid_until=spread_valid_until,
+            vol_metrics=metrics_payload,
         )
         self.market_state[symbol] = snapshot
 
