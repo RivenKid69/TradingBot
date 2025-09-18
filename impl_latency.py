@@ -16,6 +16,15 @@ import warnings
 import math
 import weakref
 
+try:
+    from latency_volatility_cache import LatencyVolatilityCache
+except ModuleNotFoundError as exc:  # pragma: no cover - explicit guidance for legacy setups
+    raise ModuleNotFoundError(
+        "latency_volatility_cache module is required; missing latency_volatility_cache.py"
+    ) from exc
+except Exception:  # pragma: no cover - optional dependency for older deployments
+    LatencyVolatilityCache = None  # type: ignore
+
 import numpy as np
 try:
     from runtime_flags import seasonality_enabled
@@ -499,6 +508,14 @@ class LatencyImpl:
                 debug["reason"] = "cache_missing"
                 return 1.0, debug
 
+            sym = symbol or getattr(sim_obj, "symbol", None)
+            if not sym:
+                debug["reason"] = "symbol_missing"
+                return 1.0, debug
+
+            sym_norm = str(sym).upper()
+            debug.setdefault("symbol", sym_norm)
+
             ready = True
             ready_attr = getattr(cache, "ready", None)
             if isinstance(ready_attr, bool):
@@ -507,16 +524,17 @@ class LatencyImpl:
                 ready_fn = getattr(cache, "is_ready", None)
                 if callable(ready_fn):
                     try:
-                        ready = bool(ready_fn())
+                        ready = bool(ready_fn(sym_norm))
+                    except TypeError:
+                        try:
+                            ready = bool(ready_fn(symbol=sym_norm))
+                        except TypeError:
+                            ready = bool(ready_fn())
                     except Exception:
                         ready = True
             if not ready:
                 debug["reason"] = "cache_not_ready"
-                return 1.0, debug
-
-            sym = symbol or getattr(sim_obj, "symbol", None)
-            if not sym:
-                debug["reason"] = "symbol_missing"
+                debug.setdefault("symbol", sym_norm)
                 return 1.0, debug
 
             method = None
@@ -539,7 +557,7 @@ class LatencyImpl:
             try:
                 try:
                     result = method(
-                        symbol=sym,
+                        symbol=sym_norm,
                         ts_ms=int(ts_ms),
                         metric=metric,
                         window=window,
@@ -547,7 +565,7 @@ class LatencyImpl:
                         clip=clip,
                     )
                 except TypeError:
-                    result = method(sym, int(ts_ms), metric, window, gamma, clip)
+                    result = method(sym_norm, int(ts_ms), metric, window, gamma, clip)
             except Exception as exc:
                 debug["error"] = str(exc)
                 return 1.0, debug
