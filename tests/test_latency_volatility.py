@@ -104,7 +104,13 @@ def test_latency_volatility_multiplier(tmp_path):
     assert cache.calls and cache.calls[0]["symbol"] == "ETHUSDT"
     debug = result.get("debug", {}).get("latency", {})
     assert debug.get("volatility_multiplier") == pytest.approx(1.5)
-    assert debug.get("volatility_debug", {}).get("source") == "dummy"
+    vol_debug = debug.get("volatility_debug", {})
+    assert vol_debug.get("source") == "dummy"
+    assert vol_debug.get("symbol") == "ETHUSDT"
+    expected_keys = {"value", "mean", "std", "zscore", "clip", "gamma", "window", "symbol", "ts"}
+    assert expected_keys.issubset(vol_debug.keys())
+    assert debug.get("jitter_component") == pytest.approx(0.0)
+    assert debug.get("vol_adjust") == pytest.approx(50.0)
 
 
 def test_latency_volatility_gamma_zero(tmp_path):

@@ -215,9 +215,9 @@ class _LatencyWithSeasonality:
                 try:
                     result = cb(symbol=symbol, ts_ms=int(ts_ms))  # type: ignore[misc]
                 except Exception as exc:  # pragma: no cover - defensive fallback
-                    result = (1.0, {"error": str(exc)})
+                    result = (1.0, {"error": str(exc), "reason": "callback_error"})
             except Exception as exc:  # pragma: no cover - defensive fallback
-                result = (1.0, {"error": str(exc)})
+                result = (1.0, {"error": str(exc), "reason": "callback_error"})
             if isinstance(result, tuple):
                 vol_mult = result[0]
                 if len(result) > 1 and isinstance(result[1], dict):
@@ -229,11 +229,27 @@ class _LatencyWithSeasonality:
             try:
                 vol_mult = float(vol_mult)
             except (TypeError, ValueError):
-                vol_debug.setdefault("fallback", "non_numeric")
+                vol_debug.setdefault("reason", "non_numeric")
                 vol_mult = 1.0
             if not math.isfinite(vol_mult) or vol_mult <= 0.0:
-                vol_debug.setdefault("fallback", "invalid")
+                vol_debug.setdefault("reason", "invalid_multiplier")
+                vol_debug.setdefault("vol_mult", vol_mult)
                 vol_mult = 1.0
+
+        if symbol is not None:
+            try:
+                vol_debug.setdefault("symbol", str(symbol).upper())
+            except Exception:
+                vol_debug.setdefault("symbol", symbol)
+        try:
+            vol_debug.setdefault("ts", int(ts_ms))
+        except Exception:
+            pass
+        if vol_debug.get("reason"):
+            vol_debug.setdefault("vol_mult", float(vol_mult) if math.isfinite(vol_mult) else vol_mult)
+            vol_mult = 1.0
+        for key in ("value", "mean", "std", "zscore", "clip", "gamma", "window"):
+            vol_debug.setdefault(key, vol_debug.get(key))
 
         with self._lock:
             base, jitter, timeout = (
@@ -244,8 +260,9 @@ class _LatencyWithSeasonality:
             seed = getattr(self._model, "seed", None)
             state_after = None
             try:
-                eff_base = float(base) * float(m) * float(vol_mult)
-                eff_jitter = float(jitter) * float(m) * float(vol_mult)
+                season_mult = float(m)
+                eff_base = float(base) * season_mult
+                eff_jitter = float(jitter) * season_mult
                 scaled_base = int(round(eff_base))
                 if scaled_base > timeout:
                     seasonality_logger.warning(
@@ -278,13 +295,18 @@ class _LatencyWithSeasonality:
             if attempts < 1:
                 attempts = 1
             raw_total = float(res.get("total_ms", 0.0))
-            base_adjust = eff_base * attempts - float(scaled_base) * attempts
-            lat_ms = raw_total + base_adjust
-            lat_ms = max(float(self._min_ms), lat_ms)
+            scaled_base_total = float(scaled_base) * attempts
+            jitter_component = raw_total - scaled_base_total
+            base_adjust = eff_base * attempts - scaled_base_total
+            vol_adjust = eff_base * (float(vol_mult) - 1.0) * attempts
+            lat_ms = raw_total + base_adjust + vol_adjust
+            min_limit = float(self._min_ms)
+            lat_ms = max(min_limit, lat_ms)
             if self._max_ms is not None:
                 lat_ms = min(float(self._max_ms), lat_ms)
             lat_ms_int = int(round(lat_ms))
-            lat_ms_int = max(self._min_ms, lat_ms_int)
+            if lat_ms_int < self._min_ms:
+                lat_ms_int = self._min_ms
             if self._max_ms is not None and lat_ms_int > self._max_ms:
                 lat_ms_int = self._max_ms
             res["total_ms"] = lat_ms_int
@@ -301,6 +323,9 @@ class _LatencyWithSeasonality:
                     "attempts": attempts,
                     "min_ms": self._min_ms,
                     "max_ms": self._max_ms,
+                    "jitter_component": jitter_component,
+                    "base_adjust": base_adjust,
+                    "vol_adjust": vol_adjust,
                 }
                 try:
                     debug_dict = res.setdefault("debug", {})
@@ -312,11 +337,15 @@ class _LatencyWithSeasonality:
             log_enabled = seasonality_logger.isEnabledFor(logging.DEBUG)
             should_emit_sample_log = (self._debug_log or log_enabled) and log_enabled
             if should_emit_sample_log:
+                vol_value = vol_debug.get("value")
+                vol_zscore = vol_debug.get("zscore")
                 seasonality_logger.debug(
-                    "latency sample h%03d season=%.3f vol=%.3f raw=%.3f final=%s attempts=%s payload=%s",
+                    "latency sample h%03d season=%.3f vol=%.3f vol_value=%s zscore=%s raw=%.3f final=%s attempts=%s payload=%s",
                     hour,
                     float(m),
                     float(vol_mult),
+                    vol_value,
+                    vol_zscore,
                     raw_total,
                     lat_ms_int,
                     attempts,
@@ -333,6 +362,8 @@ class _LatencyWithSeasonality:
                     "adjusted_total_ms": lat_ms_int,
                     "attempts": attempts,
                     "volatility_debug": vol_debug,
+                    "vol_value": vol_debug.get("value"),
+                    "zscore": vol_debug.get("zscore"),
                 }
                 logger.debug("latency volatility sample: %s", log_payload)
 
@@ -494,27 +525,53 @@ class LatencyImpl:
 
         def _resolve(symbol: Optional[str], ts_ms: int) -> Tuple[float, Dict[str, Any]]:
             debug: Dict[str, Any] = {}
+            sym_norm: Optional[str] = None
+
+            def _finalize(data: Dict[str, Any], ts_value: Optional[int]) -> Dict[str, Any]:
+                if sym_norm:
+                    data.setdefault("symbol", sym_norm)
+                if ts_value is not None:
+                    data.setdefault("ts", ts_value)
+                if "ts_ms" in data and "ts" not in data:
+                    try:
+                        data.setdefault("ts", int(data["ts_ms"]))
+                    except Exception:
+                        data.setdefault("ts", ts_value)
+                data.setdefault("gamma", gamma)
+                data.setdefault("window", window)
+                data.setdefault("clip", clip)
+                if data.get("value") is None and "last_value" in data:
+                    data["value"] = data.get("last_value")
+                data.setdefault("value", data.get("value"))
+                data.setdefault("mean", data.get("mean"))
+                data.setdefault("std", data.get("std"))
+                data.setdefault("zscore", data.get("zscore"))
+                return data
+
             if gamma == 0.0:
                 debug["reason"] = "gamma_zero"
-                return 1.0, debug
+                return 1.0, _finalize(debug, None)
 
             sim_obj = sim_ref()
             if sim_obj is None:
                 debug["reason"] = "sim_released"
-                return 1.0, debug
+                return 1.0, _finalize(debug, None)
+
+            sym = (
+                symbol
+                or getattr(sim_obj, "_latency_symbol", None)
+                or getattr(sim_obj, "symbol", None)
+            )
+            if not sym:
+                debug["reason"] = "symbol_missing"
+                return 1.0, _finalize(debug, None)
+
+            sym_norm = str(sym).upper()
 
             cache = getattr(sim_obj, "volatility_cache", None)
             if cache is None:
                 debug["reason"] = "cache_missing"
-                return 1.0, debug
-
-            sym = symbol or getattr(sim_obj, "symbol", None)
-            if not sym:
-                debug["reason"] = "symbol_missing"
-                return 1.0, debug
-
-            sym_norm = str(sym).upper()
-            debug.setdefault("symbol", sym_norm)
+                return 1.0, _finalize(debug, None)
 
             ready = True
             ready_attr = getattr(cache, "ready", None)
@@ -534,41 +591,40 @@ class LatencyImpl:
                         ready = True
             if not ready:
                 debug["reason"] = "cache_not_ready"
-                debug.setdefault("symbol", sym_norm)
-                return 1.0, debug
+                return 1.0, _finalize(debug, None)
 
-            method = None
-            for name in (
-                "latency_multiplier",
-                "get_latency_multiplier",
-                "latency_factor",
-                "get_latency_factor",
-            ):
-                cand = getattr(cache, name, None)
-                if callable(cand):
-                    method = cand
-                    break
-
-            if method is None:
+            resolver = getattr(cache, "latency_multiplier", None)
+            if not callable(resolver):
                 debug["reason"] = "no_method"
-                return 1.0, debug
+                return 1.0, _finalize(debug, None)
+
+            try:
+                ts_val = int(ts_ms)
+            except (TypeError, ValueError):
+                debug["reason"] = "invalid_ts"
+                return 1.0, _finalize(debug, None)
 
             payload: Dict[str, Any] = {}
             try:
                 try:
-                    result = method(
+                    result = resolver(
                         symbol=sym_norm,
-                        ts_ms=int(ts_ms),
+                        ts_ms=ts_val,
                         metric=metric,
                         window=window,
                         gamma=gamma,
                         clip=clip,
                     )
                 except TypeError:
-                    result = method(sym_norm, int(ts_ms), metric, window, gamma, clip)
+                    result = resolver(sym_norm, ts_val, metric, window, gamma, clip)
             except Exception as exc:
-                debug["error"] = str(exc)
-                return 1.0, debug
+                return 1.0, _finalize(
+                    {
+                        "reason": "exception",
+                        "error": str(exc),
+                    },
+                    ts_val,
+                )
 
             if isinstance(result, tuple):
                 vol_mult = result[0]
@@ -583,18 +639,20 @@ class LatencyImpl:
                 value = float(vol_mult)
             except (TypeError, ValueError):
                 payload.setdefault("reason", "non_numeric")
-                return 1.0, payload or debug
+                return 1.0, _finalize(payload or debug, ts_val)
 
             if not math.isfinite(value) or value <= 0.0:
                 payload.setdefault("reason", "invalid_multiplier")
                 payload.setdefault("vol_mult", value)
-                return 1.0, payload
+                return 1.0, _finalize(payload, ts_val)
 
             payload.setdefault("metric", metric)
             payload.setdefault("window", window)
             payload.setdefault("gamma", gamma)
             payload.setdefault("clip", clip)
-            return value, payload
+            payload.setdefault("vol_mult", value)
+            finalized = _finalize(payload, ts_val)
+            return value, finalized
 
         return _resolve
 
@@ -614,8 +672,13 @@ class LatencyImpl:
             cache = getattr(sim_obj, "volatility_cache", None)
             if cache is None:
                 return
+            updater = getattr(cache, "update_latency_factor", None)
+            if not callable(updater):
+                return
             sym = symbol or getattr(sim_obj, "_latency_symbol", None) or getattr(sim_obj, "symbol", None)
-            sym_norm = str(sym).upper() if sym else None
+            if sym is None:
+                return
+            sym_norm = str(sym).upper()
             try:
                 ts = int(ts_ms)
             except (TypeError, ValueError):
@@ -626,50 +689,14 @@ class LatencyImpl:
                 return
             if not math.isfinite(val):
                 return
-            method = None
-            for name in (
-                "update_latency_factor",
-                "update_latency",
-                "update",
-                "append",
-                "observe",
-            ):
-                cand = getattr(cache, name, None)
-                if callable(cand):
-                    method = cand
-                    break
-            if method is None:
-                return
             try:
-                if sym_norm is not None:
-                    method(symbol=sym_norm, ts_ms=ts, value=val)
-                else:
-                    method(ts_ms=ts, value=val)
-                return
-            except TypeError:
-                pass
-            try:
-                if sym_norm is not None:
-                    method(sym_norm, ts, val)
-                else:
-                    method(ts, val)
+                updater(symbol=sym_norm, ts_ms=ts, value=val)
                 return
             except TypeError:
                 try:
-                    method(ts, val)
+                    updater(sym_norm, ts, val)
+                except Exception:
                     return
-                except TypeError:
-                    try:
-                        if sym_norm is not None:
-                            method(sym_norm, val)
-                            return
-                    except Exception:
-                        pass
-                    try:
-                        method(val)
-                        return
-                    except Exception:
-                        return
             except Exception:
                 return
 
