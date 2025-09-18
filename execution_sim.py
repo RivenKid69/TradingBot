@@ -22,8 +22,9 @@ ExecutionSimulator v2
 Важно: этот модуль НЕ добавляет комиссии и слиппедж — они будут подключены отдельными шагами.
 """
 
+from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping, Callable
+from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping, Callable, Deque
 import hashlib
 import math
 import os
@@ -399,6 +400,13 @@ class Pending:
     intrabar_latency_ms: Optional[int] = None
 
 
+@dataclass
+class _VolSeriesState:
+    values: Deque[float] = field(default_factory=deque)
+    sum: float = 0.0
+    sum_sq: float = 0.0
+
+
 class _LatencyQueue:
     def __init__(
         self,
@@ -613,6 +621,67 @@ class ExecutionSimulator:
             candidate = getattr(self.slippage_cfg, "get_spread_bps", None)
             if callable(candidate):
                 self._slippage_get_spread = candidate
+
+        self._vol_window_size: int = 120
+        self._vol_zscore_clip: Optional[float] = None
+        self._vol_gamma: float = 0.0
+        self._vol_series: Dict[str, _VolSeriesState] = {}
+        self._vol_stat_cache: Dict[str, Dict[str, float]] = {}
+        self._vol_norm_metric: Optional[str] = None
+        dyn_cfg_obj: Optional[Any] = None
+        if self.slippage_cfg is not None:
+            dyn_candidate = None
+            getter = getattr(self.slippage_cfg, "get_dynamic_block", None)
+            if callable(getter):
+                try:
+                    dyn_candidate = getter()
+                except Exception:
+                    dyn_candidate = None
+            if dyn_candidate is None:
+                dyn_candidate = getattr(self.slippage_cfg, "dynamic", None)
+            if dyn_candidate is None:
+                dyn_candidate = getattr(self.slippage_cfg, "dynamic_spread", None)
+            dyn_cfg_obj = dyn_candidate
+        if dyn_cfg_obj is not None:
+            if isinstance(dyn_cfg_obj, Mapping):
+                metric_attr = dyn_cfg_obj.get("vol_metric")
+                window_attr = dyn_cfg_obj.get("vol_window")
+                gamma_attr = dyn_cfg_obj.get("gamma")
+                clip_attr = dyn_cfg_obj.get("zscore_clip")
+            else:
+                metric_attr = getattr(dyn_cfg_obj, "vol_metric", None)
+                window_attr = getattr(dyn_cfg_obj, "vol_window", None)
+                gamma_attr = getattr(dyn_cfg_obj, "gamma", None)
+                clip_attr = getattr(dyn_cfg_obj, "zscore_clip", None)
+            try:
+                metric_key = str(metric_attr).strip().lower() if metric_attr else ""
+            except Exception:
+                metric_key = ""
+            if metric_key:
+                self._vol_norm_metric = metric_key
+            window_val: Optional[int]
+            try:
+                window_val = int(window_attr) if window_attr is not None else None
+            except (TypeError, ValueError):
+                window_val = None
+            if window_val is not None:
+                if window_val < 2:
+                    window_val = 2
+                self._vol_window_size = window_val
+            try:
+                gamma_val = float(gamma_attr) if gamma_attr is not None else None
+            except (TypeError, ValueError):
+                gamma_val = None
+            if gamma_val is not None and math.isfinite(gamma_val):
+                self._vol_gamma = gamma_val
+            try:
+                clip_val = float(clip_attr) if clip_attr is not None else None
+            except (TypeError, ValueError):
+                clip_val = None
+            if clip_val is not None and math.isfinite(clip_val):
+                if clip_val < 0.0:
+                    clip_val = abs(clip_val)
+                self._vol_zscore_clip = clip_val
 
         # исполнители
         self._execution_cfg = dict(execution_config or {})
@@ -1860,13 +1929,86 @@ class ExecutionSimulator:
             self._vwap_pv += float(price) * float(volume)
             self._vwap_vol += float(volume)
 
+    def _update_vol_series(
+        self, metric: str, value: float
+    ) -> Optional[Dict[str, float]]:
+        if not metric:
+            return None
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(val):
+            return None
+        name = str(metric).lower()
+        window = self._vol_window_size if self._vol_window_size >= 2 else 2
+        state = self._vol_series.get(name)
+        if state is None:
+            state = _VolSeriesState(values=deque(maxlen=window))
+            self._vol_series[name] = state
+        dq = state.values
+        if dq.maxlen != window:
+            dq = deque(dq, maxlen=window)
+            state.values = dq
+            state.sum = 0.0
+            state.sum_sq = 0.0
+            for existing in dq:
+                state.sum += existing
+                state.sum_sq += existing * existing
+        if dq.maxlen is not None and len(dq) == dq.maxlen:
+            old = dq.popleft()
+            state.sum -= old
+            state.sum_sq -= old * old
+        dq.append(val)
+        state.sum += val
+        state.sum_sq += val * val
+        count = len(dq)
+        if count <= 0:
+            return None
+        mean = state.sum / count
+        variance = max(state.sum_sq / count - mean * mean, 0.0)
+        std = math.sqrt(variance)
+        z_raw = 0.0
+        if count >= 2 and std > 0.0:
+            z_raw = (val - mean) / std
+        clip = self._vol_zscore_clip
+        if clip is not None and math.isfinite(clip):
+            clip_abs = abs(float(clip))
+            zscore = max(-clip_abs, min(clip_abs, z_raw))
+        else:
+            zscore = z_raw
+        gamma_val = self._vol_gamma if math.isfinite(self._vol_gamma) else 0.0
+        multiplier: Optional[float] = None
+        if gamma_val != 0.0:
+            mult_candidate = 1.0 + gamma_val * zscore
+            if math.isfinite(mult_candidate):
+                multiplier = max(0.0, mult_candidate)
+        stats: Dict[str, float] = {
+            "mean": float(mean),
+            "std": float(std),
+            "zscore_raw": float(z_raw),
+            "zscore": float(zscore),
+            "count": float(count),
+        }
+        if multiplier is not None:
+            stats["multiplier"] = float(multiplier)
+        self._vol_stat_cache[name] = stats
+        return stats
+
     def _normalize_vol_metrics(
         self, metrics: Optional[Mapping[str, Any]]
     ) -> Optional[Dict[str, float]]:
         if not metrics:
             return None
+        try:
+            items = metrics.items()  # type: ignore[attr-defined]
+        except AttributeError:
+            try:
+                items = dict(metrics).items()  # type: ignore[arg-type]
+            except Exception:
+                return None
         normalized: Dict[str, float] = {}
-        for key, raw_val in metrics.items():
+        for key, raw_val in items:
             if key is None:
                 continue
             try:
@@ -1876,6 +2018,53 @@ class ExecutionSimulator:
             if not math.isfinite(val):
                 continue
             normalized[str(key).lower()] = val
+        if not normalized:
+            return None
+        if "atr_pct" in normalized:
+            atr_val = normalized["atr_pct"]
+            normalized.setdefault("atr", atr_val)
+            normalized.setdefault("atr/price", atr_val)
+        elif "atr" in normalized:
+            atr_val = normalized["atr"]
+            normalized.setdefault("atr_pct", atr_val)
+            normalized.setdefault("atr/price", atr_val)
+        range_val = normalized.get("range")
+        if range_val is not None:
+            range_clean = max(0.0, float(range_val))
+            normalized["range"] = range_clean
+            normalized.setdefault("range_ratio", range_clean)
+            normalized.setdefault("range_ratio_bps", range_clean * 1e4)
+        elif "range_ratio_bps" in normalized:
+            ratio_bps = max(0.0, float(normalized["range_ratio_bps"]))
+            normalized["range_ratio_bps"] = ratio_bps
+            ratio = ratio_bps / 1e4 if ratio_bps is not None else 0.0
+            normalized.setdefault("range_ratio", ratio)
+            normalized.setdefault("range", ratio)
+        stat_targets = set()
+        if self._vol_norm_metric and self._vol_norm_metric in normalized:
+            stat_targets.add(self._vol_norm_metric)
+        for candidate in ("sigma", "atr", "atr_pct", "range", "range_ratio_bps"):
+            if candidate in normalized:
+                stat_targets.add(candidate)
+        for metric_key in stat_targets:
+            value = normalized.get(metric_key)
+            if value is None or not math.isfinite(value):
+                continue
+            stats = self._update_vol_series(metric_key, value)
+            if not stats:
+                continue
+            base = metric_key.replace("/", "_")
+            try:
+                normalized[f"{base}_mean"] = float(stats["mean"])
+                normalized[f"{base}_std"] = float(stats["std"])
+                normalized[f"{base}_zscore_raw"] = float(stats["zscore_raw"])
+                normalized[f"{base}_zscore"] = float(stats["zscore"])
+                normalized[f"{base}_count"] = float(stats.get("count", 0.0))
+            except (KeyError, TypeError, ValueError):
+                pass
+            multiplier = stats.get("multiplier")
+            if multiplier is not None and math.isfinite(multiplier):
+                normalized[f"{base}_gamma_mult"] = float(multiplier)
         return normalized or None
 
     def _select_cache_value(

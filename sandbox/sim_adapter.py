@@ -27,7 +27,16 @@ class _VolEstimator:
 
     def __init__(self, *, vol_metric: str = "sigma", vol_window: int = 120) -> None:
         self._metric = str(vol_metric or "sigma").lower()
-        if self._metric not in {"sigma", "atr", "atr_pct", "atr/price"}:
+        allowed_metrics = {
+            "sigma",
+            "atr",
+            "atr_pct",
+            "atr/price",
+            "range",
+            "range_ratio",
+            "range_ratio_bps",
+        }
+        if self._metric not in allowed_metrics:
             self._metric = "sigma"
         self._window = max(1, int(vol_window or 1))
         self._returns: Dict[str, Deque[float]] = {}
@@ -38,6 +47,7 @@ class _VolEstimator:
         self._last_value: Dict[str, Optional[float]] = {}
         self._last_sigma: Dict[str, Optional[float]] = {}
         self._last_atr_pct: Dict[str, Optional[float]] = {}
+        self._last_range_ratio: Dict[str, Optional[float]] = {}
 
     @staticmethod
     def _to_float(val: Any) -> Optional[float]:
@@ -104,6 +114,14 @@ class _VolEstimator:
             atr_val = self._compute_atr_raw(symbol)
             if atr_val is not None:
                 return atr_val
+        elif metric_key in {"range", "range_ratio"}:
+            range_val = self._last_range_ratio.get(symbol)
+            if range_val is not None:
+                return range_val
+        elif metric_key == "range_ratio_bps":
+            range_val = self._last_range_ratio.get(symbol)
+            if range_val is not None:
+                return max(0.0, range_val) * 1e4
 
         # Fallbacks: try sigma first, then ATR, whichever has data.
         sigma_val = self._compute_sigma_raw(symbol)
@@ -136,6 +154,24 @@ class _VolEstimator:
             if log_ret is not None and math.isfinite(log_ret):
                 self._append_return(sym, log_ret)
 
+        range_ratio: Optional[float] = None
+        if hi is not None and lo is not None:
+            span = hi - lo
+            if span < 0.0:
+                span = abs(span)
+            mid_value = (hi + lo) * 0.5
+            if mid_value is not None and mid_value != 0.0:
+                try:
+                    ratio_candidate = span / abs(mid_value)
+                except ZeroDivisionError:
+                    ratio_candidate = None
+                if (
+                    ratio_candidate is not None
+                    and math.isfinite(ratio_candidate)
+                    and ratio_candidate >= 0.0
+                ):
+                    range_ratio = max(0.0, ratio_candidate)
+
         if (
             prev_close is not None
             and hi is not None
@@ -151,10 +187,24 @@ class _VolEstimator:
         if cl is not None:
             self._last_close[sym] = cl
 
+        self._last_range_ratio[sym] = range_ratio
         sigma_val = self._compute_sigma_raw(sym)
         atr_val = self._compute_atr_raw(sym)
+        range_val = range_ratio if range_ratio is not None else self._last_range_ratio.get(sym)
         if self._metric == "sigma":
             value = sigma_val if sigma_val is not None else atr_val
+        elif self._metric in {"atr", "atr_pct", "atr/price"}:
+            value = atr_val if atr_val is not None else sigma_val
+        elif self._metric in {"range", "range_ratio"}:
+            value = range_val if range_val is not None else (
+                sigma_val if sigma_val is not None else atr_val
+            )
+        elif self._metric == "range_ratio_bps":
+            if range_val is not None:
+                value = max(0.0, range_val) * 1e4
+            else:
+                fallback = sigma_val if sigma_val is not None else atr_val
+                value = fallback
         else:
             value = atr_val if atr_val is not None else sigma_val
         if value is None:
@@ -180,6 +230,16 @@ class _VolEstimator:
             if val is not None:
                 return val
             return self._compute_atr_raw(sym)
+        if metric_key in {"range", "range_ratio"}:
+            val = self._last_range_ratio.get(sym)
+            if val is not None:
+                return val
+            return None
+        if metric_key == "range_ratio_bps":
+            val = self._last_range_ratio.get(sym)
+            if val is not None:
+                return max(0.0, val) * 1e4
+            return None
         return self._last_value.get(sym)
 
 _TF_MS = {
@@ -336,6 +396,7 @@ class SimAdapter:
         actions = self._to_actions(orders)
         sigma_last = self._vol_estimator.last(self.symbol, metric="sigma")
         atr_last = self._vol_estimator.last(self.symbol, metric="atr_pct")
+        range_last = self._vol_estimator.last(self.symbol, metric="range")
         vol_raw_payload: Dict[str, float] = {}
         if sigma_last is not None:
             try:
@@ -351,6 +412,16 @@ class SimAdapter:
                 vol_raw_payload["atr_pct"] = atr_value
                 vol_raw_payload["atr"] = atr_value
                 vol_raw_payload["atr/price"] = atr_value
+        if range_last is not None:
+            try:
+                range_value = float(range_last)
+            except (TypeError, ValueError):
+                range_value = None
+            else:
+                if math.isfinite(range_value) and range_value >= 0.0:
+                    vol_raw_payload["range"] = range_value
+                    vol_raw_payload.setdefault("range_ratio", range_value)
+                    vol_raw_payload["range_ratio_bps"] = range_value * 1e4
         vol_raw_arg = vol_raw_payload or None
         close_arg = bar_close if bar_close is not None else ref_price
         report = self.sim.run_step(
