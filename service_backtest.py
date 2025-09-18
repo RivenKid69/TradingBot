@@ -64,6 +64,60 @@ def _coerce_timeframe_ms(value: Any) -> Optional[int]:
         return None
 
 
+def _extract_dynamic_slippage_cfg(
+    run_cfg: CommonRunConfig | None,
+) -> Optional[Dict[str, Any]]:
+    if run_cfg is None:
+        return None
+    slip_cfg = getattr(run_cfg, "slippage", None)
+    dyn_block: Any = None
+    if isinstance(slip_cfg, dict):
+        dyn_block = slip_cfg.get("dynamic") or slip_cfg.get("dynamic_spread")
+    else:
+        dyn_block = getattr(slip_cfg, "dynamic", None) or getattr(
+            slip_cfg, "dynamic_spread", None
+        )
+    if dyn_block is None:
+        return None
+    if isinstance(dyn_block, dict):
+        return dict(dyn_block)
+    if hasattr(dyn_block, "dict"):
+        try:
+            data = dyn_block.dict()  # type: ignore[attr-defined]
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            return dict(data)
+    if hasattr(dyn_block, "model_dump"):
+        try:
+            data = dyn_block.model_dump()  # type: ignore[attr-defined]
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            return dict(data)
+    try:
+        return dict(dyn_block)
+    except Exception:
+        pass
+    result: Dict[str, Any] = {}
+    for key in (
+        "enabled",
+        "base_bps",
+        "alpha_vol",
+        "beta_illiquidity",
+        "vol_mode",
+        "liq_col",
+        "liq_ref",
+        "min_bps",
+        "max_bps",
+        "vol_metric",
+        "vol_window",
+    ):
+        if hasattr(dyn_block, key):
+            result[key] = getattr(dyn_block, key)
+    return result or None
+
+
 @dataclass
 class BacktestConfig:
     symbol: str
@@ -153,6 +207,8 @@ class ServiceBacktest:
         )
 
         dyn_spread_cfg = self.cfg.dynamic_spread_config
+        if dyn_spread_cfg is None:
+            dyn_spread_cfg = _extract_dynamic_slippage_cfg(self._run_config)
         sim_spread_getter = getattr(self.sim, "get_spread_bps", None)
         if not callable(sim_spread_getter):
             sim_spread_getter = getattr(self.sim, "_slippage_get_spread", None)

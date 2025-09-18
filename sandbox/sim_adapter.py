@@ -257,13 +257,39 @@ class SimAdapter:
         )
         metric = "sigma"
         window = 120
-        if latency_cfg is not None:
-            if isinstance(latency_cfg, dict):
-                metric = latency_cfg.get("vol_metric", metric) or metric
-                window = latency_cfg.get("vol_window", window) or window
+        dyn_metric: Optional[Any] = None
+        dyn_window: Optional[Any] = None
+        if run_config is not None:
+            slippage_cfg = getattr(run_config, "slippage", None)
+            dyn_block: Optional[Any] = None
+            if isinstance(slippage_cfg, dict):
+                dyn_block = slippage_cfg.get("dynamic") or slippage_cfg.get("dynamic_spread")
             else:
-                metric = getattr(latency_cfg, "vol_metric", metric) or metric
-                window = getattr(latency_cfg, "vol_window", window) or window
+                dyn_block = getattr(slippage_cfg, "dynamic", None) or getattr(
+                    slippage_cfg, "dynamic_spread", None
+                )
+            if dyn_block is not None:
+                if isinstance(dyn_block, dict):
+                    dyn_metric = dyn_block.get("vol_metric", dyn_metric)
+                    dyn_window = dyn_block.get("vol_window", dyn_window)
+                else:
+                    dyn_metric = getattr(dyn_block, "vol_metric", dyn_metric)
+                    dyn_window = getattr(dyn_block, "vol_window", dyn_window)
+        if dyn_metric:
+            metric = dyn_metric
+        if dyn_window:
+            window = dyn_window
+        if (dyn_metric is None or dyn_window is None) and latency_cfg is not None:
+            if isinstance(latency_cfg, dict):
+                if dyn_metric is None:
+                    metric = latency_cfg.get("vol_metric", metric) or metric
+                if dyn_window is None:
+                    window = latency_cfg.get("vol_window", window) or window
+            else:
+                if dyn_metric is None:
+                    metric = getattr(latency_cfg, "vol_metric", metric) or metric
+                if dyn_window is None:
+                    window = getattr(latency_cfg, "vol_window", window) or window
         metric_norm = str(metric or "sigma").lower()
         try:
             window_int = int(window)

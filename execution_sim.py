@@ -1091,8 +1091,8 @@ class ExecutionSimulator:
                 message = str(exc)
                 removed = False
                 for key in list(attempted.keys()):
-                    token = f"'{key}'"
-                    if token in message and key in attempted:
+                    tokens = (f"'{key}'", f'"{key}"')
+                    if any(tok in message for tok in tokens) and key in attempted:
                         attempted.pop(key)
                         removed = True
                         break
@@ -1109,30 +1109,72 @@ class ExecutionSimulator:
         ts_ms: Optional[int],
         vol_factor: Optional[float],
     ) -> Optional[float]:
-        base_val: Optional[float] = None
-        if base_spread_bps is not None:
+        def _safe_float(value: Any) -> Optional[float]:
+            if value is None:
+                return None
             try:
-                base_val = float(base_spread_bps)
+                out = float(value)
             except (TypeError, ValueError):
-                base_val = None
-        if base_val is None or not math.isfinite(base_val) or base_val < 0.0:
+                return None
+            if not math.isfinite(out):
+                return None
+            return out
+
+        base_val = _safe_float(base_spread_bps)
+        if base_val is not None and base_val < 0.0:
             base_val = None
+        default_val = _safe_float(self._default_spread_bps())
         if base_val is None:
-            base_val = self._default_spread_bps()
+            base_val = default_val
         if base_val is None:
             return None
+
+        bid = _safe_float(self._last_bid)
+        ask = _safe_float(self._last_ask)
+        bar_high = _safe_float(self._last_bar_high)
+        bar_low = _safe_float(self._last_bar_low)
+
+        mid_price: Optional[float]
+        if bid is not None and ask is not None:
+            mid_price = (bid + ask) * 0.5
+        elif bar_high is not None and bar_low is not None:
+            mid_price = (bar_high + bar_low) * 0.5
+        else:
+            mid_price = None
+        mid_price = _safe_float(mid_price)
+        if mid_price is not None and mid_price <= 0.0:
+            mid_price = None
+
+        if mid_price is None:
+            fallback = default_val if default_val is not None else base_val
+            if fallback is None:
+                return None
+            return float(fallback)
 
         getter_kwargs: Dict[str, Any] = {
             "symbol": self.symbol,
             "ts_ms": ts_ms,
             "base_spread_bps": base_val,
             "vol_factor": vol_factor,
+            "mid_price": mid_price,
         }
         if vol_factor is None:
             getter_kwargs.pop("vol_factor")
         # Всегда передаём ts_ms даже если None — совместимо с существующим интерфейсом.
         if ts_ms is None:
             getter_kwargs["ts_ms"] = ts_ms
+        if bar_high is not None:
+            getter_kwargs["bar_high"] = bar_high
+        if bar_low is not None:
+            getter_kwargs["bar_low"] = bar_low
+        vol_metrics = None
+        if isinstance(self._last_vol_raw, Mapping):
+            try:
+                vol_metrics = dict(self._last_vol_raw)
+            except Exception:
+                vol_metrics = None
+        if vol_metrics is not None:
+            getter_kwargs["vol_metrics"] = vol_metrics
 
         result = self._call_spread_getter(getter_kwargs)
         if result is not None:
@@ -1171,6 +1213,10 @@ class ExecutionSimulator:
         ts_ms: Optional[int] = None,
         trade_price: Optional[float] = None,
         trade_qty: Optional[float] = None,
+        bar_open: Optional[float] = None,
+        bar_high: Optional[float] = None,
+        bar_low: Optional[float] = None,
+        bar_close: Optional[float] = None,
     ) -> None:
         """
         Установить последний рыночный снапшот: bid/ask (для вычисления spread и mid),
@@ -1231,6 +1277,17 @@ class ExecutionSimulator:
             vf_val = None
         self._last_vol_factor = vf_val
 
+        metrics = self._normalize_vol_metrics(vol_raw)
+        self._last_vol_raw = metrics
+
+        self._last_bar_open = float(bar_open) if bar_open is not None else None
+        self._last_bar_high = float(bar_high) if bar_high is not None else None
+        self._last_bar_low = float(bar_low) if bar_low is not None else None
+        close_val = bar_close
+        if close_val is None:
+            close_val = trade_price
+        self._last_bar_close = float(close_val) if close_val is not None else None
+
         effective_spread = self._compute_effective_spread_bps(
             base_spread_bps=sbps,
             ts_ms=ts_ms,
@@ -1246,8 +1303,6 @@ class ExecutionSimulator:
             self._last_spread_bps = float(effective_spread) * mult
         else:
             self._last_spread_bps = None
-        metrics = self._normalize_vol_metrics(vol_raw)
-        self._last_vol_raw = metrics
         liq_val = float(liquidity) if liquidity is not None else None
         self._last_liquidity = liq_val * liq_mult if liq_val is not None else None
         if ts_ms is not None and self._last_vol_factor is not None:
@@ -3028,6 +3083,12 @@ class ExecutionSimulator:
         metrics = self._normalize_vol_metrics(vol_raw)
         self._last_vol_raw = metrics
         self._last_liquidity = float(liquidity) if liquidity is not None else None
+        self._last_ref_price = float(ref_price) if ref_price is not None else None
+        self._last_bar_open = float(bar_open) if bar_open is not None else None
+        self._last_bar_high = float(bar_high) if bar_high is not None else None
+        self._last_bar_low = float(bar_low) if bar_low is not None else None
+        close_val = bar_close if bar_close is not None else self._last_ref_price
+        self._last_bar_close = float(close_val) if close_val is not None else None
         base_spread: Optional[float] = None
         if (
             compute_spread_bps_from_quotes is not None
@@ -3046,12 +3107,6 @@ class ExecutionSimulator:
             ts_ms=ts,
             vol_factor=self._last_vol_factor,
         )
-        self._last_ref_price = float(ref_price) if ref_price is not None else None
-        self._last_bar_open = float(bar_open) if bar_open is not None else None
-        self._last_bar_high = float(bar_high) if bar_high is not None else None
-        self._last_bar_low = float(bar_low) if bar_low is not None else None
-        close_val = bar_close if bar_close is not None else ref_price
-        self._last_bar_close = float(close_val) if close_val is not None else None
         if bar_timeframe_ms is not None:
             self.set_intrabar_timeframe_ms(bar_timeframe_ms)
         price_tick = trade_price if trade_price is not None else self._last_ref_price
