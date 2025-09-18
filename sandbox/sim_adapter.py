@@ -36,6 +36,8 @@ class _VolEstimator:
         self._tr_sum: Dict[str, float] = {}
         self._last_close: Dict[str, float] = {}
         self._last_value: Dict[str, Optional[float]] = {}
+        self._last_sigma: Dict[str, Optional[float]] = {}
+        self._last_atr_pct: Dict[str, Optional[float]] = {}
 
     @staticmethod
     def _to_float(val: Any) -> Optional[float]:
@@ -73,29 +75,43 @@ class _VolEstimator:
         total += value
         self._tr_sum[symbol] = total
 
+    def _compute_sigma_raw(self, symbol: str) -> Optional[float]:
+        dq = self._returns.get(symbol)
+        if not dq:
+            return None
+        total = max(0.0, self._ret_sumsq.get(symbol, 0.0))
+        try:
+            return math.sqrt(total / len(dq))
+        except ZeroDivisionError:
+            return None
+
+    def _compute_atr_raw(self, symbol: str) -> Optional[float]:
+        dq = self._tranges.get(symbol)
+        if not dq:
+            return None
+        total = self._tr_sum.get(symbol, 0.0)
+        if len(dq) == 0:
+            return None
+        return max(0.0, total / len(dq))
+
     def _compute(self, symbol: str, metric: Optional[str] = None) -> Optional[float]:
         metric_key = (metric or self._metric or "").lower()
-        metric = metric_key
-        if metric == "sigma":
-            dq = self._returns.get(symbol)
-            if dq:
-                total = max(0.0, self._ret_sumsq.get(symbol, 0.0))
-                return math.sqrt(total / len(dq))
-        elif metric in {"atr", "atr_pct", "atr/price"}:
-            dq = self._tranges.get(symbol)
-            if dq:
-                total = self._tr_sum.get(symbol, 0.0)
-                return max(0.0, total / len(dq))
+        if metric_key == "sigma":
+            sigma_val = self._compute_sigma_raw(symbol)
+            if sigma_val is not None:
+                return sigma_val
+        elif metric_key in {"atr", "atr_pct", "atr/price"}:
+            atr_val = self._compute_atr_raw(symbol)
+            if atr_val is not None:
+                return atr_val
 
         # Fallbacks: try sigma first, then ATR, whichever has data.
-        dq_ret = self._returns.get(symbol)
-        if dq_ret:
-            total = max(0.0, self._ret_sumsq.get(symbol, 0.0))
-            return math.sqrt(total / len(dq_ret))
-        dq_tr = self._tranges.get(symbol)
-        if dq_tr:
-            total = self._tr_sum.get(symbol, 0.0)
-            return max(0.0, total / len(dq_tr))
+        sigma_val = self._compute_sigma_raw(symbol)
+        if sigma_val is not None:
+            return sigma_val
+        atr_val = self._compute_atr_raw(symbol)
+        if atr_val is not None:
+            return atr_val
         return None
 
     def observe(
@@ -135,7 +151,16 @@ class _VolEstimator:
         if cl is not None:
             self._last_close[sym] = cl
 
-        value = self._compute(sym)
+        sigma_val = self._compute_sigma_raw(sym)
+        atr_val = self._compute_atr_raw(sym)
+        if self._metric == "sigma":
+            value = sigma_val if sigma_val is not None else atr_val
+        else:
+            value = atr_val if atr_val is not None else sigma_val
+        if value is None:
+            value = self._compute(sym)
+        self._last_sigma[sym] = sigma_val
+        self._last_atr_pct[sym] = atr_val
         self._last_value[sym] = value
         return value
 
@@ -144,9 +169,18 @@ class _VolEstimator:
 
     def last(self, symbol: str, metric: Optional[str] = None) -> Optional[float]:
         sym = str(symbol).upper()
-        if metric is None or metric.lower() == self._metric:
-            return self._last_value.get(sym)
-        return self._compute(sym, metric)
+        metric_key = (metric or self._metric or "").lower()
+        if metric_key == "sigma":
+            val = self._last_sigma.get(sym)
+            if val is not None:
+                return val
+            return self._compute_sigma_raw(sym)
+        if metric_key in {"atr", "atr_pct", "atr/price"}:
+            val = self._last_atr_pct.get(sym)
+            if val is not None:
+                return val
+            return self._compute_atr_raw(sym)
+        return self._last_value.get(sym)
 
 _TF_MS = {
     "1s": 1_000,
@@ -198,6 +232,11 @@ class SimAdapter:
         run_config: CommonRunConfig | None = None,
     ):
         self.sim = sim
+        if run_config is None:
+            run_config = getattr(sim, "run_config", None)
+        if run_config is None:
+            run_config = getattr(sim, "_run_config", None)
+        self.run_config = run_config
         self.symbol = str(symbol).upper()
         self.timeframe = _ensure_timeframe(timeframe)
         self.interval_ms = _timeframe_to_ms(self.timeframe)
@@ -206,7 +245,9 @@ class SimAdapter:
             run_config.timing.enforce_closed_bars if run_config is not None else True
         )
 
-        latency_cfg = getattr(run_config, "latency", None) if run_config is not None else None
+        latency_cfg = (
+            getattr(run_config, "latency", None) if run_config is not None else None
+        )
         metric = "sigma"
         window = 120
         if latency_cfg is not None:
@@ -216,11 +257,18 @@ class SimAdapter:
             else:
                 metric = getattr(latency_cfg, "vol_metric", metric) or metric
                 window = getattr(latency_cfg, "vol_window", window) or window
+        metric_norm = str(metric or "sigma").lower()
         try:
             window_int = int(window)
         except (TypeError, ValueError):
             window_int = 120
-        self._vol_estimator = _VolEstimator(vol_metric=metric, vol_window=window_int)
+        if window_int < 1:
+            window_int = 1
+        self._vol_metric = metric_norm if metric_norm else "sigma"
+        self._vol_window = window_int
+        self._vol_estimator = _VolEstimator(
+            vol_metric=self._vol_metric, vol_window=self._vol_window
+        )
 
 
     @property
@@ -248,12 +296,31 @@ class SimAdapter:
              liquidity: Optional[float],
              orders: Sequence[Order]) -> Dict[str, Any]:
         actions = self._to_actions(orders)
+        sigma_last = self._vol_estimator.last(self.symbol, metric="sigma")
+        atr_last = self._vol_estimator.last(self.symbol, metric="atr_pct")
+        vol_raw_payload: Dict[str, float] = {}
+        if sigma_last is not None:
+            try:
+                vol_raw_payload["sigma"] = float(sigma_last)
+            except (TypeError, ValueError):
+                pass
+        if atr_last is not None:
+            try:
+                atr_value = float(atr_last)
+            except (TypeError, ValueError):
+                atr_value = None
+            if atr_value is not None:
+                vol_raw_payload["atr_pct"] = atr_value
+                vol_raw_payload["atr"] = atr_value
+                vol_raw_payload["atr/price"] = atr_value
+        vol_raw_arg = vol_raw_payload or None
         report = self.sim.run_step(
             ts=ts_ms,
             ref_price=ref_price,
             bid=bid,
             ask=ask,
             vol_factor=vol_factor,
+            vol_raw=vol_raw_arg,
             liquidity=liquidity,
             actions=actions,
         )

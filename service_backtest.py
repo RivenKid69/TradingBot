@@ -66,11 +66,21 @@ class ServiceBacktest:
             return iter(())
 
     def __init__(
-        self, policy: SignalPolicy, sim: ExecutionSimulator, cfg: BacktestConfig
+        self,
+        policy: SignalPolicy,
+        sim: ExecutionSimulator,
+        cfg: BacktestConfig,
+        *,
+        run_config: CommonRunConfig | None = None,
     ) -> None:
         self.policy = policy
         self.sim = sim
         self.cfg = cfg
+        self._run_config = (
+            run_config
+            or getattr(sim, "run_config", None)
+            or getattr(sim, "_run_config", None)
+        )
 
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
@@ -92,6 +102,7 @@ class ServiceBacktest:
             symbol=self.cfg.symbol,
             timeframe=self.cfg.timeframe,
             source=self._EmptySource(),
+            run_config=self._run_config,
         )
 
         self._bt = BacktestAdapter(
@@ -182,7 +193,7 @@ def from_config(
     container = di_registry.build_graph(cfg.components, cfg)
     policy: SignalPolicy = container["policy"]
     sim: ExecutionSimulator = container["executor"]  # type: ignore[assignment]
-    service = ServiceBacktest(policy, sim, svc_cfg)
+    service = ServiceBacktest(policy, sim, svc_cfg, run_config=cfg)
     reports = service.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
 
     out_path = params.get("out_reports", "logs/sandbox_reports.csv")

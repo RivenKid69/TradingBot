@@ -23,7 +23,7 @@ ExecutionSimulator v2
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Any, Dict, Sequence
+from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping
 import math
 import os
 import logging
@@ -41,6 +41,11 @@ except Exception:  # pragma: no cover - fallback if module not found
 
 from utils.prometheus import Counter
 from config import DataDegradationConfig
+
+try:
+    from latency_volatility_cache import LatencyVolatilityCache
+except Exception:  # pragma: no cover - optional dependency for legacy setups
+    LatencyVolatilityCache = None  # type: ignore
 
 try:
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
@@ -333,6 +338,7 @@ class SimStepReport:
     latency_p95_ms: float = 0.0
     latency_timeout_ratio: float = 0.0
     execution_profile: str = ""
+    vol_raw: Optional[Dict[str, float]] = None
 
     def to_dict(self) -> dict:
         return {
@@ -367,6 +373,11 @@ class SimStepReport:
             "latency_p95_ms": float(self.latency_p95_ms),
             "latency_timeout_ratio": float(self.latency_timeout_ratio),
             "execution_profile": str(self.execution_profile),
+            "vol_raw": (
+                {str(k): float(v) for k, v in self.vol_raw.items()}
+                if isinstance(self.vol_raw, dict)
+                else None
+            ),
         }
 
 
@@ -513,6 +524,8 @@ class ExecutionSimulator:
         self.lob = lob
         self._last_ref_price: Optional[float] = None
         self._next_h1_open_price: Optional[float] = None
+        self.run_config = run_config
+        self._run_config = run_config
         self.run_id: str = str(getattr(run_config, "run_id", "sim") or "sim")
         self.step_ms: int = (
             int(getattr(run_config, "step_ms", 1000))
@@ -589,8 +602,67 @@ class ExecutionSimulator:
         self._build_executor()
 
         # латентность
+        latency_sources: List[Any] = []
+        if run_config is not None:
+            rc_latency = getattr(run_config, "latency", None)
+            if rc_latency:
+                latency_sources.append(rc_latency)
+        if latency_config:
+            latency_sources.append(latency_config)
+
+        latency_kwargs: Dict[str, Any] = {}
+        for src in latency_sources:
+            if isinstance(src, dict):
+                latency_kwargs.update(src)
+            else:
+                payload: Dict[str, Any] = {}
+                if hasattr(src, "dict"):
+                    try:
+                        payload = dict(src.dict())  # type: ignore[call-arg]
+                    except Exception:
+                        payload = {}
+                if not payload and hasattr(src, "__dict__"):
+                    try:
+                        payload = {
+                            str(k): v
+                            for k, v in vars(src).items()
+                            if not str(k).startswith("_")
+                        }
+                    except Exception:
+                        payload = {}
+                latency_kwargs.update(payload)
+
+        vol_metric_cfg = str(latency_kwargs.get("vol_metric", "sigma") or "sigma").lower()
+        self._latency_vol_metric = vol_metric_cfg if vol_metric_cfg else "sigma"
+
+        vol_window_cfg = latency_kwargs.get("vol_window")
+        try:
+            vol_window_int = int(vol_window_cfg) if vol_window_cfg is not None else 120
+        except (TypeError, ValueError):
+            vol_window_int = 120
+        if vol_window_int < 2:
+            vol_window_int = 2
+        latency_kwargs["vol_window"] = vol_window_int
+        self._latency_vol_window = vol_window_int
+
+        lat_symbol_cfg = latency_kwargs.get("symbol")
+        if lat_symbol_cfg:
+            try:
+                self._latency_symbol = str(lat_symbol_cfg).upper()
+            except Exception:
+                pass
+
+        self.volatility_cache = None
+        if LatencyVolatilityCache is not None:
+            try:
+                self.volatility_cache = LatencyVolatilityCache(window=vol_window_int)
+            except Exception:
+                self.volatility_cache = None
+        else:
+            self.volatility_cache = None
+
         self.latency = (
-            LatencyModel(**(latency_config or {})) if LatencyModel is not None else None
+            LatencyModel(**latency_kwargs) if LatencyModel is not None else None
         )
 
         # риск-менеджер
@@ -613,6 +685,7 @@ class ExecutionSimulator:
         self._last_ask: Optional[float] = None
         self._last_spread_bps: Optional[float] = None
         self._last_vol_factor: Optional[float] = None
+        self._last_vol_raw: Optional[Dict[str, float]] = None
         self._last_liquidity: Optional[float] = None
         self._snapshot_hour: Optional[int] = None
 
@@ -789,6 +862,7 @@ class ExecutionSimulator:
         ask: Optional[float],
         spread_bps: Optional[float] = None,
         vol_factor: Optional[float] = None,
+        vol_raw: Optional[Mapping[str, float]] = None,
         liquidity: Optional[float] = None,
         ts_ms: Optional[int] = None,
         trade_price: Optional[float] = None,
@@ -839,10 +913,22 @@ class ExecutionSimulator:
                 sbps = None
         self._last_spread_bps = sbps * spread_mult if sbps is not None else None
         self._last_vol_factor = float(vol_factor) if vol_factor is not None else None
+        metrics = self._normalize_vol_metrics(vol_raw)
+        self._last_vol_raw = metrics
         liq_val = float(liquidity) if liquidity is not None else None
         self._last_liquidity = liq_val * liq_mult if liq_val is not None else None
         if ts_ms is not None and self._last_vol_factor is not None:
-            self._update_latency_volatility(int(ts_ms), self._last_vol_factor)
+            ts_val = int(ts_ms)
+            cache_value = self._select_cache_value(metrics, self._last_vol_factor)
+            cache_updated = False
+            if cache_value is not None:
+                cache_updated = self._feed_latency_cache(ts_val, cache_value)
+            self._update_latency_volatility(
+                ts_val,
+                self._last_vol_factor,
+                metrics,
+                cache_already_updated=cache_updated,
+            )
         if seasonality_logger.isEnabledFor(logging.DEBUG) and ts_ms is not None:
             seasonality_logger.debug(
                 "snapshot h%03d mult=%.3f liquidity=%s",
@@ -994,7 +1080,92 @@ class ExecutionSimulator:
             self._vwap_pv += float(price) * float(volume)
             self._vwap_vol += float(volume)
 
-    def _update_latency_volatility(self, ts_ms: int, value: float) -> None:
+    def _normalize_vol_metrics(
+        self, metrics: Optional[Mapping[str, Any]]
+    ) -> Optional[Dict[str, float]]:
+        if not metrics:
+            return None
+        normalized: Dict[str, float] = {}
+        for key, raw_val in metrics.items():
+            if key is None:
+                continue
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(val):
+                continue
+            normalized[str(key).lower()] = val
+        return normalized or None
+
+    def _select_cache_value(
+        self,
+        metrics: Optional[Mapping[str, float]],
+        fallback: Optional[float],
+    ) -> Optional[float]:
+        metric_name = str(getattr(self, "_latency_vol_metric", "sigma") or "sigma").lower()
+        if metrics:
+            aliases: Tuple[str, ...]
+            if metric_name in {"atr", "atr_pct", "atr/price"}:
+                aliases = ("atr_pct", "atr", "atr/price")
+            else:
+                aliases = (metric_name,)
+            for alias in aliases:
+                val = metrics.get(alias)
+                if val is None:
+                    continue
+                try:
+                    v = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(v):
+                    return v
+        if fallback is None:
+            return None
+        try:
+            fb = float(fallback)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(fb):
+            return None
+        return fb
+
+    def _feed_latency_cache(self, ts: int, value: Optional[float]) -> bool:
+        cache = getattr(self, "volatility_cache", None)
+        if cache is None:
+            return False
+        if value is None:
+            return False
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(val):
+            return False
+        symbol = getattr(self, "_latency_symbol", None) or getattr(self, "symbol", None)
+        if not symbol:
+            return False
+        sym = str(symbol).upper()
+        try:
+            cache.update_latency_factor(symbol=sym, ts_ms=int(ts), value=val)
+            return True
+        except TypeError:
+            try:
+                cache.update_latency_factor(sym, int(ts), val)  # type: ignore[misc]
+                return True
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def _update_latency_volatility(
+        self,
+        ts_ms: int,
+        value: float,
+        raw_metrics: Optional[Mapping[str, float]] = None,
+        *,
+        cache_already_updated: bool = False,
+    ) -> None:
         try:
             ts = int(ts_ms)
             val = float(value)
@@ -1002,25 +1173,35 @@ class ExecutionSimulator:
             return
         if not math.isfinite(val):
             return
+        metrics = (
+            raw_metrics
+            if raw_metrics is None or isinstance(raw_metrics, dict)
+            else self._normalize_vol_metrics(raw_metrics)
+        )
+        if metrics is not None and not isinstance(metrics, dict):
+            metrics = self._normalize_vol_metrics(metrics)
+        cache_value = self._select_cache_value(metrics, val)
+
         latency = getattr(self, "latency", None)
-        if latency is None:
-            return
-        updater = getattr(latency, "update_volatility", None)
-        if not callable(updater):
-            return
-        symbol = getattr(self, "_latency_symbol", None) or getattr(self, "symbol", None)
-        try:
-            updater(symbol, ts, val)
-        except TypeError:
-            try:
-                updater(symbol, ts, value)  # type: ignore[arg-type]
-            except TypeError:
+        if latency is not None:
+            updater = getattr(latency, "update_volatility", None)
+            if callable(updater):
+                symbol = getattr(self, "_latency_symbol", None) or getattr(self, "symbol", None)
                 try:
-                    updater(ts, val)
+                    updater(symbol, ts, val)
+                except TypeError:
+                    try:
+                        updater(symbol, ts, value)  # type: ignore[arg-type]
+                    except TypeError:
+                        try:
+                            updater(ts, val)
+                        except Exception:
+                            pass
                 except Exception:
-                    return
-        except Exception:
-            return
+                    pass
+
+        if not cache_already_updated and cache_value is not None:
+            self._feed_latency_cache(ts, cache_value)
 
     def _apply_trade_inventory(self, side: str, price: float, qty: float) -> float:
         """
@@ -1927,6 +2108,7 @@ class ExecutionSimulator:
             latency_p95_ms=float(lat_stats.get("p95_ms", 0.0)),
             latency_timeout_ratio=float(lat_stats.get("timeout_rate", 0.0)),
             execution_profile=str(getattr(self, "execution_profile", "")),
+            vol_raw=self._last_vol_raw,
         )
 
         # логирование
@@ -1949,6 +2131,7 @@ class ExecutionSimulator:
         bid: float | None = None,
         ask: float | None = None,
         vol_factor: float | None = None,
+        vol_raw: Optional[Mapping[str, float]] = None,
         liquidity: float | None = None,
         trade_price: float | None = None,
         trade_qty: float | None = None,
@@ -1967,6 +2150,8 @@ class ExecutionSimulator:
         self._last_bid = float(bid) if bid is not None else None
         self._last_ask = float(ask) if ask is not None else None
         self._last_vol_factor = float(vol_factor) if vol_factor is not None else None
+        metrics = self._normalize_vol_metrics(vol_raw)
+        self._last_vol_raw = metrics
         self._last_liquidity = float(liquidity) if liquidity is not None else None
         self._last_spread_bps = None
         try:
@@ -1987,7 +2172,7 @@ class ExecutionSimulator:
         if price_tick is not None and qty_tick is not None:
             self._vwap_on_tick(int(ts), float(price_tick), float(qty_tick))
         if self._last_vol_factor is not None:
-            self._update_latency_volatility(int(ts), self._last_vol_factor)
+            self._update_latency_volatility(int(ts), self._last_vol_factor, metrics)
 
         # --- инициализация аккамуляторов ---
         trades: list[ExecTrade] = []

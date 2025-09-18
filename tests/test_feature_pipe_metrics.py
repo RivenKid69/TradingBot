@@ -1,4 +1,5 @@
 import math
+import pytest
 from decimal import Decimal
 
 from transformers import FeatureSpec
@@ -40,11 +41,18 @@ def test_feature_pipe_tracks_returns_sigma_and_warmup():
     expected_mean = sum(expected_returns) / len(expected_returns)
     expected_var = sum((r - expected_mean) ** 2 for r in expected_returns) / (len(expected_returns) - 1)
     expected_sigma = math.sqrt(expected_var)
+    expected_tr = [
+        max(101.0 - 101.0, abs(101.0 - 100.0), abs(101.0 - 100.0)) / 100.0,
+        max(102.0 - 102.0, abs(102.0 - 101.0), abs(102.0 - 101.0)) / 101.0,
+    ]
+    expected_atr = sum(expected_tr) / len(expected_tr)
 
     assert snapshot.ret_last is not None
     assert math.isclose(snapshot.ret_last, expected_returns[-1], rel_tol=1e-12)
     assert snapshot.sigma is not None
     assert math.isclose(snapshot.sigma, expected_sigma, rel_tol=1e-12)
+    assert snapshot.atr_pct is not None
+    assert snapshot.atr_pct == pytest.approx(expected_atr)
 
 
 def test_feature_pipe_records_spread_with_ttl_expiry():
