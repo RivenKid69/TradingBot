@@ -127,6 +127,11 @@ class SimExecutor(TradeExecutor):
                 lat_path = getattr(run_config, "latency_seasonality_path", None)
                 if lat_path and not cfg_lat.get("latency_seasonality_path"):
                     cfg_lat.setdefault("latency_seasonality_path", lat_path)
+            sim_lat_cfg = getattr(sim, "latency_config_payload", None)
+            if sim_lat_cfg:
+                sim_lat_dict = self._latency_dict(sim_lat_cfg)
+                for key, value in sim_lat_dict.items():
+                    cfg_lat.setdefault(key, value)
             cfg_lat.setdefault("symbol", symbol)
             latency = LatencyImpl.from_dict(cfg_lat)
         if slippage is None:
@@ -177,6 +182,11 @@ class SimExecutor(TradeExecutor):
         lat_path = getattr(run_config, "latency_seasonality_path", None)
         if lat_path and not l_cfg.get("latency_seasonality_path"):
             l_cfg.setdefault("latency_seasonality_path", lat_path)
+        sim_lat_cfg = getattr(sim, "latency_config_payload", None)
+        if sim_lat_cfg:
+            sim_lat_dict = SimExecutor._latency_dict(sim_lat_cfg)
+            for key, value in sim_lat_dict.items():
+                l_cfg.setdefault(key, value)
         l_cfg.setdefault("symbol", symbol)
         l_impl = LatencyImpl.from_dict(l_cfg)
         r_impl = RiskBasicImpl.from_dict(getattr(run_config, "risk", None))
