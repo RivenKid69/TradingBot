@@ -7,7 +7,9 @@ impl_latency.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+import os
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Mapping
 import importlib.util
 import sysconfig
 from pathlib import Path
@@ -204,7 +206,12 @@ class _LatencyWithSeasonality:
     def sample(self, ts_ms: int | None = None):
         if ts_ms is None:
             return self._model.sample()
-        hour = hour_of_week(int(ts_ms)) % len(self._mult)
+        idx = hour_of_week(int(ts_ms))
+        length = len(self._mult)
+        if length == 7:
+            hour = (idx // 24) % 7
+        else:
+            hour = idx % length
         m = get_latency_multiplier(int(ts_ms), self._mult, interpolate=self._interpolate)
 
         vol_mult = 1.0
@@ -381,14 +388,21 @@ class _LatencyWithSeasonality:
 
     def reset_stats(self) -> None:  # pragma: no cover - simple delegation
         self._model.reset_stats()
-        self._mult_sum = [0.0] * 168
-        self._lat_sum = [0.0] * 168
-        self._count = [0] * 168
+        with self._lock:
+            n = len(self._mult)
+            self._mult_sum = [0.0] * n
+            self._lat_sum = [0.0] * n
+            self._count = [0] * n
 
     def hourly_stats(self) -> Dict[str, List[float]]:
-        avg_mult = [self._mult_sum[i] / self._count[i] if self._count[i] else 0.0 for i in range(168)]
-        avg_lat = [self._lat_sum[i] / self._count[i] if self._count[i] else 0.0 for i in range(168)]
-        return {"multiplier": avg_mult, "latency_ms": avg_lat, "count": list(self._count)}
+        with self._lock:
+            mult_sum = list(self._mult_sum)
+            lat_sum = list(self._lat_sum)
+            count = list(self._count)
+        n = len(count)
+        avg_mult = [mult_sum[i] / count[i] if count[i] else 0.0 for i in range(n)]
+        avg_lat = [lat_sum[i] / count[i] if count[i] else 0.0 for i in range(n)]
+        return {"multiplier": avg_mult, "latency_ms": avg_lat, "count": count}
 
 class LatencyImpl:
     @staticmethod
@@ -424,6 +438,85 @@ class LatencyImpl:
             return list(arr)
         return base
 
+    @staticmethod
+    def _coerce_array(data: Any) -> Optional[np.ndarray]:
+        if isinstance(data, Mapping):
+            entries: Dict[int, float] = {}
+            try:
+                for key, raw in data.items():
+                    idx = int(key)
+                    if idx < 0:
+                        return None
+                    entries[idx] = float(raw)
+            except (TypeError, ValueError):
+                return None
+            if not entries:
+                return None
+            max_idx = max(entries)
+            length = max_idx + 1
+            arr = np.full(length, np.nan, dtype=float)
+            for idx, value in entries.items():
+                if idx >= length:
+                    return None
+                arr[idx] = value
+            if np.isnan(arr).any():
+                return None
+            return arr
+        if isinstance(data, np.ndarray):
+            arr = np.asarray(data, dtype=float)
+        elif isinstance(data, Sequence) and not isinstance(data, (str, bytes, bytearray)):
+            arr = np.asarray(list(data), dtype=float)
+        else:
+            return None
+        if arr.ndim != 1:
+            return None
+        return arr
+
+    def _prepare_multipliers(
+        self,
+        data: Any,
+        *,
+        allow_convert: bool = True,
+    ) -> Optional[List[float]]:
+        arr = self._coerce_array(data)
+        if arr is None:
+            return None
+        expected = 7 if self.cfg.seasonality_day_only else 168
+        size = arr.size
+        if size != expected and allow_convert:
+            from utils_time import interpolate_daily_multipliers, daily_from_hourly
+
+            if self.cfg.seasonality_day_only and size == 168:
+                arr = daily_from_hourly(arr)
+            elif not self.cfg.seasonality_day_only and size == 7:
+                arr = interpolate_daily_multipliers(arr)
+            else:
+                return None
+            size = arr.size
+        if size != expected:
+            return None
+        try:
+            arr_list = validate_multipliers(arr.tolist(), expected_len=expected)
+        except Exception:
+            return None
+        return list(arr_list)
+
+    def _log_seasonality_enabled(self, path: str) -> None:
+        arr = np.asarray(self.latency, dtype=float)
+        try:
+            mtime = os.path.getmtime(path)
+            mtime_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        except Exception:
+            mtime_iso = "unknown"
+        mean = float(arr.mean()) if arr.size else float("nan")
+        seasonality_logger.info(
+            "seasonality on: path=%s mtime=%s mean=%.6f len=%d",
+            path,
+            mtime_iso,
+            mean,
+            int(arr.size),
+        )
+
     def __init__(self, cfg: LatencyCfg) -> None:
         self.cfg = cfg
         self._model = LatencyModel(
@@ -436,9 +529,8 @@ class LatencyImpl:
             seed=int(cfg.seed),
         ) if LatencyModel is not None else None
         expected = 7 if cfg.seasonality_day_only else 168
-        self.latency: List[float] = self._normalize_default(
-            cfg.seasonality_default, length=expected
-        )
+        self.latency = self._normalize_default(cfg.seasonality_default, length=expected)
+        self._latency_cache: List[float] = list(self.latency)
         self._mult_lock = threading.Lock()
         path = (
             cfg.seasonality_path
@@ -446,58 +538,96 @@ class LatencyImpl:
             or "configs/liquidity_latency_seasonality.json"
         )
         self._seasonality_path = path
-        self._has_seasonality = bool(cfg.use_seasonality and seasonality_enabled())
-        if self._has_seasonality:
-            arr = load_hourly_seasonality(
-                path,
-                "latency",
-                symbol=cfg.symbol,
-                expected_hash=cfg.seasonality_hash,
-            )
-            from utils_time import interpolate_daily_multipliers, daily_from_hourly
+        use_requested = bool(cfg.use_seasonality)
+        runtime_allowed = bool(seasonality_enabled())
+        self._has_seasonality = bool(use_requested and runtime_allowed)
+        loaded_from_file = False
+        if self._has_seasonality and path:
+            try:
+                arr = load_hourly_seasonality(
+                    path,
+                    "latency",
+                    symbol=cfg.symbol,
+                    expected_hash=cfg.seasonality_hash,
+                )
+            except ValueError as exc:
+                seasonality_logger.warning(
+                    "Failed to parse latency seasonality file %s: %s",
+                    path,
+                    exc,
+                )
+                arr = None
             if arr is None:
-                logger.warning(
-                    "Seasonality helper returned no multipliers for %s; using default multipliers.",
+                seasonality_logger.warning(
+                    "Seasonality helper returned no latency multipliers for %s; using defaults.",
                     path,
                 )
                 self._has_seasonality = False
             else:
-                if cfg.seasonality_day_only and arr.size == 168:
-                    arr = daily_from_hourly(arr)
-                elif not cfg.seasonality_day_only and arr.size == 7:
-                    arr = interpolate_daily_multipliers(arr)
-                self.latency = [float(x) for x in arr]
-            if not self._has_seasonality:
-                logger.warning(
+                prepared = self._prepare_multipliers(arr)
+                if prepared is None:
+                    seasonality_logger.warning(
+                        "Latency seasonality array from %s has unexpected length; using defaults.",
+                        path,
+                    )
+                    self._has_seasonality = False
+                else:
+                    self.latency = prepared
+                    self._latency_cache = list(self.latency)
+                    loaded_from_file = True
+        if not self._has_seasonality:
+            if use_requested and runtime_allowed:
+                seasonality_logger.warning(
                     "Using default latency seasonality multipliers of 1.0; "
                     "run scripts/build_hourly_seasonality.py to generate them.",
                 )
+            self.latency = self._normalize_default(cfg.seasonality_default, length=expected)
+            self._latency_cache = list(self.latency)
+        else:
             override = cfg.seasonality_override
             o_path = cfg.seasonality_override_path
             if override is None and o_path:
-                override = load_hourly_seasonality(o_path, "latency", symbol=cfg.symbol)
+                try:
+                    override = load_hourly_seasonality(o_path, "latency", symbol=cfg.symbol)
+                except ValueError as exc:
+                    seasonality_logger.warning(
+                        "Failed to parse latency override file %s: %s",
+                        o_path,
+                        exc,
+                    )
+                    override = None
                 if override is None:
-                    logger.warning(
+                    seasonality_logger.warning(
                         "Seasonality helper returned no multipliers for override %s; ignoring.",
                         o_path,
                     )
             if override is not None:
-                arr = np.asarray(override, dtype=float)
-                if cfg.seasonality_day_only and arr.size == 168:
-                    arr = daily_from_hourly(arr)
-                elif not cfg.seasonality_day_only and arr.size == 7:
-                    arr = interpolate_daily_multipliers(arr)
-                if arr.size != len(self.latency):
-                    logger.warning(
-                        "Latency override array length %s does not match expected %s; ignoring.",
-                        arr.size,
-                        len(self.latency),
+                override_prepared = self._prepare_multipliers(override)
+                if override_prepared is None:
+                    seasonality_logger.warning(
+                        "Latency override payload could not be parsed; ignoring.",
                     )
                 else:
-                    self.latency = (
-                        np.asarray(self.latency, dtype=float) * arr
-                    ).tolist()
-        self.latency = validate_multipliers(self.latency, expected_len=len(self.latency))
+                    base_arr = np.asarray(self.latency, dtype=float)
+                    override_arr = np.asarray(override_prepared, dtype=float)
+                    try:
+                        combined = validate_multipliers(
+                            (base_arr * override_arr).tolist(),
+                            expected_len=len(self.latency),
+                        )
+                    except Exception:
+                        seasonality_logger.warning(
+                            "Latency override produced invalid multipliers; ignoring.",
+                        )
+                    else:
+                        self.latency = list(combined)
+                        self._latency_cache = list(self.latency)
+        self.latency = list(
+            validate_multipliers(self.latency, expected_len=len(self.latency))
+        )
+        self._latency_cache = list(self.latency)
+        if self._has_seasonality and loaded_from_file and path:
+            self._log_seasonality_enabled(path)
         self.attached_sim = None
         self._wrapper: _LatencyWithSeasonality | None = None
         if self._has_seasonality and cfg.seasonality_auto_reload and path:
@@ -779,21 +909,25 @@ class LatencyImpl:
     def dump_multipliers(self) -> List[float]:
         """Return current latency seasonality multipliers as a list."""
 
-        return list(self.latency)
+        return list(self._latency_cache)
 
-    def load_multipliers(self, arr: Sequence[float]) -> None:
+    def load_multipliers(self, arr: Sequence[float] | Mapping[int, float] | np.ndarray) -> None:
         """Load latency seasonality multipliers from ``arr``.
 
         ``arr`` must contain 168 float values (or 7 when
         ``seasonality_day_only`` is enabled). Raises ``ValueError`` if the
         length is incorrect. If the implementation is already attached to a
-        simulator, the underlying wrapper is updated as well.
+        simulator, the underlying wrapper is updated as well. ``arr`` may be a
+        sequence or a mapping keyed by hour-of-week.
         """
 
         expected = 7 if self.cfg.seasonality_day_only else 168
-        arr_list = validate_multipliers(arr, expected_len=expected)
+        prepared = self._prepare_multipliers(arr)
+        if prepared is None:
+            raise ValueError(f"multipliers must have length {expected}")
         with self._mult_lock:
-            self.latency = arr_list
+            self.latency = list(prepared)
+            self._latency_cache = list(self.latency)
             if self._wrapper is not None:
                 with self._wrapper._lock:
                     self._wrapper._mult = np.asarray(self.latency, dtype=float)

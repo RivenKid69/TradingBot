@@ -5,7 +5,7 @@ The hour-of-week index assumes ``0 = Monday 00:00 UTC``.
 
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Dict, Sequence, Callable
+from typing import Dict, Sequence, Callable, Mapping, Any
 import os
 import json
 import hashlib
@@ -30,6 +30,50 @@ seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
 # Clamp limits applied to liquidity and latency seasonality multipliers.
 SEASONALITY_MULT_MIN = 0.1
 SEASONALITY_MULT_MAX = 10.0
+
+
+def _coerce_seasonality_payload(value: Any) -> np.ndarray | None:
+    """Return a 1-D numpy array from ``value`` when possible.
+
+    The helper accepts sequences (lists, tuples, numpy arrays) as well as
+    mappings where keys represent the hour-of-week index.  The resulting array
+    preserves the ordering of hours from ``0`` to ``len - 1`` and returns
+    ``None`` when the payload cannot be interpreted as a dense array.
+    """
+
+    if isinstance(value, Mapping):
+        items: Dict[int, float] = {}
+        try:
+            for key, raw in value.items():
+                idx = int(key)
+                if idx < 0:
+                    return None
+                items[idx] = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not items:
+            return None
+        max_idx = max(items)
+        length = max_idx + 1
+        arr = np.full(length, np.nan, dtype=float)
+        for idx, val in items.items():
+            if idx >= length:
+                return None
+            arr[idx] = val
+        if np.isnan(arr).any():
+            return None
+        return arr
+
+    if isinstance(value, np.ndarray):
+        arr = np.asarray(value, dtype=float)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        arr = np.asarray(list(value), dtype=float)
+    else:
+        return None
+
+    if arr.ndim != 1:
+        return None
+    return arr
 
 
 def floor_to_timeframe(ts_ms: int, timeframe_ms: int) -> int:
@@ -129,9 +173,9 @@ def load_hourly_seasonality(
             if isinstance(data, dict) and k in data:
                 data = data[k]
                 break
-        if not isinstance(data, list):
+        arr = _coerce_seasonality_payload(data)
+        if arr is None:
             return None
-        arr = np.asarray(data, dtype=float)
         if arr.shape[0] in (HOURS_IN_WEEK, 7):
             if np.any(arr <= 0):
                 raise ValueError("Seasonality array values must be > 0")
@@ -193,7 +237,11 @@ def load_seasonality(path: str) -> Dict[str, np.ndarray]:
         res: Dict[str, np.ndarray] = {}
         for key in ("liquidity", "latency", "spread"):
             if key in obj:
-                arr = np.asarray(obj[key], dtype=float)
+                arr = _coerce_seasonality_payload(obj[key])
+                if arr is None:
+                    raise ValueError(
+                        "Seasonality array '%s' must be a sequence or mapping" % key
+                    )
                 if arr.shape[0] not in (HOURS_IN_WEEK, 7):
                     raise ValueError(
                         "Seasonality array '%s' must have length 168 or 7" % key
