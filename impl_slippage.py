@@ -11,7 +11,9 @@ import logging
 import math
 import os
 import threading
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 try:
@@ -75,6 +77,16 @@ def _safe_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     if not math.isfinite(num):
+        return None
+    return num
+
+
+def _safe_positive_int(value: Any) -> Optional[int]:
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        return None
+    if num <= 0:
         return None
     return num
 
@@ -291,6 +303,189 @@ class _DynamicSpreadProfile:
         return self.process_spread(spread)
 
 
+class _AdvDataset:
+    """Load and cache ADV dataset from disk."""
+
+    def __init__(self, cfg: AdvConfig) -> None:  # type: ignore[name-defined]
+        self._cfg = cfg
+        self._path = self._extract_path(cfg)
+        self._refresh_days = self._extract_refresh_days(cfg)
+        self._cache: dict[str, float] = {}
+        self._meta: dict[str, Any] = {}
+        self._mtime: float | None = None
+        self._stale = False
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _extract_path(cfg: AdvConfig) -> Optional[str]:  # type: ignore[name-defined]
+        candidates: list[Any] = []
+        extra = getattr(cfg, "extra", None)
+        if isinstance(extra, Mapping):
+            for key in ("quote_path", "adv_path", "path", "dataset", "data_path"):
+                if key in extra:
+                    candidates.append(extra[key])
+        inline = getattr(cfg, "path", None)
+        if inline is not None:
+            candidates.insert(0, inline)
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            text = str(candidate).strip()
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _extract_refresh_days(cfg: AdvConfig) -> Optional[int]:  # type: ignore[name-defined]
+        extra = getattr(cfg, "extra", None)
+        candidate: Any = None
+        if isinstance(extra, Mapping):
+            for key in ("refresh_days", "auto_refresh_days"):
+                if key in extra:
+                    candidate = extra[key]
+                    break
+        if candidate is None:
+            candidate = getattr(cfg, "refresh_days", None)
+        return _safe_positive_int(candidate)
+
+    def _ensure_loaded_locked(self) -> None:
+        path = self._path
+        if not path:
+            self._cache.clear()
+            self._meta = {}
+            self._stale = False
+            return
+        try:
+            mtime = os.path.getmtime(path)
+        except (OSError, TypeError, ValueError):
+            if not self._cache:
+                logger.warning("ADV dataset file %s is not accessible", path)
+            self._stale = False
+            return
+        if self._mtime is not None and self._cache and mtime <= self._mtime:
+            self._check_refresh_locked()
+            return
+        payload = self._read_payload(path)
+        if payload is None:
+            self._check_refresh_locked()
+            return
+        data, meta = payload
+        self._cache = data
+        self._meta = meta
+        self._mtime = mtime
+        self._check_refresh_locked()
+
+    def _read_payload(self, path: str) -> tuple[dict[str, float], dict[str, Any]] | None:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except FileNotFoundError:
+            logger.warning("ADV dataset file %s not found", path)
+            return {}, {}
+        except Exception:
+            logger.exception("Failed to load ADV dataset from %s", path)
+            return None
+        if not isinstance(payload, Mapping):
+            logger.warning("ADV dataset %s must be a JSON object", path)
+            return {}, {}
+        meta_raw = payload.get("meta")
+        data_raw = payload.get("data")
+        if not isinstance(data_raw, Mapping):
+            logger.warning("ADV dataset %s is missing 'data' mapping", path)
+            data_raw = {}
+        dataset: dict[str, float] = {}
+        for key, value in data_raw.items():
+            symbol = str(key).strip().upper()
+            if not symbol:
+                continue
+            if isinstance(value, Mapping):
+                candidate = value.get("adv_quote")
+            else:
+                candidate = value
+            adv_val = _safe_float(candidate)
+            if adv_val is None or adv_val <= 0.0:
+                continue
+            dataset[symbol] = float(adv_val)
+        meta: dict[str, Any] = dict(meta_raw) if isinstance(meta_raw, Mapping) else {}
+        meta.setdefault("path", path)
+        meta.setdefault("symbol_count", len(dataset))
+        return dataset, meta
+
+    def _extract_timestamp_locked(self) -> Optional[int]:
+        meta = self._meta
+        candidates = [
+            meta.get("generated_at_ms"),
+            meta.get("generated_ms"),
+            meta.get("timestamp_ms"),
+            meta.get("end_ms"),
+        ]
+        for candidate in candidates:
+            ts_val = _safe_positive_int(candidate)
+            if ts_val is not None:
+                return ts_val
+        for key in ("generated_at", "end_at"):
+            value = meta.get(key)
+            if not isinstance(value, str):
+                continue
+            text = value.strip()
+            if not text:
+                continue
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(text)
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        if self._mtime is not None:
+            return int(self._mtime * 1000)
+        return None
+
+    def _check_refresh_locked(self) -> None:
+        refresh_days = self._refresh_days
+        if not refresh_days:
+            self._stale = False
+            return
+        ts_ms = self._extract_timestamp_locked()
+        if ts_ms is None:
+            self._stale = True
+            logger.warning("ADV dataset %s lacks timestamp metadata", self._path)
+            return
+        age_ms = int(time.time() * 1000) - ts_ms
+        if age_ms <= 0:
+            self._stale = False
+            return
+        age_days = age_ms / 86_400_000
+        if age_days > float(refresh_days):
+            self._stale = True
+            logger.warning(
+                "ADV dataset %s is older than %.1f days (threshold=%s)",
+                self._path,
+                age_days,
+                refresh_days,
+            )
+        else:
+            self._stale = False
+
+    def get(self, symbol: str) -> Optional[float]:
+        if not symbol:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            if self._stale:
+                return None
+            if not self._cache:
+                return None
+            return self._cache.get(str(symbol).strip().upper())
+
+    def metadata(self) -> Mapping[str, Any]:
+        with self._lock:
+            self._ensure_loaded_locked()
+            return dict(self._meta)
+
+
 def _calc_dynamic_spread(
     *,
     cfg: DynamicSpreadConfig,
@@ -401,6 +596,8 @@ class SlippageImpl:
         self.cfg = cfg
         self._dynamic_profile: Optional[_DynamicSpreadProfile] = None
         dyn_cfg_obj: Optional[DynamicSpreadConfig] = None
+        self._adv_loader: Optional[_AdvDataset] = None
+        adv_cfg_obj: Optional[Any] = None
         cfg_dict: Dict[str, Any] = {
             "k": float(cfg.k),
             "min_half_spread_bps": float(cfg.min_half_spread_bps),
@@ -478,6 +675,17 @@ class SlippageImpl:
             payload = _normalise_section(block, cfg_cls)
             if payload is not None:
                 cfg_dict[key] = payload
+            if key == "adv":
+                if AdvConfig is not None and isinstance(block, AdvConfig):
+                    adv_cfg_obj = block
+                elif isinstance(payload, Mapping) and AdvConfig is not None:
+                    try:
+                        adv_cfg_obj = AdvConfig.from_dict(dict(payload))
+                    except Exception:
+                        logger.exception("Failed to parse ADV config")
+                        adv_cfg_obj = None
+                elif isinstance(payload, Mapping) and adv_cfg_obj is None:
+                    adv_cfg_obj = dict(payload)
 
         self._cfg_obj = (
             SlippageConfig.from_dict(cfg_dict)
@@ -486,6 +694,17 @@ class SlippageImpl:
         )
         if dyn_cfg_obj is None and self._cfg_obj is not None:
             dyn_cfg_obj = getattr(self._cfg_obj, "dynamic_spread", None)
+        self._adv_cfg = adv_cfg_obj
+        if self._adv_cfg is None and self._cfg_obj is not None:
+            candidate = getattr(self._cfg_obj, "adv", None)
+            if candidate is not None:
+                self._adv_cfg = candidate
+        if self._adv_cfg is not None and getattr(self._adv_cfg, "enabled", False):
+            try:
+                self._adv_loader = _AdvDataset(self._adv_cfg)
+            except Exception:
+                logger.exception("Failed to initialise ADV dataset loader")
+                self._adv_loader = None
         if dyn_cfg_obj is not None and getattr(dyn_cfg_obj, "enabled", False):
             try:
                 self._dynamic_profile = _DynamicSpreadProfile(
@@ -515,6 +734,11 @@ class SlippageImpl:
             setattr(sim, "get_spread_bps", self.get_spread_bps)
         except Exception:
             logger.exception("Failed to attach get_spread_bps to simulator")
+        try:
+            setattr(sim, "get_adv_quote", self.get_adv_quote)
+            setattr(sim, "_slippage_get_adv_quote", self.get_adv_quote)
+        except Exception:
+            logger.exception("Failed to attach get_adv_quote to simulator")
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "SlippageImpl":
@@ -628,3 +852,40 @@ class SlippageImpl:
             except Exception:
                 logger.exception("Dynamic spread fallback computation failed")
         return float(base * vol_multiplier)
+
+    def get_adv_quote(self, symbol: Any) -> Optional[float]:
+        adv_cfg = getattr(self, "_adv_cfg", None)
+        loader = self._adv_loader
+        value: Optional[float] = None
+        if loader is not None and symbol:
+            try:
+                value = loader.get(str(symbol))
+            except Exception:
+                logger.exception("Failed to query ADV dataset for %s", symbol)
+                value = None
+        def _cfg_lookup(key: str) -> Any:
+            if isinstance(adv_cfg, Mapping):
+                return adv_cfg.get(key)
+            return getattr(adv_cfg, key, None)
+
+        if value is None and adv_cfg is not None:
+            fallback = _safe_float(_cfg_lookup("fallback_adv"))
+            if fallback is not None and fallback > 0.0:
+                value = fallback
+        if value is None:
+            return None
+        candidate = _safe_float(value)
+        if candidate is None or candidate <= 0.0:
+            return None
+        min_adv = _safe_float(_cfg_lookup("min_adv")) if adv_cfg is not None else None
+        max_adv = _safe_float(_cfg_lookup("max_adv")) if adv_cfg is not None else None
+        if min_adv is not None:
+            candidate = max(min_adv, candidate)
+        if max_adv is not None:
+            candidate = min(max_adv, candidate)
+        buffer = _safe_float(_cfg_lookup("liquidity_buffer")) if adv_cfg is not None else None
+        if buffer is not None and buffer > 0.0 and buffer != 1.0:
+            candidate = candidate * buffer
+        if candidate <= 0.0 or not math.isfinite(candidate):
+            return None
+        return float(candidate)
