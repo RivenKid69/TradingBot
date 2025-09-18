@@ -68,15 +68,21 @@ slippage:
   min_half_spread_bps: 0.0
   default_spread_bps: 2.0
   eps: 1e-12
-  dynamic_spread:
-    enabled: false
+  dynamic:
+    enabled: false           # Отключено → модель использует статический спред (легаси-поведение).
+    alpha_bps: 0.0           # Аддитивная надбавка к базовому спреду (в bps) при активном динамическом режиме.
+    beta_coef: 0.0           # Коэффициент при волатильности/ликвидности; 0.0 отключает масштабирование.
+    min_spread_bps: 0.0      # Нижняя граница рассчитанного динамического спреда.
+    max_spread_bps: 20.0     # Верхняя граница рассчитанного динамического спреда.
+    smoothing_alpha: null    # Опциональная EMA-сглаживание [0,1]; null оставляет спред без сглаживания.
+    vol_metric: null         # Имя метрики волатильности (например, "sigma") для beta_coef; null = по умолчанию.
+    vol_window: null         # Окно (в барах) для vol_metric; null = используем источник данных.
     profile_kind: hourly
-    multipliers: []        # 168 нормированных коэффициентов (например, со средним 1.0)
-    path: null             # Опционально: путь к JSON-профилю (см. data/slippage/hourly_profile.sample.json)
-    min_spread_bps: 0.0
-    max_spread_bps: 20.0
-    smoothing_alpha: 0.2
-    use_volatility: false
+    multipliers: []          # 168 нормированных коэффициентов (например, со средним 1.0)
+    path: null               # Опционально: путь к JSON-профилю (см. data/slippage/hourly_profile.sample.json)
+    override_path: null      # Опциональный путь к локальным поправкам поверх базового профиля.
+    hash: null               # Опциональный SHA256 от базового профиля для контроля целостности.
+    use_volatility: false    # Легаси-переключатель; оставьте false, если используете beta_coef.
     gamma: 0.0
 
 latency:

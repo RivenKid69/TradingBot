@@ -264,7 +264,13 @@ class SlippageCfg:
     min_half_spread_bps: float = 0.0
     default_spread_bps: float = 2.0
     eps: float = 1e-12
+    dynamic: Optional[Any] = None
     dynamic_spread: Optional[Any] = None
+
+    def get_dynamic_block(self) -> Optional[Any]:
+        if self.dynamic is not None:
+            return self.dynamic
+        return self.dynamic_spread
 
 
 class SlippageImpl:
@@ -278,29 +284,44 @@ class SlippageImpl:
             "default_spread_bps": float(cfg.default_spread_bps),
             "eps": float(cfg.eps),
         }
-        if cfg.dynamic_spread is not None:
-            dyn = cfg.dynamic_spread
-            if hasattr(dyn, "to_dict"):
-                dyn_dict = dyn.to_dict()
-                if DynamicSpreadConfig is not None and isinstance(
-                    dyn, DynamicSpreadConfig
-                ):
-                    dyn_cfg_obj = dyn
-            elif isinstance(dyn, dict):
-                dyn_dict = dict(dyn)
+        if hasattr(cfg, "get_dynamic_block"):
+            dyn_block = cfg.get_dynamic_block()
+        else:
+            dyn_block = getattr(cfg, "dynamic", None)
+            if dyn_block is None:
+                dyn_block = getattr(cfg, "dynamic_spread", None)
+        dyn_dict: Optional[Dict[str, Any]] = None
+        if dyn_block is not None:
+            if DynamicSpreadConfig is not None and isinstance(
+                dyn_block, DynamicSpreadConfig
+            ):
+                dyn_cfg_obj = dyn_block
+                try:
+                    dyn_dict = dyn_block.to_dict()
+                except Exception:
+                    dyn_dict = None
+            elif hasattr(dyn_block, "to_dict"):
+                try:
+                    payload = dyn_block.to_dict()
+                except Exception:
+                    payload = None
+                if isinstance(payload, Mapping):
+                    dyn_dict = dict(payload)
+                    if DynamicSpreadConfig is not None:
+                        try:
+                            dyn_cfg_obj = DynamicSpreadConfig.from_dict(dyn_dict)
+                        except Exception:
+                            logger.exception("Failed to parse dynamic spread config")
+            elif isinstance(dyn_block, Mapping):
+                dyn_dict = dict(dyn_block)
                 if DynamicSpreadConfig is not None:
                     try:
                         dyn_cfg_obj = DynamicSpreadConfig.from_dict(dyn_dict)
                     except Exception:
                         logger.exception("Failed to parse dynamic spread config")
-            else:
-                dyn_dict = None
-            if dyn_dict is not None:
-                cfg_dict["dynamic_spread"] = dyn_dict
-        elif DynamicSpreadConfig is not None and hasattr(cfg, "dynamic_spread"):
-            dyn_val = getattr(cfg, "dynamic_spread")
-            if isinstance(dyn_val, DynamicSpreadConfig):
-                dyn_cfg_obj = dyn_val
+        if dyn_dict is not None:
+            cfg_dict["dynamic"] = dict(dyn_dict)
+            cfg_dict.setdefault("dynamic_spread", dict(dyn_dict))
 
         self._cfg_obj = (
             SlippageConfig.from_dict(cfg_dict)
@@ -341,13 +362,22 @@ class SlippageImpl:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "SlippageImpl":
-        dyn_block = d.get("dynamic_spread")
         dyn_cfg: Optional[Any] = None
+        dyn_block: Optional[Any] = None
+        for key in ("dynamic", "dynamic_spread"):
+            candidate = d.get(key)
+            if candidate is not None:
+                dyn_block = candidate
+                break
         if isinstance(dyn_block, dict):
             if DynamicSpreadConfig is not None:
                 dyn_cfg = DynamicSpreadConfig.from_dict(dyn_block)
             else:
                 dyn_cfg = dict(dyn_block)
+        elif DynamicSpreadConfig is not None and isinstance(
+            dyn_block, DynamicSpreadConfig
+        ):
+            dyn_cfg = dyn_block
 
         return SlippageImpl(
             SlippageCfg(
@@ -355,6 +385,7 @@ class SlippageImpl:
                 min_half_spread_bps=float(d.get("min_half_spread_bps", 0.0)),
                 default_spread_bps=float(d.get("default_spread_bps", 2.0)),
                 eps=float(d.get("eps", 1e-12)),
+                dynamic=dyn_cfg,
                 dynamic_spread=dyn_cfg,
             )
         )

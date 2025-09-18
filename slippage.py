@@ -15,9 +15,13 @@ class DynamicSpreadConfig:
     path: Optional[str] = None
     override_path: Optional[str] = None
     hash: Optional[str] = None
+    alpha_bps: Optional[float] = None
+    beta_coef: Optional[float] = None
     min_spread_bps: Optional[float] = None
     max_spread_bps: Optional[float] = None
     smoothing_alpha: Optional[float] = None
+    vol_metric: Optional[str] = None
+    vol_window: Optional[int] = None
     use_volatility: bool = False
     gamma: Optional[float] = None
     zscore_clip: Optional[float] = None
@@ -51,9 +55,13 @@ class DynamicSpreadConfig:
             "path",
             "override_path",
             "hash",
+            "alpha_bps",
+            "beta_coef",
             "min_spread_bps",
             "max_spread_bps",
             "smoothing_alpha",
+            "vol_metric",
+            "vol_window",
             "use_volatility",
             "gamma",
             "zscore_clip",
@@ -62,9 +70,27 @@ class DynamicSpreadConfig:
             "refresh_on_start",
             "last_refresh_ts",
             "fallback_spread_bps",
+            # legacy aliases kept for backwards compatibility
+            "alpha",
+            "beta",
+            "volatility_metric",
+            "volatility_window",
         }
 
         extra = {k: v for k, v in d.items() if k not in known_keys}
+
+        alpha_bps_val = d.get("alpha_bps")
+        if alpha_bps_val is None:
+            alpha_bps_val = d.get("alpha")
+        beta_coef_val = d.get("beta_coef")
+        if beta_coef_val is None:
+            beta_coef_val = d.get("beta")
+        vol_metric_val = d.get("vol_metric")
+        if vol_metric_val is None:
+            vol_metric_val = d.get("volatility_metric")
+        vol_window_val = d.get("vol_window")
+        if vol_window_val is None:
+            vol_window_val = d.get("volatility_window")
 
         return cls(
             enabled=bool(d.get("enabled", False)),
@@ -73,9 +99,13 @@ class DynamicSpreadConfig:
             path=str(d["path"]) if d.get("path") is not None else None,
             override_path=str(d["override_path"]) if d.get("override_path") is not None else None,
             hash=str(d["hash"]) if d.get("hash") is not None else None,
+            alpha_bps=float(alpha_bps_val) if alpha_bps_val is not None else None,
+            beta_coef=float(beta_coef_val) if beta_coef_val is not None else None,
             min_spread_bps=float(d["min_spread_bps"]) if d.get("min_spread_bps") is not None else None,
             max_spread_bps=float(d["max_spread_bps"]) if d.get("max_spread_bps") is not None else None,
             smoothing_alpha=float(d["smoothing_alpha"]) if d.get("smoothing_alpha") is not None else None,
+            vol_metric=str(vol_metric_val) if vol_metric_val is not None else None,
+            vol_window=int(vol_window_val) if vol_window_val is not None else None,
             use_volatility=bool(d.get("use_volatility", False)),
             gamma=float(d["gamma"]) if d.get("gamma") is not None else None,
             zscore_clip=float(d["zscore_clip"]) if d.get("zscore_clip") is not None else None,
@@ -100,12 +130,20 @@ class DynamicSpreadConfig:
             data["override_path"] = str(self.override_path)
         if self.hash is not None:
             data["hash"] = str(self.hash)
+        if self.alpha_bps is not None:
+            data["alpha_bps"] = float(self.alpha_bps)
+        if self.beta_coef is not None:
+            data["beta_coef"] = float(self.beta_coef)
         if self.min_spread_bps is not None:
             data["min_spread_bps"] = float(self.min_spread_bps)
         if self.max_spread_bps is not None:
             data["max_spread_bps"] = float(self.max_spread_bps)
         if self.smoothing_alpha is not None:
             data["smoothing_alpha"] = float(self.smoothing_alpha)
+        if self.vol_metric is not None:
+            data["vol_metric"] = str(self.vol_metric)
+        if self.vol_window is not None:
+            data["vol_window"] = int(self.vol_window)
         data["use_volatility"] = bool(self.use_volatility)
         if self.gamma is not None:
             data["gamma"] = float(self.gamma)
@@ -143,12 +181,15 @@ class SlippageConfig:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SlippageConfig":
-        dynamic_block = d.get("dynamic_spread")
-        dynamic_cfg = (
-            DynamicSpreadConfig.from_dict(dynamic_block)
-            if isinstance(dynamic_block, dict)
-            else None
-        )
+        dynamic_cfg: Optional[DynamicSpreadConfig] = None
+        for key in ("dynamic", "dynamic_spread"):
+            block = d.get(key)
+            if isinstance(block, dict):
+                dynamic_cfg = DynamicSpreadConfig.from_dict(block)
+                break
+            if isinstance(block, DynamicSpreadConfig):
+                dynamic_cfg = block
+                break
 
         return cls(
             k=float(d.get("k", 0.8)),
