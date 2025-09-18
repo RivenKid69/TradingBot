@@ -352,6 +352,7 @@ class BacktestAdapter:
 
         out_reports: List[Dict[str, Any]] = []
         has_hl = ("high" in df.columns) and ("low" in df.columns)
+        has_open = "open" in df.columns
 
         logger = logging.getLogger(__name__)
         skip_cnt = 0
@@ -360,6 +361,24 @@ class BacktestAdapter:
             ts = int(row[ts_col])
             sym = str(row[symbol_col]).upper()
             ref = float(row[price_col])
+
+            bar_open = None
+            if has_open:
+                try:
+                    bar_open = float(row["open"])
+                except Exception:
+                    bar_open = None
+            bar_high = None
+            bar_low = None
+            if has_hl:
+                try:
+                    bar_high = float(row["high"])
+                except Exception:
+                    bar_high = None
+                try:
+                    bar_low = float(row["low"])
+                except Exception:
+                    bar_low = None
 
             if self._timing.enforce_closed_bars:
                 close_ts = floor_to_timeframe(ts, self._timing.timeframe_ms) + self._timing.timeframe_ms
@@ -428,6 +447,11 @@ class BacktestAdapter:
                 vol_factor=vol_factor,
                 liquidity=liquidity,
                 orders=orders,
+                bar_open=bar_open,
+                bar_high=bar_high,
+                bar_low=bar_low,
+                bar_close=ref,
+                bar_timeframe_ms=self.sim.interval_ms,
             )
             out_reports.append({**rep, "symbol": sym, "ts_ms": ts, "core_order_intents": core_order_intents})
         if skip_cnt:

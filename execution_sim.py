@@ -524,6 +524,11 @@ class ExecutionSimulator:
         self.lob = lob
         self._last_ref_price: Optional[float] = None
         self._next_h1_open_price: Optional[float] = None
+        self._last_bar_open: Optional[float] = None
+        self._last_bar_high: Optional[float] = None
+        self._last_bar_low: Optional[float] = None
+        self._last_bar_close: Optional[float] = None
+        self._intrabar_timeframe_ms: Optional[int] = None
         self.run_config = run_config
         self._run_config = run_config
         self.run_id: str = str(getattr(run_config, "run_id", "sim") or "sim")
@@ -583,8 +588,14 @@ class ExecutionSimulator:
 
         # слиппедж
         self.slippage_cfg = None
-        if SlippageConfig is not None and slippage_config is not None:
-            if isinstance(slippage_config, str):
+        if SlippageConfig is not None:
+            if slippage_config is None:
+                if execution_profile is not None:
+                    try:
+                        self.slippage_cfg = SlippageConfig.from_dict({})
+                    except Exception:
+                        self.slippage_cfg = None
+            elif isinstance(slippage_config, str):
                 try:
                     self.slippage_cfg = SlippageConfig.from_file(slippage_config)
                 except Exception:
@@ -1024,6 +1035,19 @@ class ExecutionSimulator:
             qty_tick = trade_qty if trade_qty is not None else liquidity
             if price_tick is not None and qty_tick is not None:
                 self._vwap_on_tick(int(ts_ms), float(price_tick), float(qty_tick))
+
+    def set_intrabar_timeframe_ms(self, timeframe_ms: Optional[int]) -> None:
+        """Сохранить продолжительность бара для intrabar-логики."""
+        if timeframe_ms is None:
+            self._intrabar_timeframe_ms = None
+            return
+        try:
+            value = int(timeframe_ms)
+        except (TypeError, ValueError):
+            return
+        if value <= 0:
+            return
+        self._intrabar_timeframe_ms = value
 
     def get_hourly_liquidity_stats(self) -> dict:
         """Return averaged liquidity multiplier/value per hour of week."""
@@ -2198,6 +2222,11 @@ class ExecutionSimulator:
         liquidity: float | None = None,
         trade_price: float | None = None,
         trade_qty: float | None = None,
+        bar_open: float | None = None,
+        bar_high: float | None = None,
+        bar_low: float | None = None,
+        bar_close: float | None = None,
+        bar_timeframe_ms: int | None = None,
         actions: list[tuple[object, object]] | None = None,
     ) -> "ExecReport":
         """
@@ -2230,6 +2259,13 @@ class ExecutionSimulator:
         except Exception:
             self._last_spread_bps = None
         self._last_ref_price = float(ref_price) if ref_price is not None else None
+        self._last_bar_open = float(bar_open) if bar_open is not None else None
+        self._last_bar_high = float(bar_high) if bar_high is not None else None
+        self._last_bar_low = float(bar_low) if bar_low is not None else None
+        close_val = bar_close if bar_close is not None else ref_price
+        self._last_bar_close = float(close_val) if close_val is not None else None
+        if bar_timeframe_ms is not None:
+            self.set_intrabar_timeframe_ms(bar_timeframe_ms)
         price_tick = trade_price if trade_price is not None else self._last_ref_price
         qty_tick = trade_qty if trade_qty is not None else liquidity
         if price_tick is not None and qty_tick is not None:

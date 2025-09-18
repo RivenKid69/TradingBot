@@ -240,6 +240,13 @@ class SimAdapter:
         self.symbol = str(symbol).upper()
         self.timeframe = _ensure_timeframe(timeframe)
         self.interval_ms = _timeframe_to_ms(self.timeframe)
+        try:
+            if hasattr(sim, "set_intrabar_timeframe_ms"):
+                sim.set_intrabar_timeframe_ms(self.interval_ms)
+            else:
+                setattr(sim, "_intrabar_timeframe_ms", self.interval_ms)
+        except Exception:
+            setattr(sim, "_intrabar_timeframe_ms", self.interval_ms)
         self.source = source
         self.enforce_closed_bars = (
             run_config.timing.enforce_closed_bars if run_config is not None else True
@@ -294,7 +301,12 @@ class SimAdapter:
              ask: Optional[float],
              vol_factor: Optional[float],
              liquidity: Optional[float],
-             orders: Sequence[Order]) -> Dict[str, Any]:
+             orders: Sequence[Order],
+             bar_open: Optional[float] = None,
+             bar_high: Optional[float] = None,
+             bar_low: Optional[float] = None,
+             bar_close: Optional[float] = None,
+             bar_timeframe_ms: Optional[int] = None) -> Dict[str, Any]:
         actions = self._to_actions(orders)
         sigma_last = self._vol_estimator.last(self.symbol, metric="sigma")
         atr_last = self._vol_estimator.last(self.symbol, metric="atr_pct")
@@ -314,6 +326,7 @@ class SimAdapter:
                 vol_raw_payload["atr"] = atr_value
                 vol_raw_payload["atr/price"] = atr_value
         vol_raw_arg = vol_raw_payload or None
+        close_arg = bar_close if bar_close is not None else ref_price
         report = self.sim.run_step(
             ts=ts_ms,
             ref_price=ref_price,
@@ -322,6 +335,11 @@ class SimAdapter:
             vol_factor=vol_factor,
             vol_raw=vol_raw_arg,
             liquidity=liquidity,
+            bar_open=bar_open,
+            bar_high=bar_high,
+            bar_low=bar_low,
+            bar_close=close_arg,
+            bar_timeframe_ms=bar_timeframe_ms if bar_timeframe_ms is not None else self.interval_ms,
             actions=actions,
         )
         d = report.to_dict()
@@ -365,6 +383,7 @@ class SimAdapter:
 
                 orders: Sequence[Order] = list(provider.on_bar(bar) or [])
 
+                open_price = float(bar.open)
                 high = float(bar.high)
                 low = float(bar.low)
                 close = float(bar.close)
@@ -390,6 +409,11 @@ class SimAdapter:
                     vol_factor=vol_factor,
                     liquidity=liquidity,
                     orders=orders,
+                    bar_open=open_price,
+                    bar_high=high,
+                    bar_low=low,
+                    bar_close=close,
+                    bar_timeframe_ms=self.interval_ms,
                 )
 
                 rep["symbol"] = bar.symbol
