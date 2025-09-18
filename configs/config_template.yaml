@@ -90,6 +90,42 @@ slippage:
     hash: null               # Опциональный SHA256 от базового профиля для контроля целостности.
     use_volatility: false    # Легаси-переключатель; оставьте false, если используете beta_coef.
     gamma: 0.0
+  dynamic_impact:
+    enabled: false           # Включить масштабирование коэффициента impact (k) по рыночным условиям.
+    beta_vol: 0.0            # Линейный коэффициент на нормализованную волатильность; 0.0 = отключено.
+    beta_participation: 0.0  # Линейный коэффициент на нормализованную долю участия/размер ордера.
+    min_k: null              # Нижняя граница для результирующего k (null = без ограничений).
+    max_k: null              # Верхняя граница для результирующего k (null = без ограничений).
+    fallback_k: null         # Опциональный k, используемый, если входные метрики недоступны.
+    vol_metric: null         # Имя метрики волатильности для beta_vol.
+    vol_window: null         # Окно (в барах) для метрики волатильности.
+    participation_metric: null   # Источник participation (например, "participation").
+    participation_window: null   # Окно (в барах) для participation_metric.
+    smoothing_alpha: null    # EMA-сглаживание результирующего k [0,1]; null = без сглаживания.
+    zscore_clip: null        # Клип z-score при нормализации метрик; null = без клипа.
+  tail_shock:
+    enabled: false           # Включить редкие «хвостовые» шоки спреда/слиппеджа.
+    probability: 0.0         # Вероятность шока на шаг (0..1).
+    shock_bps: 0.0           # Дополнительный фиксированный шок в bps при срабатывании.
+    shock_multiplier: 1.0    # Мультипликатор к рассчитанному слиппеджу при шоке.
+    decay_halflife_bars: null  # Полупериод затухания эффекта шока (в барах); null = без затухания.
+    min_multiplier: null     # Нижняя граница итогового мультипликатора.
+    max_multiplier: null     # Верхняя граница итогового мультипликатора.
+    seed: null               # Опциональный seed для генератора шоков.
+  adv:
+    enabled: false           # Включить динамику ликвидности на основе ADV/оборотной статистики.
+    window_days: 30          # Горизонт окна (в днях) для расчёта ADV.
+    smoothing_alpha: null    # EMA-сглаживание ADV [0,1]; null = без сглаживания.
+    fallback_adv: null       # Опциональный ADV по умолчанию при отсутствии данных.
+    min_adv: null            # Нижняя граница ADV (в базовой валюте).
+    max_adv: null            # Верхняя граница ADV (в базовой валюте).
+    seasonality_path: null   # Путь к сезонному профилю ликвидности (JSON/YAML) или null.
+    override_path: null      # Путь к локальному override-сезонности или null.
+    hash: null               # Контрольная сумма сезонного профиля (опционально).
+    profile_kind: null       # Имя профиля в файле сезонности (например, "hourly").
+    multipliers: []          # Inline-мультипликаторы сезонности (по умолчанию пусто).
+    zscore_clip: null        # Клип при нормализации ADV (z-score); null = без клипа.
+    liquidity_buffer: 1.0    # Доп. буфер ликвидности (>1 увеличивает оценку доступного ADV).
 
 latency:
   use_seasonality: true          # Enable hourly latency multipliers

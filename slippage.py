@@ -162,6 +162,243 @@ class DynamicSpreadConfig:
 
 
 @dataclass
+class DynamicImpactConfig:
+    enabled: bool = False
+    beta_vol: float = 0.0
+    beta_participation: float = 0.0
+    min_k: Optional[float] = None
+    max_k: Optional[float] = None
+    fallback_k: Optional[float] = None
+    vol_metric: Optional[str] = None
+    vol_window: Optional[int] = None
+    participation_metric: Optional[str] = None
+    participation_window: Optional[int] = None
+    smoothing_alpha: Optional[float] = None
+    zscore_clip: Optional[float] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "DynamicImpactConfig":
+        if not isinstance(d, dict):
+            raise TypeError("dynamic impact config must be a dict")
+
+        known_keys = {
+            "enabled",
+            "beta_vol",
+            "beta_participation",
+            "min_k",
+            "max_k",
+            "fallback_k",
+            "vol_metric",
+            "vol_window",
+            "participation_metric",
+            "participation_window",
+            "smoothing_alpha",
+            "zscore_clip",
+        }
+
+        extra = {k: v for k, v in d.items() if k not in known_keys}
+
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            beta_vol=float(d.get("beta_vol", 0.0)),
+            beta_participation=float(d.get("beta_participation", 0.0)),
+            min_k=float(d["min_k"]) if d.get("min_k") is not None else None,
+            max_k=float(d["max_k"]) if d.get("max_k") is not None else None,
+            fallback_k=float(d["fallback_k"]) if d.get("fallback_k") is not None else None,
+            vol_metric=str(d["vol_metric"]) if d.get("vol_metric") is not None else None,
+            vol_window=int(d["vol_window"]) if d.get("vol_window") is not None else None,
+            participation_metric=str(d["participation_metric"]) if d.get("participation_metric") is not None else None,
+            participation_window=int(d["participation_window"]) if d.get("participation_window") is not None else None,
+            smoothing_alpha=float(d["smoothing_alpha"]) if d.get("smoothing_alpha") is not None else None,
+            zscore_clip=float(d["zscore_clip"]) if d.get("zscore_clip") is not None else None,
+            extra=extra,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = dict(self.extra)
+        data["enabled"] = bool(self.enabled)
+        data["beta_vol"] = float(self.beta_vol)
+        data["beta_participation"] = float(self.beta_participation)
+        if self.min_k is not None:
+            data["min_k"] = float(self.min_k)
+        if self.max_k is not None:
+            data["max_k"] = float(self.max_k)
+        if self.fallback_k is not None:
+            data["fallback_k"] = float(self.fallback_k)
+        if self.vol_metric is not None:
+            data["vol_metric"] = str(self.vol_metric)
+        if self.vol_window is not None:
+            data["vol_window"] = int(self.vol_window)
+        if self.participation_metric is not None:
+            data["participation_metric"] = str(self.participation_metric)
+        if self.participation_window is not None:
+            data["participation_window"] = int(self.participation_window)
+        if self.smoothing_alpha is not None:
+            data["smoothing_alpha"] = float(self.smoothing_alpha)
+        if self.zscore_clip is not None:
+            data["zscore_clip"] = float(self.zscore_clip)
+        return data
+
+
+@dataclass
+class TailShockConfig:
+    enabled: bool = False
+    probability: float = 0.0
+    shock_bps: float = 0.0
+    shock_multiplier: float = 1.0
+    decay_halflife_bars: Optional[int] = None
+    min_multiplier: Optional[float] = None
+    max_multiplier: Optional[float] = None
+    seed: Optional[int] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "TailShockConfig":
+        if not isinstance(d, dict):
+            raise TypeError("tail shock config must be a dict")
+
+        known_keys = {
+            "enabled",
+            "probability",
+            "shock_bps",
+            "shock_multiplier",
+            "decay_halflife_bars",
+            "min_multiplier",
+            "max_multiplier",
+            "seed",
+        }
+
+        extra = {k: v for k, v in d.items() if k not in known_keys}
+
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            probability=float(d.get("probability", 0.0)),
+            shock_bps=float(d.get("shock_bps", 0.0)),
+            shock_multiplier=float(d.get("shock_multiplier", 1.0)),
+            decay_halflife_bars=int(d["decay_halflife_bars"]) if d.get("decay_halflife_bars") is not None else None,
+            min_multiplier=float(d["min_multiplier"]) if d.get("min_multiplier") is not None else None,
+            max_multiplier=float(d["max_multiplier"]) if d.get("max_multiplier") is not None else None,
+            seed=int(d["seed"]) if d.get("seed") is not None else None,
+            extra=extra,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = dict(self.extra)
+        data["enabled"] = bool(self.enabled)
+        data["probability"] = float(self.probability)
+        data["shock_bps"] = float(self.shock_bps)
+        data["shock_multiplier"] = float(self.shock_multiplier)
+        if self.decay_halflife_bars is not None:
+            data["decay_halflife_bars"] = int(self.decay_halflife_bars)
+        if self.min_multiplier is not None:
+            data["min_multiplier"] = float(self.min_multiplier)
+        if self.max_multiplier is not None:
+            data["max_multiplier"] = float(self.max_multiplier)
+        if self.seed is not None:
+            data["seed"] = int(self.seed)
+        return data
+
+
+@dataclass
+class AdvConfig:
+    enabled: bool = False
+    window_days: int = 30
+    smoothing_alpha: Optional[float] = None
+    fallback_adv: Optional[float] = None
+    min_adv: Optional[float] = None
+    max_adv: Optional[float] = None
+    seasonality_path: Optional[str] = None
+    override_path: Optional[str] = None
+    hash: Optional[str] = None
+    profile_kind: Optional[str] = None
+    multipliers: Optional[tuple[float, ...]] = None
+    zscore_clip: Optional[float] = None
+    liquidity_buffer: float = 1.0
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AdvConfig":
+        if not isinstance(d, dict):
+            raise TypeError("adv config must be a dict")
+
+        multipliers_raw = d.get("multipliers")
+        multipliers: Optional[tuple[float, ...]] = None
+        if multipliers_raw is not None:
+            if isinstance(multipliers_raw, Sequence) and not isinstance(
+                multipliers_raw, (str, bytes, bytearray)
+            ):
+                multipliers = tuple(float(x) for x in multipliers_raw)
+            else:
+                try:
+                    multipliers = (float(multipliers_raw),)
+                except (TypeError, ValueError):
+                    multipliers = None
+
+        known_keys = {
+            "enabled",
+            "window_days",
+            "smoothing_alpha",
+            "fallback_adv",
+            "min_adv",
+            "max_adv",
+            "seasonality_path",
+            "override_path",
+            "hash",
+            "profile_kind",
+            "multipliers",
+            "zscore_clip",
+            "liquidity_buffer",
+        }
+
+        extra = {k: v for k, v in d.items() if k not in known_keys}
+
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            window_days=int(d.get("window_days", 30)),
+            smoothing_alpha=float(d["smoothing_alpha"]) if d.get("smoothing_alpha") is not None else None,
+            fallback_adv=float(d["fallback_adv"]) if d.get("fallback_adv") is not None else None,
+            min_adv=float(d["min_adv"]) if d.get("min_adv") is not None else None,
+            max_adv=float(d["max_adv"]) if d.get("max_adv") is not None else None,
+            seasonality_path=str(d["seasonality_path"]) if d.get("seasonality_path") is not None else None,
+            override_path=str(d["override_path"]) if d.get("override_path") is not None else None,
+            hash=str(d["hash"]) if d.get("hash") is not None else None,
+            profile_kind=str(d["profile_kind"]) if d.get("profile_kind") is not None else None,
+            multipliers=multipliers,
+            zscore_clip=float(d["zscore_clip"]) if d.get("zscore_clip") is not None else None,
+            liquidity_buffer=float(d.get("liquidity_buffer", 1.0)),
+            extra=extra,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = dict(self.extra)
+        data["enabled"] = bool(self.enabled)
+        data["window_days"] = int(self.window_days)
+        if self.smoothing_alpha is not None:
+            data["smoothing_alpha"] = float(self.smoothing_alpha)
+        if self.fallback_adv is not None:
+            data["fallback_adv"] = float(self.fallback_adv)
+        if self.min_adv is not None:
+            data["min_adv"] = float(self.min_adv)
+        if self.max_adv is not None:
+            data["max_adv"] = float(self.max_adv)
+        if self.seasonality_path is not None:
+            data["seasonality_path"] = str(self.seasonality_path)
+        if self.override_path is not None:
+            data["override_path"] = str(self.override_path)
+        if self.hash is not None:
+            data["hash"] = str(self.hash)
+        if self.profile_kind is not None:
+            data["profile_kind"] = str(self.profile_kind)
+        if self.multipliers is not None:
+            data["multipliers"] = [float(x) for x in self.multipliers]
+        if self.zscore_clip is not None:
+            data["zscore_clip"] = float(self.zscore_clip)
+        data["liquidity_buffer"] = float(self.liquidity_buffer)
+        return data
+
+
+@dataclass
 class SlippageConfig:
     """
     Конфиг слиппеджа «среднего уровня реализма» для среднечастотного бота.
@@ -178,6 +415,9 @@ class SlippageConfig:
     default_spread_bps: float = 2.0
     eps: float = 1e-12
     dynamic_spread: Optional[DynamicSpreadConfig] = None
+    dynamic_impact: DynamicImpactConfig = field(default_factory=DynamicImpactConfig)
+    tail_shock: TailShockConfig = field(default_factory=TailShockConfig)
+    adv: AdvConfig = field(default_factory=AdvConfig)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SlippageConfig":
@@ -191,13 +431,62 @@ class SlippageConfig:
                 dynamic_cfg = block
                 break
 
+        dynamic_impact_cfg: DynamicImpactConfig
+        impact_block = d.get("dynamic_impact")
+        if isinstance(impact_block, DynamicImpactConfig):
+            dynamic_impact_cfg = impact_block
+        elif isinstance(impact_block, dict):
+            dynamic_impact_cfg = DynamicImpactConfig.from_dict(impact_block)
+        else:
+            dynamic_impact_cfg = DynamicImpactConfig()
+
+        tail_shock_cfg: TailShockConfig
+        tail_block = d.get("tail_shock")
+        if isinstance(tail_block, TailShockConfig):
+            tail_shock_cfg = tail_block
+        elif isinstance(tail_block, dict):
+            tail_shock_cfg = TailShockConfig.from_dict(tail_block)
+        else:
+            tail_shock_cfg = TailShockConfig()
+
+        adv_cfg: AdvConfig
+        adv_block = d.get("adv")
+        if isinstance(adv_block, AdvConfig):
+            adv_cfg = adv_block
+        elif isinstance(adv_block, dict):
+            adv_cfg = AdvConfig.from_dict(adv_block)
+        else:
+            adv_cfg = AdvConfig()
+
         return cls(
             k=float(d.get("k", 0.8)),
             min_half_spread_bps=float(d.get("min_half_spread_bps", 0.0)),
             default_spread_bps=float(d.get("default_spread_bps", 2.0)),
             eps=float(d.get("eps", 1e-12)),
             dynamic_spread=dynamic_cfg,
+            dynamic_impact=dynamic_impact_cfg,
+            tail_shock=tail_shock_cfg,
+            adv=adv_cfg,
         )
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "k": float(self.k),
+            "min_half_spread_bps": float(self.min_half_spread_bps),
+            "default_spread_bps": float(self.default_spread_bps),
+            "eps": float(self.eps),
+        }
+        if self.dynamic_spread is not None:
+            dyn_dict = self.dynamic_spread.to_dict()
+            data["dynamic"] = dict(dyn_dict)
+            data.setdefault("dynamic_spread", dict(dyn_dict))
+        if self.dynamic_impact is not None:
+            data["dynamic_impact"] = self.dynamic_impact.to_dict()
+        if self.tail_shock is not None:
+            data["tail_shock"] = self.tail_shock.to_dict()
+        if self.adv is not None:
+            data["adv"] = self.adv.to_dict()
+        return data
 
     @classmethod
     def from_file(cls, path: str) -> "SlippageConfig":
