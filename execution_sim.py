@@ -23,7 +23,7 @@ ExecutionSimulator v2
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping
+from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping, Callable
 import hashlib
 import math
 import os
@@ -593,6 +593,7 @@ class ExecutionSimulator:
 
         # слиппедж
         self.slippage_cfg = None
+        self._slippage_get_spread: Optional[Callable[..., Any]] = None
         if SlippageConfig is not None:
             if slippage_config is None:
                 if execution_profile is not None:
@@ -607,6 +608,11 @@ class ExecutionSimulator:
                     logger.exception("failed to load slippage config from %s", slippage_config)
             elif isinstance(slippage_config, dict):
                 self.slippage_cfg = SlippageConfig.from_dict(slippage_config)
+
+        if self.slippage_cfg is not None:
+            candidate = getattr(self.slippage_cfg, "get_spread_bps", None)
+            if callable(candidate):
+                self._slippage_get_spread = candidate
 
         # исполнители
         self._execution_cfg = dict(execution_config or {})
@@ -1061,6 +1067,98 @@ class ExecutionSimulator:
     def set_next_open_price(self, price: float) -> None:
         self._next_h1_open_price = float(price)
 
+    def _default_spread_bps(self) -> Optional[float]:
+        cfg = self.slippage_cfg
+        if cfg is None:
+            return None
+        try:
+            value = float(getattr(cfg, "default_spread_bps"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    def _call_spread_getter(self, kwargs: Dict[str, Any]) -> Optional[float]:
+        getter = self._slippage_get_spread
+        if not callable(getter):
+            return None
+        attempted = dict(kwargs)
+        while True:
+            try:
+                return getter(**attempted)
+            except TypeError as exc:
+                message = str(exc)
+                removed = False
+                for key in list(attempted.keys()):
+                    token = f"'{key}'"
+                    if token in message and key in attempted:
+                        attempted.pop(key)
+                        removed = True
+                        break
+                if not removed:
+                    return None
+            except Exception:
+                return None
+        return None
+
+    def _compute_effective_spread_bps(
+        self,
+        *,
+        base_spread_bps: Optional[float],
+        ts_ms: Optional[int],
+        vol_factor: Optional[float],
+    ) -> Optional[float]:
+        base_val: Optional[float] = None
+        if base_spread_bps is not None:
+            try:
+                base_val = float(base_spread_bps)
+            except (TypeError, ValueError):
+                base_val = None
+        if base_val is None or not math.isfinite(base_val) or base_val < 0.0:
+            base_val = None
+        if base_val is None:
+            base_val = self._default_spread_bps()
+        if base_val is None:
+            return None
+
+        getter_kwargs: Dict[str, Any] = {
+            "symbol": self.symbol,
+            "ts_ms": ts_ms,
+            "base_spread_bps": base_val,
+            "vol_factor": vol_factor,
+        }
+        if vol_factor is None:
+            getter_kwargs.pop("vol_factor")
+        # Всегда передаём ts_ms даже если None — совместимо с существующим интерфейсом.
+        if ts_ms is None:
+            getter_kwargs["ts_ms"] = ts_ms
+
+        result = self._call_spread_getter(getter_kwargs)
+        if result is not None:
+            try:
+                candidate = float(result)
+            except (TypeError, ValueError):
+                candidate = None
+            else:
+                if math.isfinite(candidate) and candidate >= 0.0:
+                    base_val = candidate
+        return float(base_val)
+
+    def _report_spread_bps(self, spread_bps: Optional[float]) -> float:
+        if spread_bps is not None:
+            try:
+                value = float(spread_bps)
+            except (TypeError, ValueError):
+                value = None
+            else:
+                if math.isfinite(value):
+                    return value
+        default = self._default_spread_bps()
+        if default is not None:
+            return float(default)
+        return 0.0
+
     def set_market_snapshot(
         self,
         *,
@@ -1106,19 +1204,48 @@ class ExecutionSimulator:
 
         sbps: Optional[float]
         if spread_bps is not None:
-            sbps = float(spread_bps)
-        else:
-            if (
-                compute_spread_bps_from_quotes is not None
-                and self.slippage_cfg is not None
-            ):
-                sbps = compute_spread_bps_from_quotes(
-                    bid=self._last_bid, ask=self._last_ask, cfg=self.slippage_cfg
-                )
-            else:
+            try:
+                sbps = float(spread_bps)
+            except (TypeError, ValueError):
                 sbps = None
-        self._last_spread_bps = sbps * spread_mult if sbps is not None else None
-        self._last_vol_factor = float(vol_factor) if vol_factor is not None else None
+        elif (
+            compute_spread_bps_from_quotes is not None
+            and self.slippage_cfg is not None
+        ):
+            sbps = compute_spread_bps_from_quotes(
+                bid=self._last_bid, ask=self._last_ask, cfg=self.slippage_cfg
+            )
+        else:
+            sbps = None
+
+        vf_val: Optional[float]
+        if vol_factor is not None:
+            try:
+                vf_val = float(vol_factor)
+            except (TypeError, ValueError):
+                vf_val = None
+            else:
+                if not math.isfinite(vf_val):
+                    vf_val = None
+        else:
+            vf_val = None
+        self._last_vol_factor = vf_val
+
+        effective_spread = self._compute_effective_spread_bps(
+            base_spread_bps=sbps,
+            ts_ms=ts_ms,
+            vol_factor=self._last_vol_factor,
+        )
+        if effective_spread is not None:
+            try:
+                mult = float(spread_mult)
+            except (TypeError, ValueError):
+                mult = 1.0
+            if not math.isfinite(mult):
+                mult = 1.0
+            self._last_spread_bps = float(effective_spread) * mult
+        else:
+            self._last_spread_bps = None
         metrics = self._normalize_vol_metrics(vol_raw)
         self._last_vol_raw = metrics
         liq_val = float(liquidity) if liquidity is not None else None
@@ -2448,15 +2575,7 @@ class ExecutionSimulator:
                         client_order_id=p.client_order_id,
                         fee=float(fee),
                         slippage_bps=float(slip_bps),
-                        spread_bps=float(
-                            sbps
-                            if sbps is not None
-                            else (
-                                self.slippage_cfg.default_spread_bps
-                                if self.slippage_cfg is not None
-                                else 0.0
-                            )
-                        ),
+                        spread_bps=self._report_spread_bps(sbps),
                         latency_ms=int(p.lat_ms),
                         latency_spike=bool(p.spike),
                         tif=tif,
@@ -2519,15 +2638,7 @@ class ExecutionSimulator:
                 client_order_id=p.client_order_id,
                 fee=float(fee),
                 slippage_bps=float(slip_bps),
-                spread_bps=float(
-                    sbps
-                    if sbps is not None
-                    else (
-                        self.slippage_cfg.default_spread_bps
-                        if self.slippage_cfg is not None
-                        else 0.0
-                    )
-                ),
+                spread_bps=self._report_spread_bps(sbps),
                 latency_ms=int(p.lat_ms),
                 latency_spike=bool(p.spike),
                 tif=tif,
@@ -2673,15 +2784,7 @@ class ExecutionSimulator:
                         client_order_id=p.client_order_id,
                         fee=float(fee),
                         slippage_bps=0.0,
-                        spread_bps=float(
-                            sbps
-                            if sbps is not None
-                            else (
-                                self.slippage_cfg.default_spread_bps
-                                if self.slippage_cfg is not None
-                                else 0.0
-                            )
-                        ),
+                        spread_bps=self._report_spread_bps(sbps),
                         latency_ms=int(p.lat_ms),
                         latency_spike=bool(p.spike),
                         tif=tif,
@@ -2744,15 +2847,7 @@ class ExecutionSimulator:
                         client_order_id=p.client_order_id,
                         fee=float(fee),
                         slippage_bps=0.0,
-                        spread_bps=float(
-                            sbps
-                            if sbps is not None
-                            else (
-                                self.slippage_cfg.default_spread_bps
-                                if self.slippage_cfg is not None
-                                else 0.0
-                            )
-                        ),
+                        spread_bps=self._report_spread_bps(sbps),
                         latency_ms=int(p.lat_ms),
                         latency_spike=bool(p.spike),
                         tif=tif,
@@ -2919,23 +3014,38 @@ class ExecutionSimulator:
         # --- обновить рыночный снапшот ---
         self._last_bid = float(bid) if bid is not None else None
         self._last_ask = float(ask) if ask is not None else None
-        self._last_vol_factor = float(vol_factor) if vol_factor is not None else None
+        if vol_factor is not None:
+            try:
+                vf_val = float(vol_factor)
+            except (TypeError, ValueError):
+                vf_val = None
+            else:
+                if not math.isfinite(vf_val):
+                    vf_val = None
+        else:
+            vf_val = None
+        self._last_vol_factor = vf_val
         metrics = self._normalize_vol_metrics(vol_raw)
         self._last_vol_raw = metrics
         self._last_liquidity = float(liquidity) if liquidity is not None else None
-        self._last_spread_bps = None
-        try:
-            if (
-                compute_spread_bps_from_quotes is not None
-                and self.slippage_cfg is not None
-            ):
-                self._last_spread_bps = compute_spread_bps_from_quotes(
+        base_spread: Optional[float] = None
+        if (
+            compute_spread_bps_from_quotes is not None
+            and self.slippage_cfg is not None
+        ):
+            try:
+                base_spread = compute_spread_bps_from_quotes(
                     bid=self._last_bid,
                     ask=self._last_ask,
                     cfg=self.slippage_cfg,
                 )
-        except Exception:
-            self._last_spread_bps = None
+            except Exception:
+                base_spread = None
+        self._last_spread_bps = self._compute_effective_spread_bps(
+            base_spread_bps=base_spread,
+            ts_ms=ts,
+            vol_factor=self._last_vol_factor,
+        )
         self._last_ref_price = float(ref_price) if ref_price is not None else None
         self._last_bar_open = float(bar_open) if bar_open is not None else None
         self._last_bar_high = float(bar_high) if bar_high is not None else None
@@ -3253,15 +3363,7 @@ class ExecutionSimulator:
                         client_order_id=int(cli_id),
                         fee=float(fee),
                         slippage_bps=float(slip_bps),
-                        spread_bps=float(
-                            sbps
-                            if sbps is not None
-                            else (
-                                self.slippage_cfg.default_spread_bps
-                                if self.slippage_cfg is not None
-                                else 0.0
-                            )
-                        ),
+                        spread_bps=self._report_spread_bps(sbps),
                         latency_ms=int(lat_ms),
                         latency_spike=bool(lat_spike),
                         tif=tif,
