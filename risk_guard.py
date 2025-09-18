@@ -631,16 +631,18 @@ class PortfolioLimitGuard:
             if price is None:
                 blocked.add(idx)
                 continue
-            buffered_delta = exposure_delta
-            if buffered_delta > self._EPS or buffered_delta < -self._EPS:
-                buffered_delta *= buffer_mult
-            prospective_total = current_total + buffered_delta * float(price)
+            notional_delta = exposure_delta * float(price)
+            if exposure_delta > self._EPS:
+                buffered_delta = notional_delta * buffer_mult
+            else:
+                buffered_delta = notional_delta
+            prospective_total = current_total + buffered_delta
             if not _within_limits(prospective_total):
                 blocked.add(idx)
                 continue
             accepted.add(idx)
             working_positions[sym] = new
-            current_total += exposure_delta * float(price)
+            current_total += notional_delta
             if current_total < 0.0:
                 current_total = 0.0
 
