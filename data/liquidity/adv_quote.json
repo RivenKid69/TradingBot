@@ -1,0 +1,34 @@
+{
+  "meta": {
+    "version": 1,
+    "generated_at": "2024-01-01T00:00:00Z",
+    "generated_at_ms": 1704067200000,
+    "window_days": 30,
+    "interval": "1d",
+    "market": "futures",
+    "source": "binance",
+    "start_ms": 1701398400000,
+    "end_ms": 1704067200000,
+    "start_at": "2023-11-30T00:00:00Z",
+    "end_at": "2024-01-01T00:00:00Z",
+    "symbols": [
+      "BTCUSDT",
+      "ETHUSDT"
+    ],
+    "note": "Sample ADV dataset illustrating the expected format."
+  },
+  "data": {
+    "BTCUSDT": {
+      "adv_quote": 123456789.0,
+      "days": 30,
+      "days_total": 30,
+      "last_day": "2023-12-31T00:00:00Z"
+    },
+    "ETHUSDT": {
+      "adv_quote": 45678901.0,
+      "days": 30,
+      "days_total": 30,
+      "last_day": "2023-12-31T00:00:00Z"
+    }
+  }
+}

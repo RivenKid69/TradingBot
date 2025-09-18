@@ -557,9 +557,154 @@ def build_adv(
     )
 
 
+def fetch_klines_for_symbols(
+    session: RestBudgetSession,
+    symbols: Sequence[str],
+    *,
+    market: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1500,
+) -> Mapping[str, pd.DataFrame]:
+    """Fetch kline history for ``symbols`` within the supplied time range.
+
+    The helper returns a mapping of symbol → DataFrame with the same column
+    schema as :data:`KLINE_COLUMNS`.  Missing symbols are mapped to empty
+    frames.  The range is interpreted as a half-open interval
+    ``[start_ms, end_ms)``.
+    """
+
+    if not symbols:
+        return {}
+
+    interval_key = str(interval).lower()
+    if interval_key not in INTERVAL_TO_MS:
+        raise ValueError(f"unsupported interval: {interval}")
+
+    step_ms = INTERVAL_TO_MS[interval_key]
+    start_aligned, end_aligned = _align_range(start_ms, end_ms, step_ms)
+    if end_aligned <= start_aligned:
+        return {s.upper(): pd.DataFrame(columns=KLINE_COLUMNS) for s in symbols}
+
+    safe_limit = max(1, int(limit))
+    datasets: dict[str, pd.DataFrame] = {}
+
+    client = BinancePublicClient(session=session)
+    try:
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol).strip().upper()
+            if not symbol:
+                continue
+            tasks = _split_ranges_to_tasks(
+                [(start_aligned, end_aligned - step_ms)],
+                step_ms=step_ms,
+                limit=safe_limit,
+                symbol=symbol,
+            )
+            dataset = pd.DataFrame(columns=KLINE_COLUMNS)
+            for task in tasks:
+                window_end = task.start_ms + task.bars * step_ms
+                window_end = min(window_end, end_aligned)
+                raw = client.get_klines(
+                    market=market,
+                    symbol=task.symbol,
+                    interval=interval_key,
+                    start_ms=task.start_ms,
+                    end_ms=window_end - 1,
+                    limit=min(safe_limit, task.bars),
+                )
+                frame = _raw_to_df(raw, task.symbol)
+                if not frame.empty:
+                    ts_numeric = pd.to_numeric(frame["ts_ms"], errors="coerce")
+                    frame = frame.loc[
+                        (ts_numeric >= start_aligned) & (ts_numeric < end_aligned)
+                    ]
+                if not frame.empty:
+                    dataset = _merge_frames(dataset, frame)
+            if not dataset.empty:
+                ts_numeric = pd.to_numeric(dataset["ts_ms"], errors="coerce")
+                dataset = dataset.loc[
+                    (ts_numeric >= start_aligned) & (ts_numeric < end_aligned)
+                ]
+                dataset = dataset.sort_values(["symbol", "ts_ms"]).reset_index(drop=True)
+            datasets[symbol] = dataset
+    finally:
+        client.close()
+
+    return datasets
+
+
+def aggregate_daily_quote_volume(df: pd.DataFrame) -> pd.Series:
+    """Aggregate quote asset volumes to daily totals.
+
+    Returns a :class:`pandas.Series` indexed by UTC midnight timestamps with
+    daily quote volumes.  Non-numeric entries are ignored.
+    """
+
+    if df.empty:
+        return pd.Series(dtype="float64")
+    required = {"ts_ms", "quote_asset_volume"}
+    if not required.issubset(df.columns):
+        return pd.Series(dtype="float64")
+
+    ts_numeric = pd.to_numeric(df["ts_ms"], errors="coerce")
+    vol_numeric = pd.to_numeric(df["quote_asset_volume"], errors="coerce")
+    mask = ts_numeric.notna() & vol_numeric.notna()
+    if not mask.any():
+        return pd.Series(dtype="float64")
+
+    ts_dt = pd.to_datetime(ts_numeric[mask], unit="ms", utc=True)
+    volumes = vol_numeric[mask].astype("float64")
+    grouped = volumes.groupby(ts_dt.dt.floor("D")).sum(min_count=1)
+    if grouped.empty:
+        return pd.Series(dtype="float64")
+    grouped = grouped.sort_index()
+    return grouped
+
+
+def compute_adv_quote(
+    daily_quote_volume: pd.Series,
+    *,
+    window_days: int,
+    min_days: int = 1,
+) -> tuple[float | None, int, int]:
+    """Compute average daily quote volume over the specified window.
+
+    Returns a tuple ``(adv_quote, used_days, total_days)`` where
+    ``adv_quote`` is ``None`` if insufficient data is available.
+    """
+
+    window = max(1, int(window_days))
+    minimum = max(1, int(min_days))
+
+    if daily_quote_volume.empty:
+        return None, 0, 0
+
+    series = daily_quote_volume.dropna().astype("float64").sort_index()
+    total_days = int(len(series))
+    if total_days == 0:
+        return None, 0, 0
+
+    window_slice = series.tail(window)
+    window_slice = window_slice[window_slice > 0.0]
+    used_days = int(len(window_slice))
+    if used_days < minimum:
+        return None, used_days, total_days
+
+    adv_value = float(window_slice.mean())
+    if not pd.notna(adv_value) or adv_value <= 0.0:
+        return None, used_days, total_days
+
+    return adv_value, used_days, total_days
+
+
 __all__ = [
     "BuildAdvConfig",
     "BuildAdvResult",
     "FetchTask",
+    "aggregate_daily_quote_volume",
     "build_adv",
+    "compute_adv_quote",
+    "fetch_klines_for_symbols",
 ]
