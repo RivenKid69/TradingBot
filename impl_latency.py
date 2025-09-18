@@ -7,12 +7,14 @@ impl_latency.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any, List, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import importlib.util
 import sysconfig
 from pathlib import Path
 import threading
 import warnings
+import math
+import weakref
 
 import numpy as np
 try:
@@ -97,7 +99,18 @@ class _LatencyWithSeasonality:
     """Wraps LatencyModel applying hourly multipliers and collecting stats."""
 
     def __init__(
-        self, model: LatencyModel, multipliers: Sequence[float], *, interpolate: bool = False
+        self,
+        model: LatencyModel,
+        multipliers: Sequence[float],
+        *,
+        interpolate: bool = False,
+        symbol: str | None = None,
+        volatility_callback: Optional[
+            Callable[[Optional[str], int], Tuple[float, Dict[str, Any]]]
+        ] = None,
+        min_ms: int | None = None,
+        max_ms: int | None = None,
+        debug_log: bool = False,
     ):  # type: ignore[name-defined]
         self._model = model
         n = len(multipliers)
@@ -110,15 +123,65 @@ class _LatencyWithSeasonality:
         self._lat_sum: List[float] = [0.0] * n
         self._count: List[int] = [0] * n
         self._lock = threading.Lock()
+        self._symbol: Optional[str] = str(symbol).upper() if symbol else None
+        self._vol_cb = volatility_callback
+        self._debug_log = bool(debug_log)
+        self._min_ms = int(round(float(min_ms))) if min_ms is not None else 0
+        if max_ms is None:
+            self._max_ms: Optional[int] = None
+        else:
+            self._max_ms = int(round(float(max_ms)))
+        if self._max_ms is not None and self._max_ms < self._min_ms:
+            raise ValueError("max_ms must be >= min_ms")
+
+    def set_symbol(self, symbol: str | None) -> None:
+        with self._lock:
+            self._symbol = str(symbol).upper() if symbol else None
+
+    def set_volatility_callback(
+        self,
+        callback: Optional[Callable[[Optional[str], int], Tuple[float, Dict[str, Any]]]],
+    ) -> None:
+        with self._lock:
+            self._vol_cb = callback
 
     def sample(self, ts_ms: int | None = None):
         if ts_ms is None:
             return self._model.sample()
-        # Convert milliseconds since epoch to hour-of-week (0=Mon 00:00 UTC)
-        # using the shared helper.  Wrap the result to the multiplier array
-        # length for day-only configurations.
         hour = hour_of_week(int(ts_ms)) % len(self._mult)
         m = get_latency_multiplier(int(ts_ms), self._mult, interpolate=self._interpolate)
+
+        vol_mult = 1.0
+        vol_debug: Dict[str, Any] = {}
+        cb = self._vol_cb
+        symbol = self._symbol
+        if cb is not None:
+            try:
+                result = cb(symbol, int(ts_ms))
+            except TypeError:
+                try:
+                    result = cb(symbol=symbol, ts_ms=int(ts_ms))  # type: ignore[misc]
+                except Exception as exc:  # pragma: no cover - defensive fallback
+                    result = (1.0, {"error": str(exc)})
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                result = (1.0, {"error": str(exc)})
+            if isinstance(result, tuple):
+                vol_mult = result[0]
+                if len(result) > 1 and isinstance(result[1], dict):
+                    vol_debug = dict(result[1])
+                elif len(result) > 1:
+                    vol_debug = {"payload": result[1]}
+            else:
+                vol_mult = result
+            try:
+                vol_mult = float(vol_mult)
+            except (TypeError, ValueError):
+                vol_debug.setdefault("fallback", "non_numeric")
+                vol_mult = 1.0
+            if not math.isfinite(vol_mult) or vol_mult <= 0.0:
+                vol_debug.setdefault("fallback", "invalid")
+                vol_mult = 1.0
+
         with self._lock:
             base, jitter, timeout = (
                 self._model.base_ms,
@@ -128,7 +191,9 @@ class _LatencyWithSeasonality:
             seed = getattr(self._model, "seed", None)
             state_after = None
             try:
-                scaled_base = int(round(base * m))
+                eff_base = float(base) * float(m) * float(vol_mult)
+                eff_jitter = float(jitter) * float(m) * float(vol_mult)
+                scaled_base = int(round(eff_base))
                 if scaled_base > timeout:
                     seasonality_logger.warning(
                         "scaled base_ms %s exceeds timeout_ms %s; capping",
@@ -136,8 +201,12 @@ class _LatencyWithSeasonality:
                         timeout,
                     )
                     scaled_base = timeout
+                    eff_base = float(scaled_base)
                 self._model.base_ms = scaled_base
-                self._model.jitter_ms = int(round(jitter * m))
+                scaled_jitter = int(round(eff_jitter))
+                if scaled_jitter < 0:
+                    scaled_jitter = 0
+                self._model.jitter_ms = scaled_jitter
                 res = self._model.sample()
                 if hasattr(self._model, "_rng"):
                     state_after = self._model._rng.getstate()
@@ -151,17 +220,58 @@ class _LatencyWithSeasonality:
                     self._model.seed = seed
                 if state_after is not None and hasattr(self._model, "_rng"):
                     self._model._rng.setstate(state_after)
+
+            attempts = int(res.get("attempts", 1) or 1)
+            if attempts < 1:
+                attempts = 1
+            raw_total = float(res.get("total_ms", 0.0))
+            base_adjust = eff_base * attempts - float(scaled_base) * attempts
+            lat_ms = raw_total + base_adjust
+            lat_ms = max(float(self._min_ms), lat_ms)
+            if self._max_ms is not None:
+                lat_ms = min(float(self._max_ms), lat_ms)
+            lat_ms_int = int(round(lat_ms))
+            lat_ms_int = max(self._min_ms, lat_ms_int)
+            if self._max_ms is not None and lat_ms_int > self._max_ms:
+                lat_ms_int = self._max_ms
+            res["total_ms"] = lat_ms_int
+            res["timeout"] = bool(lat_ms_int > timeout)
+
+            if self._debug_log:
+                debug_entry = {
+                    "hour": hour,
+                    "seasonality_multiplier": float(m),
+                    "volatility_multiplier": float(vol_mult),
+                    "volatility_debug": vol_debug,
+                    "raw_total_ms": raw_total,
+                    "adjusted_total_ms": lat_ms_int,
+                    "attempts": attempts,
+                    "min_ms": self._min_ms,
+                    "max_ms": self._max_ms,
+                }
+                try:
+                    debug_dict = res.setdefault("debug", {})
+                    if isinstance(debug_dict, dict):
+                        debug_dict["latency"] = debug_entry
+                except Exception:  # pragma: no cover - defensive fallback
+                    res["debug"] = {"latency": debug_entry}
+
+            if self._debug_log or seasonality_logger.isEnabledFor(logging.DEBUG):
+                seasonality_logger.debug(
+                    "latency sample h%03d season=%.3f vol=%.3f raw=%.3f final=%s attempts=%s payload=%s",
+                    hour,
+                    float(m),
+                    float(vol_mult),
+                    raw_total,
+                    lat_ms_int,
+                    attempts,
+                    vol_debug,
+                )
+
             self._mult_sum[hour] += m
-            self._lat_sum[hour] += float(res.get("total_ms", 0))
+            self._lat_sum[hour] += float(lat_ms_int)
             self._count[hour] += 1
             _LATENCY_MULT_COUNTER.labels(hour=hour).inc()
-            if seasonality_logger.isEnabledFor(logging.DEBUG):
-                seasonality_logger.debug(
-                    "latency sample h%03d mult=%.3f total_ms=%s",
-                    hour,
-                    m,
-                    res.get("total_ms"),
-                )
             return res
 
     def stats(self):  # pragma: no cover - simple delegation
@@ -269,11 +379,136 @@ class LatencyImpl:
     def attach_to(self, sim) -> None:
         if self._model is not None:
             mult = self.latency if self._has_seasonality else [1.0] * len(self.latency)
+            vol_cb = self._build_volatility_callback(sim)
+            symbol = self.cfg.symbol or getattr(sim, "symbol", None)
             self._wrapper = _LatencyWithSeasonality(
-                self._model, mult, interpolate=self.cfg.seasonality_interpolate
+                self._model,
+                mult,
+                interpolate=self.cfg.seasonality_interpolate,
+                symbol=symbol,
+                volatility_callback=vol_cb,
+                min_ms=self.cfg.min_ms,
+                max_ms=self.cfg.max_ms,
+                debug_log=self.cfg.debug_log,
             )
+            sim_symbol = getattr(sim, "symbol", None)
+            if sim_symbol is not None:
+                self._wrapper.set_symbol(sim_symbol)
+            elif symbol is not None:
+                self._wrapper.set_symbol(symbol)
+            if vol_cb is not None:
+                self._wrapper.set_volatility_callback(vol_cb)
             setattr(sim, "latency", self._wrapper)
         self.attached_sim = sim
+
+    def _build_volatility_callback(
+        self, sim
+    ) -> Optional[Callable[[Optional[str], int], Tuple[float, Dict[str, Any]]]]:
+        gamma = float(self.cfg.volatility_gamma)
+        if gamma == 0.0:
+            return None
+
+        metric = str(self.cfg.vol_metric or "sigma")
+        window = int(self.cfg.vol_window or 1)
+        clip = float(self.cfg.zscore_clip)
+        sim_ref = weakref.ref(sim)
+
+        def _resolve(symbol: Optional[str], ts_ms: int) -> Tuple[float, Dict[str, Any]]:
+            debug: Dict[str, Any] = {}
+            if gamma == 0.0:
+                debug["reason"] = "gamma_zero"
+                return 1.0, debug
+
+            sim_obj = sim_ref()
+            if sim_obj is None:
+                debug["reason"] = "sim_released"
+                return 1.0, debug
+
+            cache = getattr(sim_obj, "volatility_cache", None)
+            if cache is None:
+                debug["reason"] = "cache_missing"
+                return 1.0, debug
+
+            ready = True
+            ready_attr = getattr(cache, "ready", None)
+            if isinstance(ready_attr, bool):
+                ready = ready_attr
+            else:
+                ready_fn = getattr(cache, "is_ready", None)
+                if callable(ready_fn):
+                    try:
+                        ready = bool(ready_fn())
+                    except Exception:
+                        ready = True
+            if not ready:
+                debug["reason"] = "cache_not_ready"
+                return 1.0, debug
+
+            sym = symbol or getattr(sim_obj, "symbol", None)
+            if not sym:
+                debug["reason"] = "symbol_missing"
+                return 1.0, debug
+
+            method = None
+            for name in (
+                "latency_multiplier",
+                "get_latency_multiplier",
+                "latency_factor",
+                "get_latency_factor",
+            ):
+                cand = getattr(cache, name, None)
+                if callable(cand):
+                    method = cand
+                    break
+
+            if method is None:
+                debug["reason"] = "no_method"
+                return 1.0, debug
+
+            payload: Dict[str, Any] = {}
+            try:
+                try:
+                    result = method(
+                        symbol=sym,
+                        ts_ms=int(ts_ms),
+                        metric=metric,
+                        window=window,
+                        gamma=gamma,
+                        clip=clip,
+                    )
+                except TypeError:
+                    result = method(sym, int(ts_ms), metric, window, gamma, clip)
+            except Exception as exc:
+                debug["error"] = str(exc)
+                return 1.0, debug
+
+            if isinstance(result, tuple):
+                vol_mult = result[0]
+                if len(result) > 1 and isinstance(result[1], dict):
+                    payload.update(result[1])
+                elif len(result) > 1:
+                    payload["payload"] = result[1]
+            else:
+                vol_mult = result
+
+            try:
+                value = float(vol_mult)
+            except (TypeError, ValueError):
+                payload.setdefault("reason", "non_numeric")
+                return 1.0, payload or debug
+
+            if not math.isfinite(value) or value <= 0.0:
+                payload.setdefault("reason", "invalid_multiplier")
+                payload.setdefault("vol_mult", value)
+                return 1.0, payload
+
+            payload.setdefault("metric", metric)
+            payload.setdefault("window", window)
+            payload.setdefault("gamma", gamma)
+            payload.setdefault("clip", clip)
+            return value, payload
+
+        return _resolve
 
     def get_stats(self):
         if self._wrapper is not None:
