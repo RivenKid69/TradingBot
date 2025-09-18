@@ -74,6 +74,7 @@ latency:
   min_ms: 0                  # Lower bound applied after adjustments
   max_ms: 10000              # Upper bound applied after adjustments
   debug_log: false           # Emit detailed latency sampling logs
+  vol_debug_log: false       # Emit volatility diagnostics at DEBUG level for latency
 
 risk:
   enabled: true
