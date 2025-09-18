@@ -493,6 +493,7 @@ class ExecutionSimulator:
         run_config: Any = None,
     ):
         self.symbol = str(symbol).upper()
+        self._latency_symbol: Optional[str] = self.symbol
         self.latency_steps = int(max(0, latency_steps))
         self.seed = int(seed)
         # Seed global RNGs for reproducibility of any downstream randomness.
@@ -773,6 +774,7 @@ class ExecutionSimulator:
 
     def set_symbol(self, symbol: str) -> None:
         self.symbol = str(symbol).upper()
+        self._latency_symbol = self.symbol
 
     def set_ref_price(self, price: float) -> None:
         self._last_ref_price = float(price)
@@ -839,6 +841,8 @@ class ExecutionSimulator:
         self._last_vol_factor = float(vol_factor) if vol_factor is not None else None
         liq_val = float(liquidity) if liquidity is not None else None
         self._last_liquidity = liq_val * liq_mult if liq_val is not None else None
+        if ts_ms is not None and self._last_vol_factor is not None:
+            self._update_latency_volatility(int(ts_ms), self._last_vol_factor)
         if seasonality_logger.isEnabledFor(logging.DEBUG) and ts_ms is not None:
             seasonality_logger.debug(
                 "snapshot h%03d mult=%.3f liquidity=%s",
@@ -989,6 +993,34 @@ class ExecutionSimulator:
         if price is not None and volume is not None and volume > 0.0:
             self._vwap_pv += float(price) * float(volume)
             self._vwap_vol += float(volume)
+
+    def _update_latency_volatility(self, ts_ms: int, value: float) -> None:
+        try:
+            ts = int(ts_ms)
+            val = float(value)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(val):
+            return
+        latency = getattr(self, "latency", None)
+        if latency is None:
+            return
+        updater = getattr(latency, "update_volatility", None)
+        if not callable(updater):
+            return
+        symbol = getattr(self, "_latency_symbol", None) or getattr(self, "symbol", None)
+        try:
+            updater(symbol, ts, val)
+        except TypeError:
+            try:
+                updater(symbol, ts, value)  # type: ignore[arg-type]
+            except TypeError:
+                try:
+                    updater(ts, val)
+                except Exception:
+                    return
+        except Exception:
+            return
 
     def _apply_trade_inventory(self, side: str, price: float, qty: float) -> float:
         """
@@ -1954,6 +1986,8 @@ class ExecutionSimulator:
         qty_tick = trade_qty if trade_qty is not None else liquidity
         if price_tick is not None and qty_tick is not None:
             self._vwap_on_tick(int(ts), float(price_tick), float(qty_tick))
+        if self._last_vol_factor is not None:
+            self._update_latency_volatility(int(ts), self._last_vol_factor)
 
         # --- инициализация аккамуляторов ---
         trades: list[ExecTrade] = []

@@ -23,6 +23,7 @@ sys.modules["impl_latency"] = impl_module
 spec_impl.loader.exec_module(impl_module)
 
 LatencyImpl = impl_module.LatencyImpl
+ExecutionSimulator = importlib.import_module("execution_sim").ExecutionSimulator
 
 
 class DummyCache:
@@ -30,6 +31,7 @@ class DummyCache:
         self.multiplier = float(multiplier)
         self.ready = ready
         self.calls = []
+        self.updates = []
 
     def latency_multiplier(
         self,
@@ -52,6 +54,11 @@ class DummyCache:
             }
         )
         return self.multiplier, {"source": "dummy"}
+
+    def update_latency_factor(
+        self, *, symbol: str, ts_ms: int, value: float
+    ) -> None:
+        self.updates.append({"symbol": symbol, "ts_ms": ts_ms, "value": value})
 
 
 class DummySim:
@@ -138,4 +145,43 @@ def test_latency_clamps_to_bounds(tmp_path):
     result = lat.sample(_sample_timestamp())
     assert result["total_ms"] == 180
     assert not result["timeout"]
+
+
+def test_latency_update_forwards_to_cache(tmp_path):
+    cache = DummyCache(1.0)
+    impl = _make_impl(tmp_path, {"volatility_gamma": 1.0})
+    sim = DummySim(cache=cache, symbol="ethusdt")
+    impl.attach_to(sim)
+
+    lat = sim.latency
+    lat.update_volatility(None, 1234567890, 0.25)
+    assert cache.updates
+    entry = cache.updates[-1]
+    assert entry["symbol"] == "ETHUSDT"
+    assert entry["ts_ms"] == 1234567890
+    assert entry["value"] == pytest.approx(0.25)
+
+
+def test_execution_simulator_updates_latency():
+    sim = ExecutionSimulator(symbol="adausdt")
+
+    class _Lat:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def update_volatility(self, symbol, ts_ms, value):
+            self.calls.append((symbol, ts_ms, value))
+
+    lat = _Lat()
+    sim.latency = lat
+    sim._latency_symbol = "ADAUSDT"
+
+    sim.set_market_snapshot(bid=1.0, ask=1.1, vol_factor=0.3, ts_ms=1_000)
+    assert lat.calls
+    assert lat.calls[-1] == ("ADAUSDT", 1000, 0.3)
+
+    lat.calls.clear()
+    sim.run_step(ts=2_000, ref_price=1.05, vol_factor=0.5, liquidity=1.0)
+    assert lat.calls
+    assert lat.calls[-1] == ("ADAUSDT", 2000, 0.5)
 
