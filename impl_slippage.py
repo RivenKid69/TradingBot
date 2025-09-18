@@ -327,6 +327,10 @@ class SlippageImpl:
         if self._cfg_obj is not None:
             setattr(sim, "slippage_cfg", self._cfg_obj)
         try:
+            setattr(sim, "_slippage_get_spread", self.get_spread_bps)
+        except Exception:
+            logger.exception("Failed to attach _slippage_get_spread to simulator")
+        try:
             setattr(sim, "get_spread_bps", self.get_spread_bps)
         except Exception:
             logger.exception("Failed to attach get_spread_bps to simulator")
