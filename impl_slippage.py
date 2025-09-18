@@ -60,6 +60,16 @@ def _as_iterable(values: Any) -> Optional[Iterable[Any]]:
     return None
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return num
+
+
 class _DynamicSpreadProfile:
     """Maintain hourly spread multipliers with optional smoothing."""
 
@@ -238,6 +248,21 @@ class _DynamicSpreadProfile:
             self._prev_smoothed = smoothed
         return smoothed
 
+    def seasonal_multiplier(self, ts_ms: Any) -> float:
+        """Public wrapper used by the dynamic spread helper."""
+
+        return self._seasonal_multiplier(ts_ms)
+
+    def process_spread(self, spread_bps: Any, *, already_clamped: bool = False) -> float:
+        """Clamp and smooth the supplied spread value."""
+
+        candidate = _safe_float(spread_bps)
+        if candidate is None:
+            candidate = self._base_spread_bps
+        if not already_clamped:
+            candidate = self._apply_clamp(candidate)
+        return self._apply_smoothing(candidate)
+
     def compute(
         self,
         *,
@@ -254,8 +279,94 @@ class _DynamicSpreadProfile:
                 base = self._base_spread_bps
         seasonal = self._seasonal_multiplier(ts_ms)
         spread = base * seasonal * float(vol_multiplier)
-        spread = self._apply_clamp(spread)
-        return self._apply_smoothing(spread)
+        return self.process_spread(spread)
+
+
+def _calc_dynamic_spread(
+    *,
+    cfg: DynamicSpreadConfig,
+    default_spread_bps: float,
+    bar_high: Any,
+    bar_low: Any,
+    mid_price: Any,
+    vol_metrics: Optional[Mapping[str, Any]] = None,
+    seasonal_multiplier: float = 1.0,
+    vol_multiplier: float = 1.0,
+    profile: Optional[_DynamicSpreadProfile] = None,
+) -> Optional[float]:
+    """Compute a dynamic spread using the range-based heuristic.
+
+    The helper returns ``None`` when the supplied inputs are insufficient,
+    allowing callers to fall back to the default spread behaviour.
+    """
+
+    alpha = _safe_float(getattr(cfg, "alpha_bps", None))
+    if alpha is None:
+        alpha = _safe_float(default_spread_bps) or 0.0
+    beta = _safe_float(getattr(cfg, "beta_coef", None))
+    if beta is None:
+        beta = 0.0
+
+    high = _safe_float(bar_high)
+    low = _safe_float(bar_low)
+    mid = _safe_float(mid_price)
+    range_ratio_bps: Optional[float] = None
+    if high is not None and low is not None and mid is not None and mid > 0.0:
+        price_range = high - low
+        if price_range < 0.0:
+            logger.debug(
+                "Dynamic spread received inverted bar range: high=%s low=%s",
+                high,
+                low,
+            )
+            price_range = abs(price_range)
+        ratio = price_range / mid if mid > 0.0 else None
+        if ratio is not None and math.isfinite(ratio):
+            range_ratio_bps = max(ratio, 0.0) * 1e4
+
+    if range_ratio_bps is None and vol_metrics and isinstance(vol_metrics, Mapping):
+        vol_key = getattr(cfg, "vol_metric", None)
+        candidates = []
+        if vol_key and vol_key in vol_metrics:
+            candidates.append(vol_metrics[vol_key])
+        if "range_ratio_bps" in vol_metrics:
+            candidates.append(vol_metrics["range_ratio_bps"])
+        for candidate in candidates:
+            candidate_val = _safe_float(candidate)
+            if candidate_val is not None and candidate_val >= 0.0:
+                range_ratio_bps = candidate_val
+                break
+
+    if range_ratio_bps is None:
+        logger.debug(
+            "Dynamic spread inputs missing (high=%r, low=%r, mid=%r, vol_metric=%r)",
+            bar_high,
+            bar_low,
+            mid_price,
+            getattr(cfg, "vol_metric", None),
+        )
+        return None
+
+    spread = alpha + beta * range_ratio_bps
+
+    seasonal = _safe_float(seasonal_multiplier)
+    if seasonal is None or seasonal <= 0.0:
+        seasonal = 1.0
+    vol_mult = _safe_float(vol_multiplier)
+    if vol_mult is None or vol_mult <= 0.0:
+        vol_mult = 1.0
+    spread *= seasonal * vol_mult
+
+    if profile is not None:
+        return profile.process_spread(spread)
+
+    min_spread = _safe_float(getattr(cfg, "min_spread_bps", None))
+    max_spread = _safe_float(getattr(cfg, "max_spread_bps", None))
+    if min_spread is not None:
+        spread = max(min_spread, spread)
+    if max_spread is not None:
+        spread = min(max_spread, spread)
+    return spread
 
 
 @dataclass
@@ -396,6 +507,10 @@ class SlippageImpl:
         ts_ms: Any,
         base_spread_bps: Optional[float] = None,
         vol_factor: Optional[float] = None,
+        bar_high: Any = None,
+        bar_low: Any = None,
+        mid_price: Any = None,
+        vol_metrics: Optional[Mapping[str, Any]] = None,
     ) -> float:
         base = float(self.cfg.default_spread_bps)
         if base_spread_bps is not None:
@@ -416,7 +531,29 @@ class SlippageImpl:
                 if math.isfinite(vf) and vf > 0.0:
                     vol_multiplier = vf
         profile = self._dynamic_profile
-        if profile is not None:
+        if profile is not None and getattr(profile._cfg, "enabled", False):
+            seasonal_multiplier = profile.seasonal_multiplier(ts_ms)
+            try:
+                dynamic_spread = _calc_dynamic_spread(
+                    cfg=profile._cfg,
+                    default_spread_bps=base,
+                    bar_high=bar_high,
+                    bar_low=bar_low,
+                    mid_price=mid_price,
+                    vol_metrics=vol_metrics,
+                    seasonal_multiplier=seasonal_multiplier,
+                    vol_multiplier=vol_multiplier,
+                    profile=profile,
+                )
+            except Exception:
+                logger.exception("Dynamic spread computation failed")
+            else:
+                if dynamic_spread is not None:
+                    return float(dynamic_spread)
+            logger.debug(
+                "Dynamic spread fell back to default profile computation for ts=%r",
+                ts_ms,
+            )
             try:
                 return float(
                     profile.compute(
@@ -426,5 +563,5 @@ class SlippageImpl:
                     )
                 )
             except Exception:
-                logger.exception("Dynamic spread computation failed")
+                logger.exception("Dynamic spread fallback computation failed")
         return float(base * vol_multiplier)
