@@ -408,11 +408,21 @@ class RiskManager:
                     )
 
             limit_q_pairs: List[Dict[str, Any]] = []
+            buffered_delta_notional: Optional[float]
+            if price_val is None:
+                buffered_delta_notional = None
+            else:
+                buffered_delta_notional = delta_abs_units * price_val * buffer_mult
+
             for info in exposure_limits:
                 limit_value = float(info["limit"])
                 headroom = limit_value - current_total
                 if headroom <= 0.0:
-                    code = "TOTAL_NOTIONAL_BLOCK" if info["type"] == "TOTAL_NOTIONAL" else "TOTAL_EXPOSURE_BLOCK"
+                    code = (
+                        "TOTAL_NOTIONAL_BLOCK"
+                        if info["type"] == "TOTAL_NOTIONAL"
+                        else "TOTAL_EXPOSURE_BLOCK"
+                    )
                     message = (
                         "total notional limit blocks increase"
                         if info["type"] == "TOTAL_NOTIONAL"
@@ -427,28 +437,22 @@ class RiskManager:
                         buffer=float(buffer_raw),
                     )
                     return 0.0
-                if price_val is None:
+
+                if buffered_delta_notional is None:
+                    # Cannot evaluate the effect of the order without price data.
                     continue
-                allowed_delta_notional = headroom / buffer_mult
-                if allowed_delta_notional <= 0.0:
-                    code = "TOTAL_NOTIONAL_BLOCK" if info["type"] == "TOTAL_NOTIONAL" else "TOTAL_EXPOSURE_BLOCK"
-                    message = (
-                        "total notional limit blocks increase"
-                        if info["type"] == "TOTAL_NOTIONAL"
-                        else "total exposure limit blocks increase"
-                    )
-                    self._emit(
-                        ts_ms,
-                        code,
-                        message,
-                        limit=float(limit_value),
-                        total=float(current_total),
-                        buffer=float(buffer_raw),
-                    )
-                    return 0.0
-                allowed_delta_units = allowed_delta_notional / price_val
+
+                projected_total = current_total + buffered_delta_notional
+                if projected_total <= limit_value + 1e-12:
+                    continue
+
+                allowed_delta_units = headroom / (price_val * buffer_mult)
                 if allowed_delta_units <= 0.0:
-                    code = "TOTAL_NOTIONAL_BLOCK" if info["type"] == "TOTAL_NOTIONAL" else "TOTAL_EXPOSURE_BLOCK"
+                    code = (
+                        "TOTAL_NOTIONAL_BLOCK"
+                        if info["type"] == "TOTAL_NOTIONAL"
+                        else "TOTAL_EXPOSURE_BLOCK"
+                    )
                     message = (
                         "total notional limit blocks increase"
                         if info["type"] == "TOTAL_NOTIONAL"
@@ -490,7 +494,11 @@ class RiskManager:
                 limit_value = float(limiting["limit"])
                 limit_type = str(limiting["type"])
                 if qty_cap <= 0.0:
-                    code = "TOTAL_NOTIONAL_BLOCK" if limit_type == "TOTAL_NOTIONAL" else "TOTAL_EXPOSURE_BLOCK"
+                    code = (
+                        "TOTAL_NOTIONAL_BLOCK"
+                        if limit_type == "TOTAL_NOTIONAL"
+                        else "TOTAL_EXPOSURE_BLOCK"
+                    )
                     message = (
                         "total notional limit blocks increase"
                         if limit_type == "TOTAL_NOTIONAL"
@@ -506,7 +514,11 @@ class RiskManager:
                     )
                     return 0.0
                 if q > qty_cap + 1e-12:
-                    code = "TOTAL_NOTIONAL_CLAMP" if limit_type == "TOTAL_NOTIONAL" else "TOTAL_EXPOSURE_CLAMP"
+                    code = (
+                        "TOTAL_NOTIONAL_CLAMP"
+                        if limit_type == "TOTAL_NOTIONAL"
+                        else "TOTAL_EXPOSURE_CLAMP"
+                    )
                     message = (
                         "clamped by total notional limit"
                         if limit_type == "TOTAL_NOTIONAL"
