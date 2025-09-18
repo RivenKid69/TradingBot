@@ -537,7 +537,7 @@ class LatencyImpl:
         path = (
             cfg.seasonality_path
             or cfg.latency_seasonality_path
-            or "configs/liquidity_latency_seasonality.json"
+            or "data/latency/liquidity_latency_seasonality.json"
         )
         self._seasonality_path = path
         refresh_raw = cfg.refresh_period_days

@@ -111,7 +111,7 @@ def main(argv=None) -> bool:
     )
     parser.add_argument(
         "--multipliers",
-        default="configs/liquidity_latency_seasonality.json",
+        default="data/latency/liquidity_latency_seasonality.json",
         help="Path to multipliers JSON",
     )
     parser.add_argument(

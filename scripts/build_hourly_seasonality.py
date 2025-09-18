@@ -9,7 +9,9 @@ to modulate these parameters during backtests.
 import argparse
 import hashlib
 import json
+import os
 import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -155,8 +157,8 @@ def main() -> None:
     )
     parser.add_argument(
         '--out',
-        default='configs/liquidity_latency_seasonality.json',
-        help='Output JSON path',
+        default='data/latency/liquidity_latency_seasonality.json',
+        help='Output JSON path (backups stored in data/latency/backups)',
     )
     parser.add_argument(
         '--symbol',
@@ -168,6 +170,12 @@ def main() -> None:
         type=int,
         default=30,
         help='Minimum samples per hour required before imputation',
+    )
+    parser.add_argument(
+        '--window-days',
+        type=int,
+        default=0,
+        help='Number of most recent days to include (0 to use the full dataset)',
     )
     parser.add_argument(
         '--smooth-window',
@@ -207,6 +215,32 @@ def main() -> None:
 
     data_path = Path(args.data)
     df = load_logs(data_path)
+    if df.empty:
+        raise SystemExit(f'No rows found in input data at {data_path}')
+
+    ts_column = 'ts_ms' if 'ts_ms' in df.columns else 'ts' if 'ts' in df.columns else None
+    if ts_column is None:
+        raise SystemExit('Input data must contain ts or ts_ms column')
+
+    if args.window_days and args.window_days > 0:
+        ts_numeric = pd.to_numeric(df[ts_column], errors='coerce')
+        if ts_numeric.isna().all():
+            raise SystemExit(
+                'Unable to apply --window-days filter because timestamp column contains only NaNs'
+            )
+        cutoff = ts_numeric.max() - (args.window_days * 86_400_000)
+        filtered_df = df.loc[ts_numeric >= cutoff].copy()
+        if filtered_df.empty:
+            raise SystemExit(
+                'No data available after applying --window-days '
+                f'={args.window_days}; consider lowering the value.'
+            )
+        removed = len(df) - len(filtered_df)
+        df = filtered_df
+        print(
+            f'Applied --window-days={args.window_days}: kept {len(df)} rows, '
+            f'removed {removed} rows.'
+        )
     prior: Optional[Dict[str, np.ndarray]] = None
     if args.prior_metrics:
         with open(args.prior_metrics, 'r') as f:
@@ -227,18 +261,17 @@ def main() -> None:
         for key, arr in multipliers.items():
             multipliers[key] = arr * (1.0 - args.smooth_alpha) + args.smooth_alpha
 
+    for key, arr in multipliers.items():
+        mean = float(np.mean(arr))
+        if not np.isfinite(mean) or mean == 0.0:
+            mean = 1.0
+        multipliers[key] = arr / mean
+
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        archive_dir = Path("configs/seasonality/archive")
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        archived = archive_dir / f"{out_path.stem}-{timestamp}{out_path.suffix}"
-        shutil.copy2(out_path, archived)
-        print(f"Archived previous config to {archived}")
-
     meta = {
-        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'built_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'window_days': int(args.window_days),
         'smoothing': {
             'rolling_window': args.smooth_window,
             'regularization_alpha': args.smooth_alpha,
@@ -258,14 +291,29 @@ def main() -> None:
         out_data = {k: v.tolist() for k, v in multipliers.items()}
         out_data['hour_of_week_definition'] = '0=Monday 00:00 UTC'
         out_data['metadata'] = meta
-
-    with open(out_path, 'w') as f:
-        json.dump(out_data, f, indent=2)
+    backup_dir = Path('data/latency/backups')
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    temp_file = tempfile.NamedTemporaryFile(
+        'w', delete=False, dir=out_path.parent, prefix=f'.{out_path.stem}.', suffix='.tmp'
+    )
+    try:
+        json.dump(out_data, temp_file, indent=2)
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+    finally:
+        temp_file.close()
+    temp_path = Path(temp_file.name)
+    if out_path.exists():
+        backup_path = backup_dir / f'{out_path.stem}-{timestamp}{out_path.suffix}'
+        shutil.copy2(out_path, backup_path)
+        print(f'Backed up previous config to {backup_path}')
+    os.replace(temp_path, out_path)
     if imputed:
         for key, hours in imputed.items():
             print(f'Imputed {key} multipliers for hours: {sorted(hours)}')
     checksum_path = write_checksum(data_path)
-    print(f'Saved seasonality multipliers to {args.out}')
+    print(f'Saved seasonality multipliers to {args.out} (backups in {backup_dir})')
     print(f'Input data checksum written to {checksum_path}')
 
 

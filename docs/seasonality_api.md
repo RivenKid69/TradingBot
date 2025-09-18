@@ -23,7 +23,7 @@ uvicorn app:api --reload
 
 Return the contents of the seasonality JSON file.  The optional `path`
 query parameter specifies the file to read and defaults to
-`configs/liquidity_latency_seasonality.json`.
+`data/latency/liquidity_latency_seasonality.json`.
 
 ```bash
 curl -H "X-API-Key: $SEASONALITY_API_TOKEN" \
@@ -39,7 +39,7 @@ query parameters are available:
 * `data` – path to the historical trade or latency dataset; defaults to
   `data/seasonality_source/latest.parquet`.
 * `out` – output JSON path; defaults to
-  `configs/liquidity_latency_seasonality.json`.
+  `data/latency/liquidity_latency_seasonality.json`.
 
 ```bash
 curl -X POST -H "X-API-Key: $SEASONALITY_API_TOKEN" \

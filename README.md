@@ -35,11 +35,11 @@ pip install ".[extra]"
 python script_backtest.py --config configs/config_sim.yaml
 python train_model_multi_patch.py --config configs/config_train.yaml \
   --regime-config configs/market_regimes.json \
-  --liquidity-seasonality configs/liquidity_latency_seasonality.json
+  --liquidity-seasonality data/latency/liquidity_latency_seasonality.json
 python script_compare_runs.py run1 run2 run3            # сохранит compare_runs.csv
 python script_compare_runs.py run1 metrics.json --stdout  # вывод в stdout
 python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json
-python scripts/validate_seasonality.py --historical path/to/trades.csv --multipliers configs/liquidity_latency_seasonality.json
+python scripts/validate_seasonality.py --historical path/to/trades.csv --multipliers data/latency/liquidity_latency_seasonality.json
 ```
 
 Runners load the symbol universe from ``data/universe/symbols.json`` by default.
@@ -148,12 +148,12 @@ python train_model_multi_patch.py --config configs/config_train.yaml --slippage.
 Дополнительно доступны опции `--regime-config` и `--liquidity-seasonality`,
 позволяющие указать пути к откалиброванным JSON‑файлам с параметрами
 рыночных режимов и сезонностью ликвидности и задержек соответственно. По
-умолчанию используются файлы из каталога `configs/`, где
+умолчанию используются файлы из каталога `data/latency/`, где
 `liquidity_latency_seasonality.json` содержит массивы `liquidity` и
 `latency` для 168 часов недели. Файл может быть как плоским, так и
 вложенным по символам, например `{ "BTCUSDT": {"liquidity": [...], "latency": [...] }}`.
-В качестве шаблона можно использовать `configs/liquidity_latency_seasonality.sample.json`,
-в котором все множители равны `1.0`.
+Шаблон с единичными множителями по-прежнему доступен в
+`configs/liquidity_latency_seasonality.sample.json`.
 
 ### Параметры исполнения
 

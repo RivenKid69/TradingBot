@@ -19,13 +19,13 @@ An example file with all multipliers set to `1.0` is available at `configs/liqui
    ```bash
    python scripts/build_hourly_seasonality.py \
      --data data/seasonality_source/latest.parquet \
-     --out configs/liquidity_latency_seasonality.json
+     --out data/latency/liquidity_latency_seasonality.json
    ```
 
 4. **Visualise** *(optional)*
 
    ```bash
-   python scripts/plot_seasonality.py --multipliers configs/liquidity_latency_seasonality.json
+   python scripts/plot_seasonality.py --multipliers data/latency/liquidity_latency_seasonality.json
    ```
 
 5. **Validate**
@@ -33,7 +33,7 @@ An example file with all multipliers set to `1.0` is available at `configs/liqui
    ```bash
    python scripts/validate_seasonality.py \
      --historical data/seasonality_source/latest.parquet \
-     --multipliers configs/liquidity_latency_seasonality.json
+     --multipliers data/latency/liquidity_latency_seasonality.json
    ```
 
 6. **Use in simulation**
@@ -42,5 +42,5 @@ An example file with all multipliers set to `1.0` is available at `configs/liqui
 
    ```bash
    python train_model_multi_patch.py --config configs/config_train.yaml \
-     --liquidity-seasonality configs/liquidity_latency_seasonality.json
+     --liquidity-seasonality data/latency/liquidity_latency_seasonality.json
    ```
