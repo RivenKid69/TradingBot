@@ -15,10 +15,19 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 try:
-    from slippage import SlippageConfig, DynamicSpreadConfig
+    from slippage import (
+        SlippageConfig,
+        DynamicSpreadConfig,
+        DynamicImpactConfig,
+        TailShockConfig,
+        AdvConfig,
+    )
 except Exception:  # pragma: no cover
     SlippageConfig = None  # type: ignore
     DynamicSpreadConfig = None  # type: ignore
+    DynamicImpactConfig = None  # type: ignore
+    TailShockConfig = None  # type: ignore
+    AdvConfig = None  # type: ignore
 
 try:
     from utils_time import get_hourly_multiplier, watch_seasonality_file
@@ -377,6 +386,9 @@ class SlippageCfg:
     eps: float = 1e-12
     dynamic: Optional[Any] = None
     dynamic_spread: Optional[Any] = None
+    dynamic_impact: Optional[Any] = None
+    tail_shock: Optional[Any] = None
+    adv: Optional[Any] = None
 
     def get_dynamic_block(self) -> Optional[Any]:
         if self.dynamic is not None:
@@ -434,6 +446,39 @@ class SlippageImpl:
             cfg_dict["dynamic"] = dict(dyn_dict)
             cfg_dict.setdefault("dynamic_spread", dict(dyn_dict))
 
+        def _normalise_section(
+            block: Any, cfg_cls: Optional[type]
+        ) -> Optional[Dict[str, Any]]:
+            if block is None:
+                return None
+            if cfg_cls is not None and isinstance(block, cfg_cls):
+                try:
+                    payload = block.to_dict()
+                except Exception:
+                    return None
+                else:
+                    return dict(payload)
+            if hasattr(block, "to_dict"):
+                try:
+                    payload = block.to_dict()
+                except Exception:
+                    payload = None
+                if isinstance(payload, Mapping):
+                    return dict(payload)
+            if isinstance(block, Mapping):
+                return dict(block)
+            return None
+
+        extra_sections = (
+            ("dynamic_impact", getattr(cfg, "dynamic_impact", None), DynamicImpactConfig),
+            ("tail_shock", getattr(cfg, "tail_shock", None), TailShockConfig),
+            ("adv", getattr(cfg, "adv", None), AdvConfig),
+        )
+        for key, block, cfg_cls in extra_sections:
+            payload = _normalise_section(block, cfg_cls)
+            if payload is not None:
+                cfg_dict[key] = payload
+
         self._cfg_obj = (
             SlippageConfig.from_dict(cfg_dict)
             if SlippageConfig is not None
@@ -490,6 +535,21 @@ class SlippageImpl:
         ):
             dyn_cfg = dyn_block
 
+        def _parse_section(block: Any, cfg_cls: Optional[type]) -> Optional[Any]:
+            if block is None:
+                return None
+            if cfg_cls is not None and isinstance(block, cfg_cls):
+                return block
+            if isinstance(block, Mapping):
+                if cfg_cls is not None:
+                    return cfg_cls.from_dict(block)
+                return dict(block)
+            return None
+
+        impact_cfg = _parse_section(d.get("dynamic_impact"), DynamicImpactConfig)
+        tail_cfg = _parse_section(d.get("tail_shock"), TailShockConfig)
+        adv_cfg = _parse_section(d.get("adv"), AdvConfig)
+
         return SlippageImpl(
             SlippageCfg(
                 k=float(d.get("k", 0.8)),
@@ -498,6 +558,9 @@ class SlippageImpl:
                 eps=float(d.get("eps", 1e-12)),
                 dynamic=dyn_cfg,
                 dynamic_spread=dyn_cfg,
+                dynamic_impact=impact_cfg,
+                tail_shock=tail_cfg,
+                adv=adv_cfg,
             )
         )
 
