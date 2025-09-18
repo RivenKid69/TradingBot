@@ -117,6 +117,10 @@ class BacktestAdapter:
     ) -> None:
         self.policy = policy
         self.sim = sim_bridge
+        sim_obj = getattr(self.sim, "sim", None)
+        getter = getattr(sim_obj, "get_spread_bps", None)
+        fallback_getter = getattr(sim_obj, "_slippage_get_spread", None)
+        self._sim_has_spread_getter = callable(getter) or callable(fallback_getter)
         self._dyn = DynSpreadConfig.from_dict(dynamic_spread_config or {})
         self._guards = GuardsConfig.from_dict(guards_config or {})
         self._no_trade = NoTradeConfig.from_dict(no_trade_config or {})
@@ -411,12 +415,17 @@ class BacktestAdapter:
             else:
                 orders = []
 
-            if self._dyn.enabled:
+            need_spread = self._dyn.enabled and not self._sim_has_spread_getter
+            if self._dyn.enabled or self._sim_has_spread_getter:
                 vol_factor = float(self._compute_vol_factor(row, ref=ref, has_hl=has_hl))
-                liquidity = float(self._compute_liquidity(row))
-                bid, ask, spread_bps = self._synth_quotes(symbol=sym, ref=ref, vol_factor=vol_factor, liquidity=liquidity)
             else:
                 vol_factor = float("nan")
+            if need_spread:
+                liquidity = float(self._compute_liquidity(row))
+                bid, ask, spread_bps = self._synth_quotes(
+                    symbol=sym, ref=ref, vol_factor=vol_factor, liquidity=liquidity
+                )
+            else:
                 liquidity = float("nan")
                 bid = None
                 ask = None

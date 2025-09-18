@@ -84,6 +84,25 @@ class SimExecutor(TradeExecutor):
         except Exception:
             return {}
 
+    @staticmethod
+    def _dynamic_spread_enabled(cfg: Any) -> bool:
+        if cfg is None:
+            return False
+        if isinstance(cfg, Mapping):
+            dyn_block = cfg.get("dynamic_spread")
+        else:
+            dyn_block = getattr(cfg, "dynamic_spread", None)
+        if dyn_block is None:
+            return False
+        if isinstance(dyn_block, Mapping):
+            enabled_value = dyn_block.get("enabled")
+        else:
+            enabled_value = getattr(dyn_block, "enabled", None)
+        try:
+            return bool(enabled_value)
+        except Exception:
+            return False
+
     def __init__(
         self,
         sim: ExecutionSimulator,
@@ -178,6 +197,13 @@ class SimExecutor(TradeExecutor):
         if fees is None:
             fees = FeesImpl.from_dict(rc_fees)
 
+        dyn_cfg_source: Any = None
+        if run_config is not None:
+            dyn_cfg_source = getattr(run_config, "slippage", None)
+        if dyn_cfg_source is None:
+            dyn_cfg_source = rc_slippage
+        dyn_spread_enabled = self._dynamic_spread_enabled(dyn_cfg_source)
+
         # последовательное подключение компонентов к симулятору
         if quantizer is not None:
             quantizer.attach_to(self._sim, strict=True, enforce_percent_price_by_side=True)
@@ -187,6 +213,13 @@ class SimExecutor(TradeExecutor):
             latency.attach_to(self._sim)
         if slippage is not None:
             slippage.attach_to(self._sim)
+            if dyn_spread_enabled:
+                profile = getattr(slippage, "dynamic_profile", None)
+                if profile is not None:
+                    try:
+                        setattr(self._sim, "slippage_dynamic_profile", profile)
+                    except Exception:
+                        pass
         if fees is not None:
             fees.attach_to(self._sim)
 
