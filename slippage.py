@@ -419,6 +419,22 @@ class SlippageConfig:
     tail_shock: TailShockConfig = field(default_factory=TailShockConfig)
     adv: AdvConfig = field(default_factory=AdvConfig)
 
+    def get_dynamic_block(self) -> Optional[Any]:
+        dyn = getattr(self, "dynamic_spread", None)
+        if dyn is not None:
+            return dyn
+        return getattr(self, "dynamic", None)
+
+    def dynamic_trade_cost_enabled(self) -> bool:
+        block = self.get_dynamic_block()
+        if block is None:
+            return False
+        if isinstance(block, DynamicSpreadConfig):
+            return bool(block.enabled)
+        if isinstance(block, dict):
+            return bool(block.get("enabled"))
+        return bool(getattr(block, "enabled", False))
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SlippageConfig":
         dynamic_cfg: Optional[DynamicSpreadConfig] = None
@@ -510,12 +526,102 @@ def estimate_slippage_bps(
     Оценка слиппеджа в bps по простой калибруемой формуле.
     Если spread_bps/liquidity/vol_factor отсутствуют — используются дефолты/единицы.
     """
-    sbps = float(spread_bps) if (spread_bps is not None and math.isfinite(float(spread_bps))) else float(cfg.default_spread_bps)
+    try:
+        size_val = float(size)
+    except (TypeError, ValueError):
+        size_val = 0.0
+
+    delegate = getattr(cfg, "get_trade_cost_bps", None)
+    dynamic_enabled = False
+    if callable(delegate):
+        detector = getattr(cfg, "dynamic_trade_cost_enabled", None)
+        if callable(detector):
+            try:
+                dynamic_enabled = bool(detector())
+            except Exception:
+                dynamic_enabled = False
+        if not dynamic_enabled:
+            block: Any = None
+            getter = getattr(cfg, "get_dynamic_block", None)
+            if callable(getter):
+                try:
+                    block = getter()
+                except Exception:
+                    block = None
+            if block is None:
+                block = getattr(cfg, "dynamic_spread", None)
+            if block is None:
+                block = getattr(cfg, "dynamic", None)
+            if block is not None:
+                if isinstance(block, dict):
+                    dynamic_enabled = bool(block.get("enabled"))
+                else:
+                    dynamic_enabled = bool(getattr(block, "enabled", False))
+        if dynamic_enabled:
+            side = "BUY" if size_val >= 0.0 else "SELL"
+            qty = abs(size_val)
+            vol_metrics_payload: Optional[Dict[str, float]] = None
+            vol_payload: Dict[str, float] = {}
+            if vol_factor is not None:
+                try:
+                    vf_val = float(vol_factor)
+                except (TypeError, ValueError):
+                    vf_val = None
+                else:
+                    if math.isfinite(vf_val):
+                        vol_payload["vol_factor"] = vf_val
+            if liquidity is not None:
+                try:
+                    liq_val = float(liquidity)
+                except (TypeError, ValueError):
+                    liq_val = None
+                else:
+                    if math.isfinite(liq_val):
+                        vol_payload["liquidity"] = liq_val
+            if vol_payload:
+                vol_metrics_payload = vol_payload
+            kwargs: Dict[str, Any] = {
+                "side": side,
+                "qty": qty,
+                "mid": None,
+                "spread_bps": spread_bps,
+                "bar_close_ts": None,
+                "order_seq": 0,
+            }
+            if vol_metrics_payload is not None:
+                kwargs["vol_metrics"] = vol_metrics_payload
+            try:
+                result = delegate(**kwargs)
+            except TypeError:
+                kwargs.pop("order_seq", None)
+                try:
+                    result = delegate(**kwargs)
+                except TypeError:
+                    kwargs.pop("vol_metrics", None)
+                    result = delegate(**kwargs)
+                except Exception:
+                    result = None
+            except Exception:
+                result = None
+            if result is not None:
+                try:
+                    candidate = float(result)
+                except (TypeError, ValueError):
+                    candidate = None
+                else:
+                    if math.isfinite(candidate):
+                        return float(candidate)
+
+    sbps = (
+        float(spread_bps)
+        if (spread_bps is not None and math.isfinite(float(spread_bps)))
+        else float(cfg.default_spread_bps)
+    )
     half_spread_bps = max(0.5 * sbps, float(cfg.min_half_spread_bps))
 
     vf = float(vol_factor) if (vol_factor is not None and math.isfinite(float(vol_factor))) else 1.0
     liq = float(liquidity) if (liquidity is not None and float(liquidity) > 0.0 and math.isfinite(float(liquidity))) else 1.0
-    sz = abs(float(size))
+    sz = abs(size_val)
 
     impact_term = float(cfg.k) * vf * math.sqrt(max(sz, cfg.eps) / max(liq, cfg.eps))
     return float(half_spread_bps + impact_term)
