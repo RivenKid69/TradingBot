@@ -51,7 +51,7 @@ sim = ExecutionSimulator(
 lat_cfg = {
     "base_ms": 100,
     "jitter_ms": 20,
-    "seasonality_path": "configs/liquidity_latency_seasonality.json",
+    "seasonality_path": "data/latency/liquidity_latency_seasonality.json",
     "seasonality_override": multipliers["latency"],
     "seasonality_interpolate": True,  # smooth latency multipliers
 }

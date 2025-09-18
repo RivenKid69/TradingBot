@@ -58,7 +58,7 @@ def _check_auth(x_api_key: str = Header(..., alias="X-API-Key")) -> None:
 
 @api.get("/seasonality")
 def fetch_seasonality(
-    path: str = "configs/liquidity_latency_seasonality.json",
+    path: str = "data/latency/liquidity_latency_seasonality.json",
     _: None = Depends(_check_auth),
 ) -> Dict[str, Any]:
     """Return seasonality multipliers from JSON file."""
@@ -74,7 +74,7 @@ def fetch_seasonality(
 @api.post("/seasonality/refresh")
 def refresh_seasonality(
     data: str = "data/seasonality_source/latest.parquet",
-    out: str = "configs/liquidity_latency_seasonality.json",
+    out: str = "data/latency/liquidity_latency_seasonality.json",
     _: None = Depends(_check_auth),
 ) -> Dict[str, Any]:
     """Rebuild seasonality JSON from historical data and return it."""

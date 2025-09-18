@@ -12,7 +12,7 @@ A reference template with all multipliers equal to `1.0` is available at `config
 ```bash
 python scripts/validate_seasonality.py \
   --historical data/seasonality_source/latest.parquet \
-  --multipliers configs/liquidity_latency_seasonality.json \
+  --multipliers data/latency/liquidity_latency_seasonality.json \
   --threshold 0.1
 ```
 

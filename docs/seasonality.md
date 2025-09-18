@@ -49,7 +49,7 @@ Each array therefore captures the relative deviation from the baseline for the g
 Visualise the multipliers to ensure they look reasonable:
 
 ```bash
-python scripts/plot_seasonality.py --multipliers configs/liquidity_latency_seasonality.json
+python scripts/plot_seasonality.py --multipliers data/latency/liquidity_latency_seasonality.json
 ```
 
 The script writes line charts and heatmaps for liquidity and latency multipliers to `reports/seasonality/plots`.
@@ -60,10 +60,10 @@ The script writes line charts and heatmaps for liquidity and latency multipliers
 2. Run the helper script to compute averages for each hour of week and normalise them:
 
    ```bash
-   python scripts/build_hourly_seasonality.py --data path/to/trades.parquet --out configs/liquidity_latency_seasonality.json
+   python scripts/build_hourly_seasonality.py --data path/to/trades.parquet --out data/latency/liquidity_latency_seasonality.json
 
    # To wrap the arrays under a specific symbol:
-   python scripts/build_hourly_seasonality.py --data path/to/trades.parquet --out configs/liquidity_latency_seasonality.json --symbol BTCUSDT
+   python scripts/build_hourly_seasonality.py --data path/to/trades.parquet --out data/latency/liquidity_latency_seasonality.json --symbol BTCUSDT
    ```
 3. Optionally smooth the multipliers by applying a circular rolling mean
    and/or shrinking values towards 1.0:
@@ -71,7 +71,7 @@ The script writes line charts and heatmaps for liquidity and latency multipliers
    ```bash
    python scripts/build_hourly_seasonality.py \
      --data path/to/trades.parquet \
-     --out configs/liquidity_latency_seasonality.json \
+     --out data/latency/liquidity_latency_seasonality.json \
      --smooth-window 3 \
      --smooth-alpha 0.1
    ```
@@ -79,7 +79,7 @@ The script writes line charts and heatmaps for liquidity and latency multipliers
 4. Optionally verify the multipliers against the original dataset:
 
    ```bash
-   python scripts/validate_seasonality.py --historical path/to/trades.parquet --multipliers configs/liquidity_latency_seasonality.json
+   python scripts/validate_seasonality.py --historical path/to/trades.parquet --multipliers data/latency/liquidity_latency_seasonality.json
    ```
    See [seasonality_QA.md](seasonality_QA.md) for QA steps and acceptance thresholds.
 
@@ -90,7 +90,7 @@ The script writes line charts and heatmaps for liquidity and latency multipliers
    ```bash
    python scripts/build_hourly_seasonality.py \
      --data path/to/trades.parquet \
-     --out configs/liquidity_latency_seasonality.json \
+     --out data/latency/liquidity_latency_seasonality.json \
      --prior-metrics reports/seasonality/validation_metrics.json
    ```
    The script converts each error ``e`` into a weight ``1/(1+e)`` to down-weight
@@ -122,13 +122,13 @@ periods with different volume regimes.
 Seasonality can be activated either via CLI flags or directly in YAML configs:
 
 ```bash
-python script_backtest.py --config configs/config_sim.yaml --liquidity-seasonality configs/liquidity_latency_seasonality.json
+python script_backtest.py --config configs/config_sim.yaml --liquidity-seasonality data/latency/liquidity_latency_seasonality.json
 ```yaml
-liquidity_seasonality_path: "configs/liquidity_latency_seasonality.json"
+liquidity_seasonality_path: "data/latency/liquidity_latency_seasonality.json"
 seasonality_interpolate: true  # default false; enable minute-level interpolation
 
 latency:
-  seasonality_path: "configs/liquidity_latency_seasonality.json"
+  seasonality_path: "data/latency/liquidity_latency_seasonality.json"
   seasonality_interpolate: true
 ```
 
@@ -175,7 +175,7 @@ To avoid inconsistent reads, update the JSON file using an atomic rename:
 
 ```bash
 python scripts/build_hourly_seasonality.py --out tmp.json
-mv tmp.json configs/liquidity_latency_seasonality.json
+mv tmp.json data/latency/liquidity_latency_seasonality.json
 ```
 
 Operators can therefore tweak multipliers and have the running system pick
@@ -227,7 +227,7 @@ accordingly.
 The helper script `scripts/cron_update_seasonality.sh` can be executed
 periodically (e.g. via `cron`) to rebuild the multipliers from the latest
 snapshot and commit the updated
-`configs/liquidity_latency_seasonality.json`.
+`data/latency/liquidity_latency_seasonality.json`.
 
 The script performs two comparisons against the previously committed
 version:

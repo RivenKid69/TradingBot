@@ -54,7 +54,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Plot seasonality multipliers")
     parser.add_argument(
         "--multipliers",
-        default="configs/liquidity_latency_seasonality.json",
+        default="data/latency/liquidity_latency_seasonality.json",
         help="Path to liquidity_latency_seasonality.json",
     )
     parser.add_argument(
