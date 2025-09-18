@@ -7,7 +7,7 @@ Pydantic-модели конфигураций: sim/live/train/eval + декла
 
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, List, Mapping, Union, Literal
+from typing import Dict, Any, Optional, List, Mapping, Union, Literal, Sequence
 from enum import Enum
 from dataclasses import dataclass, field
 
@@ -248,6 +248,23 @@ class MonitoringConfig:
     alerts: MonitoringAlertConfig = field(default_factory=MonitoringAlertConfig)
 
 
+class LatencyConfig(BaseModel):
+    """Latency configuration preserved on ``CommonRunConfig``."""
+
+    use_seasonality: bool = Field(default=True)
+    latency_seasonality_path: Optional[str] = Field(default=None)
+    refresh_period_days: int = Field(default=30)
+    seasonality_default: Optional[Union[float, Sequence[float]]] = Field(default=1.0)
+
+    class Config:
+        extra = "allow"
+
+    def dict(self, *args, **kwargs):  # type: ignore[override]
+        if "exclude_unset" not in kwargs:
+            kwargs["exclude_unset"] = False
+        return super().dict(*args, **kwargs)
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
         default=None, description="Идентификатор запуска; если None — генерируется."
@@ -261,6 +278,7 @@ class CommonRunConfig(BaseModel):
     seasonality_log_level: str = Field(
         default="INFO", description="Logging level for seasonality namespace"
     )
+    latency_seasonality_path: Optional[str] = Field(default=None)
     max_signals_per_sec: Optional[float] = Field(
         default=None,
         description="Maximum outbound signals per second; non-positive disables limiting.",
@@ -281,6 +299,7 @@ class CommonRunConfig(BaseModel):
     retry: RetryConfig = Field(default_factory=RetryConfig)
     state: StateConfig = Field(default_factory=StateConfig)
     risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
+    latency: LatencyConfig = Field(default_factory=LatencyConfig)
     components: Components
 
 
@@ -317,7 +336,7 @@ class SimulationConfig(CommonRunConfig):
     quantizer: Dict[str, Any] = Field(default_factory=dict)
     fees: Dict[str, Any] = Field(default_factory=dict)
     slippage: Dict[str, Any] = Field(default_factory=dict)
-    latency: Dict[str, Any] = Field(default_factory=dict)
+    latency: LatencyConfig = Field(default_factory=LatencyConfig)
     risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
     no_trade: Dict[str, Any] = Field(default_factory=dict)
     data: SimulationDataConfig
@@ -382,7 +401,7 @@ class TrainConfig(CommonRunConfig):
     quantizer: Dict[str, Any] = Field(default_factory=dict)
     fees: Dict[str, Any] = Field(default_factory=dict)
     slippage: Dict[str, Any] = Field(default_factory=dict)
-    latency: Dict[str, Any] = Field(default_factory=dict)
+    latency: LatencyConfig = Field(default_factory=LatencyConfig)
     risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
     no_trade: Dict[str, Any] = Field(default_factory=dict)
     data: TrainDataConfig
@@ -529,6 +548,7 @@ __all__ = [
     "RiskConfigSection",
     "KillSwitchConfig",
     "OpsKillSwitchConfig",
+    "LatencyConfig",
     "MonitoringThresholdsConfig",
     "MonitoringAlertConfig",
     "MonitoringConfig",

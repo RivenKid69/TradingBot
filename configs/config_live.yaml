@@ -56,6 +56,10 @@ latency_seasonality_path: "configs/liquidity_latency_seasonality.json"
 # Set false to ignore liquidity and latency multipliers
 use_seasonality: true
 latency:
+  use_seasonality: true          # Enable hourly latency multipliers
+  latency_seasonality_path: null # Optional override; defaults to global latency_seasonality_path
+  refresh_period_days: 30        # Refresh cadence for latency multipliers (days)
+  seasonality_default: 1.0       # Fallback multiplier when seasonality data is unavailable
   base_ms: 250
   jitter_ms: 50
   spike_p: 0.01
