@@ -3,8 +3,124 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Sequence
+
+
+@dataclass
+class DynamicSpreadConfig:
+    enabled: bool = False
+    profile_kind: Optional[str] = None
+    multipliers: Optional[tuple[float, ...]] = None
+    path: Optional[str] = None
+    override_path: Optional[str] = None
+    hash: Optional[str] = None
+    min_spread_bps: Optional[float] = None
+    max_spread_bps: Optional[float] = None
+    smoothing_alpha: Optional[float] = None
+    use_volatility: bool = False
+    gamma: Optional[float] = None
+    zscore_clip: Optional[float] = None
+    refresh_warn_days: Optional[int] = None
+    refresh_fail_days: Optional[int] = None
+    refresh_on_start: bool = False
+    last_refresh_ts: Optional[int] = None
+    fallback_spread_bps: Optional[float] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "DynamicSpreadConfig":
+        if not isinstance(d, dict):
+            raise TypeError("dynamic spread config must be a dict")
+
+        multipliers_raw = d.get("multipliers")
+        multipliers: Optional[tuple[float, ...]] = None
+        if multipliers_raw is not None:
+            if isinstance(multipliers_raw, Sequence) and not isinstance(multipliers_raw, (str, bytes, bytearray)):
+                multipliers = tuple(float(x) for x in multipliers_raw)
+            else:
+                try:
+                    multipliers = (float(multipliers_raw),)
+                except (TypeError, ValueError):
+                    multipliers = None
+
+        known_keys = {
+            "enabled",
+            "profile_kind",
+            "multipliers",
+            "path",
+            "override_path",
+            "hash",
+            "min_spread_bps",
+            "max_spread_bps",
+            "smoothing_alpha",
+            "use_volatility",
+            "gamma",
+            "zscore_clip",
+            "refresh_warn_days",
+            "refresh_fail_days",
+            "refresh_on_start",
+            "last_refresh_ts",
+            "fallback_spread_bps",
+        }
+
+        extra = {k: v for k, v in d.items() if k not in known_keys}
+
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            profile_kind=str(d["profile_kind"]) if d.get("profile_kind") is not None else None,
+            multipliers=multipliers,
+            path=str(d["path"]) if d.get("path") is not None else None,
+            override_path=str(d["override_path"]) if d.get("override_path") is not None else None,
+            hash=str(d["hash"]) if d.get("hash") is not None else None,
+            min_spread_bps=float(d["min_spread_bps"]) if d.get("min_spread_bps") is not None else None,
+            max_spread_bps=float(d["max_spread_bps"]) if d.get("max_spread_bps") is not None else None,
+            smoothing_alpha=float(d["smoothing_alpha"]) if d.get("smoothing_alpha") is not None else None,
+            use_volatility=bool(d.get("use_volatility", False)),
+            gamma=float(d["gamma"]) if d.get("gamma") is not None else None,
+            zscore_clip=float(d["zscore_clip"]) if d.get("zscore_clip") is not None else None,
+            refresh_warn_days=int(d["refresh_warn_days"]) if d.get("refresh_warn_days") is not None else None,
+            refresh_fail_days=int(d["refresh_fail_days"]) if d.get("refresh_fail_days") is not None else None,
+            refresh_on_start=bool(d.get("refresh_on_start", False)),
+            last_refresh_ts=int(d["last_refresh_ts"]) if d.get("last_refresh_ts") is not None else None,
+            fallback_spread_bps=float(d["fallback_spread_bps"]) if d.get("fallback_spread_bps") is not None else None,
+            extra=extra,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = dict(self.extra)
+        data["enabled"] = bool(self.enabled)
+        if self.profile_kind is not None:
+            data["profile_kind"] = str(self.profile_kind)
+        if self.multipliers is not None:
+            data["multipliers"] = [float(x) for x in self.multipliers]
+        if self.path is not None:
+            data["path"] = str(self.path)
+        if self.override_path is not None:
+            data["override_path"] = str(self.override_path)
+        if self.hash is not None:
+            data["hash"] = str(self.hash)
+        if self.min_spread_bps is not None:
+            data["min_spread_bps"] = float(self.min_spread_bps)
+        if self.max_spread_bps is not None:
+            data["max_spread_bps"] = float(self.max_spread_bps)
+        if self.smoothing_alpha is not None:
+            data["smoothing_alpha"] = float(self.smoothing_alpha)
+        data["use_volatility"] = bool(self.use_volatility)
+        if self.gamma is not None:
+            data["gamma"] = float(self.gamma)
+        if self.zscore_clip is not None:
+            data["zscore_clip"] = float(self.zscore_clip)
+        if self.refresh_warn_days is not None:
+            data["refresh_warn_days"] = int(self.refresh_warn_days)
+        if self.refresh_fail_days is not None:
+            data["refresh_fail_days"] = int(self.refresh_fail_days)
+        data["refresh_on_start"] = bool(self.refresh_on_start)
+        if self.last_refresh_ts is not None:
+            data["last_refresh_ts"] = int(self.last_refresh_ts)
+        if self.fallback_spread_bps is not None:
+            data["fallback_spread_bps"] = float(self.fallback_spread_bps)
+        return data
 
 
 @dataclass
@@ -23,14 +139,23 @@ class SlippageConfig:
     min_half_spread_bps: float = 0.0
     default_spread_bps: float = 2.0
     eps: float = 1e-12
+    dynamic_spread: Optional[DynamicSpreadConfig] = None
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SlippageConfig":
+        dynamic_block = d.get("dynamic_spread")
+        dynamic_cfg = (
+            DynamicSpreadConfig.from_dict(dynamic_block)
+            if isinstance(dynamic_block, dict)
+            else None
+        )
+
         return cls(
             k=float(d.get("k", 0.8)),
             min_half_spread_bps=float(d.get("min_half_spread_bps", 0.0)),
             default_spread_bps=float(d.get("default_spread_bps", 2.0)),
             eps=float(d.get("eps", 1e-12)),
+            dynamic_spread=dynamic_cfg,
         )
 
     @classmethod
