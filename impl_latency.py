@@ -7,7 +7,7 @@ impl_latency.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Mapping
 import importlib.util
@@ -17,6 +17,8 @@ import threading
 import warnings
 import math
 import weakref
+import subprocess
+import sys
 
 try:
     from latency_volatility_cache import LatencyVolatilityCache
@@ -538,7 +540,111 @@ class LatencyImpl:
             or "configs/liquidity_latency_seasonality.json"
         )
         self._seasonality_path = path
+        refresh_raw = cfg.refresh_period_days
+        try:
+            refresh_days = int(refresh_raw) if refresh_raw is not None else 0
+        except (TypeError, ValueError):
+            refresh_days = 0
+        if refresh_days < 0:
+            refresh_days = 0
+        self._refresh_period_days = refresh_days
+        builder_path = Path(__file__).resolve().parent / "scripts" / "build_hourly_seasonality.py"
         use_requested = bool(cfg.use_seasonality)
+        cli_hint = None
+        if path and refresh_days > 0 and use_requested:
+            cli_hint = (
+                f"python scripts/build_hourly_seasonality.py --out {path} --window-days {refresh_days}"
+            )
+            needs_refresh = False
+            now = datetime.now(timezone.utc)
+            mtime_dt: Optional[datetime] = None
+            refresh_reason = ""
+            try:
+                mtime = os.path.getmtime(path)
+            except FileNotFoundError:
+                needs_refresh = True
+                refresh_reason = "missing"
+            except OSError as exc:
+                needs_refresh = True
+                refresh_reason = f"stat_failed: {exc}"
+            else:
+                mtime_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+                if mtime_dt < now - timedelta(days=refresh_days):
+                    needs_refresh = True
+                    refresh_reason = "stale"
+            if needs_refresh:
+                if refresh_reason == "missing":
+                    detail = f"Latency seasonality file {path} is missing"
+                elif refresh_reason.startswith("stat_failed"):
+                    detail = (
+                        f"Latency seasonality file {path} could not be inspected "
+                        f"({refresh_reason.split(':', 1)[1].strip()})"
+                    )
+                else:
+                    if mtime_dt is not None:
+                        age = now - mtime_dt
+                        age_days = age.days + age.seconds / 86400.0
+                        detail = (
+                            f"Latency seasonality file {path} is older than {refresh_days} days"
+                            f" (mtime={mtime_dt.isoformat()}, age≈{age_days:.2f}d)"
+                        )
+                    else:
+                        detail = (
+                            f"Latency seasonality file {path} is older than {refresh_days} days"
+                        )
+                if builder_path.exists():
+                    python_bin = sys.executable or "python"
+                    cmd = [
+                        python_bin,
+                        str(builder_path),
+                        "--out",
+                        str(path),
+                        "--window-days",
+                        str(refresh_days),
+                    ]
+                    try:
+                        proc = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                    except Exception as exc:
+                        seasonality_logger.warning(
+                            "%s; auto-refresh command failed (%s). Run `%s` manually.",
+                            detail,
+                            exc,
+                            cli_hint,
+                        )
+                    else:
+                        if proc.returncode == 0:
+                            snippet = proc.stdout.strip() if proc.stdout else ""
+                            if len(snippet) > 200:
+                                snippet = snippet[:200] + "..."
+                            seasonality_logger.info(
+                                "%s; auto-refresh succeeded via `%s`%s",
+                                detail,
+                                cli_hint,
+                                f" (stdout: {snippet})" if snippet else "",
+                            )
+                        else:
+                            output = proc.stderr or proc.stdout or ""
+                            output = output.strip()
+                            if len(output) > 200:
+                                output = output[:200] + "..."
+                            seasonality_logger.warning(
+                                "%s; auto-refresh command exited with code %d. Run `%s` manually.%s",
+                                detail,
+                                proc.returncode,
+                                cli_hint,
+                                f" Output: {output}" if output else "",
+                            )
+                else:
+                    seasonality_logger.warning(
+                        "%s; auto-refresh script not found. Run `%s` manually.",
+                        detail,
+                        cli_hint,
+                    )
         runtime_allowed = bool(seasonality_enabled())
         self._has_seasonality = bool(use_requested and runtime_allowed)
         loaded_from_file = False

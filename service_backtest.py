@@ -190,9 +190,34 @@ def from_config(
     sym_col = params.get("symbol_col", "symbol")
     price_col = params.get("price_col", "ref_price")
 
+    exec_spec = cfg.components.executor
+    if exec_spec and isinstance(exec_spec.params, dict):
+        target = exec_spec.target or ""
+        try:
+            lat_cfg_dict = cfg.latency.dict(exclude_unset=False)
+        except Exception:
+            lat_cfg_dict = {}
+        if lat_cfg_dict and "ExecutionSimulator" in target and not exec_spec.params.get("latency_config"):
+            exec_spec.params["latency_config"] = dict(lat_cfg_dict)
+
     container = di_registry.build_graph(cfg.components, cfg)
     policy: SignalPolicy = container["policy"]
-    sim: ExecutionSimulator = container["executor"]  # type: ignore[assignment]
+    executor_obj = container["executor"]
+    sim: ExecutionSimulator
+    if isinstance(executor_obj, ExecutionSimulator):
+        sim = executor_obj
+    else:
+        candidate = getattr(executor_obj, "_sim", None)
+        if isinstance(candidate, ExecutionSimulator):
+            sim = candidate
+        else:
+            candidate = getattr(executor_obj, "sim", None)
+            if isinstance(candidate, ExecutionSimulator):
+                sim = candidate
+            else:
+                raise TypeError(
+                    "Executor component must provide an ExecutionSimulator instance"
+                )
     service = ServiceBacktest(policy, sim, svc_cfg, run_config=cfg)
     reports = service.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
 

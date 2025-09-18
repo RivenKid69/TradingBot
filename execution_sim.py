@@ -611,9 +611,24 @@ class ExecutionSimulator:
             latency_sources.append(latency_config)
 
         latency_kwargs: Dict[str, Any] = {}
+        latency_cfg_for_impl: Dict[str, Any] = {}
+
+        def _capture_latency_cfg(payload: Mapping[str, Any]) -> None:
+            keys = (
+                "use_seasonality",
+                "latency_seasonality_path",
+                "seasonality_path",
+                "refresh_period_days",
+                "seasonality_default",
+            )
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    latency_cfg_for_impl[key] = payload[key]
+
         for src in latency_sources:
             if isinstance(src, dict):
                 latency_kwargs.update(src)
+                _capture_latency_cfg(src)
             else:
                 payload: Dict[str, Any] = {}
                 if hasattr(src, "dict"):
@@ -631,6 +646,32 @@ class ExecutionSimulator:
                     except Exception:
                         payload = {}
                 latency_kwargs.update(payload)
+                if payload:
+                    _capture_latency_cfg(payload)
+
+        config_keys = (
+            "use_seasonality",
+            "latency_seasonality_path",
+            "seasonality_path",
+            "refresh_period_days",
+            "seasonality_default",
+        )
+        for key in config_keys:
+            if key in latency_kwargs:
+                latency_cfg_for_impl.setdefault(key, latency_kwargs[key])
+                latency_kwargs.pop(key, None)
+
+        lat_section = getattr(run_config, "latency", None) if run_config is not None else None
+        if lat_section is not None:
+            for key in config_keys:
+                if key not in latency_cfg_for_impl:
+                    value = getattr(lat_section, key, None)
+                    if value is not None:
+                        latency_cfg_for_impl[key] = value
+        if run_config is not None and "latency_seasonality_path" not in latency_cfg_for_impl:
+            lat_path_global = getattr(run_config, "latency_seasonality_path", None)
+            if lat_path_global is not None:
+                latency_cfg_for_impl["latency_seasonality_path"] = lat_path_global
 
         vol_metric_cfg = str(latency_kwargs.get("vol_metric", "sigma") or "sigma").lower()
         self._latency_vol_metric = vol_metric_cfg if vol_metric_cfg else "sigma"
@@ -664,6 +705,28 @@ class ExecutionSimulator:
         self.latency = (
             LatencyModel(**latency_kwargs) if LatencyModel is not None else None
         )
+
+        lat_cfg_payload: Dict[str, Any] = {}
+        refresh_cfg = latency_cfg_for_impl.get("refresh_period_days")
+        try:
+            refresh_days = int(refresh_cfg) if refresh_cfg is not None else None
+        except (TypeError, ValueError):
+            refresh_days = None
+        if refresh_days is not None and refresh_days >= 0:
+            lat_cfg_payload["refresh_period_days"] = refresh_days
+        lat_path_cfg = latency_cfg_for_impl.get("latency_seasonality_path")
+        if not lat_path_cfg:
+            lat_path_cfg = latency_cfg_for_impl.get("seasonality_path")
+        if lat_path_cfg:
+            try:
+                lat_cfg_payload["latency_seasonality_path"] = str(lat_path_cfg)
+            except Exception:
+                pass
+        if "use_seasonality" in latency_cfg_for_impl:
+            lat_cfg_payload["use_seasonality"] = bool(latency_cfg_for_impl["use_seasonality"])
+        if "seasonality_default" in latency_cfg_for_impl:
+            lat_cfg_payload["seasonality_default"] = latency_cfg_for_impl["seasonality_default"]
+        self.latency_config_payload = lat_cfg_payload
 
         # риск-менеджер
         self.risk = (
