@@ -88,6 +88,9 @@ class LatencyCfg:
     seed: int = 0
     symbol: str | None = None
     seasonality_path: str | None = None
+    latency_seasonality_path: str | None = None
+    refresh_period_days: int | None = 30
+    seasonality_default: Sequence[float] | float | None = 1.0
     use_seasonality: bool = True
     seasonality_override: Sequence[float] | None = None
     seasonality_override_path: str | None = None
@@ -388,6 +391,39 @@ class _LatencyWithSeasonality:
         return {"multiplier": avg_mult, "latency_ms": avg_lat, "count": list(self._count)}
 
 class LatencyImpl:
+    @staticmethod
+    def _normalize_default(
+        default: Sequence[float] | float | None,
+        *,
+        length: int,
+    ) -> List[float]:
+        base = [1.0] * length
+        if default is None:
+            return base
+        if isinstance(default, (int, float)):
+            try:
+                val = float(default)
+            except (TypeError, ValueError):
+                return base
+            if not math.isfinite(val) or val <= 0.0:
+                return base
+            return [float(val)] * length
+        if isinstance(default, Sequence) and not isinstance(
+            default, (str, bytes, bytearray)
+        ):
+            try:
+                arr = [float(x) for x in list(default)]
+            except (TypeError, ValueError):
+                return base
+            if len(arr) != length:
+                return base
+            try:
+                arr = validate_multipliers(arr, expected_len=length)
+            except Exception:
+                return base
+            return list(arr)
+        return base
+
     def __init__(self, cfg: LatencyCfg) -> None:
         self.cfg = cfg
         self._model = LatencyModel(
@@ -399,9 +435,16 @@ class LatencyImpl:
             retries=int(cfg.retries),
             seed=int(cfg.seed),
         ) if LatencyModel is not None else None
-        self.latency: List[float] = [1.0] * (7 if cfg.seasonality_day_only else 168)
+        expected = 7 if cfg.seasonality_day_only else 168
+        self.latency: List[float] = self._normalize_default(
+            cfg.seasonality_default, length=expected
+        )
         self._mult_lock = threading.Lock()
-        path = cfg.seasonality_path or "configs/liquidity_latency_seasonality.json"
+        path = (
+            cfg.seasonality_path
+            or cfg.latency_seasonality_path
+            or "configs/liquidity_latency_seasonality.json"
+        )
         self._seasonality_path = path
         self._has_seasonality = bool(cfg.use_seasonality and seasonality_enabled())
         if self._has_seasonality:
@@ -785,6 +828,22 @@ class LatencyImpl:
         max_ms = d.get("max_ms")
         debug_log = d.get("debug_log", False)
         vol_debug_log = d.get("vol_debug_log", False)
+        seasonality_path = d.get("seasonality_path")
+        latency_seasonality_path = d.get("latency_seasonality_path")
+        if seasonality_path is None and latency_seasonality_path:
+            seasonality_path = latency_seasonality_path
+        refresh_raw = d.get("refresh_period_days", d.get("seasonality_refresh_period_days"))
+        if refresh_raw is None:
+            refresh_period_days = 30
+        else:
+            try:
+                refresh_period_days = int(refresh_raw)
+            except (TypeError, ValueError):
+                refresh_period_days = 30
+        if "seasonality_default" in d:
+            seasonality_default = d.get("seasonality_default")
+        else:
+            seasonality_default = 1.0
         return LatencyImpl(LatencyCfg(
             base_ms=int(d.get("base_ms", 250)),
             jitter_ms=int(d.get("jitter_ms", 50)),
@@ -794,7 +853,10 @@ class LatencyImpl:
             retries=int(d.get("retries", 1)),
             seed=int(d.get("seed", 0)),
             symbol=(d.get("symbol") if d.get("symbol") is not None else None),
-            seasonality_path=d.get("seasonality_path"),
+            seasonality_path=seasonality_path,
+            latency_seasonality_path=latency_seasonality_path,
+            refresh_period_days=refresh_period_days,
+            seasonality_default=seasonality_default,
             use_seasonality=bool(d.get("use_seasonality", True)),
             seasonality_override=d.get("seasonality_override"),
             seasonality_override_path=d.get("seasonality_override_path"),
