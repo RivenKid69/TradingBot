@@ -24,6 +24,9 @@ spec_impl.loader.exec_module(impl_module)
 
 LatencyImpl = impl_module.LatencyImpl
 ExecutionSimulator = importlib.import_module("execution_sim").ExecutionSimulator
+LatencyVolatilityCache = importlib.import_module(
+    "latency_volatility_cache"
+).LatencyVolatilityCache
 
 
 class DummyCache:
@@ -160,6 +163,53 @@ def test_latency_update_forwards_to_cache(tmp_path):
     assert entry["symbol"] == "ETHUSDT"
     assert entry["ts_ms"] == 1234567890
     assert entry["value"] == pytest.approx(0.25)
+
+
+def test_latency_volatility_cache_ready_and_multiplier():
+    cache = LatencyVolatilityCache(window=3)
+    symbol = "btcusdt"
+    cache.update_latency_factor(symbol=symbol, ts_ms=1, value=1.0)
+    cache.update_latency_factor(symbol=symbol, ts_ms=2, value=2.0)
+    cache.update_latency_factor(symbol=symbol, ts_ms=3, value=3.0)
+
+    assert cache.is_ready(symbol)
+
+    mult, debug = cache.latency_multiplier(
+        symbol=symbol,
+        ts_ms=3,
+        metric="sigma",
+        window=3,
+        gamma=0.5,
+        clip=3.0,
+    )
+
+    assert mult == pytest.approx(1.0 + 0.5 * debug["zscore"])
+    assert debug["count"] == 3
+    assert debug["symbol"] == "BTCUSDT"
+    assert debug["vol_mult"] == pytest.approx(mult)
+
+
+def test_latency_volatility_cache_not_ready_reason():
+    cache = LatencyVolatilityCache(window=5, min_ready=4)
+    symbol = "ethusdt"
+    cache.update_latency_factor(symbol=symbol, ts_ms=1, value=1.0)
+    cache.update_latency_factor(symbol=symbol, ts_ms=2, value=2.0)
+
+    assert not cache.is_ready(symbol)
+
+    mult, debug = cache.latency_multiplier(
+        symbol=symbol,
+        ts_ms=2,
+        metric="sigma",
+        window=5,
+        gamma=1.0,
+        clip=2.0,
+    )
+
+    assert mult == 1.0
+    assert debug["reason"] == "not_ready"
+    assert debug["count"] == 2
+    assert debug["required"] == 4
 
 
 def test_execution_simulator_updates_latency():
