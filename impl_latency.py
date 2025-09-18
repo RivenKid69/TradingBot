@@ -93,6 +93,7 @@ class LatencyCfg:
     min_ms: int = 0
     max_ms: int = 10000
     debug_log: bool = False
+    vol_debug_log: bool = False
 
 
 class _LatencyWithSeasonality:
@@ -112,6 +113,7 @@ class _LatencyWithSeasonality:
         min_ms: int | None = None,
         max_ms: int | None = None,
         debug_log: bool = False,
+        vol_debug_log: bool = False,
     ):  # type: ignore[name-defined]
         self._model = model
         n = len(multipliers)
@@ -128,6 +130,7 @@ class _LatencyWithSeasonality:
         self._vol_cb = volatility_callback
         self._vol_update = volatility_update
         self._debug_log = bool(debug_log)
+        self._vol_debug_log = bool(vol_debug_log)
         self._min_ms = int(round(float(min_ms))) if min_ms is not None else 0
         if max_ms is None:
             self._max_ms: Optional[int] = None
@@ -297,7 +300,9 @@ class _LatencyWithSeasonality:
                 except Exception:  # pragma: no cover - defensive fallback
                     res["debug"] = {"latency": debug_entry}
 
-            if self._debug_log or seasonality_logger.isEnabledFor(logging.DEBUG):
+            log_enabled = seasonality_logger.isEnabledFor(logging.DEBUG)
+            should_emit_sample_log = (self._debug_log or log_enabled) and log_enabled
+            if should_emit_sample_log:
                 seasonality_logger.debug(
                     "latency sample h%03d season=%.3f vol=%.3f raw=%.3f final=%s attempts=%s payload=%s",
                     hour,
@@ -308,6 +313,19 @@ class _LatencyWithSeasonality:
                     attempts,
                     vol_debug,
                 )
+
+            if self._vol_debug_log and logger.isEnabledFor(logging.DEBUG):
+                log_payload = {
+                    "symbol": symbol,
+                    "hour": hour,
+                    "seasonality_multiplier": float(m),
+                    "volatility_multiplier": float(vol_mult),
+                    "raw_total_ms": raw_total,
+                    "adjusted_total_ms": lat_ms_int,
+                    "attempts": attempts,
+                    "volatility_debug": vol_debug,
+                }
+                logger.debug("latency volatility sample: %s", log_payload)
 
             self._mult_sum[hour] += m
             self._lat_sum[hour] += float(lat_ms_int)
@@ -433,6 +451,7 @@ class LatencyImpl:
                 min_ms=self.cfg.min_ms,
                 max_ms=self.cfg.max_ms,
                 debug_log=self.cfg.debug_log,
+                vol_debug_log=self.cfg.vol_debug_log,
             )
             sim_symbol = getattr(sim, "symbol", None)
             if sim_symbol is not None:
@@ -720,6 +739,7 @@ class LatencyImpl:
         min_ms = d.get("min_ms")
         max_ms = d.get("max_ms")
         debug_log = d.get("debug_log", False)
+        vol_debug_log = d.get("vol_debug_log", False)
         return LatencyImpl(LatencyCfg(
             base_ms=int(d.get("base_ms", 250)),
             jitter_ms=int(d.get("jitter_ms", 50)),
@@ -746,4 +766,5 @@ class LatencyImpl:
             min_ms=int(min_ms) if min_ms is not None else 0,
             max_ms=int(max_ms) if max_ms is not None else 10000,
             debug_log=bool(debug_log),
+            vol_debug_log=bool(vol_debug_log),
         ))
