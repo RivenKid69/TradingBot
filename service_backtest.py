@@ -33,6 +33,37 @@ from core_config import CommonRunConfig
 import di_registry
 
 
+def _coerce_timeframe_ms(value: Any) -> Optional[int]:
+    """Best-effort conversion of ``value`` to timeframe in milliseconds."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            ms = int(value)
+            return ms if ms > 0 else None
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.isdigit():
+            ms = int(text)
+            return ms if ms > 0 else None
+        suffix = text[-1].lower()
+        mult = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+        if suffix not in mult:
+            return None
+        amount_text = text[:-1].strip()
+        if not amount_text:
+            return None
+        amount = float(amount_text)
+        ms = int(amount * mult[suffix])
+        return ms if ms > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class BacktestConfig:
     symbol: str
@@ -81,6 +112,22 @@ class ServiceBacktest:
             or getattr(sim, "run_config", None)
             or getattr(sim, "_run_config", None)
         )
+
+        timeframe_ms: Optional[int] = None
+        exec_cfg = getattr(self._run_config, "execution", None)
+        if exec_cfg is not None:
+            timeframe_ms = _coerce_timeframe_ms(getattr(exec_cfg, "timeframe_ms", None))
+        if timeframe_ms is None:
+            data_cfg = getattr(self._run_config, "data", None)
+            tf_value = getattr(data_cfg, "timeframe", None) if data_cfg is not None else None
+            if tf_value is None:
+                tf_value = getattr(self.cfg, "timeframe", None)
+            timeframe_ms = _coerce_timeframe_ms(tf_value)
+        if timeframe_ms is not None:
+            try:
+                setattr(self.sim, "_execution_timeframe_ms", int(timeframe_ms))
+            except Exception:
+                pass
 
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
