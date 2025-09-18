@@ -33,6 +33,15 @@ from core_config import CommonRunConfig
 import di_registry
 
 
+try:  # pragma: no cover - optional dependency in sandbox setups
+    from impl_slippage import SlippageImpl  # type: ignore
+except Exception:  # pragma: no cover - fallback when implementation missing
+    SlippageImpl = None  # type: ignore
+
+
+logger = logging.getLogger(__name__)
+
+
 def _coerce_timeframe_ms(value: Any) -> Optional[int]:
     """Best-effort conversion of ``value`` to timeframe in milliseconds."""
 
@@ -118,6 +127,34 @@ def _extract_dynamic_slippage_cfg(
     return result or None
 
 
+def _slippage_to_dict(cfg: Any) -> Optional[Dict[str, Any]]:
+    if cfg is None:
+        return None
+    if isinstance(cfg, dict):
+        return dict(cfg)
+    for attr in ("model_dump", "dict"):
+        if hasattr(cfg, attr):
+            try:
+                method = getattr(cfg, attr)
+                if attr == "model_dump":
+                    payload = method(exclude_unset=False)  # type: ignore[call-arg]
+                else:
+                    payload = method(exclude_unset=False)  # type: ignore[call-arg]
+            except TypeError:
+                try:
+                    payload = method()
+                except Exception:
+                    payload = None
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                return dict(payload)
+    try:
+        return dict(cfg)
+    except Exception:
+        return None
+
+
 @dataclass
 class BacktestConfig:
     symbol: str
@@ -166,6 +203,19 @@ class ServiceBacktest:
             or getattr(sim, "run_config", None)
             or getattr(sim, "_run_config", None)
         )
+
+        if SlippageImpl is not None:
+            slip_attached = callable(getattr(self.sim, "_slippage_get_trade_cost", None))
+            if not slip_attached:
+                rc_slip_cfg = getattr(self._run_config, "slippage", None)
+                slip_payload = _slippage_to_dict(rc_slip_cfg)
+                if slip_payload:
+                    try:
+                        SlippageImpl.from_dict(slip_payload).attach_to(self.sim)
+                    except Exception:
+                        logger.exception("Failed to attach slippage config to simulator")
+        elif getattr(self._run_config, "slippage", None):
+            logger.debug("SlippageImpl is unavailable; using simulator defaults")
 
         timeframe_ms: Optional[int] = None
         exec_cfg = getattr(self._run_config, "execution", None)
