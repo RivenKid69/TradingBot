@@ -6,13 +6,16 @@ impl_slippage.py
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
+import random
 import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
@@ -89,6 +92,241 @@ def _safe_positive_int(value: Any) -> Optional[int]:
     if num <= 0:
         return None
     return num
+
+
+def _cfg_attr(block: Any, key: str, default: Any = None) -> Any:
+    if block is None:
+        return default
+    if isinstance(block, Mapping):
+        return block.get(key, default)
+    return getattr(block, key, default)
+
+
+def _lookup_metric(metrics: Mapping[str, Any], key: str) -> Any:
+    if key in metrics:
+        return metrics[key]
+    key_lower = key.lower()
+    for metric_key, value in metrics.items():
+        if isinstance(metric_key, str) and metric_key.lower() == key_lower:
+            return value
+    return None
+
+
+def _clamp(value: float, minimum: Optional[float], maximum: Optional[float]) -> float:
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+@dataclass
+class _TradeCostState:
+    impact_cfg: Optional[Any] = None
+    tail_cfg: Optional[Any] = None
+    adv_cfg: Optional[Any] = None
+    adv_loader: Optional["_AdvDataset"] = None
+    vol_window: Optional[int] = None
+    participation_window: Optional[int] = None
+    zscore_clip: Optional[float] = None
+    smoothing_alpha: Optional[float] = None
+    vol_metric: Optional[str] = None
+    participation_metric: Optional[str] = None
+    vol_history: deque[float] = field(default_factory=deque)
+    participation_history: deque[float] = field(default_factory=deque)
+    k_ema: Optional[float] = None
+    adv_cache: Dict[str, float] = field(default_factory=dict)
+
+    def reset(self) -> None:
+        self.vol_history.clear()
+        self.participation_history.clear()
+        self.k_ema = None
+        self.adv_cache.clear()
+
+    def _normalise(
+        self,
+        history: deque[float],
+        window: Optional[int],
+        value: Optional[float],
+    ) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(val):
+            return None
+        if window is None or window <= 1:
+            history.clear()
+            return val
+        history.append(val)
+        if len(history) > window:
+            history.popleft()
+        if len(history) <= 1:
+            return 0.0
+        mean = sum(history) / len(history)
+        variance = sum((x - mean) ** 2 for x in history) / max(len(history) - 1, 1)
+        std = math.sqrt(variance) if variance > 0.0 else 0.0
+        if std <= 0.0:
+            return 0.0
+        return (val - mean) / std
+
+    def normalise_vol(self, value: Optional[float]) -> Optional[float]:
+        norm = self._normalise(self.vol_history, self.vol_window, value)
+        if norm is None:
+            return None
+        clip = self.zscore_clip
+        if clip is not None and clip > 0.0:
+            norm = max(-clip, min(clip, norm))
+        return norm
+
+    def normalise_part(self, value: Optional[float]) -> Optional[float]:
+        norm = self._normalise(
+            self.participation_history, self.participation_window, value
+        )
+        if norm is None:
+            return None
+        clip = self.zscore_clip
+        if clip is not None and clip > 0.0:
+            norm = max(-clip, min(clip, norm))
+        return norm
+
+    def apply_k_smoothing(self, value: float) -> float:
+        try:
+            k_val = float(value)
+        except (TypeError, ValueError):
+            return value
+        alpha = self.smoothing_alpha
+        if alpha is None or alpha <= 0.0:
+            self.k_ema = k_val
+            return k_val
+        if alpha >= 1.0:
+            self.k_ema = k_val
+            return k_val
+        prev = self.k_ema
+        if prev is None:
+            self.k_ema = k_val
+            return k_val
+        smoothed = alpha * k_val + (1.0 - alpha) * prev
+        self.k_ema = smoothed
+        return smoothed
+
+def _tail_rng_seed(
+    *,
+    symbol: Optional[str],
+    ts: Any,
+    side: Any,
+    order_seq: Any,
+    seed: Any,
+) -> int:
+    try:
+        ts_val = int(ts) if ts is not None else 0
+    except (TypeError, ValueError):
+        ts_val = 0
+    try:
+        seq_val = int(order_seq) if order_seq is not None else 0
+    except (TypeError, ValueError):
+        seq_val = 0
+    try:
+        seed_val = int(seed) if seed is not None else 0
+    except (TypeError, ValueError):
+        seed_val = 0
+    key = "|".join(
+        (
+            str(symbol or ""),
+            str(ts_val),
+            str(side).upper(),
+            str(seq_val),
+            str(seed_val),
+        )
+    )
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=False)
+
+
+def _tail_percentile_sample(
+    extra: Mapping[str, Any], rng: random.Random, default_bps: float
+) -> float:
+    percentiles_raw = extra.get("percentiles") if isinstance(extra, Mapping) else None
+    weights_raw = extra.get("weights") if isinstance(extra, Mapping) else None
+    choices: list[tuple[float, float]] = []
+    if isinstance(percentiles_raw, Mapping):
+        for key, value in percentiles_raw.items():
+            candidate = _safe_float(value)
+            if candidate is None:
+                continue
+            weight_val = 1.0
+            if isinstance(weights_raw, Mapping) and key in weights_raw:
+                weight_candidate = _safe_float(weights_raw[key])
+                if weight_candidate is not None and weight_candidate > 0.0:
+                    weight_val = weight_candidate
+            if weight_val <= 0.0:
+                continue
+            choices.append((float(candidate), float(weight_val)))
+    if not choices:
+        return float(default_bps)
+    total_weight = sum(weight for _, weight in choices)
+    if total_weight <= 0.0:
+        return float(default_bps)
+    pick = rng.random() * total_weight
+    cumulative = 0.0
+    for value, weight in choices:
+        cumulative += weight
+        if pick <= cumulative:
+            return float(value)
+    return float(choices[-1][0])
+
+
+def _tail_gaussian_sample(
+    extra: Mapping[str, Any], rng: random.Random, default_bps: float
+) -> float:
+    mean = _safe_float(extra.get("gaussian_mean_bps")) if isinstance(extra, Mapping) else None
+    std = _safe_float(extra.get("gaussian_std_bps")) if isinstance(extra, Mapping) else None
+    if mean is None:
+        mean = float(default_bps)
+    if std is None or std <= 0.0:
+        std = abs(float(default_bps)) if default_bps else 0.0
+    sample = float(mean)
+    if std > 0.0:
+        sample = rng.gauss(float(mean), float(std))
+    clip_low: Optional[float] = None
+    clip_high: Optional[float] = None
+    if isinstance(extra, Mapping):
+        clip_block = extra.get("gaussian_clip_bps")
+        if isinstance(clip_block, Mapping):
+            clip_low = _safe_float(
+                clip_block.get("min")
+                or clip_block.get("low")
+                or clip_block.get("p05")
+                or clip_block.get("p5")
+            )
+            clip_high = _safe_float(
+                clip_block.get("max")
+                or clip_block.get("high")
+                or clip_block.get("p95")
+                or clip_block.get("p99")
+            )
+        if clip_low is None or clip_high is None:
+            percentiles_block = extra.get("percentiles")
+            if isinstance(percentiles_block, Mapping):
+                if clip_low is None:
+                    for key in ("p05", "p5", "low", "min"):
+                        if key in percentiles_block:
+                            clip_low = _safe_float(percentiles_block[key])
+                            if clip_low is not None:
+                                break
+                if clip_high is None:
+                    for key in ("p95", "p99", "high", "max"):
+                        if key in percentiles_block:
+                            clip_high = _safe_float(percentiles_block[key])
+                            if clip_high is not None:
+                                break
+    if clip_low is not None:
+        sample = max(clip_low, sample)
+    if clip_high is not None:
+        sample = min(clip_high, sample)
+    return float(sample)
 
 
 class _DynamicSpreadProfile:
@@ -590,14 +828,27 @@ class SlippageCfg:
             return self.dynamic
         return self.dynamic_spread
 
+    def dynamic_trade_cost_enabled(self) -> bool:
+        block = self.get_dynamic_block()
+        if block is None:
+            return False
+        enabled = _cfg_attr(block, "enabled")
+        try:
+            return bool(enabled)
+        except Exception:
+            return False
+
 
 class SlippageImpl:
     def __init__(self, cfg: SlippageCfg) -> None:
         self.cfg = cfg
+        self._symbol: Optional[str] = None
         self._dynamic_profile: Optional[_DynamicSpreadProfile] = None
         dyn_cfg_obj: Optional[DynamicSpreadConfig] = None
         self._adv_loader: Optional[_AdvDataset] = None
         adv_cfg_obj: Optional[Any] = None
+        impact_cfg_obj: Optional[Any] = None
+        tail_cfg_obj: Optional[Any] = None
         cfg_dict: Dict[str, Any] = {
             "k": float(cfg.k),
             "min_half_spread_bps": float(cfg.min_half_spread_bps),
@@ -675,6 +926,28 @@ class SlippageImpl:
             payload = _normalise_section(block, cfg_cls)
             if payload is not None:
                 cfg_dict[key] = payload
+            if key == "dynamic_impact":
+                if DynamicImpactConfig is not None and isinstance(block, DynamicImpactConfig):
+                    impact_cfg_obj = block
+                elif isinstance(payload, Mapping) and DynamicImpactConfig is not None:
+                    try:
+                        impact_cfg_obj = DynamicImpactConfig.from_dict(dict(payload))
+                    except Exception:
+                        logger.exception("Failed to parse dynamic impact config")
+                        impact_cfg_obj = dict(payload)
+                elif isinstance(payload, Mapping) and impact_cfg_obj is None:
+                    impact_cfg_obj = dict(payload)
+            elif key == "tail_shock":
+                if TailShockConfig is not None and isinstance(block, TailShockConfig):
+                    tail_cfg_obj = block
+                elif isinstance(payload, Mapping) and TailShockConfig is not None:
+                    try:
+                        tail_cfg_obj = TailShockConfig.from_dict(dict(payload))
+                    except Exception:
+                        logger.exception("Failed to parse tail shock config")
+                        tail_cfg_obj = dict(payload)
+                elif isinstance(payload, Mapping) and tail_cfg_obj is None:
+                    tail_cfg_obj = dict(payload)
             if key == "adv":
                 if AdvConfig is not None and isinstance(block, AdvConfig):
                     adv_cfg_obj = block
@@ -699,6 +972,8 @@ class SlippageImpl:
             candidate = getattr(self._cfg_obj, "adv", None)
             if candidate is not None:
                 self._adv_cfg = candidate
+        self._impact_cfg = impact_cfg_obj
+        self._tail_cfg = tail_cfg_obj
         if self._adv_cfg is not None and getattr(self._adv_cfg, "enabled", False):
             try:
                 self._adv_loader = _AdvDataset(self._adv_cfg)
@@ -714,6 +989,44 @@ class SlippageImpl:
             except Exception:
                 logger.exception("Failed to initialise dynamic spread profile")
                 self._dynamic_profile = None
+        impact_vol_metric = _cfg_attr(self._impact_cfg, "vol_metric")
+        part_metric = _cfg_attr(self._impact_cfg, "participation_metric")
+        def _normalise_str(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            try:
+                text = str(value).strip()
+            except Exception:
+                return None
+            return text.lower() if text else None
+
+        def _positive_int(value: Any) -> Optional[int]:
+            window = _safe_positive_int(value)
+            return window
+
+        smoothing_alpha = _safe_float(_cfg_attr(self._impact_cfg, "smoothing_alpha"))
+        if smoothing_alpha is not None:
+            if smoothing_alpha <= 0.0:
+                smoothing_alpha = None
+            elif smoothing_alpha >= 1.0:
+                smoothing_alpha = 1.0
+        zscore_clip = _safe_float(_cfg_attr(self._impact_cfg, "zscore_clip"))
+        if zscore_clip is not None and zscore_clip <= 0.0:
+            zscore_clip = None
+        self._trade_cost_state = _TradeCostState(
+            impact_cfg=self._impact_cfg,
+            tail_cfg=self._tail_cfg,
+            adv_cfg=self._adv_cfg,
+            adv_loader=self._adv_loader,
+            vol_window=_positive_int(_cfg_attr(self._impact_cfg, "vol_window")),
+            participation_window=_positive_int(
+                _cfg_attr(self._impact_cfg, "participation_window")
+            ),
+            zscore_clip=zscore_clip,
+            smoothing_alpha=smoothing_alpha,
+            vol_metric=_normalise_str(impact_vol_metric),
+            participation_metric=_normalise_str(part_metric),
+        )
 
     @property
     def config(self):
@@ -724,6 +1037,18 @@ class SlippageImpl:
         return self._dynamic_profile
 
     def attach_to(self, sim) -> None:
+        try:
+            symbol = getattr(sim, "symbol", None)
+        except Exception:
+            symbol = None
+        if symbol is not None:
+            try:
+                self._symbol = str(symbol)
+            except Exception:
+                self._symbol = None
+        else:
+            self._symbol = None
+        self._trade_cost_state.reset()
         if self._cfg_obj is not None:
             setattr(sim, "slippage_cfg", self._cfg_obj)
         try:
@@ -739,6 +1064,16 @@ class SlippageImpl:
             setattr(sim, "_slippage_get_adv_quote", self.get_adv_quote)
         except Exception:
             logger.exception("Failed to attach get_adv_quote to simulator")
+        try:
+            setattr(sim, "get_trade_cost_bps", self.get_trade_cost_bps)
+            setattr(sim, "_slippage_get_trade_cost", self.get_trade_cost_bps)
+        except Exception:
+            logger.exception("Failed to attach get_trade_cost_bps to simulator")
+        if self._cfg_obj is not None:
+            try:
+                setattr(self._cfg_obj, "get_trade_cost_bps", self.get_trade_cost_bps)
+            except Exception:
+                logger.exception("Failed to attach get_trade_cost_bps to config")
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "SlippageImpl":
@@ -889,3 +1224,200 @@ class SlippageImpl:
         if candidate <= 0.0 or not math.isfinite(candidate):
             return None
         return float(candidate)
+
+    def _resolve_adv_value(
+        self,
+        *,
+        symbol: Optional[str],
+        metrics: Mapping[str, Any],
+    ) -> Optional[float]:
+        state = self._trade_cost_state
+        adv_hint = _safe_float(metrics.get("adv"))
+        if adv_hint is not None and adv_hint > 0.0:
+            return adv_hint
+        if symbol:
+            cached = state.adv_cache.get(symbol)
+            if cached is not None and math.isfinite(cached) and cached > 0.0:
+                return cached
+        adv_val = self.get_adv_quote(symbol) if symbol else None
+        if adv_val is not None and adv_val > 0.0 and math.isfinite(adv_val) and symbol:
+            state.adv_cache[symbol] = adv_val
+        if adv_val is not None and adv_val > 0.0 and math.isfinite(adv_val):
+            return adv_val
+        liquidity_hint = _safe_float(metrics.get("liquidity"))
+        if liquidity_hint is not None and liquidity_hint > 0.0:
+            return liquidity_hint
+        return None
+
+    def _evaluate_tail_shock(
+        self,
+        *,
+        side: Any,
+        bar_close_ts: Any,
+        order_seq: Any,
+    ) -> tuple[float, float]:
+        cfg = self._tail_cfg
+        if cfg is None:
+            return 1.0, 0.0
+        enabled = _cfg_attr(cfg, "enabled")
+        try:
+            if not bool(enabled):
+                return 1.0, 0.0
+        except Exception:
+            return 1.0, 0.0
+        probability = _safe_float(_cfg_attr(cfg, "probability"))
+        if probability is None or probability <= 0.0:
+            return 1.0, 0.0
+        probability = max(0.0, min(1.0, probability))
+        rng_seed = _tail_rng_seed(
+            symbol=self._symbol,
+            ts=bar_close_ts,
+            side=side,
+            order_seq=order_seq,
+            seed=_cfg_attr(cfg, "seed"),
+        )
+        rng = random.Random(rng_seed)
+        if rng.random() > probability:
+            return 1.0, 0.0
+        base_bps = _safe_float(_cfg_attr(cfg, "shock_bps"))
+        if base_bps is None:
+            base_bps = 0.0
+        extra = _cfg_attr(cfg, "extra")
+        mode = ""
+        if isinstance(extra, Mapping):
+            raw_mode = extra.get("mode")
+            if raw_mode is not None:
+                try:
+                    mode = str(raw_mode).strip().lower()
+                except Exception:
+                    mode = ""
+        tail_bps = float(base_bps)
+        if isinstance(extra, Mapping):
+            if mode == "percentile":
+                tail_bps = _tail_percentile_sample(extra, rng, tail_bps)
+            elif mode == "gaussian":
+                tail_bps = _tail_gaussian_sample(extra, rng, tail_bps)
+        multiplier = _safe_float(_cfg_attr(cfg, "shock_multiplier"))
+        if multiplier is None or multiplier <= 0.0:
+            multiplier = 1.0
+        min_mult = _safe_float(_cfg_attr(cfg, "min_multiplier"))
+        max_mult = _safe_float(_cfg_attr(cfg, "max_multiplier"))
+        multiplier = _clamp(float(multiplier), min_mult, max_mult)
+        if not math.isfinite(tail_bps):
+            tail_bps = base_bps if math.isfinite(base_bps) else 0.0
+        return float(multiplier), float(tail_bps)
+
+    def get_trade_cost_bps(
+        self,
+        *,
+        side: Any,
+        qty: Any,
+        mid: Any,
+        spread_bps: Any = None,
+        bar_close_ts: Any = None,
+        order_seq: Any = None,
+        vol_metrics: Optional[Mapping[str, Any]] = None,
+    ) -> float:
+        base_spread = _safe_float(spread_bps)
+        if base_spread is None or base_spread < 0.0:
+            base_spread = float(self.cfg.default_spread_bps)
+        half_spread = max(0.5 * float(base_spread), float(self.cfg.min_half_spread_bps))
+        qty_val = _safe_float(qty)
+        if qty_val is None or qty_val <= 0.0:
+            return float(half_spread)
+        metrics: Dict[str, Any] = {}
+        if isinstance(vol_metrics, Mapping):
+            try:
+                metrics = dict(vol_metrics)
+            except Exception:
+                metrics = {}
+        mid_val = _safe_float(mid)
+        if mid_val is None or mid_val <= 0.0:
+            mid_candidate = _safe_float(metrics.get("mid"))
+            if mid_candidate is not None and mid_candidate > 0.0:
+                mid_val = mid_candidate
+        order_notional = None
+        if mid_val is not None and mid_val > 0.0:
+            order_notional = qty_val * mid_val
+        else:
+            notional_hint = _safe_float(metrics.get("notional"))
+            if notional_hint is not None and notional_hint > 0.0:
+                order_notional = notional_hint
+        symbol = self._symbol
+        adv_val = self._resolve_adv_value(symbol=symbol, metrics=metrics)
+        participation_ratio: Optional[float] = None
+        if order_notional is not None and adv_val is not None and adv_val > 0.0:
+            try:
+                participation_ratio = float(order_notional) / float(adv_val)
+            except (TypeError, ValueError, ZeroDivisionError):
+                participation_ratio = None
+        if participation_ratio is None:
+            liquidity_hint = _safe_float(metrics.get("liquidity"))
+            if liquidity_hint is not None and liquidity_hint > 0.0:
+                participation_ratio = qty_val / liquidity_hint
+        if participation_ratio is None:
+            participation_ratio = qty_val
+        participation_ratio = max(float(participation_ratio), float(self.cfg.eps))
+
+        impact_cfg = self._impact_cfg
+        k_base = float(self.cfg.k)
+        k_effective = k_base
+        vol_mult = 1.0
+        metrics_available = False
+        if impact_cfg is not None:
+            enabled = _cfg_attr(impact_cfg, "enabled")
+            try:
+                impact_enabled = bool(enabled)
+            except Exception:
+                impact_enabled = False
+            if impact_enabled:
+                state = self._trade_cost_state
+                vol_value = None
+                if state.vol_metric and metrics:
+                    metric_val = _lookup_metric(metrics, state.vol_metric)
+                    vol_value = _safe_float(metric_val)
+                if vol_value is None:
+                    vol_value = _safe_float(metrics.get("vol_factor"))
+                part_metric_value = None
+                if state.participation_metric and metrics:
+                    metric_val = _lookup_metric(metrics, state.participation_metric)
+                    part_metric_value = _safe_float(metric_val)
+                if part_metric_value is None and participation_ratio is not None:
+                    part_metric_value = float(participation_ratio)
+                vol_norm = state.normalise_vol(vol_value)
+                part_norm = state.normalise_part(part_metric_value)
+                beta_vol = _safe_float(_cfg_attr(impact_cfg, "beta_vol")) or 0.0
+                beta_part = _safe_float(_cfg_attr(impact_cfg, "beta_participation")) or 0.0
+                if vol_norm is not None:
+                    vol_mult += beta_vol * vol_norm
+                    metrics_available = True
+                if part_norm is not None:
+                    vol_mult += beta_part * part_norm
+                    metrics_available = True
+                if not math.isfinite(vol_mult):
+                    vol_mult = 1.0
+                if vol_mult < 0.0:
+                    vol_mult = 0.0
+                if metrics_available:
+                    k_effective = k_base * vol_mult
+                else:
+                    fallback_k = _safe_float(_cfg_attr(impact_cfg, "fallback_k"))
+                    if fallback_k is not None and fallback_k > 0.0:
+                        k_effective = fallback_k
+                min_k = _safe_float(_cfg_attr(impact_cfg, "min_k"))
+                max_k = _safe_float(_cfg_attr(impact_cfg, "max_k"))
+                if min_k is not None or max_k is not None:
+                    k_effective = _clamp(k_effective, min_k, max_k)
+                k_effective = self._trade_cost_state.apply_k_smoothing(k_effective)
+
+        impact_term = k_effective * math.sqrt(max(participation_ratio, float(self.cfg.eps)))
+        base_cost = half_spread + impact_term
+        tail_mult, tail_bps = self._evaluate_tail_shock(
+            side=side, bar_close_ts=bar_close_ts, order_seq=order_seq
+        )
+        total_cost = base_cost * tail_mult + tail_bps
+        if not math.isfinite(total_cost):
+            total_cost = base_cost
+        if total_cost < 0.0:
+            total_cost = 0.0
+        return float(total_cost)

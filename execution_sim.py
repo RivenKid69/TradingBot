@@ -602,6 +602,7 @@ class ExecutionSimulator:
         # слиппедж
         self.slippage_cfg = None
         self._slippage_get_spread: Optional[Callable[..., Any]] = None
+        self._slippage_get_trade_cost: Optional[Callable[..., Any]] = None
         if SlippageConfig is not None:
             if slippage_config is None:
                 if execution_profile is not None:
@@ -621,6 +622,9 @@ class ExecutionSimulator:
             candidate = getattr(self.slippage_cfg, "get_spread_bps", None)
             if callable(candidate):
                 self._slippage_get_spread = candidate
+            cost_candidate = getattr(self.slippage_cfg, "get_trade_cost_bps", None)
+            if callable(cost_candidate):
+                self._slippage_get_trade_cost = cost_candidate
 
         self._vol_window_size: int = 120
         self._vol_zscore_clip: Optional[float] = None
@@ -1170,6 +1174,163 @@ class ExecutionSimulator:
             except Exception:
                 return None
         return None
+
+    def _is_dynamic_trade_cost_enabled(self) -> bool:
+        getter = getattr(self, "_slippage_get_trade_cost", None)
+        if not callable(getter):
+            return False
+        cfg = self.slippage_cfg
+        if cfg is None:
+            return False
+        detector = getattr(cfg, "dynamic_trade_cost_enabled", None)
+        if callable(detector):
+            try:
+                if bool(detector()):
+                    return True
+            except Exception:
+                pass
+        block: Any = None
+        getter_fn = getattr(cfg, "get_dynamic_block", None)
+        if callable(getter_fn):
+            try:
+                block = getter_fn()
+            except Exception:
+                block = None
+        if block is None:
+            block = getattr(cfg, "dynamic_spread", None)
+        if block is None:
+            block = getattr(cfg, "dynamic", None)
+        if block is None:
+            return False
+        if isinstance(block, Mapping):
+            enabled = block.get("enabled")
+        else:
+            enabled = getattr(block, "enabled", False)
+        try:
+            return bool(enabled)
+        except Exception:
+            return False
+
+    def _call_trade_cost_getter(self, kwargs: Dict[str, Any]) -> Optional[float]:
+        getter = getattr(self, "_slippage_get_trade_cost", None)
+        if not callable(getter):
+            return None
+        attempted = dict(kwargs)
+        while True:
+            try:
+                return getter(**attempted)
+            except TypeError as exc:
+                message = str(exc)
+                removed = False
+                for key in list(attempted.keys()):
+                    tokens = (f"'{key}'", f'"{key}"')
+                    if any(tok in message for tok in tokens) and key in attempted:
+                        attempted.pop(key)
+                        removed = True
+                        break
+                if not removed:
+                    return None
+            except Exception:
+                return None
+        return None
+
+    def _compute_dynamic_trade_cost_bps(
+        self,
+        *,
+        side: str,
+        qty: float,
+        spread_bps: Optional[float],
+        base_price: Optional[float],
+        liquidity: Optional[float],
+        vol_factor: Optional[float],
+        order_seq: Optional[int],
+    ) -> Optional[float]:
+        if not self._is_dynamic_trade_cost_enabled():
+            return None
+        qty_val: float
+        try:
+            qty_val = float(qty)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(qty_val) or qty_val <= 0.0:
+            return None
+        if base_price is not None:
+            try:
+                base_val = float(base_price)
+            except (TypeError, ValueError):
+                base_val = None
+            else:
+                if not math.isfinite(base_val) or base_val <= 0.0:
+                    base_val = None
+        else:
+            base_val = None
+        mid_price = None
+        if mid_from_quotes is not None:
+            try:
+                mid_price = mid_from_quotes(
+                    bid=self._last_bid,
+                    ask=self._last_ask,
+                )
+            except Exception:
+                mid_price = None
+        if mid_price is None:
+            mid_price = base_val
+        kwargs: Dict[str, Any] = {
+            "side": side,
+            "qty": qty_val,
+            "mid": mid_price,
+            "spread_bps": spread_bps,
+            "bar_close_ts": getattr(self, "_last_bar_close_ts", None),
+            "order_seq": order_seq,
+        }
+        metrics: Dict[str, Any] = {}
+        raw_metrics = getattr(self, "_last_vol_raw", None)
+        if isinstance(raw_metrics, Mapping):
+            try:
+                metrics.update(dict(raw_metrics))
+            except Exception:
+                metrics = {}
+        if vol_factor is not None:
+            try:
+                vf_val = float(vol_factor)
+            except (TypeError, ValueError):
+                vf_val = None
+            else:
+                if math.isfinite(vf_val):
+                    metrics["vol_factor"] = vf_val
+        if liquidity is not None:
+            try:
+                liq_val = float(liquidity)
+            except (TypeError, ValueError):
+                liq_val = None
+            else:
+                if math.isfinite(liq_val) and liq_val > 0.0:
+                    metrics["liquidity"] = liq_val
+        if base_val is not None:
+            notional = base_val * qty_val
+            if math.isfinite(notional) and notional > 0.0:
+                metrics["notional"] = notional
+            metrics["mid"] = base_val
+        if spread_bps is not None:
+            try:
+                sbps_val = float(spread_bps)
+            except (TypeError, ValueError):
+                sbps_val = None
+            else:
+                if math.isfinite(sbps_val):
+                    metrics.setdefault("spread_bps", sbps_val)
+        if metrics:
+            kwargs["vol_metrics"] = metrics
+        result = self._call_trade_cost_getter(kwargs)
+        if result is None:
+            return None
+        try:
+            value = float(result)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return float(value)
 
     def _compute_effective_spread_bps(
         self,
@@ -2743,34 +2904,47 @@ class ExecutionSimulator:
                         if (liq_override is not None)
                         else self._last_liquidity
                     )
+                    pre_slip_price = float(filled_price)
                     cfg_slip = (
                         self.execution_params.get("slippage_bps")
                         if isinstance(self.execution_params, dict)
                         else None
                     )
+                    slip_candidate: Optional[float] = None
                     if cfg_slip is not None:
-                        slip_bps = float(cfg_slip)
+                        try:
+                            slip_candidate = float(cfg_slip)
+                        except (TypeError, ValueError):
+                            slip_candidate = None
+                    elif self.slippage_cfg is not None and apply_slippage_price is not None:
+                        slip_candidate = self._compute_dynamic_trade_cost_bps(
+                            side=side,
+                            qty=q_child,
+                            spread_bps=sbps,
+                            base_price=pre_slip_price,
+                            liquidity=liq,
+                            vol_factor=vf,
+                            order_seq=order_seq,
+                        )
+                        if slip_candidate is None and estimate_slippage_bps is not None:
+                            slip_candidate = estimate_slippage_bps(
+                                spread_bps=sbps,
+                                size=q_child,
+                                liquidity=liq,
+                                vol_factor=vf,
+                                cfg=self.slippage_cfg,
+                            )
+                    if slip_candidate is not None:
+                        try:
+                            slip_bps = float(slip_candidate)
+                        except (TypeError, ValueError):
+                            slip_bps = 0.0
                         if apply_slippage_price is not None:
                             filled_price = apply_slippage_price(
                                 side=side,
-                                quote_price=filled_price,
+                                quote_price=pre_slip_price,
                                 slippage_bps=slip_bps,
                             )
-                    elif (
-                        self.slippage_cfg is not None
-                        and estimate_slippage_bps is not None
-                        and apply_slippage_price is not None
-                    ):
-                        slip_bps = estimate_slippage_bps(
-                            spread_bps=sbps,
-                            size=q_child,
-                            liquidity=liq,
-                            vol_factor=vf,
-                            cfg=self.slippage_cfg,
-                        )
-                        filled_price = apply_slippage_price(
-                            side=side, quote_price=filled_price, slippage_bps=slip_bps
-                        )
 
                     filled_price, final_clip = self._clip_to_bar_range(filled_price)
 
@@ -2843,21 +3017,35 @@ class ExecutionSimulator:
             sbps = self._last_spread_bps
             vf = self._last_vol_factor
             liq = self._last_liquidity
-            if (
-                self.slippage_cfg is not None
-                and estimate_slippage_bps is not None
-                and apply_slippage_price is not None
-            ):
-                slip_bps = estimate_slippage_bps(
+            pre_slip_price = float(filled_price)
+            slip_candidate: Optional[float] = None
+            if self.slippage_cfg is not None and apply_slippage_price is not None:
+                slip_candidate = self._compute_dynamic_trade_cost_bps(
+                    side=side,
+                    qty=qty,
                     spread_bps=sbps,
-                    size=qty,
+                    base_price=pre_slip_price,
                     liquidity=liq,
                     vol_factor=vf,
-                    cfg=self.slippage_cfg,
+                    order_seq=None,
                 )
-                filled_price = apply_slippage_price(
-                    side=side, quote_price=filled_price, slippage_bps=slip_bps
-                )
+                if slip_candidate is None and estimate_slippage_bps is not None:
+                    slip_candidate = estimate_slippage_bps(
+                        spread_bps=sbps,
+                        size=qty,
+                        liquidity=liq,
+                        vol_factor=vf,
+                        cfg=self.slippage_cfg,
+                    )
+            if slip_candidate is not None:
+                try:
+                    slip_bps = float(slip_candidate)
+                except (TypeError, ValueError):
+                    slip_bps = 0.0
+                if apply_slippage_price is not None:
+                    filled_price = apply_slippage_price(
+                        side=side, quote_price=pre_slip_price, slippage_bps=slip_bps
+                    )
 
             # комиссия
             fee = 0.0
@@ -3543,21 +3731,37 @@ class ExecutionSimulator:
                     sbps = self._last_spread_bps
                     vf = self._last_vol_factor
                     liq = self._last_liquidity
-                    if (
-                        self.slippage_cfg is not None
-                        and estimate_slippage_bps is not None
-                        and apply_slippage_price is not None
-                    ):
-                        slip_bps = estimate_slippage_bps(
+                    pre_slip_price = float(filled_price)
+                    slip_candidate: Optional[float] = None
+                    if self.slippage_cfg is not None and apply_slippage_price is not None:
+                        slip_candidate = self._compute_dynamic_trade_cost_bps(
+                            side=side,
+                            qty=q_child,
                             spread_bps=sbps,
-                            size=q_child,
+                            base_price=pre_slip_price,
                             liquidity=liq,
                             vol_factor=vf,
-                            cfg=self.slippage_cfg,
+                            order_seq=order_seq,
                         )
-                        filled_price = apply_slippage_price(
-                            side=side, quote_price=filled_price, slippage_bps=slip_bps
-                        )
+                        if slip_candidate is None and estimate_slippage_bps is not None:
+                            slip_candidate = estimate_slippage_bps(
+                                spread_bps=sbps,
+                                size=q_child,
+                                liquidity=liq,
+                                vol_factor=vf,
+                                cfg=self.slippage_cfg,
+                            )
+                    if slip_candidate is not None:
+                        try:
+                            slip_bps = float(slip_candidate)
+                        except (TypeError, ValueError):
+                            slip_bps = 0.0
+                        if apply_slippage_price is not None:
+                            filled_price = apply_slippage_price(
+                                side=side,
+                                quote_price=pre_slip_price,
+                                slippage_bps=slip_bps,
+                            )
 
                     filled_price, final_clip = self._clip_to_bar_range(filled_price)
 
