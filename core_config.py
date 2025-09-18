@@ -265,6 +265,36 @@ class LatencyConfig(BaseModel):
         return super().dict(*args, **kwargs)
 
 
+class ExecutionBridgeConfig(BaseModel):
+    """Configuration payload for execution bridge adapters."""
+
+    intrabar_price_model: Optional[str] = Field(default=None)
+    timeframe_ms: Optional[int] = Field(default=None)
+    use_latency_from: Optional[str] = Field(default=None)
+    latency_constant_ms: Optional[int] = Field(default=None)
+
+    class Config:
+        extra = "allow"
+
+
+class ExecutionRuntimeConfig(BaseModel):
+    """Runtime execution configuration shared across run modes."""
+
+    intrabar_price_model: Optional[str] = Field(default=None)
+    timeframe_ms: Optional[int] = Field(default=None)
+    use_latency_from: Optional[str] = Field(default=None)
+    latency_constant_ms: Optional[int] = Field(default=None)
+    bridge: ExecutionBridgeConfig = Field(default_factory=ExecutionBridgeConfig)
+
+    class Config:
+        extra = "allow"
+
+    def dict(self, *args, **kwargs):  # type: ignore[override]
+        if "exclude_unset" not in kwargs:
+            kwargs["exclude_unset"] = False
+        return super().dict(*args, **kwargs)
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
         default=None, description="Идентификатор запуска; если None — генерируется."
@@ -300,6 +330,7 @@ class CommonRunConfig(BaseModel):
     state: StateConfig = Field(default_factory=StateConfig)
     risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
     latency: LatencyConfig = Field(default_factory=LatencyConfig)
+    execution: ExecutionRuntimeConfig = Field(default_factory=ExecutionRuntimeConfig)
     components: Components
 
 
@@ -345,6 +376,7 @@ class SimulationConfig(CommonRunConfig):
         default=ExecutionProfile.MKT_OPEN_NEXT_H1
     )
     execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
+    execution: ExecutionRuntimeConfig = Field(default_factory=ExecutionRuntimeConfig)
 
     @root_validator(pre=True)
     def _sync_symbols(cls, values):
@@ -549,6 +581,8 @@ __all__ = [
     "KillSwitchConfig",
     "OpsKillSwitchConfig",
     "LatencyConfig",
+    "ExecutionBridgeConfig",
+    "ExecutionRuntimeConfig",
     "MonitoringThresholdsConfig",
     "MonitoringAlertConfig",
     "MonitoringConfig",

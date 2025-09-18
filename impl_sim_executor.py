@@ -65,6 +65,25 @@ class SimExecutor(TradeExecutor):
         except Exception:
             return {}
 
+    @staticmethod
+    def _execution_dict(cfg: Any) -> Dict[str, Any]:
+        if cfg is None:
+            return {}
+        if hasattr(cfg, "dict"):
+            try:
+                payload = cfg.dict(exclude_unset=False)  # type: ignore[call-arg]
+            except Exception:
+                payload = {}
+            else:
+                if isinstance(payload, dict):
+                    return dict(payload)
+        if isinstance(cfg, dict):
+            return dict(cfg)
+        try:
+            return dict(cfg)  # type: ignore[arg-type]
+        except Exception:
+            return {}
+
     def __init__(
         self,
         sim: ExecutionSimulator,
@@ -109,6 +128,26 @@ class SimExecutor(TradeExecutor):
             if run_config is not None
             else ExecutionParams()
         )
+        self._execution_cfg = getattr(run_config, "execution", None) if run_config else None
+        exec_cfg_payload: Dict[str, Any] = {}
+        if run_config is not None:
+            exec_cfg_payload = self._execution_dict(self._execution_cfg)
+        if exec_cfg_payload:
+            try:
+                setattr(self._sim, "_execution_intrabar_cfg", dict(exec_cfg_payload))
+            except Exception:
+                pass
+            bridge_payload = exec_cfg_payload.get("bridge")
+            if isinstance(bridge_payload, dict):
+                try:
+                    setattr(self._sim, "_execution_bridge_cfg", dict(bridge_payload))
+                except Exception:
+                    pass
+        if run_config is not None:
+            try:
+                setattr(self._sim, "_execution_runtime_cfg", self._execution_cfg)
+            except Exception:
+                pass
         if data_degradation is None:
             data_degradation = (
                 DataDegradationConfig.from_dict(rc_degradation)
@@ -193,6 +232,25 @@ class SimExecutor(TradeExecutor):
         d_impl = DataDegradationConfig.from_dict(
             getattr(run_config, "data_degradation", {}) or {}
         )
+
+        execution_cfg = getattr(run_config, "execution", None)
+        exec_cfg_payload = SimExecutor._execution_dict(execution_cfg)
+        if exec_cfg_payload:
+            try:
+                setattr(sim, "_execution_intrabar_cfg", dict(exec_cfg_payload))
+            except Exception:
+                pass
+            bridge_payload = exec_cfg_payload.get("bridge")
+            if isinstance(bridge_payload, dict):
+                try:
+                    setattr(sim, "_execution_bridge_cfg", dict(bridge_payload))
+                except Exception:
+                    pass
+        if run_config is not None:
+            try:
+                setattr(sim, "_execution_runtime_cfg", execution_cfg)
+            except Exception:
+                pass
 
         if q_impl is not None:
             q_impl.attach_to(sim, strict=True, enforce_percent_price_by_side=True)

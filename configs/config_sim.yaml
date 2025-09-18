@@ -9,6 +9,16 @@ execution_params:
   limit_offset_bps: 0.0  # e.g. 25 for 0.25% offset when using LIMIT_MID_BPS
   ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
   tif: GTC               # e.g. IOC or FOK
+execution:
+  intrabar_price_model: null
+  timeframe_ms: null
+  use_latency_from: null
+  latency_constant_ms: null
+  bridge:
+    intrabar_price_model: null
+    timeframe_ms: null
+    use_latency_from: null
+    latency_constant_ms: null
 execution_config:
   notional_threshold: 10000.0
   large_order_algo: TWAP
