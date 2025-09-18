@@ -395,6 +395,7 @@ class Pending:
     timeout: bool = False
     spike: bool = False
     delayed: bool = False
+    intrabar_latency_ms: Optional[int] = None
 
 
 class _LatencyQueue:
@@ -609,6 +610,104 @@ class ExecutionSimulator:
             str(execution_profile) if execution_profile is not None else ""
         )
         self.execution_params: dict = dict(execution_params or {})
+        self._execution_intrabar_cfg: Dict[str, Any] = {}
+        exec_cfg_sources: List[Any] = []
+        if execution_config:
+            exec_cfg_sources.append(execution_config)
+        if run_config is not None:
+            rc_exec = getattr(run_config, "execution", None)
+            if rc_exec is not None:
+                exec_cfg_sources.append(rc_exec)
+
+        for cfg_src in exec_cfg_sources:
+            payload: Dict[str, Any] = {}
+            if isinstance(cfg_src, Mapping):
+                try:
+                    payload = {str(k): v for k, v in cfg_src.items()}
+                except Exception:
+                    payload = dict(cfg_src)
+            elif hasattr(cfg_src, "dict"):
+                try:
+                    payload = dict(cfg_src.dict(exclude_unset=False))  # type: ignore[call-arg]
+                except Exception:
+                    payload = {}
+            elif hasattr(cfg_src, "__dict__"):
+                try:
+                    payload = {
+                        str(k): v
+                        for k, v in vars(cfg_src).items()
+                        if not str(k).startswith("_")
+                    }
+                except Exception:
+                    payload = {}
+            if payload:
+                self._execution_intrabar_cfg.update(payload)
+
+        self._intrabar_price_model: Optional[str] = None
+        self._intrabar_config_timeframe_ms: Optional[int] = None
+        self._intrabar_latency_source: str = "latency"
+        self._intrabar_latency_constant_ms: Optional[int] = None
+        self._intrabar_log_warnings: bool = False
+        self._intrabar_warn_next_log_ms: int = 0
+        self._timing_timeframe_ms: Optional[int] = None
+
+        if self._execution_intrabar_cfg:
+            mode = self._execution_intrabar_cfg.get("intrabar_price_model")
+            if mode is not None:
+                try:
+                    self._intrabar_price_model = str(mode)
+                except Exception:
+                    self._intrabar_price_model = None
+
+            tf_cfg = self._execution_intrabar_cfg.get("timeframe_ms")
+            try:
+                tf_int = int(tf_cfg) if tf_cfg is not None else None
+            except (TypeError, ValueError):
+                tf_int = None
+            if tf_int is not None and tf_int > 0:
+                self._intrabar_config_timeframe_ms = tf_int
+
+            lat_src = self._execution_intrabar_cfg.get("use_latency_from")
+            if lat_src is not None:
+                try:
+                    value = str(lat_src).strip().lower()
+                except Exception:
+                    value = "latency"
+                self._intrabar_latency_source = value or "latency"
+
+            const_cfg = self._execution_intrabar_cfg.get("latency_constant_ms")
+            try:
+                const_int = int(const_cfg) if const_cfg is not None else None
+            except (TypeError, ValueError):
+                const_int = None
+            if const_int is not None and const_int >= 0:
+                self._intrabar_latency_constant_ms = const_int
+
+            log_flag_keys = (
+                "log_intrabar_warnings",
+                "log_intrabar_latency",
+                "log_latency_warnings",
+            )
+            for key in log_flag_keys:
+                if key in self._execution_intrabar_cfg:
+                    self._intrabar_log_warnings = bool(
+                        self._execution_intrabar_cfg.get(key)
+                    )
+                    if self._intrabar_log_warnings:
+                        break
+
+        if run_config is not None:
+            timing_cfg = getattr(run_config, "timing", None)
+            if timing_cfg is not None:
+                timeframe_val = getattr(timing_cfg, "timeframe_ms", None)
+                try:
+                    timeframe_int = (
+                        int(timeframe_val) if timeframe_val is not None else None
+                    )
+                except (TypeError, ValueError):
+                    timeframe_int = None
+                if timeframe_int is not None and timeframe_int > 0:
+                    self._timing_timeframe_ms = timeframe_int
         self._executor: Optional[BaseExecutor] = None
         self._build_executor()
 
@@ -1049,6 +1148,200 @@ class ExecutionSimulator:
             return
         self._intrabar_timeframe_ms = value
 
+    def _resolve_intrabar_timeframe(self, ts_ms: Optional[int] = None) -> int:
+        """Определить длину бара для intrabar-расчётов."""
+
+        timeframe: Optional[int] = self._intrabar_timeframe_ms
+        if timeframe is None and self._intrabar_config_timeframe_ms is not None:
+            timeframe = int(self._intrabar_config_timeframe_ms)
+        if timeframe is None and self._timing_timeframe_ms is not None:
+            timeframe = int(self._timing_timeframe_ms)
+        if timeframe is None:
+            base = int(self.step_ms) if self.step_ms > 0 else 0
+            timeframe = base if base > 0 else 1
+        if timeframe <= 0:
+            timeframe = 1
+        return int(timeframe)
+
+    def _intrabar_latency_ms(
+        self,
+        latency_sample: Any,
+        child_offset_ms: Optional[int] = None,
+    ) -> int:
+        """Выбрать источник латентности для intrabar-модели."""
+
+        mode = (self._intrabar_latency_source or "latency").strip().lower()
+
+        sample_val: Optional[float]
+        if isinstance(latency_sample, Mapping):
+            sample_val = latency_sample.get("total_ms")  # type: ignore[index]
+        else:
+            sample_val = latency_sample
+        try:
+            sample_ms = int(round(float(sample_val))) if sample_val is not None else 0
+        except (TypeError, ValueError):
+            sample_ms = 0
+        if not math.isfinite(float(sample_ms)) or sample_ms < 0:
+            sample_ms = 0
+
+        offset_ms = 0
+        if child_offset_ms is not None:
+            try:
+                offset_ms = int(child_offset_ms)
+            except (TypeError, ValueError):
+                offset_ms = 0
+            if offset_ms < 0:
+                offset_ms = 0
+
+        const_ms = self._intrabar_latency_constant_ms
+        if mode == "constant" and const_ms is not None:
+            return int(const_ms)
+
+        child_modes = {"child", "child_offset", "schedule", "plan"}
+        sum_modes = {
+            "child_plus_latency",
+            "child+latency",
+            "schedule_plus_latency",
+            "latency_plus_child",
+            "child_latency_sum",
+            "latency+child",
+        }
+
+        if mode in child_modes:
+            if child_offset_ms is not None:
+                return offset_ms
+            return sample_ms
+        if mode in sum_modes:
+            return offset_ms + sample_ms
+
+        if mode == "constant" and const_ms is None and child_offset_ms is not None:
+            return offset_ms
+
+        return sample_ms
+
+    def _intrabar_time_fraction(
+        self, latency_ms: Optional[int | float], timeframe_ms: Optional[int | float]
+    ) -> float:
+        """Рассчитать положение внутри бара по латентности."""
+
+        try:
+            lat_val = float(latency_ms) if latency_ms is not None else 0.0
+        except (TypeError, ValueError):
+            lat_val = 0.0
+        if not math.isfinite(lat_val) or lat_val < 0.0:
+            lat_val = 0.0
+
+        try:
+            tf_val = float(timeframe_ms) if timeframe_ms is not None else 0.0
+        except (TypeError, ValueError):
+            tf_val = 0.0
+        if not math.isfinite(tf_val) or tf_val <= 0.0:
+            tf_val = float(self._resolve_intrabar_timeframe(None))
+        if tf_val <= 0.0:
+            tf_val = 1.0
+
+        ratio = lat_val / tf_val
+        if ratio > 1.0 and self._intrabar_log_warnings:
+            now = now_ms()
+            if now >= self._intrabar_warn_next_log_ms:
+                logger.warning(
+                    "intrabar latency %.0f ms exceeds timeframe %.0f ms (mode=%s, source=%s)",
+                    lat_val,
+                    tf_val,
+                    self._intrabar_price_model,
+                    self._intrabar_latency_source,
+                )
+                throttle = max(int(tf_val), 1)
+                self._intrabar_warn_next_log_ms = now + throttle
+
+        if ratio < 0.0:
+            ratio = 0.0
+        if ratio > 1.0:
+            ratio = 1.0
+        return float(ratio)
+
+    def _intrabar_reference_price(self, side: str, time_fraction: float) -> Optional[float]:
+        """Вернуть референсную цену внутри бара по выбранной модели."""
+
+        mode_raw = self._intrabar_price_model
+        if not mode_raw:
+            return None
+        mode = str(mode_raw).strip().lower()
+        if not mode or mode in {"book", "none", "default"}:
+            return None
+
+        try:
+            frac = float(time_fraction)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(frac):
+            return None
+        frac = min(max(frac, 0.0), 1.0)
+
+        def _finite(value: Optional[float]) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(val):
+                return None
+            return val
+
+        open_p = _finite(self._last_bar_open)
+        high_p = _finite(self._last_bar_high)
+        low_p = _finite(self._last_bar_low)
+        close_p = _finite(self._last_bar_close)
+
+        if mode in {"open"}:
+            return open_p
+        if mode in {"close"}:
+            return close_p
+        if mode in {"high"}:
+            return high_p
+        if mode in {"low"}:
+            return low_p
+        if mode in {"mid"}:
+            bid = _finite(self._last_bid)
+            ask = _finite(self._last_ask)
+            if bid is not None and ask is not None:
+                return (bid + ask) / 2.0
+            mid_linear = None
+            if open_p is not None and close_p is not None:
+                mid_linear = open_p + (close_p - open_p) * frac
+            if mid_linear is not None:
+                return mid_linear
+            return _finite(self._last_ref_price)
+
+        linear_modes = {
+            "linear",
+            "open_close_linear",
+            "open-close-linear",
+            "oc_linear",
+            "linear_oc",
+        }
+        if mode in linear_modes:
+            if open_p is None or close_p is None:
+                return None
+            return open_p + (close_p - open_p) * frac
+
+        ohlc_modes = {"ohlc", "ohlc-linear", "ohlc_linear"}
+        if mode in ohlc_modes:
+            if open_p is None or close_p is None:
+                return None
+            side_u = str(side).upper()
+            extreme = high_p if side_u == "BUY" else low_p
+            if extreme is None:
+                extreme = high_p if high_p is not None else low_p
+            if extreme is None:
+                return open_p + (close_p - open_p) * frac
+            if frac <= 0.5:
+                return open_p + (extreme - open_p) * (frac / 0.5)
+            return extreme + (close_p - extreme) * ((frac - 0.5) / 0.5)
+
+        return None
+
     def get_hourly_liquidity_stats(self) -> dict:
         """Return averaged liquidity multiplier/value per hour of week."""
         avg_mult = [
@@ -1466,6 +1759,7 @@ class ExecutionSimulator:
         timeout = False
         spike = False
         remaining = self.latency_steps
+        latency_payload: Any = 0
         if self.latency is not None:
             try:
                 ts = int(now_ts) if now_ts is not None else 0
@@ -1477,11 +1771,16 @@ class ExecutionSimulator:
                 timeout = bool(d.get("timeout", False))
                 spike = bool(d.get("spike", False))
                 remaining = int(lat_ms // int(self.step_ms))
+                latency_payload = d
             except Exception:
                 lat_ms = 0
                 timeout = False
                 spike = False
                 remaining = self.latency_steps
+                latency_payload = 0
+        else:
+            latency_payload = lat_ms
+        intrabar_lat_ms = self._intrabar_latency_ms(latency_payload)
         if timeout:
             self._cancelled_on_submit.append(cid)
             return cid
@@ -1494,6 +1793,7 @@ class ExecutionSimulator:
                 lat_ms=int(lat_ms),
                 timeout=bool(timeout),
                 spike=bool(spike),
+                intrabar_latency_ms=int(max(0, intrabar_lat_ms)),
             )
         )
         return cid
@@ -1622,6 +1922,7 @@ class ExecutionSimulator:
         new_order_ids: List[int] = []
         new_order_pos: List[int] = []
         fee_total: float = 0.0
+        risk_events_buffer: List[RiskEvent] = []  # type: ignore[var-annotated]
 
         ts = int(now_ts or now_ms())
         ref = self._ref(ref_price)
@@ -1641,12 +1942,35 @@ class ExecutionSimulator:
                 is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
                 side = "BUY" if is_buy else "SELL"
                 qty_raw = abs(float(getattr(proto, "volume_frac", 0.0)))
-                qty_total = self._apply_filters_market(side, qty_raw, ref)
-                if qty_total <= 0.0:
+                parent_latency_src: Any = (
+                    p.intrabar_latency_ms
+                    if p.intrabar_latency_ms is not None
+                    else p.lat_ms
+                )
+                parent_latency = self._intrabar_latency_ms(parent_latency_src)
+                parent_timeframe = self._resolve_intrabar_timeframe(ts)
+                parent_fraction = self._intrabar_time_fraction(
+                    parent_latency, parent_timeframe
+                )
+                ref_market: Optional[float] = None
+                intrabar_parent_ref = self._intrabar_reference_price(
+                    side, parent_fraction
+                )
+                if intrabar_parent_ref is not None and math.isfinite(
+                    float(intrabar_parent_ref)
+                ):
+                    ref_market = float(intrabar_parent_ref)
+                else:
+                    try:
+                        ref_market = float(ref) if ref is not None else None
+                    except (TypeError, ValueError):
+                        ref_market = None
+                if ref_market is None or not math.isfinite(ref_market):
                     _cancel(p.client_order_id)
                     continue
 
-                if ref is None or not math.isfinite(ref):
+                qty_total = self._apply_filters_market(side, qty_raw, ref_market)
+                if qty_total <= 0.0:
                     _cancel(p.client_order_id)
                     continue
 
@@ -1654,23 +1978,24 @@ class ExecutionSimulator:
                 risk_events_local: List[RiskEvent] = []
                 if self.risk is not None:
                     portfolio_total = None
-                    if ref is not None:
-                        try:
-                            ref_val = float(ref)
-                        except (TypeError, ValueError):
-                            ref_val = None
-                        else:
-                            if math.isfinite(ref_val) and ref_val > 0.0:
-                                portfolio_total = abs(float(self.position_qty)) * ref_val
+                    try:
+                        ref_val = float(ref_market)
+                    except (TypeError, ValueError):
+                        ref_val = None
+                    else:
+                        if math.isfinite(ref_val) and ref_val > 0.0:
+                            portfolio_total = abs(float(self.position_qty)) * ref_val
                     adj_qty = self.risk.pre_trade_adjust(
                         ts_ms=ts,
                         side=side,
                         intended_qty=qty_total,
-                        price=ref,
+                        price=ref_market,
                         position_qty=self.position_qty,
                         total_notional=portfolio_total,
                     )
                     risk_events_local.extend(self.risk.pop_events())
+                    if risk_events_local:
+                        risk_events_buffer.extend(risk_events_local)
                     qty_total = float(adj_qty)
                     if qty_total <= 0.0:
                         _cancel(p.client_order_id)
@@ -1679,7 +2004,7 @@ class ExecutionSimulator:
                         continue
 
                 # планирование ребёнков (intra-bar)
-                notional = abs(qty_total) * float(ref)
+                notional = abs(qty_total) * float(ref_market)
                 executor = self._executor
                 if executor is None:
                     thr = float(
@@ -1703,7 +2028,7 @@ class ExecutionSimulator:
                     "spread_bps": self._last_spread_bps,
                     "vol_factor": self._last_vol_factor,
                     "liquidity": self._last_liquidity,
-                    "ref_price": ref,
+                    "ref_price": ref_market,
                 }
                 plan = executor.plan_market(
                     now_ts_ms=ts, side=side, target_qty=qty_total, snapshot=snapshot
@@ -1718,10 +2043,28 @@ class ExecutionSimulator:
                 _ = bool(p.spike)  # spike flag unused, kept for diagnostics
 
                 for child in plan:
-                    ts_fill = int(ts + int(child.ts_offset_ms) + lat_ms)
+                    child_offset = int(getattr(child, "ts_offset_ms", 0))
+                    base_ts = int(ts + child_offset)
+                    ts_fill = int(base_ts + lat_ms)
                     q_child = float(child.qty)
                     if q_child <= 0.0:
                         continue
+
+                    child_latency = self._intrabar_latency_ms(
+                        p.lat_ms, child_offset_ms=child_offset
+                    )
+                    child_timeframe = self._resolve_intrabar_timeframe(base_ts)
+                    child_fraction = self._intrabar_time_fraction(
+                        child_latency, child_timeframe
+                    )
+                    ref_child_price = ref_market
+                    intrabar_child_ref = self._intrabar_reference_price(
+                        side, child_fraction
+                    )
+                    if intrabar_child_ref is not None and math.isfinite(
+                        float(intrabar_child_ref)
+                    ):
+                        ref_child_price = float(intrabar_child_ref)
 
                     # риск: рейт-лимит на отправку «детей»
                     if self.risk is not None:
@@ -1742,7 +2085,7 @@ class ExecutionSimulator:
                     if self.quantizer is not None:
                         q_child = self.quantizer.quantize_qty(self.symbol, q_child)
                         q_child = self.quantizer.clamp_notional(
-                            self.symbol, ref, q_child
+                            self.symbol, ref_child_price, q_child
                         )
                         if q_child <= 0.0:
                             continue
@@ -1752,10 +2095,12 @@ class ExecutionSimulator:
                         base_price = (
                             self._last_hour_vwap
                             if self._last_hour_vwap is not None
-                            else ref
+                            else ref_child_price
                         )
                         filled_price = (
-                            float(base_price) if base_price is not None else float(ref)
+                            float(base_price)
+                            if base_price is not None
+                            else float(ref_child_price)
                         )
                     elif (
                         str(getattr(self, "execution_profile", "")).upper()
@@ -1764,20 +2109,26 @@ class ExecutionSimulator:
                         if self._next_h1_open_price is not None:
                             filled_price = float(self._next_h1_open_price)
                         else:
-                            filled_price = float(ref)
-                            if ref is not None:
-                                self._next_h1_open_price = float(ref)
+                            filled_price = float(ref_child_price)
+                            if ref_child_price is not None:
+                                self._next_h1_open_price = float(ref_child_price)
                     else:
                         if side == "BUY":
                             base_price = (
-                                self._last_ask if self._last_ask is not None else ref
+                                self._last_ask
+                                if self._last_ask is not None
+                                else ref_child_price
                             )
                         else:
                             base_price = (
-                                self._last_bid if self._last_bid is not None else ref
+                                self._last_bid
+                                if self._last_bid is not None
+                                else ref_child_price
                             )
                         filled_price = (
-                            float(base_price) if base_price is not None else float(ref)
+                            float(base_price)
+                            if base_price is not None
+                            else float(ref_child_price)
                         )
 
                     # слиппедж на ребёнка
@@ -1941,21 +2292,44 @@ class ExecutionSimulator:
                 is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
                 side = "BUY" if is_buy else "SELL"
                 qty_raw = abs(float(getattr(proto, "volume_frac", 0.0)))
+                limit_latency_src: Any = (
+                    p.intrabar_latency_ms
+                    if p.intrabar_latency_ms is not None
+                    else p.lat_ms
+                )
+                limit_latency = self._intrabar_latency_ms(limit_latency_src)
+                limit_timeframe = self._resolve_intrabar_timeframe(ts)
+                limit_fraction = self._intrabar_time_fraction(
+                    limit_latency, limit_timeframe
+                )
+                ref_limit: Optional[float] = None
+                intrabar_limit_ref = self._intrabar_reference_price(
+                    side, limit_fraction
+                )
+                if intrabar_limit_ref is not None and math.isfinite(
+                    float(intrabar_limit_ref)
+                ):
+                    ref_limit = float(intrabar_limit_ref)
+                else:
+                    try:
+                        ref_limit = float(ref) if ref is not None else None
+                    except (TypeError, ValueError):
+                        ref_limit = None
 
                 # Определяем лимитную цену
                 abs_price = getattr(proto, "abs_price", None)
                 if abs_price is None:
                     # нет абсолютной цены в proto — попробуем использовать ref_price как базу
-                    if ref is None:
+                    if ref_limit is None:
                         # ничего не можем сделать — считаем, что заявка размещена (эмуляция)
                         new_order_ids.append(int(p.client_order_id))
                         new_order_pos.append(0)
                         continue
                     # без знания tickSize в тиках используем abs_price=ref (реальную оффсет-логику добавим позже)
-                    abs_price = float(ref)
+                    abs_price = float(ref_limit)
 
                 price_q, qty_q, ok = self._apply_filters_limit(
-                    side, float(abs_price), qty_raw, ref
+                    side, float(abs_price), qty_raw, ref_limit
                 )
                 if qty_q <= 0.0 or not ok:
                     _cancel(p.client_order_id)
@@ -2151,6 +2525,8 @@ class ExecutionSimulator:
 
         # риск: обновить дневной PnL и возможную паузу
         risk_events_all: List[RiskEvent] = []
+        if risk_events_buffer:
+            risk_events_all.extend(risk_events_buffer)
         risk_paused_until = 0
         if self.risk is not None:
             try:
@@ -2318,13 +2694,33 @@ class ExecutionSimulator:
                 qty_raw = abs(float(vol))
                 ttl_steps = int(getattr(proto, "ttl_steps", 0))
                 tif = str(getattr(proto, "tif", "GTC")).upper()
-                ref = self._last_ref_price
-                if ref is None:
+                ref_parent = self._last_ref_price
+                parent_latency = self._intrabar_latency_ms(0)
+                parent_timeframe = self._resolve_intrabar_timeframe(ts)
+                parent_fraction = self._intrabar_time_fraction(
+                    parent_latency, parent_timeframe
+                )
+                ref_market: Optional[float] = None
+                intrabar_parent_ref = self._intrabar_reference_price(
+                    side, parent_fraction
+                )
+                if intrabar_parent_ref is not None and math.isfinite(
+                    float(intrabar_parent_ref)
+                ):
+                    ref_market = float(intrabar_parent_ref)
+                else:
+                    try:
+                        ref_market = (
+                            float(ref_parent) if ref_parent is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        ref_market = None
+                if ref_market is None or not math.isfinite(ref_market):
                     _cancel(cli_id)
                     continue
 
                 # применить фильтры рынка (квантизация/minNotional и т.п. внутри вспом. функции)
-                qty_total = self._apply_filters_market(side, qty_raw, ref)
+                qty_total = self._apply_filters_market(side, qty_raw, ref_market)
                 if qty_total <= 0.0:
                     _cancel(cli_id)
                     continue
@@ -2332,9 +2728,9 @@ class ExecutionSimulator:
                 # риск: корректировка/пауза
                 if self.risk is not None:
                     portfolio_total = None
-                    if ref is not None:
+                    if ref_market is not None:
                         try:
-                            ref_val = float(ref)
+                            ref_val = float(ref_market)
                         except (TypeError, ValueError):
                             ref_val = None
                         else:
@@ -2344,7 +2740,7 @@ class ExecutionSimulator:
                         ts_ms=ts,
                         side=side,
                         intended_qty=qty_total,
-                        price=ref,
+                        price=ref_market,
                         position_qty=self.position_qty,
                         total_notional=portfolio_total,
                     )
@@ -2371,7 +2767,7 @@ class ExecutionSimulator:
                     "spread_bps": self._last_spread_bps,
                     "vol_factor": self._last_vol_factor,
                     "liquidity": self._last_liquidity,
-                    "ref_price": ref,
+                    "ref_price": ref_market,
                 }
                 plan = executor.plan_market(
                     now_ts_ms=ts, side=side, target_qty=qty_total, snapshot=snapshot
@@ -2382,7 +2778,9 @@ class ExecutionSimulator:
 
                 # пройтись по детям с учётом латентности/слиппеджа/комиссий/инвентаря/рейт-лимита
                 for child in plan:
-                    ts_fill = int(ts + int(child.ts_offset_ms))
+                    child_offset = int(getattr(child, "ts_offset_ms", 0))
+                    base_ts = int(ts + child_offset)
+                    ts_fill = int(base_ts)
                     q_child = float(child.qty)
                     if q_child <= 0.0:
                         continue
@@ -2399,18 +2797,10 @@ class ExecutionSimulator:
                             continue
                         self.risk.on_new_order(ts_fill)
 
-                    # квантайзер и minNotional
-                    if self.quantizer is not None:
-                        q_child = self.quantizer.quantize_qty(self.symbol, q_child)
-                        q_child = self.quantizer.clamp_notional(
-                            self.symbol, ref, q_child
-                        )
-                        if q_child <= 0.0:
-                            continue
-
-                    # латентность
+                    # латентность и intrabar-референс
                     lat_ms = 0
                     lat_spike = False
+                    latency_payload: Any = lat_ms
                     if self.latency is not None:
                         try:
                             d = self.latency.sample(int(ts_fill))
@@ -2421,17 +2811,45 @@ class ExecutionSimulator:
                         if bool(d.get("timeout", False)):
                             _cancel(cli_id)
                             continue
-                    ts_fill = int(ts_fill + lat_ms)
+                        latency_payload = d
+                    child_latency = self._intrabar_latency_ms(
+                        latency_payload, child_offset_ms=child_offset
+                    )
+                    child_timeframe = self._resolve_intrabar_timeframe(base_ts)
+                    child_fraction = self._intrabar_time_fraction(
+                        child_latency, child_timeframe
+                    )
+                    ref_child_price = ref_market
+                    intrabar_child_ref = self._intrabar_reference_price(
+                        side, child_fraction
+                    )
+                    if intrabar_child_ref is not None and math.isfinite(
+                        float(intrabar_child_ref)
+                    ):
+                        ref_child_price = float(intrabar_child_ref)
+
+                    # квантайзер и minNotional
+                    if self.quantizer is not None:
+                        q_child = self.quantizer.quantize_qty(self.symbol, q_child)
+                        q_child = self.quantizer.clamp_notional(
+                            self.symbol, ref_child_price, q_child
+                        )
+                        if q_child <= 0.0:
+                            continue
+
+                    ts_fill = int(base_ts + lat_ms)
                     # цена исполнения
                     if VWAPExecutor is not None and isinstance(executor, VWAPExecutor):
                         self._vwap_on_tick(ts_fill, None, None)
                         base_price = (
                             self._last_hour_vwap
                             if self._last_hour_vwap is not None
-                            else ref
+                            else ref_child_price
                         )
                         filled_price = (
-                            float(base_price) if base_price is not None else float(ref)
+                            float(base_price)
+                            if base_price is not None
+                            else float(ref_child_price)
                         )
                     elif (
                         str(getattr(self, "execution_profile", "")).upper()
@@ -2442,14 +2860,20 @@ class ExecutionSimulator:
                     else:
                         if side == "BUY":
                             base_price = (
-                                self._last_ask if self._last_ask is not None else ref
+                                self._last_ask
+                                if self._last_ask is not None
+                                else ref_child_price
                             )
                         else:
                             base_price = (
-                                self._last_bid if self._last_bid is not None else ref
+                                self._last_bid
+                                if self._last_bid is not None
+                                else ref_child_price
                             )
                         filled_price = (
-                            float(base_price) if base_price is not None else float(ref)
+                            float(base_price)
+                            if base_price is not None
+                            else float(ref_child_price)
                         )
                     slip_bps = 0.0
                     sbps = self._last_spread_bps
