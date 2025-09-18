@@ -94,6 +94,24 @@ def test_hourly_seasonality_clamping(tmp_path):
     assert arr2.max() == SEASONALITY_MULT_MAX
 
 
+def test_hourly_seasonality_mapping(tmp_path):
+    mapping = {str(i): 1.0 for i in range(HOURS_IN_WEEK)}
+    p = tmp_path / "map.json"
+    p.write_text(json.dumps({"latency": mapping}))
+    arr = load_hourly_seasonality(str(p), "latency")
+    assert arr.shape[0] == HOURS_IN_WEEK
+    assert np.allclose(arr, 1.0)
+    data = load_seasonality(str(p))
+    assert np.allclose(data["latency"], 1.0)
+
+    day_mapping = {str(i): 2.0 for i in range(7)}
+    p2 = tmp_path / "map_day.json"
+    p2.write_text(json.dumps({"latency": day_mapping}))
+    arr_day = load_hourly_seasonality(str(p2), "latency")
+    assert arr_day.shape[0] == 7
+    assert np.allclose(arr_day, 2.0)
+
+
 def test_load_seasonality_daily(tmp_path):
     p = tmp_path / "day.json"
     p.write_text(json.dumps({"liquidity": [1.0] * 7}))

@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import sys
+import numpy as np
 import pytest
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
@@ -51,3 +52,47 @@ def test_latency_impl_load_multipliers_validation():
     impl_instance = LatencyImpl.from_dict(cfg)
     with pytest.raises(ValueError, match="length 168"):
         impl_instance.load_multipliers([1.0] * 167)
+
+
+def test_latency_impl_load_multipliers_accepts_daily_for_hourly():
+    cfg = {
+        "base_ms": 50,
+        "jitter_ms": 10,
+        "spike_p": 0.0,
+        "timeout_ms": 500,
+    }
+    impl_instance = LatencyImpl.from_dict(cfg)
+    impl_instance.load_multipliers([1.0] * 7)
+    dump = impl_instance.dump_multipliers()
+    assert len(dump) == 168
+    assert np.allclose(dump, 1.0)
+
+
+def test_latency_impl_load_multipliers_hourly_to_daily():
+    cfg = {
+        "base_ms": 50,
+        "jitter_ms": 10,
+        "spike_p": 0.0,
+        "timeout_ms": 500,
+        "seasonality_day_only": True,
+    }
+    impl_instance = LatencyImpl.from_dict(cfg)
+    impl_instance.load_multipliers([1.0] * 168)
+    dump = impl_instance.dump_multipliers()
+    assert len(dump) == 7
+    assert np.allclose(dump, 1.0)
+
+
+def test_latency_impl_load_multipliers_mapping():
+    cfg = {
+        "base_ms": 50,
+        "jitter_ms": 10,
+        "spike_p": 0.0,
+        "timeout_ms": 500,
+    }
+    impl_instance = LatencyImpl.from_dict(cfg)
+    payload = {str(i): 1.0 for i in range(168)}
+    impl_instance.load_multipliers(payload)
+    dump = impl_instance.dump_multipliers()
+    assert len(dump) == 168
+    assert np.allclose(dump, 1.0)
