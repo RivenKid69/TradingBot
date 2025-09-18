@@ -108,6 +108,7 @@ class _LatencyWithSeasonality:
         volatility_callback: Optional[
             Callable[[Optional[str], int], Tuple[float, Dict[str, Any]]]
         ] = None,
+        volatility_update: Optional[Callable[[Optional[str], int, float], None]] = None,
         min_ms: int | None = None,
         max_ms: int | None = None,
         debug_log: bool = False,
@@ -125,6 +126,7 @@ class _LatencyWithSeasonality:
         self._lock = threading.Lock()
         self._symbol: Optional[str] = str(symbol).upper() if symbol else None
         self._vol_cb = volatility_callback
+        self._vol_update = volatility_update
         self._debug_log = bool(debug_log)
         self._min_ms = int(round(float(min_ms))) if min_ms is not None else 0
         if max_ms is None:
@@ -144,6 +146,45 @@ class _LatencyWithSeasonality:
     ) -> None:
         with self._lock:
             self._vol_cb = callback
+
+    def set_volatility_update(
+        self, callback: Optional[Callable[[Optional[str], int, float], None]]
+    ) -> None:
+        with self._lock:
+            self._vol_update = callback
+
+    def update_volatility(
+        self, symbol: str | None, ts_ms: int, value: float | None
+    ) -> None:
+        if value is None:
+            return
+        with self._lock:
+            cb = self._vol_update
+            sym = symbol or self._symbol
+        if cb is None:
+            return
+        try:
+            ts = int(ts_ms)
+        except (TypeError, ValueError):
+            return
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(val):
+            return
+        try:
+            cb(sym, ts, val)
+        except TypeError:
+            try:
+                if sym is not None:
+                    cb(sym, ts, value)  # type: ignore[arg-type]
+                else:
+                    cb(None, ts, val)
+            except Exception:
+                return
+        except Exception:
+            return
 
     def sample(self, ts_ms: int | None = None):
         if ts_ms is None:
@@ -380,6 +421,7 @@ class LatencyImpl:
         if self._model is not None:
             mult = self.latency if self._has_seasonality else [1.0] * len(self.latency)
             vol_cb = self._build_volatility_callback(sim)
+            vol_update = self._build_volatility_updater(sim)
             symbol = self.cfg.symbol or getattr(sim, "symbol", None)
             self._wrapper = _LatencyWithSeasonality(
                 self._model,
@@ -387,6 +429,7 @@ class LatencyImpl:
                 interpolate=self.cfg.seasonality_interpolate,
                 symbol=symbol,
                 volatility_callback=vol_cb,
+                volatility_update=vol_update,
                 min_ms=self.cfg.min_ms,
                 max_ms=self.cfg.max_ms,
                 debug_log=self.cfg.debug_log,
@@ -398,7 +441,15 @@ class LatencyImpl:
                 self._wrapper.set_symbol(symbol)
             if vol_cb is not None:
                 self._wrapper.set_volatility_callback(vol_cb)
+            if vol_update is not None:
+                self._wrapper.set_volatility_update(vol_update)
             setattr(sim, "latency", self._wrapper)
+            final_symbol = getattr(self._wrapper, "_symbol", None)
+            if final_symbol:
+                try:
+                    setattr(sim, "_latency_symbol", str(final_symbol).upper())
+                except Exception:
+                    pass
         self.attached_sim = sim
 
     def _build_volatility_callback(
@@ -510,6 +561,83 @@ class LatencyImpl:
 
         return _resolve
 
+    def _build_volatility_updater(
+        self, sim
+    ) -> Optional[Callable[[Optional[str], int, float], None]]:
+        gamma = float(self.cfg.volatility_gamma)
+        if gamma == 0.0:
+            return None
+
+        sim_ref = weakref.ref(sim)
+
+        def _update(symbol: Optional[str], ts_ms: int, value: float) -> None:
+            sim_obj = sim_ref()
+            if sim_obj is None:
+                return
+            cache = getattr(sim_obj, "volatility_cache", None)
+            if cache is None:
+                return
+            sym = symbol or getattr(sim_obj, "_latency_symbol", None) or getattr(sim_obj, "symbol", None)
+            sym_norm = str(sym).upper() if sym else None
+            try:
+                ts = int(ts_ms)
+            except (TypeError, ValueError):
+                return
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(val):
+                return
+            method = None
+            for name in (
+                "update_latency_factor",
+                "update_latency",
+                "update",
+                "append",
+                "observe",
+            ):
+                cand = getattr(cache, name, None)
+                if callable(cand):
+                    method = cand
+                    break
+            if method is None:
+                return
+            try:
+                if sym_norm is not None:
+                    method(symbol=sym_norm, ts_ms=ts, value=val)
+                else:
+                    method(ts_ms=ts, value=val)
+                return
+            except TypeError:
+                pass
+            try:
+                if sym_norm is not None:
+                    method(sym_norm, ts, val)
+                else:
+                    method(ts, val)
+                return
+            except TypeError:
+                try:
+                    method(ts, val)
+                    return
+                except TypeError:
+                    try:
+                        if sym_norm is not None:
+                            method(sym_norm, val)
+                            return
+                    except Exception:
+                        pass
+                    try:
+                        method(val)
+                        return
+                    except Exception:
+                        return
+            except Exception:
+                return
+
+        return _update
+
     def get_stats(self):
         if self._wrapper is not None:
             return self._wrapper.stats()
@@ -522,6 +650,19 @@ class LatencyImpl:
             self._wrapper.reset_stats()
         elif self._model is not None:
             self._model.reset_stats()
+
+    def update_volatility(
+        self, symbol: Optional[str], ts_ms: int, value: float | None
+    ) -> None:
+        if self._wrapper is None:
+            return
+        updater = getattr(self._wrapper, "update_volatility", None)
+        if not callable(updater):
+            return
+        try:
+            updater(symbol, ts_ms, value)
+        except Exception:
+            return
 
     def get_hourly_stats(self):
         if self._wrapper is None:
