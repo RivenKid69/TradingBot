@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Mapping
 import logging
 import os
+import math
 import pandas as pd
 
 from execution_sim import ExecutionSimulator  # type: ignore
@@ -200,17 +201,279 @@ def _log_adv_runtime_warnings(
             )
 
 
+def _as_mapping(cfg: Any) -> Dict[str, Any]:
+    if cfg is None:
+        return {}
+    if isinstance(cfg, Mapping):
+        try:
+            return {str(k): v for k, v in cfg.items()}
+        except Exception:
+            return dict(cfg)
+    for attr in ("model_dump", "dict"):
+        if hasattr(cfg, attr):
+            try:
+                method = getattr(cfg, attr)
+                payload = method(exclude_unset=False)  # type: ignore[call-arg]
+            except TypeError:
+                try:
+                    payload = method()
+                except Exception:
+                    payload = None
+            except Exception:
+                payload = None
+            if isinstance(payload, Mapping):
+                try:
+                    return {str(k): v for k, v in payload.items()}
+                except Exception:
+                    return dict(payload)
+    if hasattr(cfg, "__dict__"):
+        try:
+            return {
+                str(k): v
+                for k, v in vars(cfg).items()
+                if not str(k).startswith("_")
+            }
+        except Exception:
+            return {}
+    return {}
+
+
+_BAR_CAPACITY_KEY_ALIASES: Dict[str, set[str]] = {
+    "enabled": {"enabled"},
+    "adv_base_path": {"adv_base_path", "adv_path", "path", "dataset_path"},
+    "capacity_frac_of_ADV_base": {
+        "capacity_frac_of_adv_base",
+        "capacity_fraction_of_adv_base",
+        "capacity_frac_of_adv",
+        "capacity_fraction_of_adv",
+        "capacity_frac_of_adv_base_pct",
+    },
+    "floor_base": {"floor_base", "floor", "adv_floor", "adv_floor_base"},
+    "timeframe_ms": {
+        "timeframe_ms",
+        "timeframe",
+        "bar_timeframe_ms",
+        "bar_timeframe",
+    },
+}
+
+
+def _normalise_bar_capacity_block(block: Mapping[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    stack: List[Mapping[str, Any]] = [block]
+    while stack:
+        current = stack.pop()
+        for raw_key, value in current.items():
+            try:
+                key_lower = str(raw_key).strip().lower()
+            except Exception:
+                continue
+            if key_lower == "extra" and isinstance(value, Mapping):
+                stack.append(value)
+                continue
+            for target, aliases in _BAR_CAPACITY_KEY_ALIASES.items():
+                if key_lower in aliases and target not in result:
+                    result[target] = value
+                    break
+    return result
+
+
+def _extract_bar_capacity_base_cfg(
+    run_cfg: CommonRunConfig | None,
+) -> Optional[Dict[str, Any]]:
+    if run_cfg is None:
+        return None
+    exec_cfg = getattr(run_cfg, "execution", None)
+    if exec_cfg is None:
+        return None
+    exec_payload = _as_mapping(exec_cfg)
+    block: Any = None
+    if "bar_capacity_base" in exec_payload:
+        block = exec_payload.get("bar_capacity_base")
+    elif hasattr(exec_cfg, "bar_capacity_base"):
+        block = getattr(exec_cfg, "bar_capacity_base")
+    if block is None and isinstance(exec_payload.get("extra"), Mapping):
+        block = exec_payload["extra"].get("bar_capacity_base")
+    block_map = _as_mapping(block)
+    if not block_map:
+        return None
+    normalised = _normalise_bar_capacity_block(block_map)
+    return normalised or None
+
+
+def _finalise_bar_capacity_payload(
+    raw_cfg: Optional[Dict[str, Any]],
+    *,
+    adv_store: Optional[ADVStore],
+    default_timeframe_ms: Optional[int],
+) -> tuple[Optional[Dict[str, Any]], List[tuple[str, Any]], List[str]]:
+    if not raw_cfg:
+        return None, [], []
+
+    payload: Dict[str, Any] = {}
+    fallbacks: List[tuple[str, Any]] = []
+    missing: List[str] = []
+
+    if "enabled" in raw_cfg:
+        payload["enabled"] = bool(raw_cfg.get("enabled"))
+    if "capacity_frac_of_ADV_base" in raw_cfg:
+        payload["capacity_frac_of_ADV_base"] = raw_cfg.get(
+            "capacity_frac_of_ADV_base"
+        )
+    if "floor_base" in raw_cfg:
+        payload["floor_base"] = raw_cfg.get("floor_base")
+
+    raw_path = raw_cfg.get("adv_base_path")
+    path_val: Optional[str] = None
+    if raw_path is not None:
+        try:
+            candidate = str(raw_path).strip()
+        except Exception:
+            candidate = ""
+        if candidate:
+            path_val = candidate
+    if path_val:
+        payload["adv_base_path"] = path_val
+    else:
+        fallback_path = getattr(adv_store, "path", None) if adv_store is not None else None
+        if fallback_path:
+            payload["adv_base_path"] = fallback_path
+            fallbacks.append(("adv_base_path", fallback_path))
+        else:
+            missing.append("adv_base_path")
+
+    timeframe_candidate = raw_cfg.get("timeframe_ms")
+    timeframe_val = _coerce_timeframe_ms(timeframe_candidate)
+    used_fallback_timeframe = False
+    if timeframe_val is None and default_timeframe_ms is not None:
+        timeframe_val = _coerce_timeframe_ms(default_timeframe_ms)
+        if timeframe_val is not None:
+            used_fallback_timeframe = True
+    if timeframe_val is not None:
+        payload["timeframe_ms"] = timeframe_val
+        if used_fallback_timeframe:
+            fallbacks.append(("timeframe_ms", timeframe_val))
+    else:
+        missing.append("timeframe_ms")
+
+    payload = {k: v for k, v in payload.items() if v is not None}
+    if not payload:
+        return None, fallbacks, missing
+    return payload, fallbacks, missing
+
+
+def _apply_bar_capacity_base_config(
+    sim: ExecutionSimulator,
+    raw_cfg: Optional[Dict[str, Any]],
+    *,
+    adv_store: Optional[ADVStore],
+    default_timeframe_ms: Optional[int],
+    context: str,
+) -> None:
+    set_cfg = getattr(sim, "set_bar_capacity_base_config", None)
+    if not callable(set_cfg):
+        if raw_cfg:
+            logger.warning(
+                "%s: ExecutionSimulator lacks set_bar_capacity_base_config(); bar capacity base disabled",
+                context,
+            )
+        return
+
+    payload, fallbacks, missing = _finalise_bar_capacity_payload(
+        raw_cfg, adv_store=adv_store, default_timeframe_ms=default_timeframe_ms
+    )
+    if not payload:
+        return
+
+    try:
+        set_cfg(**payload)
+    except Exception:
+        logger.exception("%s: failed to configure bar capacity base", context)
+        return
+
+    if fallbacks:
+        for field, value in fallbacks:
+            if field == "adv_base_path":
+                logger.warning(
+                    "%s: bar_capacity_base.%s not configured; falling back to ADV dataset %s",
+                    context,
+                    field,
+                    value,
+                )
+            elif field == "timeframe_ms":
+                logger.warning(
+                    "%s: bar_capacity_base.%s not configured; falling back to timeframe %s",
+                    context,
+                    field,
+                    value,
+                )
+            else:
+                logger.warning(
+                    "%s: bar_capacity_base.%s missing; using fallback %s",
+                    context,
+                    field,
+                    value,
+                )
+
+    enabled_flag = raw_cfg.get("enabled") if raw_cfg else None
+    should_warn_missing = bool(enabled_flag) if enabled_flag is not None else bool(raw_cfg)
+    if should_warn_missing:
+        for field in missing:
+            logger.warning(
+                "%s: bar_capacity_base.%s not configured and no fallback available",
+                context,
+                field,
+            )
+
+
+def _yield_bar_capacity_meta(report: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    collected: List[Mapping[str, Any]] = []
+    if not isinstance(report, Mapping):
+        return collected
+
+    core_reports = report.get("core_exec_reports")
+    if isinstance(core_reports, list) and core_reports:
+        for entry in core_reports:
+            if not isinstance(entry, Mapping):
+                continue
+            meta = entry.get("meta")
+            if not isinstance(meta, Mapping):
+                continue
+            bc_meta = meta.get("bar_capacity_base")
+            if isinstance(bc_meta, Mapping):
+                collected.append(bc_meta)
+        if collected:
+            return collected
+
+    trades = report.get("trades")
+    if isinstance(trades, list):
+        for entry in trades:
+            if not isinstance(entry, Mapping):
+                continue
+            meta = entry.get("meta")
+            if isinstance(meta, Mapping):
+                bc_meta = meta.get("bar_capacity_base")
+                if isinstance(bc_meta, Mapping):
+                    collected.append(bc_meta)
+                    continue
+            reason = entry.get("capacity_reason")
+            if isinstance(reason, str) and reason.upper() == "BAR_CAPACITY_BASE":
+                collected.append(entry)
+    return collected
+
+
 def _configure_adv_runtime(
     sim: ExecutionSimulator,
     run_cfg: CommonRunConfig | None,
     *,
     context: str,
-) -> Optional[ADVStore]:
+) -> tuple[Optional[ADVStore], Optional[Dict[str, Any]]]:
+    bar_capacity_cfg = _extract_bar_capacity_base_cfg(run_cfg)
     if run_cfg is None:
-        return None
+        return None, bar_capacity_cfg
     adv_cfg = getattr(run_cfg, "adv", None)
     if adv_cfg is None or not getattr(adv_cfg, "enabled", False):
-        return None
+        return None, bar_capacity_cfg
     set_store = getattr(sim, "set_adv_store", None)
     if not callable(set_store):
         logger.warning(
@@ -252,7 +515,7 @@ def _configure_adv_runtime(
             _log_adv_runtime_warnings(
                 existing_store, getattr(sim, "symbol", None), adv_cfg, context
             )
-        return existing_store
+        return existing_store, bar_capacity_cfg
     try:
         store = ADVStore(adv_cfg)
     except Exception:
@@ -267,9 +530,9 @@ def _configure_adv_runtime(
         )
     except Exception:
         logger.exception("%s: failed to attach ADV store to simulator", context)
-        return None
+        return None, bar_capacity_cfg
     _log_adv_runtime_warnings(store, getattr(sim, "symbol", None), adv_cfg, context)
-    return store
+    return store, bar_capacity_cfg
 
 
 @dataclass
@@ -315,7 +578,7 @@ class ServiceBacktest:
         self.policy = policy
         self.sim = sim
         self.cfg = cfg
-        self._adv_store = _configure_adv_runtime(
+        self._adv_store, _bar_capacity_cfg = _configure_adv_runtime(
             sim, run_config, context="service_backtest"
         )
         self._run_config = (
@@ -354,6 +617,14 @@ class ServiceBacktest:
                 setattr(self.sim, "_execution_timeframe_ms", int(timeframe_ms))
             except Exception:
                 pass
+
+        _apply_bar_capacity_base_config(
+            self.sim,
+            _bar_capacity_cfg,
+            adv_store=self._adv_store,
+            default_timeframe_ms=timeframe_ms,
+            context="service_backtest",
+        )
 
         run_id = self.cfg.run_id or "sim"
         logs_dir = self.cfg.logs_dir or "logs"
@@ -411,6 +682,53 @@ class ServiceBacktest:
         reports = self._bt.run(
             df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col
         )
+
+        total_trades = 0
+        total_fill_sum = 0.0
+        total_fill_count = 0
+        for rep in reports:
+            if not isinstance(rep, dict):
+                continue
+            capacity_meta = _yield_bar_capacity_meta(rep)
+            per_count = 0
+            per_fill_sum = 0.0
+            per_fill_count = 0
+            for meta in capacity_meta:
+                if not isinstance(meta, Mapping):
+                    continue
+                per_count += 1
+                fill_raw = meta.get("fill_ratio")
+                try:
+                    fill_val = float(fill_raw) if fill_raw is not None else None
+                except (TypeError, ValueError):
+                    fill_val = None
+                if fill_val is not None and math.isfinite(fill_val):
+                    per_fill_sum += fill_val
+                    per_fill_count += 1
+            rep["bar_capacity_base_trade_count"] = per_count
+            rep["bar_capacity_base_fill_ratio_avg"] = (
+                per_fill_sum / per_fill_count if per_fill_count else None
+            )
+            total_trades += per_count
+            total_fill_sum += per_fill_sum
+            total_fill_count += per_fill_count
+
+        if total_trades:
+            if total_fill_count:
+                overall_avg = total_fill_sum / total_fill_count
+                logger.info(
+                    "%s: bar_capacity_base trades=%d fill_ratio_avg=%.6f (n=%d)",
+                    "service_backtest",
+                    total_trades,
+                    overall_avg,
+                    total_fill_count,
+                )
+            else:
+                logger.info(
+                    "%s: bar_capacity_base trades=%d (fill_ratio unavailable)",
+                    "service_backtest",
+                    total_trades,
+                )
         try:
             if getattr(self.sim, "_logger", None):
                 self.sim._logger.flush()
