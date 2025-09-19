@@ -94,6 +94,24 @@ def _safe_float(value: Any) -> Optional[float]:
     return num
 
 
+def _safe_non_negative_float(value: Any, default: float = 0.0) -> float:
+    num = _safe_float(value)
+    if num is None or num < 0.0:
+        return float(default)
+    return float(num)
+
+
+def _safe_share_value(value: Any, default: float = 0.5) -> float:
+    share = _safe_float(value)
+    if share is None:
+        share = float(default)
+    if share < 0.0:
+        share = 0.0
+    elif share > 1.0:
+        share = 1.0
+    return float(share)
+
+
 def _safe_positive_int(value: Any) -> Optional[int]:
     try:
         num = int(value)
@@ -686,6 +704,11 @@ class SlippageImpl:
         self._adv_runtime_cfg: Optional[Any] = None
         self._maker_taker_share_raw: Optional[Dict[str, Any]] = None
         self.maker_taker_share_cfg: Optional[MakerTakerShareSettings] = None
+        self._maker_taker_share_enabled: bool = False
+        self._maker_share_default: float = 0.5
+        self._spread_cost_maker_bps_default: float = 0.0
+        self._spread_cost_taker_bps_default: float = 0.0
+        self._last_trade_cost_meta: Dict[str, Any] = {}
         dyn_cfg_obj: Optional[DynamicSpreadConfig] = None
         adv_cfg_obj: Optional[Any] = None
         impact_cfg_obj: Optional[Any] = None
@@ -748,6 +771,42 @@ class SlippageImpl:
             self._maker_taker_share_raw = share_cfg.as_dict()
         elif isinstance(share_block, Mapping):
             self._maker_taker_share_raw = dict(share_block)
+
+        share_enabled = False
+        maker_share_default = self._maker_share_default
+        maker_spread_cost = self._spread_cost_maker_bps_default
+        taker_spread_cost = self._spread_cost_taker_bps_default
+        if share_cfg is not None:
+            share_enabled = bool(share_cfg.enabled)
+            maker_share_default = _safe_share_value(
+                share_cfg.maker_share_default, maker_share_default
+            )
+            maker_spread_cost = _safe_non_negative_float(
+                share_cfg.spread_cost_maker_bps, maker_spread_cost
+            )
+            taker_spread_cost = _safe_non_negative_float(
+                share_cfg.spread_cost_taker_bps, taker_spread_cost
+            )
+        elif isinstance(share_block, Mapping):
+            share_enabled = bool(share_block.get("enabled", False))
+            maker_share_default = _safe_share_value(
+                share_block.get("maker_share_default"), maker_share_default
+            )
+            maker_spread_cost = _safe_non_negative_float(
+                share_block.get("spread_cost_maker_bps"), maker_spread_cost
+            )
+            taker_spread_cost = _safe_non_negative_float(
+                share_block.get("spread_cost_taker_bps"), taker_spread_cost
+            )
+        self._maker_taker_share_enabled = share_enabled
+        self._maker_share_default = maker_share_default
+        self._spread_cost_maker_bps_default = maker_spread_cost
+        self._spread_cost_taker_bps_default = taker_spread_cost
+        if self._maker_taker_share_raw is not None:
+            self._maker_taker_share_raw["enabled"] = share_enabled
+            self._maker_taker_share_raw["maker_share_default"] = maker_share_default
+            self._maker_taker_share_raw["spread_cost_maker_bps"] = maker_spread_cost
+            self._maker_taker_share_raw["spread_cost_taker_bps"] = taker_spread_cost
 
         def _normalise_section(
             block: Any, cfg_cls: Optional[type]
@@ -1008,6 +1067,19 @@ class SlippageImpl:
     def dynamic_profile(self) -> Optional[_DynamicSpreadProfile]:
         return self._dynamic_profile
 
+    def _consume_trade_cost_meta(self) -> Dict[str, Any]:
+        meta = dict(self._last_trade_cost_meta)
+        self._last_trade_cost_meta = {}
+        return meta
+
+    def _get_maker_taker_share_info(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self._maker_taker_share_enabled),
+            "maker_share": float(self._maker_share_default),
+            "spread_cost_maker_bps": float(self._spread_cost_maker_bps_default),
+            "spread_cost_taker_bps": float(self._spread_cost_taker_bps_default),
+        }
+
     def attach_to(self, sim) -> None:
         prev_symbol = self._symbol
         try:
@@ -1050,6 +1122,22 @@ class SlippageImpl:
             setattr(sim, "_slippage_get_trade_cost", self.get_trade_cost_bps)
         except Exception:
             logger.exception("Failed to attach get_trade_cost_bps to simulator")
+        try:
+            setattr(
+                sim,
+                "_slippage_consume_trade_cost_meta",
+                self._consume_trade_cost_meta,
+            )
+        except Exception:
+            logger.exception("Failed to attach trade cost meta consumer to simulator")
+        try:
+            setattr(
+                sim,
+                "_slippage_get_maker_taker_share_info",
+                self._get_maker_taker_share_info,
+            )
+        except Exception:
+            logger.exception("Failed to attach maker/taker share info provider")
         if self._cfg_obj is not None:
             try:
                 setattr(self._cfg_obj, "get_trade_cost_bps", self.get_trade_cost_bps)
@@ -1482,4 +1570,39 @@ class SlippageImpl:
             total_cost = base_cost
         if total_cost < 0.0:
             total_cost = 0.0
+        taker_cost = float(total_cost)
+        if self._maker_taker_share_enabled:
+            share_metric: Any = None
+            maker_cost_metric: Any = None
+            taker_cost_metric: Any = None
+            if metrics:
+                share_metric = _lookup_metric(metrics, "maker_share")
+                if share_metric is None:
+                    share_metric = metrics.get("maker_share_default")
+                maker_cost_metric = _lookup_metric(metrics, "spread_cost_maker_bps")
+                taker_cost_metric = _lookup_metric(metrics, "spread_cost_taker_bps")
+            share_value = _safe_share_value(share_metric, self._maker_share_default)
+            maker_cost = _safe_non_negative_float(
+                maker_cost_metric, self._spread_cost_maker_bps_default
+            )
+            taker_cost_effective = _safe_non_negative_float(
+                taker_cost_metric, taker_cost
+            )
+            expected_spread = (
+                share_value * maker_cost + (1.0 - share_value) * taker_cost_effective
+            )
+            if not math.isfinite(expected_spread):
+                expected_spread = taker_cost_effective
+            if expected_spread < 0.0:
+                expected_spread = 0.0
+            trade_meta = {
+                "maker_share": float(share_value),
+                "spread_cost_maker_bps": float(maker_cost),
+                "spread_cost_taker_bps": float(taker_cost_effective),
+                "taker_spread_bps": float(taker_cost_effective),
+                "expected_spread_bps": float(expected_spread),
+            }
+            self._last_trade_cost_meta = trade_meta
+        else:
+            self._last_trade_cost_meta = {}
         return float(total_cost)
