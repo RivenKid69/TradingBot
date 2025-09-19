@@ -21,6 +21,10 @@ slippage:
     smoothing_alpha: null    # EMA-сглаживание [0,1]; null → без сглаживания.
     vol_metric: null         # Имя метрики волатильности (например, "sigma").
     vol_window: null         # Окно (в барах) для метрики волатильности.
+    fallback_spread_bps: null  # Фолбек-спред (bps), если нет входных данных; null → используем default_spread_bps.
+    refresh_warn_days: null  # Предупреждать, если профиль старше указанного числа дней; null → без проверки.
+    refresh_fail_days: null  # Ошибку, если профиль старше указанного числа дней; null → без проверки.
+    refresh_on_start: false  # true → принудительно пересчитать профиль при запуске (если поддерживается).
     profile_kind: hourly     # Имя профиля в seasonal-файле.
     multipliers: []          # Inline-мультипликаторы (168 значений для часа недели).
     path: null               # Путь к базовому seasonal JSON/YAML.
@@ -28,6 +32,8 @@ slippage:
     hash: null               # Опциональная контрольная сумма base-профиля.
     use_volatility: false    # Легаси-переключатель; оставьте false, если используете beta_coef.
     gamma: 0.0               # Дополнительная экспонента на seasonal multiplier.
+    zscore_clip: null        # Клип на z-score при нормализации волатильности; null → без клипа.
+    last_refresh_ts: null    # Метка времени (мс) последнего обновления профиля; обслуживается автоматикой.
 
   # --- Динамический impact (корректировка k) ---
   dynamic_impact:

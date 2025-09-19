@@ -14,7 +14,7 @@
     - [Example notebook](docs/seasonality_example.md)
     - [Migration guide](docs/seasonality_migration.md)
 - **Dynamic spread builder**: Added `scripts/build_spread_seasonality.py` for generating
-  hour-of-week spread profiles consumed by `slippage.dynamic_spread`. The script
+  hour-of-week spread profiles consumed by `slippage.dynamic`. The script
   supports custom output paths, rolling windows and warns when the source
   snapshot exceeds the configured `refresh_warn_days` threshold.
 

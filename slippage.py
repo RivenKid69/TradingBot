@@ -40,7 +40,9 @@ class DynamicSpreadConfig:
         multipliers_raw = d.get("multipliers")
         multipliers: Optional[tuple[float, ...]] = None
         if multipliers_raw is not None:
-            if isinstance(multipliers_raw, Sequence) and not isinstance(multipliers_raw, (str, bytes, bytearray)):
+            if isinstance(multipliers_raw, Sequence) and not isinstance(
+                multipliers_raw, (str, bytes, bytearray)
+            ):
                 multipliers = tuple(float(x) for x in multipliers_raw)
             else:
                 try:
@@ -79,18 +81,16 @@ class DynamicSpreadConfig:
 
         extra = {k: v for k, v in d.items() if k not in known_keys}
 
-        alpha_bps_val = d.get("alpha_bps")
-        if alpha_bps_val is None:
-            alpha_bps_val = d.get("alpha")
-        beta_coef_val = d.get("beta_coef")
-        if beta_coef_val is None:
-            beta_coef_val = d.get("beta")
-        vol_metric_val = d.get("vol_metric")
-        if vol_metric_val is None:
-            vol_metric_val = d.get("volatility_metric")
-        vol_window_val = d.get("vol_window")
-        if vol_window_val is None:
-            vol_window_val = d.get("volatility_window")
+        def _first_non_null(*keys: str) -> Any:
+            for key in keys:
+                if key in d and d[key] is not None:
+                    return d[key]
+            return None
+
+        alpha_bps_val = _first_non_null("alpha_bps", "alpha")
+        beta_coef_val = _first_non_null("beta_coef", "beta")
+        vol_metric_val = _first_non_null("vol_metric", "volatility_metric")
+        vol_window_val = _first_non_null("vol_window", "volatility_window")
 
         return cls(
             enabled=bool(d.get("enabled", False)),

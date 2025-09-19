@@ -85,6 +85,10 @@ slippage:
     smoothing_alpha: null    # Опциональная EMA-сглаживание [0,1]; null оставляет спред без сглаживания.
     vol_metric: null         # Имя метрики волатильности (например, "sigma") для beta_coef; null = по умолчанию.
     vol_window: null         # Окно (в барах) для vol_metric; null = используем источник данных.
+    fallback_spread_bps: null  # Фолбек-спред (bps), когда нет данных; null → используем default_spread_bps.
+    refresh_warn_days: null  # Предупреждать, если профиль сезонности устарел; null → без проверки.
+    refresh_fail_days: null  # Прерывать выполнение при сильно устаревшем профиле; null → без проверки.
+    refresh_on_start: false  # Принудительно обновлять профиль при старте (если поддерживается).
     profile_kind: hourly
     multipliers: []          # 168 нормированных коэффициентов (например, со средним 1.0)
     path: null               # Опционально: путь к JSON-профилю (см. data/slippage/hourly_profile.sample.json)
@@ -92,6 +96,8 @@ slippage:
     hash: null               # Опциональный SHA256 от базового профиля для контроля целостности.
     use_volatility: false    # Легаси-переключатель; оставьте false, если используете beta_coef.
     gamma: 0.0
+    zscore_clip: null        # Z-score клип при нормализации волатильности; null → без клипа.
+    last_refresh_ts: null    # Последняя отметка обновления профиля (мс); заполняется автообновлением.
   dynamic_impact:
     enabled: false           # Включить масштабирование коэффициента impact (k) по рыночным условиям.
     beta_vol: 0.0            # Линейный коэффициент на нормализованную волатильность; 0.0 = отключено.
