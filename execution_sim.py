@@ -318,6 +318,9 @@ class ExecTrade:
     latency_spike: bool = False
     tif: str = "GTC"
     ttl_steps: int = 0
+    status: str = "FILLED"
+    used_base_before: float = 0.0
+    used_base_after: float = 0.0
 
 
 @dataclass
@@ -581,6 +584,8 @@ class ExecutionSimulator:
         self._bar_cap_base_loaded_ts: Optional[int] = None
         self._bar_cap_base_meta: Dict[str, Any] = {}
         self._bar_cap_base_warned_symbols: set[str] = set()
+        self._used_base_in_bar: dict[str, float] = {}
+        self._capacity_bar_ts: Optional[int] = None
         self.run_id: str = str(getattr(run_config, "run_id", "sim") or "sim")
         self.step_ms: int = (
             int(getattr(run_config, "step_ms", 1000))
@@ -1803,6 +1808,34 @@ class ExecutionSimulator:
         if capacity_per_bar < 0.0:
             capacity_per_bar = 0.0
         return capacity_per_bar
+
+    def _reset_bar_capacity_if_needed(self, ts_ms: int) -> float:
+        try:
+            ts_val = int(ts_ms)
+        except (TypeError, ValueError):
+            ts_val = int(now_ms())
+        timeframe = self._resolve_intrabar_timeframe(ts_val)
+        if timeframe <= 0:
+            timeframe = 1
+        try:
+            bar_start = (ts_val // timeframe) * timeframe
+        except Exception:
+            bar_start = ts_val
+        if self._capacity_bar_ts is None or bar_start != self._capacity_bar_ts:
+            self._capacity_bar_ts = bar_start
+            self._used_base_in_bar = {}
+        cap = self._resolve_cap_base_per_bar(self.symbol, timeframe)
+        if cap is None:
+            return 0.0
+        try:
+            cap_float = float(cap)
+        except (TypeError, ValueError):
+            cap_float = 0.0
+        if not math.isfinite(cap_float):
+            cap_float = 0.0
+        if cap_float < 0.0:
+            cap_float = 0.0
+        return cap_float
 
     def _resolve_adv_bars_per_day(self, timeframe_ms: Optional[int]) -> Optional[float]:
         override = self._adv_bars_per_day_override
@@ -3727,12 +3760,82 @@ class ExecutionSimulator:
                     risk_events_local.extend(self.risk.pop_events())
                     if risk_events_local:
                         risk_events_buffer.extend(risk_events_local)
-                    qty_total = float(adj_qty)
-                    if qty_total <= 0.0:
-                        _cancel(p.client_order_id)
-                        # накопим события риска
-                        # (дальше они будут добавлены к отчёту)
+                qty_total = float(adj_qty)
+                if qty_total <= 0.0:
+                    _cancel(p.client_order_id)
+                    # накопим события риска
+                    # (дальше они будут добавлены к отчёту)
+                    continue
+
+                cap_base_per_bar = self._reset_bar_capacity_if_needed(ts)
+                cap_enforced = bool(
+                    self._bar_cap_base_enabled and cap_base_per_bar > 0.0
+                )
+                symbol_key = str(self.symbol).upper() if self.symbol is not None else ""
+                used_base_now = max(
+                    0.0, float(self._used_base_in_bar.get(symbol_key, 0.0))
+                )
+                if cap_enforced:
+                    remaining_total = max(0.0, cap_base_per_bar - used_base_now)
+                    if remaining_total <= 0.0:
+                        cid_int = int(p.client_order_id)
+                        if cid_int not in cancelled_ids:
+                            _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
+                        else:
+                            cancelled_reasons[cid_int] = "BAR_CAPACITY_BASE"
+                        trade = ExecTrade(
+                            ts=ts,
+                            side=side,
+                            price=float(ref_market),
+                            qty=0.0,
+                            notional=0.0,
+                            liquidity="taker",
+                            proto_type=atype,
+                            client_order_id=int(p.client_order_id),
+                            slippage_bps=0.0,
+                            spread_bps=self._report_spread_bps(self._last_spread_bps),
+                            latency_ms=int(p.lat_ms),
+                            latency_spike=bool(p.spike),
+                            tif=tif,
+                            ttl_steps=ttl_steps,
+                            status="CANCELED",
+                            used_base_before=used_base_now,
+                            used_base_after=used_base_now,
+                        )
+                        trades.append(trade)
+                        self._trade_log.append(trade)
                         continue
+                    qty_total = min(qty_total, remaining_total)
+                    if qty_total <= 0.0:
+                        cid_int = int(p.client_order_id)
+                        if cid_int not in cancelled_ids:
+                            _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
+                        else:
+                            cancelled_reasons[cid_int] = "BAR_CAPACITY_BASE"
+                        trade = ExecTrade(
+                            ts=ts,
+                            side=side,
+                            price=float(ref_market),
+                            qty=0.0,
+                            notional=0.0,
+                            liquidity="taker",
+                            proto_type=atype,
+                            client_order_id=int(p.client_order_id),
+                            slippage_bps=0.0,
+                            spread_bps=self._report_spread_bps(self._last_spread_bps),
+                            latency_ms=int(p.lat_ms),
+                            latency_spike=bool(p.spike),
+                            tif=tif,
+                            ttl_steps=ttl_steps,
+                            status="CANCELED",
+                            used_base_before=used_base_now,
+                            used_base_after=used_base_now,
+                        )
+                        trades.append(trade)
+                        self._trade_log.append(trade)
+                        continue
+                else:
+                    cap_base_per_bar = 0.0
 
                 # планирование ребёнков (intra-bar)
                 notional = abs(qty_total) * float(ref_market)
@@ -3845,13 +3948,87 @@ class ExecutionSimulator:
                         self.risk.on_new_order(ts_fill)
 
                     # квантайзер и minNotional для ребёнка
-                    if self.quantizer is not None:
-                        q_child = self.quantizer.quantize_qty(self.symbol, q_child)
-                        q_child = self.quantizer.clamp_notional(
-                            self.symbol, ref_child_price, q_child
+                    used_base_before_child = max(
+                        0.0, float(self._used_base_in_bar.get(symbol_key, 0.0))
+                    )
+                    if cap_enforced:
+                        remaining_base = max(
+                            0.0, cap_base_per_bar - used_base_before_child
                         )
-                        if q_child <= 0.0:
-                            continue
+                        fill_qty_base = min(q_child, remaining_base)
+                    else:
+                        remaining_base = float("inf")
+                        fill_qty_base = q_child
+
+                    if self.quantizer is not None:
+                        fill_qty_base = self.quantizer.quantize_qty(
+                            self.symbol, fill_qty_base
+                        )
+                        if cap_enforced and fill_qty_base > remaining_base + 1e-12:
+                            alt_qty = self.quantizer.quantize_qty(
+                                self.symbol, max(0.0, remaining_base)
+                            )
+                            if alt_qty <= remaining_base + 1e-12:
+                                fill_qty_base = alt_qty
+                            else:
+                                fill_qty_base = 0.0
+                        if fill_qty_base > 0.0:
+                            fill_qty_base = self.quantizer.clamp_notional(
+                                self.symbol, ref_child_price, fill_qty_base
+                            )
+                            if cap_enforced and fill_qty_base > remaining_base + 1e-12:
+                                alt_qty = self.quantizer.quantize_qty(
+                                    self.symbol, max(0.0, remaining_base)
+                                )
+                                if alt_qty > 0.0:
+                                    alt_qty = self.quantizer.clamp_notional(
+                                        self.symbol, ref_child_price, alt_qty
+                                    )
+                                if alt_qty <= remaining_base + 1e-12:
+                                    fill_qty_base = alt_qty
+                                else:
+                                    fill_qty_base = 0.0
+                    elif cap_enforced:
+                        fill_qty_base = min(fill_qty_base, remaining_base)
+
+                    if cap_enforced and fill_qty_base <= 0.0:
+                        ts_zero = int(base_ts + lat_ms)
+                        cid_int = int(p.client_order_id)
+                        if cid_int not in cancelled_ids:
+                            _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
+                        else:
+                            cancelled_reasons[cid_int] = "BAR_CAPACITY_BASE"
+                        used_before = used_base_before_child
+                        trade = ExecTrade(
+                            ts=ts_zero,
+                            side=side,
+                            price=float(ref_child_price),
+                            qty=0.0,
+                            notional=0.0,
+                            liquidity="taker",
+                            proto_type=atype,
+                            client_order_id=int(p.client_order_id),
+                            slippage_bps=0.0,
+                            spread_bps=self._report_spread_bps(self._last_spread_bps),
+                            latency_ms=int(p.lat_ms),
+                            latency_spike=bool(p.spike),
+                            tif=tif,
+                            ttl_steps=ttl_steps,
+                            status="CANCELED",
+                            used_base_before=used_before,
+                            used_base_after=used_before,
+                        )
+                        trades.append(trade)
+                        self._trade_log.append(trade)
+                        continue
+
+                    q_child = float(fill_qty_base)
+                    if q_child <= 0.0:
+                        continue
+
+                    used_base_after_child = max(0.0, used_base_before_child + q_child)
+                    self._used_base_in_bar[symbol_key] = used_base_after_child
+
                     # базовая котировка
                     if VWAPExecutor is not None and isinstance(executor, VWAPExecutor):
                         self._vwap_on_tick(ts_fill, None, None)
@@ -4016,6 +4193,8 @@ class ExecutionSimulator:
                         latency_spike=bool(p.spike),
                         tif=tif,
                         ttl_steps=ttl_steps,
+                        used_base_before=used_base_before_child,
+                        used_base_after=used_base_after_child,
                     )
                     trades.append(trade)
                     self._trade_log.append(trade)
@@ -4665,6 +4844,74 @@ class ExecutionSimulator:
                         _cancel(cli_id)
                         continue
 
+                cap_base_per_bar = self._reset_bar_capacity_if_needed(ts)
+                cap_enforced = bool(
+                    self._bar_cap_base_enabled and cap_base_per_bar > 0.0
+                )
+                symbol_key = str(self.symbol).upper() if self.symbol is not None else ""
+                used_base_now = max(
+                    0.0, float(self._used_base_in_bar.get(symbol_key, 0.0))
+                )
+                if cap_enforced:
+                    remaining_total = max(0.0, cap_base_per_bar - used_base_now)
+                    if remaining_total <= 0.0:
+                        if cli_id not in cancelled_ids:
+                            _cancel(cli_id, "BAR_CAPACITY_BASE")
+                        else:
+                            cancelled_reasons[int(cli_id)] = "BAR_CAPACITY_BASE"
+                        trade = ExecTrade(
+                            ts=ts,
+                            side=side,
+                            price=float(ref_market),
+                            qty=0.0,
+                            notional=0.0,
+                            liquidity="taker",
+                            proto_type=getattr(atype, "value", 0),
+                            client_order_id=int(cli_id),
+                            slippage_bps=0.0,
+                            spread_bps=self._report_spread_bps(self._last_spread_bps),
+                            latency_ms=0,
+                            latency_spike=False,
+                            tif=tif,
+                            ttl_steps=ttl_steps,
+                            status="CANCELED",
+                            used_base_before=used_base_now,
+                            used_base_after=used_base_now,
+                        )
+                        trades.append(trade)
+                        self._trade_log.append(trade)
+                        continue
+                    qty_total = min(qty_total, remaining_total)
+                    if qty_total <= 0.0:
+                        if cli_id not in cancelled_ids:
+                            _cancel(cli_id, "BAR_CAPACITY_BASE")
+                        else:
+                            cancelled_reasons[int(cli_id)] = "BAR_CAPACITY_BASE"
+                        trade = ExecTrade(
+                            ts=ts,
+                            side=side,
+                            price=float(ref_market),
+                            qty=0.0,
+                            notional=0.0,
+                            liquidity="taker",
+                            proto_type=getattr(atype, "value", 0),
+                            client_order_id=int(cli_id),
+                            slippage_bps=0.0,
+                            spread_bps=self._report_spread_bps(self._last_spread_bps),
+                            latency_ms=0,
+                            latency_spike=False,
+                            tif=tif,
+                            ttl_steps=ttl_steps,
+                            status="CANCELED",
+                            used_base_before=used_base_now,
+                            used_base_after=used_base_now,
+                        )
+                        trades.append(trade)
+                        self._trade_log.append(trade)
+                        continue
+                else:
+                    cap_base_per_bar = 0.0
+
                 # планирование исполнения
                 executor = (
                     self._executor if self._executor is not None else TakerExecutor()
@@ -4774,13 +5021,85 @@ class ExecutionSimulator:
                     intrabar_base_price = ref_child_price
 
                     # квантайзер и minNotional
-                    if self.quantizer is not None:
-                        q_child = self.quantizer.quantize_qty(self.symbol, q_child)
-                        q_child = self.quantizer.clamp_notional(
-                            self.symbol, ref_child_price, q_child
+                    used_base_before_child = max(
+                        0.0, float(self._used_base_in_bar.get(symbol_key, 0.0))
+                    )
+                    if cap_enforced:
+                        remaining_base = max(
+                            0.0, cap_base_per_bar - used_base_before_child
                         )
-                        if q_child <= 0.0:
-                            continue
+                        fill_qty_base = min(q_child, remaining_base)
+                    else:
+                        remaining_base = float("inf")
+                        fill_qty_base = q_child
+
+                    if self.quantizer is not None:
+                        fill_qty_base = self.quantizer.quantize_qty(
+                            self.symbol, fill_qty_base
+                        )
+                        if cap_enforced and fill_qty_base > remaining_base + 1e-12:
+                            alt_qty = self.quantizer.quantize_qty(
+                                self.symbol, max(0.0, remaining_base)
+                            )
+                            if alt_qty <= remaining_base + 1e-12:
+                                fill_qty_base = alt_qty
+                            else:
+                                fill_qty_base = 0.0
+                        if fill_qty_base > 0.0:
+                            fill_qty_base = self.quantizer.clamp_notional(
+                                self.symbol, ref_child_price, fill_qty_base
+                            )
+                            if cap_enforced and fill_qty_base > remaining_base + 1e-12:
+                                alt_qty = self.quantizer.quantize_qty(
+                                    self.symbol, max(0.0, remaining_base)
+                                )
+                                if alt_qty > 0.0:
+                                    alt_qty = self.quantizer.clamp_notional(
+                                        self.symbol, ref_child_price, alt_qty
+                                    )
+                                if alt_qty <= remaining_base + 1e-12:
+                                    fill_qty_base = alt_qty
+                                else:
+                                    fill_qty_base = 0.0
+                    elif cap_enforced:
+                        fill_qty_base = min(fill_qty_base, remaining_base)
+
+                    if cap_enforced and fill_qty_base <= 0.0:
+                        ts_zero = int(base_ts + lat_ms)
+                        if cli_id not in cancelled_ids:
+                            _cancel(cli_id, "BAR_CAPACITY_BASE")
+                        else:
+                            cancelled_reasons[int(cli_id)] = "BAR_CAPACITY_BASE"
+                        used_before = used_base_before_child
+                        trade = ExecTrade(
+                            ts=ts_zero,
+                            side=side,
+                            price=float(ref_child_price),
+                            qty=0.0,
+                            notional=0.0,
+                            liquidity="taker",
+                            proto_type=getattr(atype, "value", 0),
+                            client_order_id=int(cli_id),
+                            slippage_bps=0.0,
+                            spread_bps=self._report_spread_bps(self._last_spread_bps),
+                            latency_ms=int(lat_ms),
+                            latency_spike=bool(lat_spike),
+                            tif=tif,
+                            ttl_steps=ttl_steps,
+                            status="CANCELED",
+                            used_base_before=used_before,
+                            used_base_after=used_before,
+                        )
+                        trades.append(trade)
+                        self._trade_log.append(trade)
+                        continue
+
+                    q_child = float(fill_qty_base)
+                    if q_child <= 0.0:
+                        continue
+
+                    used_base_after_child = max(0.0, used_base_before_child + q_child)
+                    self._used_base_in_bar[symbol_key] = used_base_after_child
 
                     ts_fill = int(base_ts + lat_ms)
                     # цена исполнения
@@ -4927,6 +5246,8 @@ class ExecutionSimulator:
                         latency_spike=bool(lat_spike),
                         tif=tif,
                         ttl_steps=ttl_steps,
+                        used_base_before=used_base_before_child,
+                        used_base_after=used_base_after_child,
                     )
                     trades.append(trade)
                     self._trade_log.append(trade)
