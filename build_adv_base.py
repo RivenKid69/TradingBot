@@ -635,6 +635,26 @@ def fetch_klines_for_symbols(
     return datasets
 
 
+def aggregate_daily_base_volume(df: pd.DataFrame) -> pd.Series:
+    """Aggregate base asset volumes to daily totals."""
+
+    if df.empty or "ts_ms" not in df.columns or "volume" not in df.columns:
+        return pd.Series(dtype="float64")
+
+    ts_numeric = pd.to_numeric(df["ts_ms"], errors="coerce")
+    base_series = pd.to_numeric(df["volume"], errors="coerce").astype("float64")
+
+    mask = ts_numeric.notna() & base_series.notna()
+    if not mask.any():
+        return pd.Series(dtype="float64")
+
+    buckets = pd.to_datetime(ts_numeric[mask], unit="ms", utc=True).dt.floor("D")
+    grouped = base_series[mask].groupby(buckets).sum(min_count=1)
+    if grouped.empty:
+        return pd.Series(dtype="float64")
+    return grouped.sort_index()
+
+
 def aggregate_daily_quote_volume(df: pd.DataFrame) -> pd.Series:
     """Aggregate quote asset volumes to daily totals.
 
@@ -671,19 +691,15 @@ def aggregate_daily_quote_volume(df: pd.DataFrame) -> pd.Series:
     return grouped
 
 
-def compute_adv_quote(
-    daily_quote_volume: pd.Series,
+def _compute_adv_from_series(
+    daily_volume: pd.Series,
     *,
     window_days: int,
     min_days: int = 1,
     min_total_days: int | None = None,
     clip_percentiles: tuple[float, float] | None = None,
 ) -> tuple[float | None, int, int]:
-    """Compute average daily quote volume over the specified window.
-
-    Returns a tuple ``(adv_quote, used_days, total_days)`` where
-    ``adv_quote`` is ``None`` if insufficient data is available.
-    """
+    """Compute average daily volume over the specified window."""
 
     window = max(1, int(window_days))
     minimum = max(1, int(min_days))
@@ -691,10 +707,10 @@ def compute_adv_quote(
     if total_minimum < 0:
         total_minimum = 0
 
-    if daily_quote_volume.empty:
+    if daily_volume.empty:
         return None, 0, 0
 
-    numeric = pd.to_numeric(daily_quote_volume, errors="coerce")
+    numeric = pd.to_numeric(daily_volume, errors="coerce")
     series = numeric.dropna().astype("float64")
     series = series[series > 0.0].sort_index()
     total_days = int(len(series))
@@ -735,12 +751,52 @@ def compute_adv_quote(
     return adv_value, used_days, total_days
 
 
+def compute_adv_quote(
+    daily_quote_volume: pd.Series,
+    *,
+    window_days: int,
+    min_days: int = 1,
+    min_total_days: int | None = None,
+    clip_percentiles: tuple[float, float] | None = None,
+) -> tuple[float | None, int, int]:
+    """Compute average daily quote volume over the specified window."""
+
+    return _compute_adv_from_series(
+        daily_quote_volume,
+        window_days=window_days,
+        min_days=min_days,
+        min_total_days=min_total_days,
+        clip_percentiles=clip_percentiles,
+    )
+
+
+def compute_adv_base(
+    daily_base_volume: pd.Series,
+    *,
+    window_days: int,
+    min_days: int = 1,
+    min_total_days: int | None = None,
+    clip_percentiles: tuple[float, float] | None = None,
+) -> tuple[float | None, int, int]:
+    """Compute average daily base volume over the specified window."""
+
+    return _compute_adv_from_series(
+        daily_base_volume,
+        window_days=window_days,
+        min_days=min_days,
+        min_total_days=min_total_days,
+        clip_percentiles=clip_percentiles,
+    )
+
+
 __all__ = [
     "BuildAdvConfig",
     "BuildAdvResult",
     "FetchTask",
+    "aggregate_daily_base_volume",
     "aggregate_daily_quote_volume",
     "build_adv",
+    "compute_adv_base",
     "compute_adv_quote",
     "fetch_klines_for_symbols",
 ]
