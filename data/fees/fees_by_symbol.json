@@ -1,0 +1,38 @@
+{
+  "metadata": {
+    "built_at": "2025-09-19T17:59:31Z",
+    "source": "Binance spot fee schedule retrieved via public docs",
+    "vip_tier": "VIP 0",
+    "schema_version": 1
+  },
+  "fees": {
+    "BTCUSDT": {
+      "maker_bps": 10,
+      "taker_bps": 10,
+      "fee_rounding_step_bps": 0.1,
+      "bnb_discount_bps": 7.5
+    },
+    "ETHUSDT": {
+      "maker_bps": 10,
+      "taker_bps": 10,
+      "bnb_discount_bps": 7.5
+    },
+    "BNBUSDT": {
+      "maker_bps": 9,
+      "taker_bps": 9,
+      "fee_rounding_step_bps": 0.1,
+      "bnb_discount_bps": 6.75
+    },
+    "ADAUSDT": {
+      "maker_bps": 10,
+      "taker_bps": 12,
+      "fee_rounding_step_bps": 0.05,
+      "bnb_discount_bps": 9
+    },
+    "SOLUSDT": {
+      "maker_bps": 8,
+      "taker_bps": 10,
+      "bnb_discount_bps": 7.5
+    }
+  }
+}
