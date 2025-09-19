@@ -441,6 +441,7 @@ class _TradeCostResult:
     base_price: Optional[float]
     inputs: Dict[str, Any] = field(default_factory=dict)
     metrics: Dict[str, Any] = field(default_factory=dict)
+    expected_spread_bps: Optional[float] = None
     latency_timeout_ratio: float = 0.0
     execution_profile: str = ""
     vol_raw: Optional[Dict[str, float]] = None
@@ -864,6 +865,11 @@ class ExecutionSimulator:
             self._maker_taker_share_enabled = False
             self._expected_fee_bps = 0.0
             self._expected_maker_share = 0.0
+
+        self._slippage_share_enabled: bool = False
+        self._slippage_share_default: float = 0.0
+        self._slippage_spread_cost_maker_bps: float = 0.0
+        self._slippage_spread_cost_taker_bps: float = 0.0
 
         self.funding = (
             FundingCalculator(**(funding_config or {"enabled": False}))
@@ -2257,6 +2263,101 @@ class ExecutionSimulator:
                 return None, dict(attempted)
         return None, dict(attempted)
 
+    @staticmethod
+    def _trade_cost_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(num):
+            return None
+        return num
+
+    @staticmethod
+    def _trade_cost_non_negative(value: Any, default: float = 0.0) -> float:
+        candidate = ExecutionSimulator._trade_cost_float(value)
+        if candidate is None:
+            candidate = float(default)
+        if candidate < 0.0:
+            candidate = 0.0
+        return float(candidate)
+
+    @staticmethod
+    def _trade_cost_share(value: Any, default: float = 0.0) -> float:
+        candidate = ExecutionSimulator._trade_cost_float(value)
+        if candidate is None:
+            candidate = float(default)
+        if candidate < 0.0:
+            candidate = 0.0
+        elif candidate > 1.0:
+            candidate = 1.0
+        return float(candidate)
+
+    def _refresh_slippage_share_info(self) -> None:
+        getter = getattr(self, "_slippage_get_maker_taker_share_info", None)
+        if not callable(getter):
+            return
+        try:
+            payload = getter()
+        except Exception:
+            return
+        if not isinstance(payload, Mapping):
+            return
+        enabled = bool(payload.get("enabled", self._slippage_share_enabled))
+        maker_share = self._trade_cost_share(
+            payload.get("maker_share"), self._slippage_share_default
+        )
+        maker_cost = self._trade_cost_non_negative(
+            payload.get("spread_cost_maker_bps"), self._slippage_spread_cost_maker_bps
+        )
+        taker_cost = self._trade_cost_non_negative(
+            payload.get("spread_cost_taker_bps"), self._slippage_spread_cost_taker_bps
+        )
+        self._slippage_share_enabled = enabled
+        self._slippage_share_default = maker_share
+        self._slippage_spread_cost_maker_bps = maker_cost
+        self._slippage_spread_cost_taker_bps = taker_cost
+
+    def _blend_expected_spread(
+        self,
+        *,
+        taker_bps: Optional[float],
+        maker_bps: Optional[float] = None,
+        maker_share: Optional[float] = None,
+    ) -> Optional[float]:
+        self._refresh_slippage_share_info()
+        taker_val = self._trade_cost_float(taker_bps)
+        if taker_val is None:
+            taker_val = self._trade_cost_float(self._slippage_spread_cost_taker_bps)
+        if taker_val is None:
+            return None
+        taker_val = max(0.0, float(taker_val))
+        if not self._slippage_share_enabled:
+            return taker_val
+        share_val = self._trade_cost_share(maker_share, self._slippage_share_default)
+        maker_val = self._trade_cost_non_negative(
+            maker_bps, self._slippage_spread_cost_maker_bps
+        )
+        expected = share_val * maker_val + (1.0 - share_val) * taker_val
+        if not math.isfinite(expected):
+            expected = taker_val
+        if expected < 0.0:
+            expected = 0.0
+        return float(expected)
+
+    def _trade_cost_expected_bps(self, trade_cost: _TradeCostResult) -> float:
+        expected = self._trade_cost_float(getattr(trade_cost, "expected_spread_bps", None))
+        if expected is None and trade_cost.metrics:
+            expected = self._trade_cost_float(trade_cost.metrics.get("expected_spread_bps"))
+        taker = self._trade_cost_float(trade_cost.bps)
+        if expected is None:
+            expected = taker
+        if expected is None:
+            return 0.0
+        return max(0.0, float(expected))
+
     def _compute_dynamic_trade_cost_bps(
         self,
         *,
@@ -2406,12 +2507,65 @@ class ExecutionSimulator:
                 safe_inputs[key] = float(val)
             except (TypeError, ValueError):
                 safe_inputs[key] = val
+        self._refresh_slippage_share_info()
+        metrics_out: Dict[str, Any] = dict(metrics_payload)
+        taker_metric = max(0.0, float(value))
+        metrics_out["taker_spread_bps"] = taker_metric
+        metrics_out["spread_cost_taker_bps"] = taker_metric
+        expected_spread_bps: Optional[float] = None
+        meta_payload: Optional[Mapping[str, Any]] = None
+        meta_getter = getattr(self, "_slippage_consume_trade_cost_meta", None)
+        if callable(meta_getter):
+            try:
+                meta_candidate = meta_getter()
+            except Exception:
+                meta_candidate = None
+            if isinstance(meta_candidate, Mapping):
+                meta_payload = dict(meta_candidate)
+        if meta_payload:
+            share_override = meta_payload.get("maker_share")
+            maker_override = meta_payload.get("spread_cost_maker_bps")
+            taker_override = meta_payload.get("spread_cost_taker_bps")
+            expected_override = meta_payload.get("expected_spread_bps")
+            taker_override_val = self._trade_cost_float(taker_override)
+            if taker_override_val is not None:
+                taker_metric = max(0.0, taker_override_val)
+                metrics_out["taker_spread_bps"] = taker_metric
+                metrics_out["spread_cost_taker_bps"] = taker_metric
+            maker_cost_val = self._trade_cost_non_negative(
+                maker_override, self._slippage_spread_cost_maker_bps
+            )
+            metrics_out["spread_cost_maker_bps"] = maker_cost_val
+            share_val = self._trade_cost_share(
+                share_override, self._slippage_share_default
+            )
+            if share_override is not None or self._slippage_share_enabled:
+                metrics_out["maker_share"] = share_val
+            expected_override_val = self._trade_cost_float(expected_override)
+            if expected_override_val is not None:
+                expected_spread_bps = max(0.0, expected_override_val)
+            else:
+                expected_spread_bps = self._blend_expected_spread(
+                    taker_bps=taker_metric,
+                    maker_bps=maker_override,
+                    maker_share=share_override,
+                )
+        if expected_spread_bps is None:
+            expected_spread_bps = self._blend_expected_spread(taker_bps=taker_metric)
+        if expected_spread_bps is None:
+            expected_spread_bps = taker_metric
+        if self._slippage_share_enabled and "maker_share" not in metrics_out:
+            metrics_out["maker_share"] = self._slippage_share_default
+        if self._slippage_share_enabled and "spread_cost_maker_bps" not in metrics_out:
+            metrics_out["spread_cost_maker_bps"] = self._slippage_spread_cost_maker_bps
+        metrics_out["expected_spread_bps"] = float(expected_spread_bps)
         return _TradeCostResult(
             bps=float(value),
             mid=mid_out,
             base_price=base_val,
             inputs=safe_inputs,
-            metrics=metrics_payload,
+            metrics=metrics_out,
+            expected_spread_bps=float(expected_spread_bps),
         )
 
     def _apply_trade_cost_price(
@@ -2437,9 +2591,12 @@ class ExecutionSimulator:
                     mid_val = None
         if mid_val is None or not math.isfinite(mid_val) or mid_val <= 0.0:
             return float(pre_slip_price)
+        expected_bps = self._trade_cost_expected_bps(trade_cost)
         try:
-            cost_fraction = float(trade_cost.bps) / 1e4
+            cost_fraction = float(expected_bps) / 1e4
         except (TypeError, ValueError):
+            return float(pre_slip_price)
+        if not math.isfinite(cost_fraction):
             return float(pre_slip_price)
         side_key = str(side).upper()
         if side_key == "BUY":
@@ -2547,6 +2704,7 @@ class ExecutionSimulator:
             "final_price": float(final_price),
             "inputs": trade_cost.inputs,
         }
+        payload["expected_bps"] = self._trade_cost_expected_bps(trade_cost)
         if trade_cost.metrics:
             payload["metrics"] = trade_cost.metrics
         logger.debug("trade_cost %s", payload)
@@ -4414,7 +4572,7 @@ class ExecutionSimulator:
                                 cfg=self.slippage_cfg,
                             )
                     if trade_cost is not None:
-                        slip_bps = float(trade_cost.bps)
+                        slip_bps = self._trade_cost_expected_bps(trade_cost)
                         new_price = self._apply_trade_cost_price(
                             side=side,
                             pre_slip_price=pre_slip_price,
@@ -4430,10 +4588,13 @@ class ExecutionSimulator:
                             trade_cost=trade_cost,
                         )
                     elif fallback_slip is not None:
-                        try:
-                            slip_bps = float(fallback_slip)
-                        except (TypeError, ValueError):
+                        blended = self._blend_expected_spread(
+                            taker_bps=fallback_slip
+                        )
+                        if blended is None:
                             slip_bps = 0.0
+                        else:
+                            slip_bps = float(blended)
                         if apply_slippage_price is not None:
                             filled_price = apply_slippage_price(
                                 side=side,
@@ -4559,7 +4720,7 @@ class ExecutionSimulator:
                         cfg=self.slippage_cfg,
                     )
             if trade_cost is not None:
-                slip_bps = float(trade_cost.bps)
+                slip_bps = self._trade_cost_expected_bps(trade_cost)
                 filled_price = self._apply_trade_cost_price(
                     side=side,
                     pre_slip_price=pre_slip_price,
@@ -4574,10 +4735,11 @@ class ExecutionSimulator:
                     trade_cost=trade_cost,
                 )
             elif fallback_slip is not None:
-                try:
-                    slip_bps = float(fallback_slip)
-                except (TypeError, ValueError):
+                blended = self._blend_expected_spread(taker_bps=fallback_slip)
+                if blended is None:
                     slip_bps = 0.0
+                else:
+                    slip_bps = float(blended)
                 if apply_slippage_price is not None:
                     filled_price = apply_slippage_price(
                         side=side, quote_price=pre_slip_price, slippage_bps=slip_bps
@@ -5544,7 +5706,7 @@ class ExecutionSimulator:
                                 cfg=self.slippage_cfg,
                             )
                     if trade_cost is not None:
-                        slip_bps = float(trade_cost.bps)
+                        slip_bps = self._trade_cost_expected_bps(trade_cost)
                         new_price = self._apply_trade_cost_price(
                             side=side,
                             pre_slip_price=pre_slip_price,
@@ -5560,10 +5722,13 @@ class ExecutionSimulator:
                             trade_cost=trade_cost,
                         )
                     elif fallback_slip is not None:
-                        try:
-                            slip_bps = float(fallback_slip)
-                        except (TypeError, ValueError):
+                        blended = self._blend_expected_spread(
+                            taker_bps=fallback_slip
+                        )
+                        if blended is None:
                             slip_bps = 0.0
+                        else:
+                            slip_bps = float(blended)
                         if apply_slippage_price is not None:
                             filled_price = apply_slippage_price(
                                 side=side,
