@@ -16,7 +16,8 @@ compat_shims.py
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
+import math
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 from core_models import (
     ExecReport as CoreExecReport,
@@ -43,6 +44,64 @@ def _get(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
         if k in d and d[k] is not None:
             return d[k]
     return default
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+def _extract_capacity_meta(source: Mapping[str, Any]) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {}
+    for field in ("cap_base_per_bar", "used_base_before", "used_base_after", "fill_ratio"):
+        if field in source:
+            f_val = _float_or_none(source.get(field))
+            if f_val is not None:
+                meta[field] = f_val
+    reason = source.get("capacity_reason")
+    if reason not in (None, ""):
+        meta["capacity_reason"] = str(reason)
+    exec_status_val = source.get("exec_status")
+    if exec_status_val not in (None, ""):
+        meta["exec_status"] = str(exec_status_val)
+    return meta
+
+
+def _attach_capacity_meta(meta: Dict[str, Any], source: Mapping[str, Any]) -> None:
+    capacity_meta = _extract_capacity_meta(source)
+    if not capacity_meta:
+        return
+    existing = meta.get("bar_capacity_base")
+    if isinstance(existing, Mapping):
+        merged = dict(existing)
+        merged.update(capacity_meta)
+        meta["bar_capacity_base"] = merged
+    else:
+        meta["bar_capacity_base"] = capacity_meta
+
+
+def _derive_exec_status(trade: Dict[str, Any]) -> Tuple[ExecStatus, Optional[str]]:
+    raw = _get(trade, "exec_status", default=None)
+    if raw is None:
+        raw = _get(trade, "status", default=None)
+    if raw is None:
+        return ExecStatus.FILLED, None
+    raw_str = str(raw)
+    up = raw_str.upper()
+    if "PART" in up:
+        return ExecStatus.PARTIALLY_FILLED, raw_str
+    if "REJECT" in up:
+        return ExecStatus.REJECTED, raw_str
+    if "CANCEL" in up:
+        return ExecStatus.CANCELED, raw_str
+    if up in ("NEW", "NONE"):
+        return ExecStatus.NEW, raw_str
+    return ExecStatus.FILLED, raw_str
 
 def _as_side(trade: Dict[str, Any]) -> Side:
     v = _get(trade, "side", "SIDE", "s", "buy_sell", default=None)
@@ -135,6 +194,13 @@ def trade_dict_to_core_exec_report(
     liquidity = _as_liquidity(trade)
     ts_ms = _ts(trade, parent)
     order_id, trade_id = _order_and_trade_ids(trade, parent)
+    exec_status_enum, exec_status_raw = _derive_exec_status(trade)
+    meta: Dict[str, Any] = {"raw": trade}
+    _attach_capacity_meta(meta, trade)
+    if exec_status_raw:
+        base_meta = meta.setdefault("bar_capacity_base", {})  # type: ignore[assignment]
+        if isinstance(base_meta, dict) and "exec_status" not in base_meta:
+            base_meta["exec_status"] = exec_status_raw
     return CoreExecReport(
         ts=ts_ms,
         run_id=run_id,
@@ -146,13 +212,13 @@ def trade_dict_to_core_exec_report(
         quantity=qty,
         fee=fee,
         fee_asset=(None if fee_asset is None else str(fee_asset)),
-        exec_status=ExecStatus.FILLED,
+        exec_status=exec_status_enum,
         liquidity=liquidity,
         client_order_id=(None if client_order_id is None else str(client_order_id)),
         order_id=order_id,
         trade_id=trade_id,
         pnl=None,
-        meta={"raw": trade},
+        meta=meta,
     )
 
 def _distribute_fee(total_fee: Decimal, trades: List[CoreExecReport]) -> List[CoreExecReport]:
@@ -169,6 +235,10 @@ def _distribute_fee(total_fee: Decimal, trades: List[CoreExecReport]) -> List[Co
     out: List[CoreExecReport] = []
     for t, w in zip(trades, notionals):
         share = (w / s) * tf
+        meta = dict(t.meta)
+        raw_payload = meta.get("raw")
+        if isinstance(raw_payload, Mapping):
+            _attach_capacity_meta(meta, raw_payload)
         out.append(CoreExecReport(
             ts=t.ts,
             run_id=t.run_id,
@@ -186,7 +256,7 @@ def _distribute_fee(total_fee: Decimal, trades: List[CoreExecReport]) -> List[Co
             order_id=t.order_id,
             trade_id=t.trade_id,
             pnl=t.pnl,
-            meta=t.meta,
+            meta=meta,
         ))
     return out
 
