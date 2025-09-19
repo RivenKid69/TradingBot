@@ -642,21 +642,29 @@ def aggregate_daily_quote_volume(df: pd.DataFrame) -> pd.Series:
     daily quote volumes.  Non-numeric entries are ignored.
     """
 
-    if df.empty:
-        return pd.Series(dtype="float64")
-    required = {"ts_ms", "quote_asset_volume"}
-    if not required.issubset(df.columns):
+    if df.empty or "ts_ms" not in df.columns:
         return pd.Series(dtype="float64")
 
     ts_numeric = pd.to_numeric(df["ts_ms"], errors="coerce")
-    vol_numeric = pd.to_numeric(df["quote_asset_volume"], errors="coerce")
-    mask = ts_numeric.notna() & vol_numeric.notna()
+
+    quote_series = pd.Series(float("nan"), index=df.index, dtype="float64")
+    if "quote_asset_volume" in df.columns:
+        quote_series = pd.to_numeric(df["quote_asset_volume"], errors="coerce").astype(
+            "float64"
+        )
+
+    if "volume" in df.columns and "close" in df.columns:
+        base_numeric = pd.to_numeric(df["volume"], errors="coerce")
+        close_numeric = pd.to_numeric(df["close"], errors="coerce")
+        fallback = (base_numeric * close_numeric).astype("float64")
+        quote_series = quote_series.where(quote_series.notna(), fallback)
+
+    mask = ts_numeric.notna() & quote_series.notna()
     if not mask.any():
         return pd.Series(dtype="float64")
 
-    ts_dt = pd.to_datetime(ts_numeric[mask], unit="ms", utc=True)
-    volumes = vol_numeric[mask].astype("float64")
-    grouped = volumes.groupby(ts_dt.dt.floor("D")).sum(min_count=1)
+    buckets = pd.to_datetime(ts_numeric[mask], unit="ms", utc=True).dt.floor("D")
+    grouped = quote_series[mask].groupby(buckets).sum(min_count=1)
     if grouped.empty:
         return pd.Series(dtype="float64")
     grouped = grouped.sort_index()
@@ -668,6 +676,8 @@ def compute_adv_quote(
     *,
     window_days: int,
     min_days: int = 1,
+    min_total_days: int | None = None,
+    clip_percentiles: tuple[float, float] | None = None,
 ) -> tuple[float | None, int, int]:
     """Compute average daily quote volume over the specified window.
 
@@ -677,17 +687,43 @@ def compute_adv_quote(
 
     window = max(1, int(window_days))
     minimum = max(1, int(min_days))
+    total_minimum = int(min_total_days) if min_total_days is not None else minimum
+    if total_minimum < 0:
+        total_minimum = 0
 
     if daily_quote_volume.empty:
         return None, 0, 0
 
-    series = daily_quote_volume.dropna().astype("float64").sort_index()
+    numeric = pd.to_numeric(daily_quote_volume, errors="coerce")
+    series = numeric.dropna().astype("float64")
+    series = series[series > 0.0].sort_index()
     total_days = int(len(series))
     if total_days == 0:
         return None, 0, 0
 
+    if total_minimum and total_days < total_minimum:
+        return None, 0, total_days
+
     window_slice = series.tail(window)
-    window_slice = window_slice[window_slice > 0.0]
+    if clip_percentiles is not None:
+        lower, upper = clip_percentiles
+        try:
+            lower_val = float(lower)
+            upper_val = float(upper)
+        except (TypeError, ValueError):
+            lower_val = float("nan")
+            upper_val = float("nan")
+        if (
+            pd.notna(lower_val)
+            and pd.notna(upper_val)
+            and 0.0 <= lower_val < upper_val <= 100.0
+            and not window_slice.empty
+        ):
+            lower_clip = window_slice.quantile(lower_val / 100.0, interpolation="linear")
+            upper_clip = window_slice.quantile(upper_val / 100.0, interpolation="linear")
+            window_slice = window_slice.clip(lower=lower_clip, upper=upper_clip)
+
+    window_slice = window_slice.dropna()
     used_days = int(len(window_slice))
     if used_days < minimum:
         return None, used_days, total_days
