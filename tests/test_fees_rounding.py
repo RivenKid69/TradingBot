@@ -1,0 +1,98 @@
+import pytest
+
+from impl_fees import FeesImpl
+from fees import FeesModel
+
+
+def test_rounding_nested_options_normalized():
+    fees = FeesImpl.from_dict(
+        {
+            "rounding": {
+                "enabled": True,
+                "mode": "STEP",
+                "step": "0.0005",
+                "per_symbol": {
+                    "btcusdt": {"step": 0.001},
+                    "ethusdt": {"enabled": False},
+                },
+            }
+        }
+    )
+
+    assert fees.model_payload["fee_rounding_step"] == pytest.approx(0.0005)
+    rounding_payload = fees.model_payload.get("rounding") or {}
+    assert rounding_payload.get("mode") == "step"
+    assert rounding_payload.get("step") == pytest.approx(0.0005)
+    assert rounding_payload.get("per_symbol", {}).get("BTCUSDT", {}).get("step") == pytest.approx(0.001)
+
+    rounding_meta = fees.metadata.get("rounding") or {}
+    assert rounding_meta.get("enabled") is True
+    assert rounding_meta.get("step") == pytest.approx(0.0005)
+    assert rounding_meta.get("per_symbol", {}).get("BTCUSDT", {}).get("step") == pytest.approx(0.001)
+    assert rounding_meta.get("per_symbol", {}).get("ETHUSDT", {}).get("enabled") is False
+
+    expected_rounding = fees.expected_payload.get("rounding") or {}
+    assert expected_rounding.get("step") == pytest.approx(0.0005)
+
+    model = fees.model
+    assert model is not None
+    assert model.fee_rounding_step == pytest.approx(0.0005)
+    assert model.rounding.get("step") == pytest.approx(0.0005)
+    assert model.rounding.get("per_symbol", {}).get("BTCUSDT", {}).get("step") == pytest.approx(0.001)
+
+
+def test_rounding_disabled_drops_fee_step():
+    fees = FeesImpl.from_dict({"rounding": {"enabled": False, "step": 0.1}})
+
+    assert "fee_rounding_step" not in fees.model_payload
+    rounding_payload = fees.model_payload.get("rounding") or {}
+    assert rounding_payload.get("enabled") is False
+    assert rounding_payload.get("step") is None
+
+    rounding_meta = fees.metadata.get("rounding") or {}
+    assert rounding_meta.get("enabled") is False
+    assert "fee_rounding_step" not in fees.metadata
+
+    model = fees.model
+    assert model is not None
+    assert model.fee_rounding_step == pytest.approx(0.0)
+    assert model.rounding.get("enabled") is False
+    assert "step" not in model.rounding
+
+
+def test_settlement_options_propagated():
+    fees = FeesImpl.from_dict(
+        {
+            "settlement": {
+                "mode": "bnb",
+                "currency": "bnb",
+                "prefer_discount_asset": True,
+            }
+        }
+    )
+
+    settlement_payload = fees.model_payload.get("settlement") or {}
+    assert settlement_payload.get("mode") == "bnb"
+    assert settlement_payload.get("currency") == "BNB"
+    assert settlement_payload.get("prefer_discount_asset") is True
+
+    settlement_meta = fees.metadata.get("settlement") or {}
+    assert settlement_meta.get("currency") == "BNB"
+    assert settlement_meta.get("mode") == "bnb"
+
+    expected_settlement = fees.expected_payload.get("settlement") or {}
+    assert expected_settlement.get("currency") == "BNB"
+
+    model = fees.model
+    assert model is not None
+    assert model.settlement.get("currency") == "BNB"
+    assert model.settlement.get("prefer_discount_asset") is True
+
+
+def test_fees_model_rounding_from_nested_only():
+    model = FeesModel.from_dict({"rounding": {"step": 0.25}})
+
+    assert model.fee_rounding_step == pytest.approx(0.25)
+    assert model.rounding.get("step") == pytest.approx(0.25)
+    assert model.rounding.get("enabled") is True
+

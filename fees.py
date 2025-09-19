@@ -57,6 +57,216 @@ def _sanitize_discount(value: Any, default: float) -> float:
     return float(sanitized)
 
 
+def _sanitize_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _sanitize_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    return text or None
+
+
+def _sanitize_rounding_config(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, Mapping):
+        return {}
+
+    mapping = dict(data)
+    normalized: Dict[str, Any] = {}
+
+    step_value = _sanitize_optional_non_negative(mapping.get("step"))
+    if step_value is not None and step_value > 0.0:
+        normalized["step"] = float(step_value)
+
+    mode = _sanitize_text(mapping.get("mode"))
+    if mode:
+        normalized["mode"] = mode.lower()
+
+    precision = mapping.get("precision")
+    if precision is not None:
+        try:
+            precision_int = int(precision)
+        except (TypeError, ValueError):
+            precision_int = None
+        else:
+            if precision_int >= 0:
+                normalized["precision"] = precision_int
+
+    decimals = mapping.get("decimals")
+    if decimals is not None:
+        try:
+            decimals_int = int(decimals)
+        except (TypeError, ValueError):
+            decimals_int = None
+        else:
+            if decimals_int >= 0:
+                normalized["decimals"] = decimals_int
+
+    minimum_fee = (
+        _sanitize_optional_non_negative(mapping.get("minimum_fee"))
+        or _sanitize_optional_non_negative(mapping.get("min_fee"))
+        or _sanitize_optional_non_negative(mapping.get("minimum"))
+    )
+    if minimum_fee is not None:
+        normalized["minimum_fee"] = float(minimum_fee)
+
+    maximum_fee = (
+        _sanitize_optional_non_negative(mapping.get("maximum_fee"))
+        or _sanitize_optional_non_negative(mapping.get("max_fee"))
+        or _sanitize_optional_non_negative(mapping.get("maximum"))
+    )
+    if maximum_fee is not None:
+        normalized["maximum_fee"] = float(maximum_fee)
+
+    per_symbol_raw = mapping.get("per_symbol") or mapping.get("symbols")
+    if isinstance(per_symbol_raw, Mapping):
+        per_symbol: Dict[str, Any] = {}
+        for symbol, payload in per_symbol_raw.items():
+            if not isinstance(symbol, str):
+                continue
+            nested = _sanitize_rounding_config(payload)
+            if nested:
+                per_symbol[symbol.upper()] = nested
+        if per_symbol:
+            normalized["per_symbol"] = per_symbol
+
+    handled_keys = {
+        "enabled",
+        "step",
+        "mode",
+        "precision",
+        "decimals",
+        "minimum",
+        "minimum_fee",
+        "min_fee",
+        "maximum",
+        "maximum_fee",
+        "max_fee",
+        "per_symbol",
+        "symbols",
+    }
+    for key, value in mapping.items():
+        if key in handled_keys:
+            continue
+        if isinstance(value, Mapping):
+            nested = _sanitize_rounding_config(value)
+            if nested:
+                normalized[key] = nested
+        elif isinstance(value, (str, int, float, bool)):
+            normalized[key] = value
+
+    enabled = _sanitize_optional_bool(mapping.get("enabled"))
+    if enabled is False:
+        normalized.pop("step", None)
+        normalized["enabled"] = False
+    else:
+        has_payload = bool(normalized)
+        if "step" in normalized:
+            normalized["enabled"] = True if enabled is None else bool(enabled)
+        elif has_payload:
+            normalized["enabled"] = True if enabled is None else bool(enabled)
+        elif enabled is not None:
+            normalized["enabled"] = bool(enabled)
+
+    return normalized
+
+
+def _sanitize_settlement_config(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, Mapping):
+        return {}
+
+    mapping = dict(data)
+    normalized: Dict[str, Any] = {}
+
+    enabled = _sanitize_optional_bool(mapping.get("enabled"))
+    if enabled is not None:
+        normalized["enabled"] = bool(enabled)
+
+    mode = (
+        _sanitize_text(mapping.get("mode"))
+        or _sanitize_text(mapping.get("type"))
+        or _sanitize_text(mapping.get("settle_mode"))
+    )
+    if mode:
+        normalized["mode"] = mode.lower()
+
+    currency = (
+        _sanitize_text(mapping.get("currency"))
+        or _sanitize_text(mapping.get("asset"))
+        or _sanitize_text(mapping.get("symbol"))
+    )
+    if currency:
+        normalized["currency"] = currency.upper()
+
+    fallback_currency = (
+        _sanitize_text(mapping.get("fallback_currency"))
+        or _sanitize_text(mapping.get("fallback_asset"))
+    )
+    if fallback_currency:
+        normalized["fallback_currency"] = fallback_currency.upper()
+
+    priority = mapping.get("priority")
+    if priority is not None:
+        normalized["priority"] = _sanitize_int(priority, default=0, minimum=0)
+
+    for key in (
+        "prefer_discount_asset",
+        "allow_conversion",
+        "allow_external",
+        "auto_convert",
+    ):
+        if key in mapping:
+            normalized[key] = bool(mapping.get(key))
+
+    per_symbol_raw = mapping.get("per_symbol") or mapping.get("symbols")
+    if isinstance(per_symbol_raw, Mapping):
+        per_symbol: Dict[str, Any] = {}
+        for symbol, payload in per_symbol_raw.items():
+            if not isinstance(symbol, str):
+                continue
+            nested = _sanitize_settlement_config(payload)
+            if nested:
+                per_symbol[symbol.upper()] = nested
+        if per_symbol:
+            normalized["per_symbol"] = per_symbol
+
+    handled_keys = {
+        "enabled",
+        "mode",
+        "type",
+        "settle_mode",
+        "currency",
+        "asset",
+        "symbol",
+        "fallback_currency",
+        "fallback_asset",
+        "priority",
+        "prefer_discount_asset",
+        "allow_conversion",
+        "allow_external",
+        "auto_convert",
+        "per_symbol",
+        "symbols",
+    }
+    for key, value in mapping.items():
+        if key in handled_keys:
+            continue
+        if isinstance(value, Mapping):
+            nested = _sanitize_settlement_config(value)
+            if nested:
+                normalized[key] = nested
+        elif isinstance(value, (str, int, float, bool)):
+            normalized[key] = value
+
+    return normalized
+
+
 @dataclass
 class FeeRateSpec:
     maker_bps: Optional[float] = None
@@ -197,6 +407,10 @@ class FeesModel:
     fee_rounding_step:
         Глобальный шаг округления комиссии (например, 0.0001 USDT). Значение
         ``0`` отключает округление.
+    rounding:
+        Дополнительные параметры округления (включая вложенные настройки).
+    settlement:
+        Настройки валюты/режима списания комиссий.
     """
 
     maker_bps: float = 1.0
@@ -207,6 +421,8 @@ class FeesModel:
     vip_tier: int = 0
     symbol_fee_table: Dict[str, SymbolFeeConfig] = field(default_factory=dict)
     fee_rounding_step: float = 0.0
+    rounding: Dict[str, Any] = field(default_factory=dict)
+    settlement: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.maker_bps = _sanitize_non_negative(self.maker_bps, 1.0)
@@ -231,6 +447,26 @@ class FeesModel:
                 normalized[key] = SymbolFeeConfig.from_dict(cfg)
         self.symbol_fee_table = normalized
 
+        self.rounding = _sanitize_rounding_config(self.rounding)
+        rounding_enabled = self.rounding.get("enabled")
+        rounding_step = self.rounding.get("step")
+        if rounding_enabled is False:
+            self.rounding.pop("step", None)
+            self.fee_rounding_step = 0.0
+        elif rounding_step is not None:
+            sanitized_step = _sanitize_rounding_step(rounding_step)
+            if sanitized_step > 0.0:
+                self.rounding["step"] = sanitized_step
+                self.fee_rounding_step = sanitized_step
+            else:
+                self.rounding.pop("step", None)
+        elif "step" in self.rounding:
+            self.rounding.pop("step")
+        if "enabled" not in self.rounding and self.rounding:
+            self.rounding["enabled"] = True
+
+        self.settlement = _sanitize_settlement_config(self.settlement)
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FeesModel":
         maker_bps = _sanitize_non_negative(d.get("maker_bps"), 1.0)
@@ -243,7 +479,17 @@ class FeesModel:
             d.get("taker_discount_mult"), 0.75 if use_bnb else 1.0
         )
         vip_tier = _sanitize_int(d.get("vip_tier", 0), default=0, minimum=0)
-        fee_rounding_step = _sanitize_rounding_step(d.get("fee_rounding_step"))
+        raw_rounding = d.get("rounding") or d.get("rounding_options") or {}
+        rounding_cfg = _sanitize_rounding_config(raw_rounding)
+        raw_settlement = d.get("settlement") or d.get("settlement_options") or {}
+        settlement_cfg = _sanitize_settlement_config(raw_settlement)
+
+        rounding_step_candidate = d.get("fee_rounding_step")
+        if rounding_step_candidate is None:
+            rounding_step_candidate = rounding_cfg.get("step")
+        fee_rounding_step = _sanitize_rounding_step(rounding_step_candidate)
+        if rounding_cfg.get("enabled") is False:
+            fee_rounding_step = 0.0
 
         symbol_fee_table: Dict[str, SymbolFeeConfig] = {}
         raw_table = d.get("symbol_fee_table") or {}
@@ -263,6 +509,8 @@ class FeesModel:
             vip_tier=vip_tier,
             symbol_fee_table=symbol_fee_table,
             fee_rounding_step=fee_rounding_step,
+            rounding=rounding_cfg,
+            settlement=settlement_cfg,
         )
 
     def _fallback_rate(self) -> FeeRate:

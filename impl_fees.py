@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -76,6 +77,225 @@ def _plain_mapping(data: Any) -> Dict[str, Any]:
     return {}
 
 
+def _safe_non_negative_float(value: Any) -> Optional[float]:
+    result = _safe_float(value)
+    if result is None:
+        return None
+    if result < 0.0:
+        return None
+    return result
+
+
+def _normalise_rounding_options(
+    payload: Any, *, fallback_step: Optional[float]
+) -> Tuple[Optional[Dict[str, Any]], bool, Optional[float]]:
+    mapping = dict(payload) if isinstance(payload, Mapping) else {}
+
+    fallback_candidate = _safe_non_negative_float(fallback_step)
+    has_input = bool(mapping) or (fallback_candidate is not None and fallback_candidate > 0.0)
+    normalized: Dict[str, Any] = {}
+
+    step_value = _safe_non_negative_float(mapping.get("step"))
+    if step_value is not None and step_value <= 0.0:
+        step_value = None
+
+    fallback = fallback_candidate
+    if fallback is not None and fallback <= 0.0:
+        fallback = None
+    if step_value is None:
+        step_value = fallback
+
+    mode = _safe_str(mapping.get("mode"))
+    if mode:
+        normalized["mode"] = mode.lower()
+
+    precision = _safe_positive_int(mapping.get("precision"))
+    if precision is not None:
+        normalized["precision"] = precision
+
+    decimals = _safe_positive_int(mapping.get("decimals"))
+    if decimals is not None:
+        normalized["decimals"] = decimals
+
+    minimum = _safe_non_negative_float(
+        mapping.get("minimum")
+        or mapping.get("min_fee")
+        or mapping.get("minimum_fee")
+    )
+    if minimum is not None:
+        normalized["minimum_fee"] = float(minimum)
+
+    maximum = _safe_non_negative_float(
+        mapping.get("maximum")
+        or mapping.get("max_fee")
+        or mapping.get("maximum_fee")
+    )
+    if maximum is not None:
+        normalized["maximum_fee"] = float(maximum)
+
+    per_symbol_raw = mapping.get("per_symbol") or mapping.get("symbols")
+    per_symbol: Dict[str, Any] = {}
+    if isinstance(per_symbol_raw, Mapping):
+        for symbol, cfg in per_symbol_raw.items():
+            if not isinstance(symbol, str):
+                continue
+            nested_norm, nested_enabled, nested_step = _normalise_rounding_options(
+                cfg, fallback_step=None
+            )
+            if nested_norm is None:
+                nested_norm = {}
+            if nested_enabled:
+                if nested_step is not None and nested_step > 0.0:
+                    nested_norm = dict(nested_norm)
+                    nested_norm.setdefault("step", float(nested_step))
+                    nested_norm.setdefault("enabled", True)
+                else:
+                    nested_norm = dict(nested_norm)
+                    nested_norm.setdefault("enabled", True)
+            else:
+                nested_norm = dict(nested_norm)
+                nested_norm["enabled"] = False
+                nested_norm.pop("step", None)
+            if nested_norm:
+                per_symbol[symbol.upper()] = nested_norm
+        if per_symbol:
+            normalized["per_symbol"] = per_symbol
+            has_input = True
+
+    for key, value in mapping.items():
+        if key in {
+            "enabled",
+            "step",
+            "per_symbol",
+            "symbols",
+            "mode",
+            "precision",
+            "decimals",
+            "minimum",
+            "min_fee",
+            "minimum_fee",
+            "maximum",
+            "max_fee",
+            "maximum_fee",
+        }:
+            continue
+        if isinstance(value, Mapping):
+            normalized[key] = _plain_mapping(value)
+            has_input = True
+        elif isinstance(value, (str, int, float, bool)):
+            normalized[key] = value
+            has_input = True
+
+    enabled_raw = mapping.get("enabled")
+    if enabled_raw is None:
+        enabled = bool(step_value)
+    else:
+        enabled = bool(enabled_raw)
+
+    effective_step = step_value if enabled and step_value is not None else None
+
+    if effective_step is not None:
+        normalized["step"] = float(effective_step)
+    elif "step" in normalized:
+        normalized.pop("step", None)
+
+    if enabled or has_input:
+        normalized["enabled"] = bool(enabled)
+    elif not has_input and enabled_raw is False:
+        normalized["enabled"] = False
+
+    if not normalized and not has_input:
+        return None, bool(enabled), effective_step
+
+    return normalized, bool(enabled), effective_step
+
+
+def _normalise_settlement_options(payload: Any) -> Optional[Dict[str, Any]]:
+    mapping = dict(payload) if isinstance(payload, Mapping) else {}
+    if not mapping:
+        return None
+
+    normalized: Dict[str, Any] = {}
+
+    if "enabled" in mapping:
+        normalized["enabled"] = bool(mapping.get("enabled"))
+
+    mode = (
+        _safe_str(mapping.get("mode"))
+        or _safe_str(mapping.get("type"))
+        or _safe_str(mapping.get("settle_mode"))
+    )
+    if mode:
+        normalized["mode"] = mode.lower()
+
+    currency = (
+        _safe_str(mapping.get("currency"))
+        or _safe_str(mapping.get("asset"))
+        or _safe_str(mapping.get("symbol"))
+    )
+    if currency:
+        normalized["currency"] = currency.upper()
+
+    fallback_currency = (
+        _safe_str(mapping.get("fallback_currency"))
+        or _safe_str(mapping.get("fallback_asset"))
+    )
+    if fallback_currency:
+        normalized["fallback_currency"] = fallback_currency.upper()
+
+    priority = _safe_positive_int(mapping.get("priority"))
+    if priority is not None:
+        normalized["priority"] = priority
+
+    for key in (
+        "prefer_discount_asset",
+        "allow_conversion",
+        "allow_external",
+        "auto_convert",
+    ):
+        if key in mapping:
+            normalized[key] = bool(mapping.get(key))
+
+    per_symbol_raw = mapping.get("per_symbol") or mapping.get("symbols")
+    if isinstance(per_symbol_raw, Mapping):
+        per_symbol: Dict[str, Any] = {}
+        for symbol, cfg in per_symbol_raw.items():
+            if not isinstance(symbol, str):
+                continue
+            nested = _normalise_settlement_options(cfg)
+            if nested:
+                per_symbol[symbol.upper()] = nested
+        if per_symbol:
+            normalized["per_symbol"] = per_symbol
+
+    for key, value in mapping.items():
+        if key in {
+            "enabled",
+            "mode",
+            "type",
+            "settle_mode",
+            "currency",
+            "asset",
+            "symbol",
+            "fallback_currency",
+            "fallback_asset",
+            "priority",
+            "prefer_discount_asset",
+            "allow_conversion",
+            "allow_external",
+            "auto_convert",
+            "per_symbol",
+            "symbols",
+        }:
+            continue
+        if isinstance(value, Mapping):
+            normalized[key] = _plain_mapping(value)
+        elif isinstance(value, (str, int, float, bool)):
+            normalized[key] = value
+
+    return normalized if normalized else None
+
+
 @dataclass
 class FeesConfig:
     """Normalised configuration for :class:`FeesImpl`."""
@@ -90,6 +310,8 @@ class FeesConfig:
     taker_discount_mult: Optional[float] = None
     vip_tier: Optional[int] = None
     fee_rounding_step: Optional[float] = None
+    rounding: Dict[str, Any] = field(default_factory=dict)
+    settlement: Dict[str, Any] = field(default_factory=dict)
     symbol_fee_table: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     account_info: Dict[str, Any] = field(default_factory=dict)
@@ -105,6 +327,10 @@ class FeesConfig:
     maker_taker_share_cfg: Optional[MakerTakerShareSettings] = field(
         init=False, default=None
     )
+    rounding_options: Optional[Dict[str, Any]] = field(init=False, default=None)
+    rounding_enabled: bool = field(init=False, default=False)
+    rounding_step_effective: Optional[float] = field(init=False, default=None)
+    settlement_options: Optional[Dict[str, Any]] = field(init=False, default=None)
     account_info_enabled: bool = field(init=False, default=False)
     account_info_endpoint: Optional[str] = field(init=False, default=None)
     account_info_recv_window_ms: Optional[int] = field(init=False, default=None)
@@ -141,9 +367,35 @@ class FeesConfig:
         self.vip_tier = _safe_positive_int(self.vip_tier)
 
         step = _safe_float(self.fee_rounding_step)
-        if step is not None and step < 0.0:
-            step = 0.0
+        if step is not None and step <= 0.0:
+            step = None
         self.fee_rounding_step = step
+
+        rounding_norm, rounding_enabled, rounding_step = _normalise_rounding_options(
+            self.rounding, fallback_step=step
+        )
+        if rounding_norm is not None:
+            rounding_clean = copy.deepcopy(rounding_norm)
+            self.rounding = rounding_clean
+            self.rounding_options = copy.deepcopy(rounding_norm)
+        else:
+            self.rounding = {}
+            self.rounding_options = None
+        self.rounding_enabled = bool(rounding_enabled)
+        if rounding_step is not None and rounding_enabled:
+            self.fee_rounding_step = float(rounding_step)
+        elif not rounding_enabled:
+            self.fee_rounding_step = None
+        self.rounding_step_effective = self.fee_rounding_step
+
+        settlement_norm = _normalise_settlement_options(self.settlement)
+        if settlement_norm is not None:
+            settlement_clean = copy.deepcopy(settlement_norm)
+            self.settlement = settlement_clean
+            self.settlement_options = copy.deepcopy(settlement_norm)
+        else:
+            self.settlement = {}
+            self.settlement_options = None
 
         if isinstance(self.symbol_fee_table, Mapping):
             table: Dict[str, Any] = {}
@@ -258,6 +510,10 @@ class FeesImpl:
         self.symbol_fee_table: Dict[str, Any] = {}
         self._table_account_overrides: Dict[str, Any] = {}
         self._table_share_raw: Optional[Dict[str, Any]] = None
+        self._table_rounding_normalised: Optional[Dict[str, Any]] = None
+        self._table_rounding_enabled: Optional[bool] = None
+        self._table_rounding_step: Optional[float] = None
+        self._table_settlement_normalised: Optional[Dict[str, Any]] = None
         self.account_fee_info: AccountFeeInfo | None = None
         self.account_fee_overrides: Dict[str, Any] = {}
         self.account_fee_status: str = "disabled"
@@ -283,6 +539,21 @@ class FeesImpl:
             account_payload = _plain_mapping(table_payload.get("account"))
             if account_payload:
                 self._table_account_overrides = account_payload
+                round_block = account_payload.get("rounding")
+                fallback_step = _safe_float(account_payload.get("fee_rounding_step"))
+                if isinstance(round_block, Mapping):
+                    (
+                        self._table_rounding_normalised,
+                        self._table_rounding_enabled,
+                        self._table_rounding_step,
+                    ) = _normalise_rounding_options(
+                        round_block, fallback_step=fallback_step
+                    )
+                settle_block = account_payload.get("settlement")
+                if isinstance(settle_block, Mapping):
+                    self._table_settlement_normalised = _normalise_settlement_options(
+                        settle_block
+                    )
             share_payload = table_payload.get("share")
             if isinstance(share_payload, Mapping):
                 self._table_share_raw = dict(share_payload)
@@ -320,11 +591,55 @@ class FeesImpl:
         self._taker_discount_mult = float(cfg.taker_discount_mult)
         self._use_bnb_discount = bool(cfg.use_bnb_discount)
 
+        rounding_payload = (
+            copy.deepcopy(cfg.rounding_options)
+            if cfg.rounding_options is not None
+            else None
+        )
+        settlement_payload = (
+            copy.deepcopy(cfg.settlement_options)
+            if cfg.settlement_options is not None
+            else None
+        )
+        rounding_disabled_explicit = (
+            rounding_payload is not None
+            and rounding_payload.get("enabled") is False
+        )
+
         fee_rounding_step = cfg.fee_rounding_step
-        if fee_rounding_step is None:
-            candidate = _safe_float(self._table_account_overrides.get("fee_rounding_step"))
-            if candidate is not None and candidate >= 0.0:
-                fee_rounding_step = candidate
+        if fee_rounding_step is not None and fee_rounding_step <= 0.0:
+            fee_rounding_step = None
+        if fee_rounding_step is None and not rounding_disabled_explicit:
+            if self._table_rounding_enabled is False:
+                fee_rounding_step = None
+            elif self._table_rounding_step is not None:
+                fee_rounding_step = self._table_rounding_step
+            else:
+                candidate = _safe_float(
+                    self._table_account_overrides.get("fee_rounding_step")
+                )
+                if candidate is not None and candidate > 0.0:
+                    fee_rounding_step = candidate
+
+        if rounding_payload is None:
+            if self._table_rounding_normalised is not None:
+                rounding_payload = copy.deepcopy(self._table_rounding_normalised)
+            elif self._table_rounding_enabled is False:
+                rounding_payload = {"enabled": False}
+        if rounding_payload is None and fee_rounding_step is not None:
+            rounding_payload = {"enabled": True, "step": float(fee_rounding_step)}
+
+        if settlement_payload is None and self._table_settlement_normalised is not None:
+            settlement_payload = copy.deepcopy(self._table_settlement_normalised)
+
+        final_rounding_payload = (
+            copy.deepcopy(rounding_payload) if rounding_payload is not None else None
+        )
+        final_settlement_payload = (
+            copy.deepcopy(settlement_payload) if settlement_payload is not None else None
+        )
+        self.rounding_options = final_rounding_payload
+        self.settlement_options = final_settlement_payload
 
         vip_tier = cfg.vip_tier
         if vip_tier is None:
@@ -386,6 +701,10 @@ class FeesImpl:
         }
         if fee_rounding_step is not None:
             self.model_payload["fee_rounding_step"] = float(fee_rounding_step)
+        if final_rounding_payload is not None:
+            self.model_payload["rounding"] = copy.deepcopy(final_rounding_payload)
+        if final_settlement_payload is not None:
+            self.model_payload["settlement"] = copy.deepcopy(final_settlement_payload)
         if symbol_table_payload:
             self.model_payload["symbol_fee_table"] = symbol_table_payload
 
@@ -398,14 +717,23 @@ class FeesImpl:
         self.metadata = self._build_metadata(
             vip_tier=vip_tier,
             fee_rounding_step=fee_rounding_step,
+            rounding=final_rounding_payload,
+            settlement=final_settlement_payload,
         )
 
         self.expected_payload: Dict[str, Any] = self._build_expected_payload(
-            vip_tier=vip_tier
+            vip_tier=vip_tier,
+            rounding=final_rounding_payload,
+            settlement=final_settlement_payload,
         )
 
     def _build_metadata(
-        self, *, vip_tier: int, fee_rounding_step: Optional[float]
+        self,
+        *,
+        vip_tier: int,
+        fee_rounding_step: Optional[float],
+        rounding: Optional[Dict[str, Any]],
+        settlement: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         meta: Dict[str, Any] = {}
         if self.cfg.metadata:
@@ -421,6 +749,19 @@ class FeesImpl:
             table_meta.setdefault("account_overrides", self._table_account_overrides)
         if self._table_share_raw is not None:
             table_meta.setdefault("share_from_file", self._table_share_raw)
+        if self._table_rounding_normalised is not None:
+            table_meta.setdefault(
+                "rounding_from_file", copy.deepcopy(self._table_rounding_normalised)
+            )
+        if self._table_rounding_enabled is not None:
+            table_meta.setdefault("rounding_enabled", bool(self._table_rounding_enabled))
+        if self._table_rounding_step is not None:
+            table_meta.setdefault("rounding_step", float(self._table_rounding_step))
+        if self._table_settlement_normalised is not None:
+            table_meta.setdefault(
+                "settlement_from_file",
+                copy.deepcopy(self._table_settlement_normalised),
+            )
         meta["table"] = table_meta
         account_meta: Dict[str, Any] = {
             "enabled": bool(self.cfg.account_info_enabled),
@@ -457,6 +798,10 @@ class FeesImpl:
         meta["vip_tier"] = int(vip_tier)
         if fee_rounding_step is not None:
             meta["fee_rounding_step"] = float(fee_rounding_step)
+        meta["rounding"] = copy.deepcopy(rounding) if rounding is not None else None
+        meta["settlement"] = (
+            copy.deepcopy(settlement) if settlement is not None else None
+        )
         meta["maker_taker_share"] = (
             dict(self.maker_taker_share_raw)
             if isinstance(self.maker_taker_share_raw, Mapping)
@@ -466,7 +811,13 @@ class FeesImpl:
         meta["table_applied"] = bool(self.symbol_fee_table)
         return meta
 
-    def _build_expected_payload(self, *, vip_tier: int) -> Dict[str, Any]:
+    def _build_expected_payload(
+        self,
+        *,
+        vip_tier: int,
+        rounding: Optional[Dict[str, Any]],
+        settlement: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "maker_fee_bps": self.base_fee_bps["maker_fee_bps"],
             "taker_fee_bps": self.base_fee_bps["taker_fee_bps"],
@@ -479,6 +830,10 @@ class FeesImpl:
             payload.update(self.maker_taker_share_expected)
         else:
             payload.setdefault("expected_fee_bps", payload["taker_fee_bps"])
+        if rounding is not None:
+            payload["rounding"] = copy.deepcopy(rounding)
+        if settlement is not None:
+            payload["settlement"] = copy.deepcopy(settlement)
         return payload
 
     @staticmethod
@@ -504,6 +859,8 @@ class FeesImpl:
             "taker_discount_mult",
             "vip_tier",
             "fee_rounding_step",
+            "rounding",
+            "settlement",
         }
         for key in account_keys:
             if key in raw and raw[key] is not None and key not in account:
@@ -784,6 +1141,20 @@ class FeesImpl:
                 account_info_cfg = dict(block)
                 break
 
+        rounding_cfg = None
+        for key in ("rounding", "rounding_options"):
+            block = d.get(key)
+            if isinstance(block, Mapping):
+                rounding_cfg = dict(block)
+                break
+
+        settlement_cfg = None
+        for key in ("settlement", "settlement_options"):
+            block = d.get(key)
+            if isinstance(block, Mapping):
+                settlement_cfg = dict(block)
+                break
+
         path = None
         for key in ("path", "fees_path", "symbol_fee_path"):
             candidate = d.get(key)
@@ -808,6 +1179,8 @@ class FeesImpl:
                 taker_discount_mult=taker_mult,
                 vip_tier=vip_tier,
                 fee_rounding_step=fee_rounding_step,
+                rounding=rounding_cfg or {},
+                settlement=settlement_cfg or {},
                 symbol_fee_table=symbol_table,
                 metadata=metadata,
                 account_info=account_info_cfg or {},
