@@ -211,7 +211,9 @@ class ServiceBacktest:
                 slip_payload = _slippage_to_dict(rc_slip_cfg)
                 if slip_payload:
                     try:
-                        SlippageImpl.from_dict(slip_payload).attach_to(self.sim)
+                        SlippageImpl.from_dict(
+                            slip_payload, run_config=self._run_config
+                        ).attach_to(self.sim)
                     except Exception:
                         logger.exception("Failed to attach slippage config to simulator")
         elif getattr(self._run_config, "slippage", None):
