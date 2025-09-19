@@ -75,6 +75,17 @@ fees:
   spread_cost_maker_bps: null    # Override доп. издержек maker (bps) при разделении потока; null → 0.0 по умолчанию.
   spread_cost_taker_bps: null    # Override доп. издержек taker (bps) при разделении потока; null → 0.0 по умолчанию.
   taker_fee_override_bps: null   # Жёсткий override тейкерской комиссии (bps) после скидок; null → без override.
+  rounding:
+    enabled: true               # Включить округление комиссий; false → возвращать сырые значения без пост-обработки.
+    step: null                  # Override шага округления (например 0.0001); null → использовать commission_step из фильтров/таблицы.
+    mode: "up"                 # Режим относительно шага: up (ceil, дефолт Binance) | nearest | down.
+    minimum_fee: null           # Минимальная комиссия после округления; null → без нижней границы.
+    maximum_fee: null           # Максимальная комиссия после округления; null → без верхней границы.
+  settlement:
+    enabled: false              # Платить комиссии альтернативным активом (например, BNB); false → оставаться в котируемой валюте.
+    mode: null                  # Жёсткий режим расчёта (bnb/quote/auto); null → авто по аккаунту или таблице комиссий.
+    currency: null              # Код валюты расчёта (например, "BNB"); null → использовать mode/значения биржи.
+    prefer_discount_asset: false  # true → запрашивать скидочную валюту при доступности; false → без приоритета.
   maker_taker_share:
     enabled: false               # Включить расчёт доли maker/taker; false → использовать maker_share_default.
     mode: "fixed"                # Режим: fixed | model | predictor; fixed → всегда брать maker_share_default.

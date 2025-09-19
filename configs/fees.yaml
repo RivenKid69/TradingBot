@@ -14,7 +14,26 @@ fees:
   spread_cost_maker_bps: null      # Доп. издержки maker (bps) поверх комиссии; null → 0.0.
   spread_cost_taker_bps: null      # Доп. издержки taker (bps) поверх комиссии; null → 0.0.
   taker_fee_override_bps: null     # Жёсткий override тейкерской комиссии (bps); null → не применяется.
-  fee_rounding_step: null          # Шаг округления комиссии (например 0.0001); null → без округления.
+  rounding:
+    enabled: true                  # Включить округление комиссий; false → возвращать сырые значения.
+    step: 0.0001                   # Глобальный шаг округления; null → использовать commission_step из фильтров/таблицы.
+    mode: "up"                    # Режим округления шага: up (ceil, поведение Binance) | nearest | down.
+    minimum_fee: null              # Нижняя граница комиссии после округления; null → без ограничения.
+    maximum_fee: null              # Верхняя граница комиссии после округления; null → без ограничения.
+    per_symbol:                    # Переопределения для отдельных символов.
+      BTCUSDT:
+        step: 0.00005              # Более тонкий шаг округления для BTCUSDT.
+        minimum_fee: 0.0001        # Минимальная комиссия после округления.
+      ETHUSDT:
+        enabled: false             # Локально отключить округление для ETHUSDT.
+  settlement:
+    enabled: false                 # Разрешить расчёт комиссий альтернативным активом (BNB и т. п.).
+    mode: "bnb"                   # "bnb" → предпочитать BNB; null → авто по аккаунту/таблице.
+    currency: "BNB"               # Жёсткий код валюты расчёта; null → определять автоматически.
+    prefer_discount_asset: true    # Принудительно запрашивать скидочную валюту (BNB), когда доступна.
+    per_symbol:
+      ETHUSDT:
+        enabled: false             # На уровне символа можно отключить альтернативное взыскание комиссий.
   symbol_fee_table:                # Inline-таблица ставок; может дополнять/override внешний файл.
     BTCUSDT:
       maker_bps: 1.8
@@ -23,6 +42,8 @@ fees:
     ETHUSDT:
       maker_bps: 2.0
       taker_bps: 4.0
+      quantizer:
+        commission_step: 0.0001    # Доп. шаг из фильтров; подхватится как fallback для rounding.step.
   metadata:
     source: "binance"
     fetched_at: "2024-01-01T00:00:00Z"

@@ -17,6 +17,11 @@
   hour-of-week spread profiles consumed by `slippage.dynamic`. The script
   supports custom output paths, rolling windows and warns when the source
   snapshot exceeds the configured `refresh_warn_days` threshold.
+- **Fee settlement & rounding controls**: YAML-конфиги теперь содержат блоки
+  `fees.rounding` и `fees.settlement` с безопасными значениями по умолчанию.
+  `rounding` умеет использовать `commission_step` из биржевых фильтров и
+  таблиц комиссий, а `settlement` описывает расчёт комиссий в альтернативном
+  активе (например, BNB) с учётом скидок.
 
 ### Deprecated
 - `LatencyImpl.dump_latency_multipliers` and
