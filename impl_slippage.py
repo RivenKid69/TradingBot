@@ -679,6 +679,43 @@ class SlippageCfg:
     tail_shock: Optional[Any] = None
     adv: Optional[Any] = None
 
+    @staticmethod
+    def _normalise_dynamic(block: Any) -> Optional[Any]:
+        if block is None:
+            return None
+        if DynamicSpreadConfig is None:
+            return block
+        if isinstance(block, DynamicSpreadConfig):
+            return block
+        candidate: Any = block
+        if hasattr(block, "to_dict"):
+            try:
+                payload = block.to_dict()
+            except Exception:
+                payload = None
+            else:
+                if isinstance(payload, Mapping):
+                    candidate = dict(payload)
+        if isinstance(candidate, Mapping):
+            try:
+                return DynamicSpreadConfig.from_dict(dict(candidate))
+            except Exception:
+                logger.exception("Failed to normalise dynamic spread config")
+                return dict(candidate)
+        return block
+
+    def __post_init__(self) -> None:
+        dyn_source: Any = self.dynamic if self.dynamic is not None else self.dynamic_spread
+        normalised = self._normalise_dynamic(dyn_source)
+        if isinstance(normalised, DynamicSpreadConfig):
+            self.dynamic = normalised
+            self.dynamic_spread = normalised
+        else:
+            if self.dynamic is None and self.dynamic_spread is not None:
+                self.dynamic = self.dynamic_spread
+            if self.dynamic_spread is None and self.dynamic is not None:
+                self.dynamic_spread = self.dynamic
+
     def get_dynamic_block(self) -> Optional[Any]:
         if self.dynamic is not None:
             return self.dynamic

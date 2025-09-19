@@ -1,7 +1,7 @@
 # Dynamic Spread Profiles
 
 Dynamic spread profiles allow the simulator to modulate the bid-ask spread by
-hour of week. The feature is configured via the `slippage.dynamic_spread` block
+hour of week. The feature is configured via the `slippage.dynamic` block
 in YAML configs (see `configs/config_sim.yaml` for an example). Set
 `profile_kind: "hourly"`, enable the block, and either embed the 168
 multipliers inline via `multipliers` or point `path` to a JSON profile
@@ -63,12 +63,12 @@ Key options:
   stale inputs before running backtests.
 
 The resulting JSON can be referenced from configs via
-`slippage.dynamic_spread.path`. To roll out a refreshed profile:
+`slippage.dynamic.path`. To roll out a refreshed profile:
 
 1. Download or export the latest historical bars to Parquet/CSV.
 2. Run the helper script with the desired options.
 3. Commit the new JSON and its checksum (if applicable).
-4. Update `slippage.dynamic_spread.hash` when configs track file integrity.
+4. Update `slippage.dynamic.hash` when configs track file integrity.
 5. Restart services or allow the auto-reloader (if enabled) to pick up the new
    profile.
 

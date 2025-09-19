@@ -4,7 +4,7 @@ The script expects a CSV or Parquet file with historical bar data. It
 computes the average bid-ask spread (either from an explicit spread column or
 from high/low mid-prices) for every hour of the week, normalises the result so
 that the mean multiplier is ``1.0`` and writes a JSON profile compatible with
-``SlippageConfig.dynamic_spread``.
+``SlippageConfig.dynamic``.
 
 Example
 -------
