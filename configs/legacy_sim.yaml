@@ -17,6 +17,9 @@ fees:
     spread_cost_maker_bps: 0.0
     spread_cost_taker_bps: 0.0
     taker_fee_override_bps: null
+    distance_to_mid: null
+    latency: null
+    coefficients: {}
 
 funding:
   enabled: false
