@@ -26,6 +26,13 @@ fees:
   metadata:
     source: "binance"
     fetched_at: "2024-01-01T00:00:00Z"
+  account_info:
+    enabled: false                # Подтягивать ли vip-tier и ставки из приватного API.
+    endpoint: "https://api.binance.com"  # Базовый URL SAPI (дефолт: https://api.binance.com).
+    recv_window_ms: 5000          # recvWindow для подписанных запросов (мс).
+    timeout_s: 10                 # HTTP таймаут запроса (секунды).
+    api_key: null                 # Ключ Binance; null → возьмётся из BINANCE_API_KEY.
+    api_secret: null              # Секрет Binance; null → возьмётся из BINANCE_API_SECRET.
   maker_taker_share:
     enabled: false                 # Переключатель динамического деления потока.
     mode: "fixed"                  # fixed | model | predictor.
