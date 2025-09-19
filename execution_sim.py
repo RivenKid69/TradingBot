@@ -46,6 +46,11 @@ from utils.prometheus import Counter, Summary
 from config import DataDegradationConfig
 
 try:
+    from services.costs import MakerTakerShareSettings
+except Exception:  # pragma: no cover - optional dependency in stripped environments
+    MakerTakerShareSettings = None  # type: ignore
+
+try:
     from latency_volatility_cache import LatencyVolatilityCache
 except Exception:  # pragma: no cover - optional dependency for legacy setups
     LatencyVolatilityCache = None  # type: ignore
@@ -320,7 +325,7 @@ class ExecTrade:
     price: float
     qty: float
     notional: float
-    liquidity: str  # "taker"|"maker"
+    liquidity: str  # "taker"|"maker"; may reflect actual fill even if fees use expected share
     proto_type: int  # см. ActionType
     client_order_id: int
     fee: float = 0.0
@@ -634,6 +639,40 @@ class ExecutionSimulator:
         self._intrabar_debug_logged: int = 0
         self._trade_cost_debug_logged: int = 0
         self._trade_cost_debug_limit: int = 100
+
+        def _convert_to_plain_mapping(obj: Any) -> Dict[str, Any]:
+            if isinstance(obj, Mapping):
+                try:
+                    return {str(k): v for k, v in obj.items()}
+                except Exception:
+                    return dict(obj)
+            if hasattr(obj, "dict"):
+                try:
+                    data = obj.dict(exclude_unset=False)  # type: ignore[call-arg]
+                except Exception:
+                    data = {}
+                if isinstance(data, Mapping):
+                    return _convert_to_plain_mapping(data)
+            if hasattr(obj, "__dict__"):
+                try:
+                    return {
+                        str(k): v
+                        for k, v in vars(obj).items()
+                        if not str(k).startswith("_")
+                    }
+                except Exception:
+                    return {}
+            return {}
+
+        def _safe_float(value: Any, default: float = 0.0) -> float:
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                return default
+            if not math.isfinite(num):
+                return default
+            return num
+
         self.lob = lob
         self._last_ref_price: Optional[float] = None
         self._next_h1_open_price: Optional[float] = None
@@ -756,6 +795,76 @@ class ExecutionSimulator:
         self.fees = (
             FeesModel.from_dict(fees_config or {}) if FeesModel is not None else None
         )
+        self._maker_taker_share_cfg: Optional[Dict[str, Any]] = None
+        self._maker_taker_share_enabled: bool = False
+        self._expected_fee_bps: float = 0.0
+        self._expected_maker_share: float = 0.0
+
+        fees_cfg_payloads: List[Dict[str, Any]] = []
+        if fees_config:
+            payload = _convert_to_plain_mapping(fees_config)
+            if payload:
+                fees_cfg_payloads.append(payload)
+        if run_config is not None:
+            rc_fees = getattr(run_config, "fees", None)
+            if rc_fees is not None:
+                payload = _convert_to_plain_mapping(rc_fees)
+                if payload:
+                    fees_cfg_payloads.append(payload)
+
+        share_block: Any = None
+        for payload in fees_cfg_payloads:
+            block = payload.get("maker_taker_share") if isinstance(payload, Mapping) else None
+            if block is not None:
+                share_block = block
+                break
+        if share_block is None and run_config is not None:
+            direct_share = getattr(run_config, "maker_taker_share", None)
+            if direct_share is not None:
+                share_block = direct_share
+
+        maker_fee_bps = 0.0
+        taker_fee_bps = 0.0
+        if self.fees is not None:
+            maker_fee_bps = _safe_float(getattr(self.fees, "maker_bps", 0.0)) * _safe_float(
+                getattr(self.fees, "maker_discount_mult", 1.0), 1.0
+            )
+            taker_fee_bps = _safe_float(getattr(self.fees, "taker_bps", 0.0)) * _safe_float(
+                getattr(self.fees, "taker_discount_mult", 1.0), 1.0
+            )
+        if maker_fee_bps == 0.0 and taker_fee_bps == 0.0 and fees_cfg_payloads:
+            base_payload = fees_cfg_payloads[0]
+            maker_fee_bps = _safe_float(base_payload.get("maker_bps"), 0.0) * _safe_float(
+                base_payload.get("maker_discount_mult", 1.0), 1.0
+            )
+            taker_fee_bps = _safe_float(base_payload.get("taker_bps"), 0.0) * _safe_float(
+                base_payload.get("taker_discount_mult", 1.0), 1.0
+            )
+
+        share_payload: Optional[Dict[str, Any]] = None
+        if MakerTakerShareSettings is not None and share_block is not None:
+            share_cfg = MakerTakerShareSettings.parse(share_block)
+            if share_cfg is not None:
+                share_payload = share_cfg.to_sim_payload(maker_fee_bps, taker_fee_bps)
+        if share_payload is None and isinstance(share_block, Mapping):
+            share_payload = _convert_to_plain_mapping(share_block)
+
+        if share_payload:
+            self._maker_taker_share_cfg = share_payload
+            self._maker_taker_share_enabled = bool(share_payload.get("enabled", False))
+            self._expected_fee_bps = _safe_float(
+                share_payload.get("expected_fee_bps"), 0.0
+            )
+            maker_share_val = share_payload.get("maker_share")
+            if maker_share_val is None:
+                maker_share_val = share_payload.get("maker_share_default")
+            self._expected_maker_share = _safe_float(maker_share_val, 0.0)
+        else:
+            self._maker_taker_share_cfg = share_payload
+            self._maker_taker_share_enabled = False
+            self._expected_fee_bps = 0.0
+            self._expected_maker_share = 0.0
+
         self.funding = (
             FundingCalculator(**(funding_config or {"enabled": False}))
             if FundingCalculator is not None
@@ -868,31 +977,6 @@ class ExecutionSimulator:
             self._trade_cost_debug_limit = int(limit_val)
         self._execution_intrabar_cfg: Dict[str, Any] = {}
         bar_cap_base_cfg: Dict[str, Any] = {}
-
-        def _convert_to_plain_mapping(obj: Any) -> Dict[str, Any]:
-            if isinstance(obj, Mapping):
-                try:
-                    return {str(k): v for k, v in obj.items()}
-                except Exception:
-                    return dict(obj)
-            if hasattr(obj, "dict"):
-                try:
-                    data = obj.dict(exclude_unset=False)  # type: ignore[call-arg]
-                except Exception:
-                    data = {}
-                if isinstance(data, Mapping):
-                    return _convert_to_plain_mapping(data)
-                return {}
-            if hasattr(obj, "__dict__"):
-                try:
-                    return {
-                        str(k): v
-                        for k, v in vars(obj).items()
-                        if not str(k).startswith("_")
-                    }
-                except Exception:
-                    return {}
-            return {}
 
         def _update_bar_capacity_cfg(candidate: Any) -> None:
             mapping = _convert_to_plain_mapping(candidate)
@@ -2365,6 +2449,73 @@ class ExecutionSimulator:
         if not math.isfinite(candidate) or candidate <= 0.0:
             return float(pre_slip_price)
         return float(candidate)
+
+    def _compute_trade_fee(
+        self,
+        *,
+        side: str,
+        price: float,
+        qty: float,
+        liquidity: str,
+    ) -> float:
+        side_key = str(side).upper()
+        liquidity_key = str(liquidity).lower()
+        if liquidity_key not in ("maker", "taker") and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "fee role fallback side=%s liquidity=%s", side_key, liquidity_key
+            )
+
+        share_cfg = self._maker_taker_share_cfg
+        enabled = self._maker_taker_share_enabled
+        expected_bps = self._expected_fee_bps
+        expected_share = self._expected_maker_share
+        if isinstance(share_cfg, Mapping):
+            enabled = bool(share_cfg.get("enabled", enabled))
+            rate_candidate = share_cfg.get("expected_fee_bps")
+            if rate_candidate is not None:
+                try:
+                    expected_bps = float(rate_candidate)
+                except (TypeError, ValueError):
+                    expected_bps = self._expected_fee_bps
+            share_candidate = share_cfg.get("maker_share")
+            if share_candidate is None:
+                share_candidate = share_cfg.get("maker_share_default")
+            if share_candidate is not None:
+                try:
+                    expected_share = float(share_candidate)
+                except (TypeError, ValueError):
+                    expected_share = self._expected_maker_share
+            self._maker_taker_share_enabled = enabled
+            self._expected_fee_bps = expected_bps
+            self._expected_maker_share = expected_share
+        try:
+            price_val = float(price)
+            qty_val = float(qty)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(price_val) or not math.isfinite(qty_val):
+            return 0.0
+        notional = abs(price_val * qty_val)
+        if notional <= 0.0:
+            return 0.0
+        if enabled:
+            rate_bps = float(expected_bps)
+            if not math.isfinite(rate_bps):
+                rate_bps = 0.0
+            fee = notional * (rate_bps / 1e4)
+            return float(fee)
+        if self.fees is None:
+            return 0.0
+        try:
+            fee_val = self.fees.compute(
+                side=side,
+                price=price_val,
+                qty=qty_val,
+                liquidity=liquidity,
+            )
+        except Exception:
+            return 0.0
+        return float(fee_val)
 
     def _log_trade_cost_debug(
         self,
@@ -4310,14 +4461,12 @@ class ExecutionSimulator:
                             self._intrabar_debug_logged += 1
 
                     # комиссия
-                    fee = 0.0
-                    if self.fees is not None:
-                        fee = self.fees.compute(
-                            side=side,
-                            price=filled_price,
-                            qty=q_child,
-                            liquidity="taker",
-                        )
+                    fee = self._compute_trade_fee(
+                        side=side,
+                        price=filled_price,
+                        qty=q_child,
+                        liquidity="taker",
+                    )
                     fee_total += float(fee)
                     self.fees_cum += float(fee)
 
@@ -4435,11 +4584,9 @@ class ExecutionSimulator:
                     )
 
             # комиссия
-            fee = 0.0
-            if self.fees is not None:
-                fee = self.fees.compute(
-                    side=side, price=filled_price, qty=qty, liquidity="taker"
-                )
+            fee = self._compute_trade_fee(
+                side=side, price=filled_price, qty=qty, liquidity="taker"
+            )
             fee_total += float(fee)
             self.fees_cum += float(fee)
 
@@ -4579,14 +4726,12 @@ class ExecutionSimulator:
                                 int(order_seq),
                             )
                             self._intrabar_debug_logged += 1
-                    fee = 0.0
-                    if self.fees is not None:
-                        fee = self.fees.compute(
-                            side=side,
-                            price=filled_price,
-                            qty=exec_qty,
-                            liquidity=liquidity_role,
-                        )
+                    fee = self._compute_trade_fee(
+                        side=side,
+                        price=filled_price,
+                        qty=exec_qty,
+                        liquidity=liquidity_role,
+                    )
                     fee_total += float(fee)
                     _ = self._apply_trade_inventory(
                         side=side, price=filled_price, qty=exec_qty
@@ -4642,14 +4787,12 @@ class ExecutionSimulator:
                                 int(order_seq),
                             )
                             self._intrabar_debug_logged += 1
-                    fee = 0.0
-                    if self.fees is not None:
-                        fee = self.fees.compute(
-                            side=side,
-                            price=filled_price,
-                            qty=qty_q,
-                            liquidity=liquidity_role,
-                        )
+                    fee = self._compute_trade_fee(
+                        side=side,
+                        price=filled_price,
+                        qty=qty_q,
+                        liquidity=liquidity_role,
+                    )
                     fee_total += float(fee)
                     _ = self._apply_trade_inventory(
                         side=side, price=filled_price, qty=qty_q
@@ -5448,14 +5591,12 @@ class ExecutionSimulator:
                             self._intrabar_debug_logged += 1
 
                     # комиссия
-                    fee = 0.0
-                    if self.fees is not None:
-                        fee = self.fees.compute(
-                            side=side,
-                            price=filled_price,
-                            qty=q_child,
-                            liquidity="taker",
-                        )
+                    fee = self._compute_trade_fee(
+                        side=side,
+                        price=filled_price,
+                        qty=q_child,
+                        liquidity="taker",
+                    )
                     fee_total += float(fee)
                     self.fees_cum += float(fee)
 
