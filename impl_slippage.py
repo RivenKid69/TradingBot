@@ -540,6 +540,12 @@ class _DynamicSpreadProfile:
             self._prev_smoothed = smoothed
         return smoothed
 
+    def _finalise_spread(self, spread_bps: float, *, already_clamped: bool = False) -> float:
+        candidate = float(spread_bps)
+        if not already_clamped:
+            candidate = self._apply_clamp(candidate)
+        return self._apply_smoothing(candidate)
+
     def seasonal_multiplier(self, ts_ms: Any) -> float:
         """Public wrapper used by the dynamic spread helper."""
 
@@ -551,9 +557,22 @@ class _DynamicSpreadProfile:
         candidate = _safe_float(spread_bps)
         if candidate is None:
             candidate = self._base_spread_bps
-        if not already_clamped:
-            candidate = self._apply_clamp(candidate)
-        return self._apply_smoothing(candidate)
+        result = _calc_dynamic_spread(
+            cfg=self._cfg,
+            default_spread_bps=self._base_spread_bps,
+            bar_high=None,
+            bar_low=None,
+            mid_price=None,
+            seasonal_multiplier=1.0,
+            vol_multiplier=1.0,
+            profile=self,
+            raw_spread_bps=candidate,
+            already_clamped=already_clamped,
+        )
+        if result is None:
+            # fall back to direct smoothing if helper rejected the value
+            return self._finalise_spread(candidate, already_clamped=already_clamped)
+        return float(result)
 
     def compute(
         self,
@@ -570,8 +589,21 @@ class _DynamicSpreadProfile:
             if not math.isfinite(base) or base <= 0.0:
                 base = self._base_spread_bps
         seasonal = self._seasonal_multiplier(ts_ms)
-        spread = base * seasonal * float(vol_multiplier)
-        return self.process_spread(spread)
+        result = _calc_dynamic_spread(
+            cfg=self._cfg,
+            default_spread_bps=self._base_spread_bps,
+            bar_high=None,
+            bar_low=None,
+            mid_price=None,
+            seasonal_multiplier=seasonal,
+            vol_multiplier=vol_multiplier,
+            profile=self,
+            raw_spread_bps=base,
+        )
+        if result is None:
+            spread = base * seasonal * float(vol_multiplier)
+            return self._finalise_spread(spread)
+        return float(result)
 
 
     def metadata(self) -> Mapping[str, Any]:
@@ -591,12 +623,48 @@ def _calc_dynamic_spread(
     seasonal_multiplier: float = 1.0,
     vol_multiplier: float = 1.0,
     profile: Optional[_DynamicSpreadProfile] = None,
+    raw_spread_bps: Optional[float] = None,
+    already_clamped: bool = False,
 ) -> Optional[float]:
     """Compute a dynamic spread using the range-based heuristic.
 
-    The helper returns ``None`` when the supplied inputs are insufficient,
-    allowing callers to fall back to the default spread behaviour.
+    The helper returns ``None`` when the supplied inputs are insufficient or the
+    resulting value is invalid, allowing callers to fall back to default
+    behaviour.
     """
+
+    def _finalise_value(value: float) -> Optional[float]:
+        if profile is not None:
+            result = profile._finalise_spread(value, already_clamped=already_clamped)
+        else:
+            candidate = float(value)
+            if not already_clamped:
+                min_spread = _safe_float(getattr(cfg, "min_spread_bps", None))
+                max_spread = _safe_float(getattr(cfg, "max_spread_bps", None))
+                if min_spread is not None:
+                    candidate = max(min_spread, candidate)
+                if max_spread is not None:
+                    candidate = min(max_spread, candidate)
+            smoothing_alpha = _safe_float(getattr(cfg, "smoothing_alpha", None))
+            if smoothing_alpha is not None:
+                if smoothing_alpha <= 0.0:
+                    smoothing_alpha = None
+                elif smoothing_alpha >= 1.0:
+                    smoothing_alpha = 1.0
+            if smoothing_alpha is not None:
+                prev = getattr(cfg, "_ema_prev_spread", None)
+                if prev is None or not math.isfinite(prev):
+                    ema_val = candidate
+                else:
+                    ema_val = smoothing_alpha * candidate + (1.0 - smoothing_alpha) * prev
+                setattr(cfg, "_ema_prev_spread", float(ema_val))
+                candidate = ema_val
+            result = candidate
+        if not math.isfinite(result):
+            return None
+        if result < 0.0:
+            result = 0.0
+        return float(result)
 
     alpha = _safe_float(getattr(cfg, "alpha_bps", None))
     if alpha is None:
@@ -605,47 +673,56 @@ def _calc_dynamic_spread(
     if beta is None:
         beta = 0.0
 
-    high = _safe_float(bar_high)
-    low = _safe_float(bar_low)
-    mid = _safe_float(mid_price)
-    range_ratio_bps: Optional[float] = None
-    if high is not None and low is not None and mid is not None and mid > 0.0:
-        price_range = high - low
-        if price_range < 0.0:
+    base_spread: Optional[float]
+    if raw_spread_bps is not None:
+        base_spread = _safe_float(raw_spread_bps)
+        if base_spread is None:
+            return None
+    else:
+        high = _safe_float(bar_high)
+        low = _safe_float(bar_low)
+        mid = _safe_float(mid_price)
+        range_ratio_bps: Optional[float] = None
+        if high is not None and low is not None and mid is not None and mid > 0.0:
+            price_range = high - low
+            if price_range < 0.0:
+                logger.debug(
+                    "Dynamic spread received inverted bar range: high=%s low=%s",
+                    high,
+                    low,
+                )
+                price_range = abs(price_range)
+            ratio = price_range / mid if mid > 0.0 else None
+            if ratio is not None and math.isfinite(ratio):
+                range_ratio_bps = max(ratio, 0.0) * 1e4
+
+        if range_ratio_bps is None and vol_metrics and isinstance(vol_metrics, Mapping):
+            vol_key = getattr(cfg, "vol_metric", None)
+            candidates = []
+            if vol_key and vol_key in vol_metrics:
+                candidates.append(vol_metrics[vol_key])
+            if "range_ratio_bps" in vol_metrics:
+                candidates.append(vol_metrics["range_ratio_bps"])
+            for candidate in candidates:
+                candidate_val = _safe_float(candidate)
+                if candidate_val is not None and candidate_val >= 0.0:
+                    range_ratio_bps = candidate_val
+                    break
+
+        if range_ratio_bps is None:
             logger.debug(
-                "Dynamic spread received inverted bar range: high=%s low=%s",
-                high,
-                low,
+                "Dynamic spread inputs missing (high=%r, low=%r, mid=%r, vol_metric=%r)",
+                bar_high,
+                bar_low,
+                mid_price,
+                getattr(cfg, "vol_metric", None),
             )
-            price_range = abs(price_range)
-        ratio = price_range / mid if mid > 0.0 else None
-        if ratio is not None and math.isfinite(ratio):
-            range_ratio_bps = max(ratio, 0.0) * 1e4
+            return None
 
-    if range_ratio_bps is None and vol_metrics and isinstance(vol_metrics, Mapping):
-        vol_key = getattr(cfg, "vol_metric", None)
-        candidates = []
-        if vol_key and vol_key in vol_metrics:
-            candidates.append(vol_metrics[vol_key])
-        if "range_ratio_bps" in vol_metrics:
-            candidates.append(vol_metrics["range_ratio_bps"])
-        for candidate in candidates:
-            candidate_val = _safe_float(candidate)
-            if candidate_val is not None and candidate_val >= 0.0:
-                range_ratio_bps = candidate_val
-                break
+        base_spread = alpha + beta * range_ratio_bps
 
-    if range_ratio_bps is None:
-        logger.debug(
-            "Dynamic spread inputs missing (high=%r, low=%r, mid=%r, vol_metric=%r)",
-            bar_high,
-            bar_low,
-            mid_price,
-            getattr(cfg, "vol_metric", None),
-        )
+    if base_spread is None:
         return None
-
-    spread = alpha + beta * range_ratio_bps
 
     seasonal = _safe_float(seasonal_multiplier)
     if seasonal is None or seasonal <= 0.0:
@@ -653,18 +730,12 @@ def _calc_dynamic_spread(
     vol_mult = _safe_float(vol_multiplier)
     if vol_mult is None or vol_mult <= 0.0:
         vol_mult = 1.0
-    spread *= seasonal * vol_mult
 
-    if profile is not None:
-        return profile.process_spread(spread)
+    adjusted = base_spread * seasonal * vol_mult
+    if not math.isfinite(adjusted):
+        return None
 
-    min_spread = _safe_float(getattr(cfg, "min_spread_bps", None))
-    max_spread = _safe_float(getattr(cfg, "max_spread_bps", None))
-    if min_spread is not None:
-        spread = max(min_spread, spread)
-    if max_spread is not None:
-        spread = min(max_spread, spread)
-    return spread
+    return _finalise_value(adjusted)
 
 
 @dataclass
@@ -1277,22 +1348,49 @@ class SlippageImpl:
             except Exception:
                 logger.exception("Dynamic spread computation failed")
             else:
-                if dynamic_spread is not None:
+                if dynamic_spread is not None and math.isfinite(dynamic_spread):
                     return float(dynamic_spread)
             logger.debug(
                 "Dynamic spread fell back to default profile computation for ts=%r",
                 ts_ms,
             )
             try:
-                return float(
-                    profile.compute(
-                        ts_ms=ts_ms,
-                        base_spread_bps=base,
-                        vol_multiplier=vol_multiplier,
-                    )
+                fallback = profile.compute(
+                    ts_ms=ts_ms,
+                    base_spread_bps=base,
+                    vol_multiplier=vol_multiplier,
                 )
             except Exception:
                 logger.exception("Dynamic spread fallback computation failed")
+            else:
+                if math.isfinite(fallback):
+                    return float(fallback)
+
+        dyn_cfg: Optional[DynamicSpreadConfig] = None
+        if profile is not None:
+            dyn_cfg = profile._cfg
+        elif isinstance(self.cfg.get_dynamic_block(), DynamicSpreadConfig):
+            dyn_cfg = self.cfg.get_dynamic_block()  # type: ignore[assignment]
+
+        if dyn_cfg is not None and getattr(dyn_cfg, "enabled", False):
+            try:
+                processed = _calc_dynamic_spread(
+                    cfg=dyn_cfg,
+                    default_spread_bps=base,
+                    bar_high=None,
+                    bar_low=None,
+                    mid_price=None,
+                    seasonal_multiplier=1.0,
+                    vol_multiplier=vol_multiplier,
+                    profile=profile,
+                    raw_spread_bps=base,
+                )
+            except Exception:
+                logger.exception("Dynamic spread base processing failed")
+            else:
+                if processed is not None and math.isfinite(processed):
+                    return float(processed)
+
         return float(base * vol_multiplier)
 
     def _normalise_symbol(self, symbol: Any) -> Optional[str]:
