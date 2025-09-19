@@ -610,6 +610,36 @@ class ExecutionSimulator:
     same seed and inputs therefore yields identical child order trajectories.
     """
 
+    @staticmethod
+    def _plain_mapping(obj: Any) -> Dict[str, Any]:
+        """Best-effort conversion of arbitrary objects to a plain mapping."""
+
+        if isinstance(obj, Mapping):
+            try:
+                return {str(k): v for k, v in obj.items()}
+            except Exception:
+                try:
+                    return dict(obj)
+                except Exception:
+                    return {}
+        if hasattr(obj, "dict"):
+            try:
+                data = obj.dict(exclude_unset=False)  # type: ignore[call-arg]
+            except Exception:
+                data = {}
+            if isinstance(data, Mapping):
+                return ExecutionSimulator._plain_mapping(data)
+        if hasattr(obj, "__dict__"):
+            try:
+                return {
+                    str(k): v
+                    for k, v in vars(obj).items()
+                    if not str(k).startswith("_")
+                }
+            except Exception:
+                return {}
+        return {}
+
     def __init__(
         self,
         *,
@@ -823,8 +853,13 @@ class ExecutionSimulator:
         self.fees = (
             FeesModel.from_dict(fees_config or {}) if FeesModel is not None else None
         )
+        self.fees_config_payload: Dict[str, Any] = {}
+        self.fees_metadata: Dict[str, Any] = {}
+        self.fees_expected_payload: Dict[str, Any] = {}
+        self.fees_symbol_fee_table: Dict[str, Any] = {}
         self._maker_taker_share_cfg: Optional[Dict[str, Any]] = None
         self._maker_taker_share_enabled: bool = False
+        self._maker_taker_share_mode: Optional[str] = None
         self._expected_fee_bps: float = 0.0
         self._expected_maker_share: float = 0.0
 
@@ -873,25 +908,18 @@ class ExecutionSimulator:
         if MakerTakerShareSettings is not None and share_block is not None:
             share_cfg = MakerTakerShareSettings.parse(share_block)
             if share_cfg is not None:
-                share_payload = share_cfg.to_sim_payload(maker_fee_bps, taker_fee_bps)
+                try:
+                    share_payload = share_cfg.to_sim_payload(
+                        maker_fee_bps, taker_fee_bps
+                    )
+                except Exception:
+                    share_payload = None
         if share_payload is None and isinstance(share_block, Mapping):
             share_payload = _convert_to_plain_mapping(share_block)
 
-        if share_payload:
-            self._maker_taker_share_cfg = share_payload
-            self._maker_taker_share_enabled = bool(share_payload.get("enabled", False))
-            self._expected_fee_bps = _safe_float(
-                share_payload.get("expected_fee_bps"), 0.0
-            )
-            maker_share_val = share_payload.get("maker_share")
-            if maker_share_val is None:
-                maker_share_val = share_payload.get("maker_share_default")
-            self._expected_maker_share = _safe_float(maker_share_val, 0.0)
-        else:
-            self._maker_taker_share_cfg = share_payload
-            self._maker_taker_share_enabled = False
-            self._expected_fee_bps = 0.0
-            self._expected_maker_share = 0.0
+        self._initialise_fee_payloads(fees_cfg_payloads, share_payload)
+
+        self._apply_maker_taker_share_payload(share_payload)
 
         self._slippage_share_enabled: bool = False
         self._slippage_share_default: float = 0.0
@@ -2322,6 +2350,366 @@ class ExecutionSimulator:
             candidate = 1.0
         return float(candidate)
 
+    def _initialise_fee_payloads(
+        self,
+        payloads: Sequence[Mapping[str, Any]],
+        share_payload: Optional[Mapping[str, Any]],
+    ) -> None:
+        """Best-effort ingestion of extended fee payloads at construction time."""
+
+        config_payload: Optional[Mapping[str, Any]] = None
+        metadata_payload: Optional[Mapping[str, Any]] = None
+        expected_payload: Optional[Mapping[str, Any]] = None
+
+        for payload in payloads:
+            if not isinstance(payload, Mapping):
+                continue
+            if config_payload is None:
+                config_payload = self._extract_fee_config_payload(payload)
+            if metadata_payload is None:
+                metadata_payload = self._extract_fee_metadata(payload)
+            if expected_payload is None:
+                expected_payload = self._extract_fee_expected(payload)
+
+        self.set_fees_config(config_payload, metadata=metadata_payload, expected_payload=expected_payload)
+
+        if share_payload is not None:
+            self.set_fees_config(None, share_payload=share_payload)
+
+    def _extract_fee_config_payload(
+        self, payload: Mapping[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        candidates = (
+            payload.get("fees_config_payload"),
+            payload.get("config"),
+            payload.get("model_payload"),
+            payload.get("model"),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, Mapping):
+                normalised = ExecutionSimulator._plain_mapping(candidate)
+                if normalised:
+                    return normalised
+        keys = {
+            "maker_bps",
+            "taker_bps",
+            "use_bnb_discount",
+            "maker_discount_mult",
+            "taker_discount_mult",
+            "vip_tier",
+            "fee_rounding_step",
+            "symbol_fee_table",
+        }
+        subset: Dict[str, Any] = {}
+        for key in keys:
+            if key in payload:
+                subset[key] = payload[key]
+        if subset:
+            return ExecutionSimulator._plain_mapping(subset)
+        return None
+
+    def _extract_fee_metadata(
+        self, payload: Mapping[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        for key in ("fees_metadata", "metadata", "meta"):
+            candidate = payload.get(key)
+            if isinstance(candidate, Mapping):
+                normalised = ExecutionSimulator._plain_mapping(candidate)
+                if normalised:
+                    return normalised
+        return None
+
+    def _extract_fee_expected(
+        self, payload: Mapping[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        for key in ("fees_expected_payload", "expected"):
+            candidate = payload.get(key)
+            if isinstance(candidate, Mapping):
+                normalised = ExecutionSimulator._plain_mapping(candidate)
+                if normalised:
+                    return normalised
+        return None
+
+    def _apply_maker_taker_share_payload(
+        self, payload: Optional[Mapping[str, Any]]
+    ) -> None:
+        if payload is None:
+            self._maker_taker_share_cfg = None
+            self._maker_taker_share_enabled = False
+            self._maker_taker_share_mode = None
+            self._expected_fee_bps = 0.0
+            self._expected_maker_share = 0.0
+            return
+
+        mapping = ExecutionSimulator._plain_mapping(payload)
+        self._maker_taker_share_cfg = mapping or None
+        if not mapping:
+            self._maker_taker_share_enabled = False
+            self._maker_taker_share_mode = None
+            self._expected_fee_bps = 0.0
+            self._expected_maker_share = 0.0
+            return
+
+        enabled = bool(mapping.get("enabled", self._maker_taker_share_enabled))
+        self._maker_taker_share_enabled = enabled
+        mode = mapping.get("mode")
+        self._maker_taker_share_mode = str(mode) if isinstance(mode, str) else None
+        self._refresh_expected_fee_inputs()
+
+    def _refresh_expected_fee_inputs(self) -> None:
+        share_payload = (
+            self._maker_taker_share_cfg
+            if isinstance(self._maker_taker_share_cfg, Mapping)
+            else None
+        )
+        expected_payload = (
+            self.fees_expected_payload
+            if isinstance(self.fees_expected_payload, Mapping)
+            else None
+        )
+
+        share_candidates: List[Any] = []
+        if share_payload:
+            share_candidates.append(share_payload.get("maker_share"))
+            share_candidates.append(share_payload.get("maker_share_default"))
+        if expected_payload:
+            share_candidates.append(expected_payload.get("maker_share"))
+            share_candidates.append(expected_payload.get("maker_share_default"))
+
+        maker_share_val: Optional[float] = None
+        for candidate in share_candidates:
+            share = ExecutionSimulator._trade_cost_float(candidate)
+            if share is None:
+                continue
+            maker_share_val = share
+            break
+        if maker_share_val is None:
+            maker_share_val = ExecutionSimulator._trade_cost_float(self._expected_maker_share)
+        if maker_share_val is None:
+            maker_share_val = 0.0
+        maker_share_val = min(max(float(maker_share_val), 0.0), 1.0)
+        self._expected_maker_share = maker_share_val
+
+        fee_candidates: List[Any] = []
+        if share_payload:
+            fee_candidates.append(share_payload.get("expected_fee_bps"))
+        if expected_payload:
+            fee_candidates.append(expected_payload.get("expected_fee_bps"))
+
+        maker_fee = None
+        taker_fee = None
+        if share_payload:
+            maker_fee = ExecutionSimulator._trade_cost_float(
+                share_payload.get("maker_fee_bps")
+            )
+            taker_fee = ExecutionSimulator._trade_cost_float(
+                share_payload.get("taker_fee_bps")
+            )
+        if maker_fee is None or taker_fee is None:
+            if expected_payload:
+                if maker_fee is None:
+                    maker_fee = ExecutionSimulator._trade_cost_float(
+                        expected_payload.get("maker_fee_bps")
+                    )
+                if taker_fee is None:
+                    taker_fee = ExecutionSimulator._trade_cost_float(
+                        expected_payload.get("taker_fee_bps")
+                    )
+        if maker_fee is not None and taker_fee is not None:
+            fee_candidates.append(
+                maker_share_val * maker_fee + (1.0 - maker_share_val) * taker_fee
+            )
+
+        expected_fee_val: Optional[float] = None
+        for candidate in fee_candidates:
+            value = ExecutionSimulator._trade_cost_float(candidate)
+            if value is None:
+                continue
+            expected_fee_val = value
+            break
+        if expected_fee_val is None:
+            expected_fee_val = ExecutionSimulator._trade_cost_float(self._expected_fee_bps)
+        if expected_fee_val is None:
+            expected_fee_val = 0.0
+        if not math.isfinite(expected_fee_val) or expected_fee_val < 0.0:
+            expected_fee_val = 0.0
+        self._expected_fee_bps = float(expected_fee_val)
+
+    @staticmethod
+    def _fees_symbol_key(symbol: Optional[str]) -> Optional[str]:
+        if not symbol or not isinstance(symbol, str):
+            return None
+        key = symbol.strip().upper()
+        return key or None
+
+    def _resolve_fee_discount_multiplier(
+        self,
+        symbol: Optional[str],
+        is_maker: bool,
+        fee_model: Any,
+    ) -> float:
+        multiplier: Optional[float] = None
+        discount_fn = getattr(fee_model, "_discount_multiplier", None)
+        if callable(discount_fn):
+            try:
+                multiplier = float(discount_fn(symbol, is_maker))
+            except Exception:
+                logger.debug(
+                    "fees._discount_multiplier failed for %s/%s",
+                    symbol,
+                    "maker" if is_maker else "taker",
+                    exc_info=True,
+                )
+                multiplier = None
+        if multiplier is None or not math.isfinite(multiplier) or multiplier <= 0.0:
+            fallback = self._fallback_discount_multiplier(symbol, is_maker)
+            if fallback is not None:
+                multiplier = fallback
+        if multiplier is None or not math.isfinite(multiplier) or multiplier <= 0.0:
+            multiplier = 1.0
+        return float(multiplier)
+
+    def _fallback_discount_multiplier(
+        self, symbol: Optional[str], is_maker: bool
+    ) -> Optional[float]:
+        key = "maker_discount_mult" if is_maker else "taker_discount_mult"
+        sources: List[Any] = []
+        if isinstance(self.fees_expected_payload, Mapping):
+            sources.append(self.fees_expected_payload.get(key))
+        if isinstance(self.fees_config_payload, Mapping):
+            sources.append(self.fees_config_payload.get(key))
+        symbol_key = ExecutionSimulator._fees_symbol_key(symbol)
+        if symbol_key and isinstance(self.fees_symbol_fee_table, Mapping):
+            symbol_cfg = self.fees_symbol_fee_table.get(symbol_key)
+            if isinstance(symbol_cfg, Mapping):
+                sources.append(symbol_cfg.get(key))
+        table_meta = None
+        if isinstance(self.fees_metadata, Mapping):
+            table_meta = self.fees_metadata.get("table")
+        if isinstance(table_meta, Mapping):
+            account_overrides = table_meta.get("account_overrides")
+            if isinstance(account_overrides, Mapping):
+                sources.append(account_overrides.get(key))
+        for candidate in sources:
+            value = ExecutionSimulator._trade_cost_float(candidate)
+            if value is None or value <= 0.0:
+                continue
+            return float(value)
+        return None
+
+    def _fallback_fee_rate(
+        self, symbol: Optional[str], is_maker: bool
+    ) -> Optional[float]:
+        key = "maker_fee_bps" if is_maker else "taker_fee_bps"
+        if isinstance(self.fees_expected_payload, Mapping):
+            candidate = ExecutionSimulator._trade_cost_float(
+                self.fees_expected_payload.get(key)
+            )
+            if candidate is not None and candidate >= 0.0:
+                return float(candidate)
+        symbol_key = ExecutionSimulator._fees_symbol_key(symbol)
+        if symbol_key and isinstance(self.fees_symbol_fee_table, Mapping):
+            symbol_cfg = self.fees_symbol_fee_table.get(symbol_key)
+            if isinstance(symbol_cfg, Mapping):
+                rate_candidate = ExecutionSimulator._trade_cost_float(
+                    symbol_cfg.get("maker_bps" if is_maker else "taker_bps")
+                )
+                if rate_candidate is not None:
+                    discount = self._fallback_discount_multiplier(symbol, is_maker)
+                    if discount is None:
+                        discount = 1.0
+                    return float(max(rate_candidate * discount, 0.0))
+        if isinstance(self.fees_config_payload, Mapping):
+            rate_candidate = ExecutionSimulator._trade_cost_float(
+                self.fees_config_payload.get("maker_bps" if is_maker else "taker_bps")
+            )
+            if rate_candidate is not None:
+                discount = self._fallback_discount_multiplier(symbol, is_maker)
+                if discount is None:
+                    discount = 1.0
+                return float(max(rate_candidate * discount, 0.0))
+        expected_default = ExecutionSimulator._trade_cost_float(self._expected_fee_bps)
+        if expected_default is not None and expected_default >= 0.0:
+            return float(expected_default)
+        return None
+
+    def _resolve_fee_rate_bps(
+        self,
+        *,
+        symbol: Optional[str],
+        is_maker: bool,
+    ) -> Optional[float]:
+        fee_model = getattr(self, "fees", None)
+        rate_bps: Optional[float] = None
+        if fee_model is not None:
+            get_bps = getattr(fee_model, "get_fee_bps", None)
+            if callable(get_bps):
+                try:
+                    raw_rate = get_bps(symbol, is_maker)
+                except Exception:
+                    logger.debug(
+                        "fees.get_fee_bps failed for %s/%s",
+                        symbol,
+                        "maker" if is_maker else "taker",
+                        exc_info=True,
+                    )
+                    raw_rate = None
+                rate_bps = ExecutionSimulator._trade_cost_float(raw_rate)
+                if rate_bps is not None:
+                    discount = self._resolve_fee_discount_multiplier(
+                        symbol, is_maker, fee_model
+                    )
+                    rate_bps = float(rate_bps * discount)
+        if rate_bps is None:
+            rate_bps = self._fallback_fee_rate(symbol, is_maker)
+        if rate_bps is None or not math.isfinite(rate_bps) or rate_bps < 0.0:
+            return None
+        return float(rate_bps)
+
+    def set_fees_config(
+        self,
+        config_payload: Optional[Mapping[str, Any]],
+        share_payload: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        expected_payload: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Attach extended fee configuration payloads from :class:`FeesImpl`."""
+
+        if config_payload is not None:
+            mapping = ExecutionSimulator._plain_mapping(config_payload)
+            if mapping:
+                self.fees_config_payload = mapping
+                table_payload = mapping.get("symbol_fee_table")
+                if isinstance(table_payload, Mapping):
+                    normalised: Dict[str, Any] = {}
+                    for symbol, data in table_payload.items():
+                        if not isinstance(symbol, str) or not isinstance(data, Mapping):
+                            continue
+                        normalised[symbol.upper()] = ExecutionSimulator._plain_mapping(data)
+                    self.fees_symbol_fee_table = normalised
+            else:
+                logger.debug("Received empty fees config payload; ignoring")
+
+        if metadata is not None:
+            mapping = ExecutionSimulator._plain_mapping(metadata)
+            if mapping:
+                self.fees_metadata = mapping
+            else:
+                logger.debug("Received empty fees metadata payload; ignoring")
+
+        if expected_payload is not None:
+            mapping = ExecutionSimulator._plain_mapping(expected_payload)
+            if mapping:
+                self.fees_expected_payload = mapping
+            else:
+                logger.debug("Received empty expected fee payload; ignoring")
+
+        if share_payload is not None:
+            self._apply_maker_taker_share_payload(share_payload)
+        else:
+            # Share settings may change implicitly when expected payload updates.
+            self._refresh_expected_fee_inputs()
+
     def _refresh_slippage_share_info(self) -> None:
         getter = getattr(self, "_slippage_get_maker_taker_share_info", None)
         if not callable(getter):
@@ -2649,29 +3037,6 @@ class ExecutionSimulator:
                 "fee role fallback side=%s liquidity=%s", side_key, liquidity_key
             )
 
-        share_cfg = self._maker_taker_share_cfg
-        enabled = self._maker_taker_share_enabled
-        expected_bps = self._expected_fee_bps
-        expected_share = self._expected_maker_share
-        if isinstance(share_cfg, Mapping):
-            enabled = bool(share_cfg.get("enabled", enabled))
-            rate_candidate = share_cfg.get("expected_fee_bps")
-            if rate_candidate is not None:
-                try:
-                    expected_bps = float(rate_candidate)
-                except (TypeError, ValueError):
-                    expected_bps = self._expected_fee_bps
-            share_candidate = share_cfg.get("maker_share")
-            if share_candidate is None:
-                share_candidate = share_cfg.get("maker_share_default")
-            if share_candidate is not None:
-                try:
-                    expected_share = float(share_candidate)
-                except (TypeError, ValueError):
-                    expected_share = self._expected_maker_share
-            self._maker_taker_share_enabled = enabled
-            self._expected_fee_bps = expected_bps
-            self._expected_maker_share = expected_share
         try:
             price_val = float(price)
             qty_val = float(qty)
@@ -2682,60 +3047,145 @@ class ExecutionSimulator:
         notional = abs(price_val * qty_val)
         if notional <= 0.0:
             return 0.0
-        if enabled:
-            rate_bps = float(expected_bps)
-            if not math.isfinite(rate_bps):
-                rate_bps = 0.0
-            fee = notional * (rate_bps / 1e4)
-            return float(fee)
-        if self.fees is None:
-            return 0.0
-        try:
-            fee_val = self.fees.compute(
-                side=side,
-                price=price_val,
-                qty=qty_val,
-                liquidity=liquidity,
+
+        symbol_value: Optional[str] = getattr(self, "symbol", None)
+        is_maker = liquidity_key == "maker"
+        rate_bps = self._resolve_fee_rate_bps(symbol=symbol_value, is_maker=is_maker)
+        fee_model = getattr(self, "fees", None)
+
+        if rate_bps is not None:
+            fee_amount = notional * (rate_bps / 1e4)
+            round_fn = getattr(fee_model, "_round_fee", None) if fee_model is not None else None
+            if callable(round_fn):
+                try:
+                    fee_amount = round_fn(fee_amount, symbol_value)
+                except Exception:
+                    logger.debug(
+                        "fees._round_fee failed for %s/%s",
+                        symbol_value,
+                        "maker" if is_maker else "taker",
+                        exc_info=True,
+                    )
+            if not math.isfinite(fee_amount) or fee_amount <= 0.0:
+                fee_amount = 0.0
+            return float(fee_amount)
+
+        if fee_model is not None:
+            compute_fn = getattr(fee_model, "compute", None)
+            if callable(compute_fn):
+                try:
+                    fee_val = compute_fn(
+                        side=side,
+                        price=price_val,
+                        qty=qty_val,
+                        liquidity=liquidity,
+                        symbol=symbol_value,
+                    )
+                except Exception:
+                    logger.debug(
+                        "fees.compute fallback failed for %s/%s",
+                        symbol_value,
+                        "maker" if is_maker else "taker",
+                        exc_info=True,
+                    )
+                else:
+                    fee_num = ExecutionSimulator._trade_cost_float(fee_val)
+                    if fee_num is not None and fee_num > 0.0:
+                        return float(fee_num)
+
+        fallback_rate = self._fallback_fee_rate(symbol_value, is_maker)
+        if fallback_rate is not None:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "fee rate fallback used for %s/%s -> %.6f bps",
+                    symbol_value,
+                    "maker" if is_maker else "taker",
+                    float(fallback_rate),
+                )
+            fee_amount = notional * (fallback_rate / 1e4)
+            if math.isfinite(fee_amount) and fee_amount > 0.0:
+                return float(fee_amount)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "fee calculation failed for %s/%s; returning 0",
+                symbol_value,
+                "maker" if is_maker else "taker",
             )
-        except Exception:
-            return 0.0
-        return float(fee_val)
+        return 0.0
 
     def _expected_cost_snapshot(
         self,
     ) -> Tuple[Optional[float], Optional[float], Optional[float], Dict[str, Optional[float]]]:
+        self._refresh_expected_fee_inputs()
         share_cfg = getattr(self, "_maker_taker_share_cfg", None)
         share_enabled = bool(getattr(self, "_maker_taker_share_enabled", False))
+        if isinstance(share_cfg, Mapping):
+            share_enabled = bool(share_cfg.get("enabled", share_enabled))
+
+        expected_payload = (
+            self.fees_expected_payload
+            if isinstance(self.fees_expected_payload, Mapping)
+            else None
+        )
+
         share_default = float(getattr(self, "_expected_maker_share", 0.0))
         share_candidate: Any = None
         if isinstance(share_cfg, Mapping):
             share_candidate = share_cfg.get("maker_share")
             if share_candidate is None:
                 share_candidate = share_cfg.get("maker_share_default")
-        maker_share_val = ExecutionSimulator._trade_cost_share(
-            share_candidate, share_default
-        )
-        try:
-            maker_share_out = float(maker_share_val)
-        except (TypeError, ValueError):
-            maker_share_out = None
-        if maker_share_out is not None:
-            if not math.isfinite(maker_share_out) or maker_share_out < 0.0:
-                maker_share_out = 0.0
-            elif maker_share_out > 1.0:
-                maker_share_out = 1.0
+        if share_candidate is None and expected_payload is not None:
+            share_candidate = expected_payload.get("maker_share")
+            if share_candidate is None:
+                share_candidate = expected_payload.get("maker_share_default")
+        maker_share_val = ExecutionSimulator._trade_cost_float(share_candidate)
+        if maker_share_val is None:
+            maker_share_val = share_default
+        maker_share_out = float(min(max(maker_share_val, 0.0), 1.0))
         if not share_enabled:
-            maker_share_out = 0.0 if maker_share_out is None else float(maker_share_out)
+            maker_share_out = 0.0
 
-        expected_fee_candidate: Any = getattr(self, "_expected_fee_bps", None)
-        if isinstance(share_cfg, Mapping) and share_cfg.get("expected_fee_bps") is not None:
-            expected_fee_candidate = share_cfg.get("expected_fee_bps")
-        expected_fee_val = ExecutionSimulator._trade_cost_float(expected_fee_candidate)
-        expected_fee_out: Optional[float]
-        if expected_fee_val is None or not math.isfinite(expected_fee_val):
-            expected_fee_out = None
-        else:
-            expected_fee_out = max(0.0, float(expected_fee_val))
+        maker_fee_val = None
+        taker_fee_val = None
+        if isinstance(share_cfg, Mapping):
+            maker_fee_val = ExecutionSimulator._trade_cost_float(
+                share_cfg.get("maker_fee_bps")
+            )
+            taker_fee_val = ExecutionSimulator._trade_cost_float(
+                share_cfg.get("taker_fee_bps")
+            )
+        if expected_payload is not None:
+            if maker_fee_val is None:
+                maker_fee_val = ExecutionSimulator._trade_cost_float(
+                    expected_payload.get("maker_fee_bps")
+                )
+            if taker_fee_val is None:
+                taker_fee_val = ExecutionSimulator._trade_cost_float(
+                    expected_payload.get("taker_fee_bps")
+                )
+
+        expected_fee_candidates: List[Any] = []
+        if isinstance(share_cfg, Mapping):
+            expected_fee_candidates.append(share_cfg.get("expected_fee_bps"))
+        if expected_payload is not None:
+            expected_fee_candidates.append(expected_payload.get("expected_fee_bps"))
+        if maker_fee_val is not None and taker_fee_val is not None:
+            expected_fee_candidates.append(
+                maker_share_out * maker_fee_val
+                + (1.0 - maker_share_out) * taker_fee_val
+            )
+        expected_fee_candidates.append(self._expected_fee_bps)
+
+        expected_fee_out: Optional[float] = None
+        for candidate in expected_fee_candidates:
+            value = ExecutionSimulator._trade_cost_float(candidate)
+            if value is None:
+                continue
+            if not math.isfinite(value) or value < 0.0:
+                continue
+            expected_fee_out = float(value)
+            break
         if not share_enabled:
             expected_fee_out = 0.0 if expected_fee_out is not None else 0.0
 
@@ -2748,6 +3198,15 @@ class ExecutionSimulator:
             spread_taker_val = ExecutionSimulator._trade_cost_float(
                 share_cfg.get("spread_cost_taker_bps")
             )
+        if expected_payload is not None:
+            if spread_maker_val is None:
+                spread_maker_val = ExecutionSimulator._trade_cost_float(
+                    expected_payload.get("spread_cost_maker_bps")
+                )
+            if spread_taker_val is None:
+                spread_taker_val = ExecutionSimulator._trade_cost_float(
+                    expected_payload.get("spread_cost_taker_bps")
+                )
         expected_spread_val = self._blend_expected_spread(
             taker_bps=spread_taker_val,
             maker_bps=spread_maker_val,
@@ -2775,16 +3234,22 @@ class ExecutionSimulator:
             expected_spread_out = None
 
         components: Dict[str, Optional[float]] = {}
-        if expected_fee_out is not None:
+        if share_enabled and expected_fee_out is not None:
             components["fee_bps"] = float(expected_fee_out)
         else:
             components["fee_bps"] = 0.0 if share_enabled else 0.0
         if expected_spread_out is not None:
             components["spread_bps"] = float(expected_spread_out)
+        if maker_fee_val is not None:
+            components.setdefault("maker_fee_bps", float(max(maker_fee_val, 0.0)))
+        if taker_fee_val is not None:
+            components.setdefault("taker_fee_bps", float(max(taker_fee_val, 0.0)))
         total_val = 0.0
         total_count = 0
-        for value in components.values():
+        for name, value in components.items():
             if value is None:
+                continue
+            if name in {"maker_fee_bps", "taker_fee_bps"}:
                 continue
             try:
                 num = float(value)
