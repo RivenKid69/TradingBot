@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
+from adv_store import ADVStore
+
 try:
     from slippage import (
         SlippageConfig,
@@ -33,6 +35,11 @@ except Exception:  # pragma: no cover
     DynamicImpactConfig = None  # type: ignore
     TailShockConfig = None  # type: ignore
     AdvConfig = None  # type: ignore
+
+try:  # pragma: no cover - optional during tests
+    from core_config import AdvRuntimeConfig
+except Exception:  # pragma: no cover
+    AdvRuntimeConfig = None  # type: ignore
 
 try:
     from utils_time import get_hourly_multiplier, watch_seasonality_file
@@ -125,7 +132,7 @@ class _TradeCostState:
     impact_cfg: Optional[Any] = None
     tail_cfg: Optional[Any] = None
     adv_cfg: Optional[Any] = None
-    adv_loader: Optional["_AdvDataset"] = None
+    adv_store: Optional[ADVStore] = None
     vol_window: Optional[int] = None
     participation_window: Optional[int] = None
     zscore_clip: Optional[float] = None
@@ -137,11 +144,16 @@ class _TradeCostState:
     k_ema: Optional[float] = None
     adv_cache: Dict[str, float] = field(default_factory=dict)
 
-    def reset(self) -> None:
+    def reset(self, *, reset_store: bool = True) -> None:
         self.vol_history.clear()
         self.participation_history.clear()
         self.k_ema = None
         self.adv_cache.clear()
+        if reset_store and self.adv_store is not None:
+            try:
+                self.adv_store.reset_runtime_state()
+            except Exception:
+                logger.exception("Failed to reset ADV store runtime state")
 
     def _normalise(
         self,
@@ -541,183 +553,6 @@ class _DynamicSpreadProfile:
         return self.process_spread(spread)
 
 
-class _AdvDataset:
-    """Load and cache ADV dataset from disk."""
-
-    def __init__(self, cfg: AdvConfig) -> None:  # type: ignore[name-defined]
-        self._cfg = cfg
-        self._path = self._extract_path(cfg)
-        self._refresh_days = self._extract_refresh_days(cfg)
-        self._cache: dict[str, float] = {}
-        self._meta: dict[str, Any] = {}
-        self._mtime: float | None = None
-        self._stale = False
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def _extract_path(cfg: AdvConfig) -> Optional[str]:  # type: ignore[name-defined]
-        candidates: list[Any] = []
-        extra = getattr(cfg, "extra", None)
-        if isinstance(extra, Mapping):
-            for key in ("quote_path", "adv_path", "path", "dataset", "data_path"):
-                if key in extra:
-                    candidates.append(extra[key])
-        inline = getattr(cfg, "path", None)
-        if inline is not None:
-            candidates.insert(0, inline)
-        for candidate in candidates:
-            if candidate is None:
-                continue
-            text = str(candidate).strip()
-            if text:
-                return text
-        return None
-
-    @staticmethod
-    def _extract_refresh_days(cfg: AdvConfig) -> Optional[int]:  # type: ignore[name-defined]
-        extra = getattr(cfg, "extra", None)
-        candidate: Any = None
-        if isinstance(extra, Mapping):
-            for key in ("refresh_days", "auto_refresh_days"):
-                if key in extra:
-                    candidate = extra[key]
-                    break
-        if candidate is None:
-            candidate = getattr(cfg, "refresh_days", None)
-        return _safe_positive_int(candidate)
-
-    def _ensure_loaded_locked(self) -> None:
-        path = self._path
-        if not path:
-            self._cache.clear()
-            self._meta = {}
-            self._stale = False
-            return
-        try:
-            mtime = os.path.getmtime(path)
-        except (OSError, TypeError, ValueError):
-            if not self._cache:
-                logger.warning("ADV dataset file %s is not accessible", path)
-            self._stale = False
-            return
-        if self._mtime is not None and self._cache and mtime <= self._mtime:
-            self._check_refresh_locked()
-            return
-        payload = self._read_payload(path)
-        if payload is None:
-            self._check_refresh_locked()
-            return
-        data, meta = payload
-        self._cache = data
-        self._meta = meta
-        self._mtime = mtime
-        self._check_refresh_locked()
-
-    def _read_payload(self, path: str) -> tuple[dict[str, float], dict[str, Any]] | None:
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except FileNotFoundError:
-            logger.warning("ADV dataset file %s not found", path)
-            return {}, {}
-        except Exception:
-            logger.exception("Failed to load ADV dataset from %s", path)
-            return None
-        if not isinstance(payload, Mapping):
-            logger.warning("ADV dataset %s must be a JSON object", path)
-            return {}, {}
-        meta_raw = payload.get("meta")
-        data_raw = payload.get("data")
-        if not isinstance(data_raw, Mapping):
-            logger.warning("ADV dataset %s is missing 'data' mapping", path)
-            data_raw = {}
-        dataset: dict[str, float] = {}
-        for key, value in data_raw.items():
-            symbol = str(key).strip().upper()
-            if not symbol:
-                continue
-            if isinstance(value, Mapping):
-                candidate = value.get("adv_quote")
-            else:
-                candidate = value
-            adv_val = _safe_float(candidate)
-            if adv_val is None or adv_val <= 0.0:
-                continue
-            dataset[symbol] = float(adv_val)
-        meta: dict[str, Any] = dict(meta_raw) if isinstance(meta_raw, Mapping) else {}
-        meta.setdefault("path", path)
-        meta.setdefault("symbol_count", len(dataset))
-        return dataset, meta
-
-    def _extract_timestamp_locked(self) -> Optional[int]:
-        meta = self._meta
-        candidates = [
-            meta.get("generated_at_ms"),
-            meta.get("generated_ms"),
-            meta.get("timestamp_ms"),
-            meta.get("end_ms"),
-        ]
-        for candidate in candidates:
-            ts_val = _safe_positive_int(candidate)
-            if ts_val is not None:
-                return ts_val
-        for key in ("generated_at", "end_at"):
-            value = meta.get(key)
-            if not isinstance(value, str):
-                continue
-            text = value.strip()
-            if not text:
-                continue
-            if text.endswith("Z"):
-                text = text[:-1] + "+00:00"
-            try:
-                dt = datetime.fromisoformat(text)
-            except ValueError:
-                continue
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp() * 1000)
-        if self._mtime is not None:
-            return int(self._mtime * 1000)
-        return None
-
-    def _check_refresh_locked(self) -> None:
-        refresh_days = self._refresh_days
-        if not refresh_days:
-            self._stale = False
-            return
-        ts_ms = self._extract_timestamp_locked()
-        if ts_ms is None:
-            self._stale = True
-            logger.warning("ADV dataset %s lacks timestamp metadata", self._path)
-            return
-        age_ms = int(time.time() * 1000) - ts_ms
-        if age_ms <= 0:
-            self._stale = False
-            return
-        age_days = age_ms / 86_400_000
-        if age_days > float(refresh_days):
-            self._stale = True
-            logger.warning(
-                "ADV dataset %s is older than %.1f days (threshold=%s)",
-                self._path,
-                age_days,
-                refresh_days,
-            )
-        else:
-            self._stale = False
-
-    def get(self, symbol: str) -> Optional[float]:
-        if not symbol:
-            return None
-        with self._lock:
-            self._ensure_loaded_locked()
-            if self._stale:
-                return None
-            if not self._cache:
-                return None
-            return self._cache.get(str(symbol).strip().upper())
-
     def metadata(self) -> Mapping[str, Any]:
         with self._lock:
             self._ensure_loaded_locked()
@@ -840,15 +675,17 @@ class SlippageCfg:
 
 
 class SlippageImpl:
-    def __init__(self, cfg: SlippageCfg) -> None:
+    def __init__(self, cfg: SlippageCfg, *, run_config: Any | None = None) -> None:
         self.cfg = cfg
         self._symbol: Optional[str] = None
         self._dynamic_profile: Optional[_DynamicSpreadProfile] = None
+        self._adv_store: Optional[ADVStore] = None
+        self._adv_runtime_cfg: Optional[Any] = None
         dyn_cfg_obj: Optional[DynamicSpreadConfig] = None
-        self._adv_loader: Optional[_AdvDataset] = None
         adv_cfg_obj: Optional[Any] = None
         impact_cfg_obj: Optional[Any] = None
         tail_cfg_obj: Optional[Any] = None
+        adv_runtime_payload: Dict[str, Any] = {}
         cfg_dict: Dict[str, Any] = {
             "k": float(cfg.k),
             "min_half_spread_bps": float(cfg.min_half_spread_bps),
@@ -974,12 +811,129 @@ class SlippageImpl:
                 self._adv_cfg = candidate
         self._impact_cfg = impact_cfg_obj
         self._tail_cfg = tail_cfg_obj
-        if self._adv_cfg is not None and getattr(self._adv_cfg, "enabled", False):
+        legacy_adv_overrides = self._adv_cfg
+
+        def _adv_runtime_dict(block: Any) -> Dict[str, Any]:
+            if block is None:
+                return {}
+            if AdvRuntimeConfig is not None and isinstance(block, AdvRuntimeConfig):
+                try:
+                    payload = block.dict(exclude_unset=False)
+                except Exception:
+                    payload = {}
+                if isinstance(payload, Mapping):
+                    return dict(payload)
+                return {}
+            if hasattr(block, "dict"):
+                try:
+                    payload = block.dict(exclude_unset=False)  # type: ignore[call-arg]
+                except Exception:
+                    payload = {}
+                if isinstance(payload, Mapping):
+                    return dict(payload)
+            if isinstance(block, Mapping):
+                return dict(block)
+            return {}
+
+        def _legacy_adv_runtime(block: Any) -> Dict[str, Any]:
+            overrides: Dict[str, Any] = {}
+            if block is None:
+                return overrides
+            enabled_val = _cfg_attr(block, "enabled")
+            if enabled_val is not None:
+                try:
+                    overrides["enabled"] = bool(enabled_val)
+                except Exception:
+                    pass
+            fallback_adv = _safe_float(_cfg_attr(block, "fallback_adv"))
+            if fallback_adv is not None and fallback_adv > 0.0:
+                overrides.setdefault("default_quote", fallback_adv)
+            min_adv = _safe_float(_cfg_attr(block, "min_adv"))
+            if min_adv is not None and min_adv > 0.0:
+                overrides.setdefault("floor_quote", min_adv)
+            refresh_days = _safe_positive_int(_cfg_attr(block, "refresh_days"))
+            if refresh_days is not None:
+                overrides.setdefault("refresh_days", refresh_days)
+            window_days = _safe_positive_int(_cfg_attr(block, "window_days"))
+            if window_days is not None:
+                overrides.setdefault("window_days", window_days)
+            seasonality_path = _cfg_attr(block, "seasonality_path")
+            if seasonality_path is not None:
+                overrides.setdefault("seasonality_path", seasonality_path)
+            seasonality_profile = _cfg_attr(block, "profile_kind")
+            if seasonality_profile is not None:
+                overrides.setdefault("seasonality_profile", seasonality_profile)
+            override_path = _cfg_attr(block, "override_path")
+            if override_path is not None:
+                overrides["path"] = override_path
+            extra = _cfg_attr(block, "extra")
+            if isinstance(extra, Mapping):
+                for key in ("quote_path", "adv_path", "path", "data_path"):
+                    candidate = extra.get(key)
+                    if candidate is not None and "path" not in overrides:
+                        overrides["path"] = candidate
+                dataset = extra.get("dataset")
+                if dataset is not None:
+                    overrides.setdefault("dataset", dataset)
+                missing_policy = extra.get("missing_symbol_policy")
+                if missing_policy is not None:
+                    overrides.setdefault("missing_symbol_policy", missing_policy)
+                default_quote = _safe_float(extra.get("default_quote"))
+                if default_quote is not None and default_quote > 0.0:
+                    overrides.setdefault("default_quote", default_quote)
+                floor_quote = _safe_float(extra.get("floor_quote"))
+                if floor_quote is not None and floor_quote > 0.0:
+                    overrides.setdefault("floor_quote", floor_quote)
+                refresh_extra = _safe_positive_int(extra.get("refresh_days"))
+                if refresh_extra is not None and "refresh_days" not in overrides:
+                    overrides["refresh_days"] = refresh_extra
+                auto_refresh = _safe_positive_int(extra.get("auto_refresh_days"))
+                if auto_refresh is not None and "refresh_days" not in overrides:
+                    overrides["refresh_days"] = auto_refresh
+                window_extra = _safe_positive_int(extra.get("window_days"))
+                if window_extra is not None and "window_days" not in overrides:
+                    overrides["window_days"] = window_extra
+                seasonality_profile_extra = extra.get("seasonality_profile")
+                if seasonality_profile_extra is not None:
+                    overrides.setdefault("seasonality_profile", seasonality_profile_extra)
+            return overrides
+
+        adv_runtime_payload.update(_legacy_adv_runtime(legacy_adv_overrides))
+        if run_config is not None:
+            adv_block = getattr(run_config, "adv", None)
+            for key, value in _adv_runtime_dict(adv_block).items():
+                if value is None:
+                    continue
+                adv_runtime_payload[key] = value
+        adv_runtime_cfg_obj: Optional[Any] = None
+        if adv_runtime_payload:
+            if AdvRuntimeConfig is not None:
+                try:
+                    adv_runtime_cfg_obj = AdvRuntimeConfig.parse_obj(adv_runtime_payload)
+                except Exception:
+                    logger.exception("Failed to parse runtime ADV config")
+                    adv_runtime_cfg_obj = dict(adv_runtime_payload)
+            else:
+                adv_runtime_cfg_obj = dict(adv_runtime_payload)
+        self._adv_runtime_cfg = adv_runtime_cfg_obj
+        adv_enabled_val = None
+        if self._adv_runtime_cfg is not None:
+            adv_enabled_val = _cfg_attr(self._adv_runtime_cfg, "enabled")
+        if adv_enabled_val is None:
+            adv_enabled_val = _cfg_attr(self._adv_cfg, "enabled")
+        try:
+            adv_enabled = bool(adv_enabled_val)
+        except Exception:
+            adv_enabled = False
+        if adv_enabled and (self._adv_runtime_cfg is not None or adv_runtime_payload):
+            store_source: Any = self._adv_runtime_cfg
+            if store_source is None:
+                store_source = dict(adv_runtime_payload)
             try:
-                self._adv_loader = _AdvDataset(self._adv_cfg)
+                self._adv_store = ADVStore(store_source)
             except Exception:
-                logger.exception("Failed to initialise ADV dataset loader")
-                self._adv_loader = None
+                logger.exception("Failed to initialise ADV store")
+                self._adv_store = None
         if dyn_cfg_obj is not None and getattr(dyn_cfg_obj, "enabled", False):
             try:
                 self._dynamic_profile = _DynamicSpreadProfile(
@@ -1017,7 +971,7 @@ class SlippageImpl:
             impact_cfg=self._impact_cfg,
             tail_cfg=self._tail_cfg,
             adv_cfg=self._adv_cfg,
-            adv_loader=self._adv_loader,
+            adv_store=self._adv_store,
             vol_window=_positive_int(_cfg_attr(self._impact_cfg, "vol_window")),
             participation_window=_positive_int(
                 _cfg_attr(self._impact_cfg, "participation_window")
@@ -1037,18 +991,19 @@ class SlippageImpl:
         return self._dynamic_profile
 
     def attach_to(self, sim) -> None:
+        prev_symbol = self._symbol
         try:
-            symbol = getattr(sim, "symbol", None)
+            symbol_attr = getattr(sim, "symbol", None)
         except Exception:
-            symbol = None
-        if symbol is not None:
-            try:
-                self._symbol = str(symbol)
-            except Exception:
-                self._symbol = None
+            symbol_attr = None
+        new_symbol = self._normalise_symbol(symbol_attr)
+        self._symbol = new_symbol
+        symbol_changed = prev_symbol != new_symbol
+        state = self._trade_cost_state
+        if symbol_changed:
+            state.reset()
         else:
-            self._symbol = None
-        self._trade_cost_state.reset()
+            state.reset(reset_store=False)
         if self._cfg_obj is not None:
             setattr(sim, "slippage_cfg", self._cfg_obj)
         try:
@@ -1064,6 +1019,14 @@ class SlippageImpl:
             setattr(sim, "_slippage_get_adv_quote", self.get_adv_quote)
         except Exception:
             logger.exception("Failed to attach get_adv_quote to simulator")
+        if self._adv_store is not None:
+            try:
+                setattr(sim, "get_bar_capacity_quote", self.get_bar_capacity_quote)
+                setattr(
+                    sim, "_slippage_get_bar_capacity_quote", self.get_bar_capacity_quote
+                )
+            except Exception:
+                logger.exception("Failed to attach get_bar_capacity_quote to simulator")
         try:
             setattr(sim, "get_trade_cost_bps", self.get_trade_cost_bps)
             setattr(sim, "_slippage_get_trade_cost", self.get_trade_cost_bps)
@@ -1076,7 +1039,7 @@ class SlippageImpl:
                 logger.exception("Failed to attach get_trade_cost_bps to config")
 
     @staticmethod
-    def from_dict(d: Dict[str, Any]) -> "SlippageImpl":
+    def from_dict(d: Dict[str, Any], *, run_config: Any | None = None) -> "SlippageImpl":
         dyn_cfg: Optional[Any] = None
         dyn_block: Optional[Any] = None
         for key in ("dynamic", "dynamic_spread"):
@@ -1120,7 +1083,8 @@ class SlippageImpl:
                 dynamic_impact=impact_cfg,
                 tail_shock=tail_cfg,
                 adv=adv_cfg,
-            )
+            ),
+            run_config=run_config,
         )
 
     def get_spread_bps(
@@ -1188,40 +1152,117 @@ class SlippageImpl:
                 logger.exception("Dynamic spread fallback computation failed")
         return float(base * vol_multiplier)
 
-    def get_adv_quote(self, symbol: Any) -> Optional[float]:
-        adv_cfg = getattr(self, "_adv_cfg", None)
-        loader = self._adv_loader
-        value: Optional[float] = None
-        if loader is not None and symbol:
-            try:
-                value = loader.get(str(symbol))
-            except Exception:
-                logger.exception("Failed to query ADV dataset for %s", symbol)
-                value = None
-        def _cfg_lookup(key: str) -> Any:
-            if isinstance(adv_cfg, Mapping):
-                return adv_cfg.get(key)
-            return getattr(adv_cfg, key, None)
-
-        if value is None and adv_cfg is not None:
-            fallback = _safe_float(_cfg_lookup("fallback_adv"))
-            if fallback is not None and fallback > 0.0:
-                value = fallback
-        if value is None:
+    def _normalise_symbol(self, symbol: Any) -> Optional[str]:
+        if symbol is None:
             return None
+        try:
+            text = str(symbol).strip().upper()
+        except Exception:
+            return None
+        return text or None
+
+    def _resolve_adv_default_quote(self) -> Optional[float]:
+        store = self._adv_store
+        if store is not None:
+            default_quote = store.default_quote
+            if default_quote is not None and default_quote > 0.0:
+                return float(default_quote)
+        runtime_cfg = self._adv_runtime_cfg
+        if runtime_cfg is not None:
+            default_quote = _safe_float(_cfg_attr(runtime_cfg, "default_quote"))
+            if default_quote is not None and default_quote > 0.0:
+                return float(default_quote)
+            extra = _cfg_attr(runtime_cfg, "extra")
+            if isinstance(extra, Mapping):
+                extra_default = _safe_float(extra.get("default_quote"))
+                if extra_default is not None and extra_default > 0.0:
+                    return float(extra_default)
+        adv_cfg = self._adv_cfg
+        if adv_cfg is not None:
+            fallback = _safe_float(_cfg_attr(adv_cfg, "fallback_adv"))
+            if fallback is not None and fallback > 0.0:
+                return float(fallback)
+        return None
+
+    def _resolve_adv_floor(self) -> Optional[float]:
+        floor_candidates: list[float] = []
+        store = self._adv_store
+        if store is not None:
+            floor_quote = store.floor_quote
+            if floor_quote is not None and floor_quote > 0.0:
+                floor_candidates.append(float(floor_quote))
+        runtime_cfg = self._adv_runtime_cfg
+        if runtime_cfg is not None:
+            runtime_floor = _safe_float(_cfg_attr(runtime_cfg, "floor_quote"))
+            if runtime_floor is not None and runtime_floor > 0.0:
+                floor_candidates.append(float(runtime_floor))
+            extra = _cfg_attr(runtime_cfg, "extra")
+            if isinstance(extra, Mapping):
+                extra_floor = _safe_float(extra.get("floor_quote"))
+                if extra_floor is not None and extra_floor > 0.0:
+                    floor_candidates.append(float(extra_floor))
+        adv_cfg = self._adv_cfg
+        if adv_cfg is not None:
+            min_adv = _safe_float(_cfg_attr(adv_cfg, "min_adv"))
+            if min_adv is not None and min_adv > 0.0:
+                floor_candidates.append(float(min_adv))
+        if not floor_candidates:
+            return None
+        return max(floor_candidates)
+
+    def get_adv_quote(self, symbol: Any) -> Optional[float]:
+        symbol_key = self._normalise_symbol(symbol)
+        if not symbol_key:
+            return self._resolve_adv_default_quote()
+        state = self._trade_cost_state
+        cached = state.adv_cache.get(symbol_key)
+        if cached is not None and math.isfinite(cached) and cached > 0.0:
+            return cached
+        value: Optional[float] = None
+        if self._adv_store is not None:
+            try:
+                value = self._adv_store.get_adv_quote(symbol_key)
+            except Exception:
+                logger.exception("Failed to query ADV store for %s", symbol_key)
+                value = None
+        if value is None:
+            value = self._resolve_adv_default_quote()
         candidate = _safe_float(value)
         if candidate is None or candidate <= 0.0:
             return None
-        min_adv = _safe_float(_cfg_lookup("min_adv")) if adv_cfg is not None else None
-        max_adv = _safe_float(_cfg_lookup("max_adv")) if adv_cfg is not None else None
-        if min_adv is not None:
-            candidate = max(min_adv, candidate)
-        if max_adv is not None:
-            candidate = min(max_adv, candidate)
-        buffer = _safe_float(_cfg_lookup("liquidity_buffer")) if adv_cfg is not None else None
+        floor_quote = self._resolve_adv_floor()
+        if floor_quote is not None:
+            candidate = max(candidate, floor_quote)
+        adv_cfg = self._adv_cfg
+        max_adv = _safe_float(_cfg_attr(adv_cfg, "max_adv")) if adv_cfg is not None else None
+        if max_adv is not None and max_adv > 0.0:
+            candidate = min(candidate, max_adv)
+        buffer = _safe_float(_cfg_attr(adv_cfg, "liquidity_buffer")) if adv_cfg is not None else None
         if buffer is not None and buffer > 0.0 and buffer != 1.0:
             candidate = candidate * buffer
         if candidate <= 0.0 or not math.isfinite(candidate):
+            return None
+        state.adv_cache[symbol_key] = float(candidate)
+        return float(candidate)
+
+    def get_bar_capacity_quote(self, symbol: Any) -> Optional[float]:
+        symbol_key = self._normalise_symbol(symbol)
+        if not symbol_key:
+            return self._resolve_adv_default_quote()
+        if self._adv_store is None:
+            return self._resolve_adv_default_quote()
+        try:
+            capacity = self._adv_store.get_bar_capacity_quote(symbol_key)
+        except Exception:
+            logger.exception("Failed to query ADV bar capacity for %s", symbol_key)
+            return self._resolve_adv_default_quote()
+        candidate = _safe_float(capacity)
+        if candidate is None or candidate <= 0.0:
+            return self._resolve_adv_default_quote()
+        floor_quote = self._resolve_adv_floor()
+        if floor_quote is not None:
+            candidate = max(candidate, floor_quote)
+        if not math.isfinite(candidate) or candidate <= 0.0:
             return None
         return float(candidate)
 
@@ -1233,16 +1274,19 @@ class SlippageImpl:
     ) -> Optional[float]:
         state = self._trade_cost_state
         adv_hint = _safe_float(metrics.get("adv"))
-        if adv_hint is not None and adv_hint > 0.0:
+        if adv_hint is not None and adv_hint > 0.0 and math.isfinite(adv_hint):
             return adv_hint
-        if symbol:
-            cached = state.adv_cache.get(symbol)
+        symbol_key = self._normalise_symbol(symbol)
+        if symbol_key:
+            cached = state.adv_cache.get(symbol_key)
             if cached is not None and math.isfinite(cached) and cached > 0.0:
                 return cached
-        adv_val = self.get_adv_quote(symbol) if symbol else None
-        if adv_val is not None and adv_val > 0.0 and math.isfinite(adv_val) and symbol:
-            state.adv_cache[symbol] = adv_val
+            adv_val = self.get_adv_quote(symbol_key)
+        else:
+            adv_val = self._resolve_adv_default_quote()
         if adv_val is not None and adv_val > 0.0 and math.isfinite(adv_val):
+            if symbol_key:
+                state.adv_cache[symbol_key] = adv_val
             return adv_val
         liquidity_hint = _safe_float(metrics.get("liquidity"))
         if liquidity_hint is not None and liquidity_hint > 0.0:

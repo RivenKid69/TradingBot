@@ -197,7 +197,7 @@ class SimExecutor(TradeExecutor):
             cfg_lat.setdefault("symbol", symbol)
             latency = LatencyImpl.from_dict(cfg_lat)
         if slippage is None:
-            slippage = SlippageImpl.from_dict(rc_slippage)
+            slippage = SlippageImpl.from_dict(rc_slippage, run_config=run_config)
         if fees is None:
             fees = FeesImpl.from_dict(rc_fees)
 
@@ -253,7 +253,9 @@ class SimExecutor(TradeExecutor):
 
         q_impl = QuantizerImpl.from_dict(getattr(run_config, "quantizer", {}) or {})
         f_impl = FeesImpl.from_dict(getattr(run_config, "fees", {}) or {})
-        s_impl = SlippageImpl.from_dict(getattr(run_config, "slippage", {}) or {})
+        s_impl = SlippageImpl.from_dict(
+            getattr(run_config, "slippage", {}) or {}, run_config=run_config
+        )
         l_cfg = SimExecutor._latency_dict(getattr(run_config, "latency", None))
         lat_path = getattr(run_config, "latency_seasonality_path", None)
         if lat_path and not l_cfg.get("latency_seasonality_path"):
