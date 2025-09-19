@@ -593,6 +593,20 @@ class SymbolFeeConfig:
 
 
 @dataclass
+class FeeComputation:
+    fee: float
+    fee_before_rounding: float
+    commission_step: Optional[float]
+    rounding_step: Optional[float]
+    rounding_enabled: bool
+    settlement_mode: Optional[str]
+    settlement_currency: Optional[str]
+    use_bnb_settlement: bool
+    bnb_conversion_rate: Optional[float]
+    requires_bnb_conversion: bool
+
+
+@dataclass
 class FeesModel:
     """Расширенная модель комиссий Binance.
 
@@ -852,6 +866,7 @@ class FeesModel:
         expected = prob * maker_bps + (1.0 - prob) * taker_bps
         return float(_sanitize_non_negative(expected, 0.0))
 
+
     def compute(
         self,
         *,
@@ -861,7 +876,8 @@ class FeesModel:
         liquidity: str,
         symbol: Optional[str] = None,
         bnb_conversion_rate: Optional[float] = None,
-    ) -> float:
+        return_details: bool = False,
+    ) -> float | FeeComputation:
         """Расчитывает абсолютную комиссию в валюте котировки.
 
         Parameters
@@ -879,26 +895,44 @@ class FeesModel:
         bnb_conversion_rate:
             Цена BNB в валюте котировки. Используется, когда комиссии списываются
             в BNB (``settlement.mode == "bnb"`` или ``settlement.currency == "BNB"``).
+        return_details:
+            Если ``True``, возвращает :class:`FeeComputation` с подробным описанием
+            расчёта комиссии. По умолчанию возвращает только числовое значение.
 
         Returns
         -------
-        float
+        float | FeeComputation
             Абсолютная величина комиссии (>= 0). При некорректных данных возвращает ``0``.
             Если комиссии списываются в BNB и передан ``bnb_conversion_rate``,
-            результат возвращается в BNB.
+            результат возвращается в BNB. При ``return_details=True`` возвращается
+            экземпляр :class:`FeeComputation` с дополнительными полями.
         """
+
+        def _zero_result() -> FeeComputation:
+            return FeeComputation(
+                fee=0.0,
+                fee_before_rounding=0.0,
+                commission_step=None,
+                rounding_step=None,
+                rounding_enabled=False,
+                settlement_mode=None,
+                settlement_currency=None,
+                use_bnb_settlement=False,
+                bnb_conversion_rate=None,
+                requires_bnb_conversion=False,
+            )
 
         try:
             price_f = float(price)
             qty_f = float(qty)
         except (TypeError, ValueError):
-            return 0.0
+            return 0.0 if not return_details else _zero_result()
         if not (math.isfinite(price_f) and math.isfinite(qty_f)):
-            return 0.0
+            return 0.0 if not return_details else _zero_result()
 
         notional = abs(price_f * qty_f)
         if notional <= 0.0:
-            return 0.0
+            return 0.0 if not return_details else _zero_result()
 
         is_maker = str(liquidity).lower() == "maker"
         rate_bps = self.get_fee_bps(symbol, is_maker)
@@ -906,7 +940,18 @@ class FeesModel:
 
         fee = notional * (rate_bps / 1e4)
         if not math.isfinite(fee) or fee <= 0.0:
-            return 0.0
+            return 0.0 if not return_details else FeeComputation(
+                fee=0.0,
+                fee_before_rounding=0.0,
+                commission_step=None,
+                rounding_step=None,
+                rounding_enabled=False,
+                settlement_mode=None,
+                settlement_currency=None,
+                use_bnb_settlement=False,
+                bnb_conversion_rate=None,
+                requires_bnb_conversion=False,
+            )
 
         settlement_enabled, settlement_cfg = self._resolve_settlement_context(symbol)
         settlement_mode = str(settlement_cfg.get("mode") or "").lower()
@@ -917,13 +962,49 @@ class FeesModel:
         )
 
         effective_fee = float(fee)
+        conversion_used: Optional[float] = None
+        requires_conversion = False
         if use_bnb_settlement:
             conversion = _sanitize_positive_float(bnb_conversion_rate)
             if conversion is not None and conversion > 0.0:
-                effective_fee = effective_fee / conversion
+                conversion_used = float(conversion)
+                effective_fee = effective_fee / conversion_used
+            else:
+                requires_conversion = True
 
+        rounding_enabled, rounding_step, _ = self._resolve_rounding_context(symbol)
+        fee_before_rounding = float(effective_fee)
         effective_fee = self._round_fee(effective_fee, symbol)
-        return float(_sanitize_non_negative(effective_fee, 0.0))
+        final_fee = float(_sanitize_non_negative(effective_fee, 0.0))
+
+        if not return_details:
+            return final_fee
+
+        commission_step: Optional[float] = None
+        cfg = self._symbol_config(symbol)
+        if cfg and cfg.commission_step is not None:
+            step_candidate = _sanitize_positive_float(cfg.commission_step)
+            if step_candidate is not None and step_candidate > 0.0:
+                commission_step = float(step_candidate)
+        if commission_step is None and rounding_step is not None and rounding_step > 0.0:
+            commission_step = float(rounding_step)
+
+        rounded_step = None
+        if rounding_step is not None and rounding_step > 0.0:
+            rounded_step = float(rounding_step)
+
+        return FeeComputation(
+            fee=final_fee,
+            fee_before_rounding=float(_sanitize_non_negative(fee_before_rounding, 0.0)),
+            commission_step=commission_step,
+            rounding_step=rounded_step,
+            rounding_enabled=bool(rounding_enabled),
+            settlement_mode=settlement_mode or None,
+            settlement_currency=settlement_currency or None,
+            use_bnb_settlement=bool(use_bnb_settlement),
+            bnb_conversion_rate=conversion_used,
+            requires_bnb_conversion=bool(requires_conversion),
+        )
 
 
 @dataclass

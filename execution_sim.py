@@ -32,6 +32,7 @@ import logging
 import threading
 import random
 import json
+import time
 from clock import now_ms
 
 try:
@@ -857,6 +858,11 @@ class ExecutionSimulator:
         self.fees_metadata: Dict[str, Any] = {}
         self.fees_expected_payload: Dict[str, Any] = {}
         self.fees_symbol_fee_table: Dict[str, Any] = {}
+        self.fees_rounding: Dict[str, Any] = {}
+        self.fees_settlement: Dict[str, Any] = {}
+        self.fees_commission_steps: Dict[str, float] = {}
+        self.fees_conversion_rates: Dict[str, float] = {}
+        self._fees_conversion_requests: Dict[str, float] = {}
         self._maker_taker_share_cfg: Optional[Dict[str, Any]] = None
         self._maker_taker_share_enabled: bool = False
         self._maker_taker_share_mode: Optional[str] = None
@@ -2814,14 +2820,54 @@ class ExecutionSimulator:
             mapping = ExecutionSimulator._plain_mapping(config_payload)
             if mapping:
                 self.fees_config_payload = mapping
+                rounding_payload = mapping.get("rounding")
+                if isinstance(rounding_payload, Mapping):
+                    self.fees_rounding = ExecutionSimulator._plain_mapping(rounding_payload)
+                else:
+                    self.fees_rounding = {}
+                settlement_payload = mapping.get("settlement")
+                if isinstance(settlement_payload, Mapping):
+                    self.fees_settlement = ExecutionSimulator._plain_mapping(
+                        settlement_payload
+                    )
+                else:
+                    self.fees_settlement = {}
+                self.fees_commission_steps = {}
+                default_step = ExecutionSimulator._trade_cost_float(
+                    mapping.get("fee_rounding_step")
+                )
+                if default_step is not None and default_step > 0.0:
+                    self.fees_commission_steps["__default__"] = float(default_step)
+                conversion_rate = ExecutionSimulator._trade_cost_float(
+                    mapping.get("bnb_conversion_rate")
+                )
+                if conversion_rate is not None and conversion_rate > 0.0:
+                    self.fees_conversion_rates["BNB"] = float(conversion_rate)
+                else:
+                    self.fees_conversion_rates.pop("BNB", None)
                 table_payload = mapping.get("symbol_fee_table")
                 if isinstance(table_payload, Mapping):
                     normalised: Dict[str, Any] = {}
                     for symbol, data in table_payload.items():
                         if not isinstance(symbol, str) or not isinstance(data, Mapping):
                             continue
-                        normalised[symbol.upper()] = ExecutionSimulator._plain_mapping(data)
+                        data_mapping = ExecutionSimulator._plain_mapping(data)
+                        symbol_key = symbol.upper()
+                        normalised[symbol_key] = data_mapping
+                        step_candidate = ExecutionSimulator._trade_cost_float(
+                            data_mapping.get("commission_step")
+                        )
+                        if step_candidate is None or step_candidate <= 0.0:
+                            quant_block = data_mapping.get("quantizer")
+                            if isinstance(quant_block, Mapping):
+                                step_candidate = ExecutionSimulator._trade_cost_float(
+                                    quant_block.get("commission_step")
+                                )
+                        if step_candidate is not None and step_candidate > 0.0:
+                            self.fees_commission_steps[symbol_key] = float(step_candidate)
                     self.fees_symbol_fee_table = normalised
+                elif table_payload is None:
+                    self.fees_symbol_fee_table = {}
             else:
                 logger.debug("Received empty fees config payload; ignoring")
 
@@ -2844,6 +2890,76 @@ class ExecutionSimulator:
         else:
             # Share settings may change implicitly when expected payload updates.
             self._refresh_expected_fee_inputs()
+
+    def _fees_commission_step(self, symbol: Optional[str]) -> Optional[float]:
+        symbol_key = ExecutionSimulator._fees_symbol_key(symbol)
+        if isinstance(self.fees_commission_steps, Mapping):
+            if symbol_key and symbol_key in self.fees_commission_steps:
+                step_val = ExecutionSimulator._trade_cost_float(
+                    self.fees_commission_steps.get(symbol_key)
+                )
+                if step_val is not None and step_val > 0.0:
+                    return float(step_val)
+            default_step = ExecutionSimulator._trade_cost_float(
+                self.fees_commission_steps.get("__default__")
+            )
+            if default_step is not None and default_step > 0.0:
+                return float(default_step)
+        quantizer = getattr(self, "quantizer", None)
+        getter = getattr(quantizer, "get_commission_step", None) if quantizer is not None else None
+        if callable(getter) and symbol_key:
+            try:
+                step_raw = getter(symbol_key)
+            except Exception:
+                step_raw = None
+            step_val = ExecutionSimulator._trade_cost_float(step_raw)
+            if step_val is not None and step_val > 0.0:
+                return float(step_val)
+        if isinstance(self.fees_rounding, Mapping):
+            rounding_step = ExecutionSimulator._trade_cost_float(
+                self.fees_rounding.get("step")
+            )
+            if rounding_step is not None and rounding_step > 0.0:
+                return float(rounding_step)
+        return None
+
+    def _fees_fetch_bnb_conversion_rate(self, symbol: Optional[str]) -> Optional[float]:
+        candidates: List[Any] = []
+        if isinstance(self.fees_config_payload, Mapping):
+            candidates.append(self.fees_config_payload.get("bnb_conversion_rate"))
+        if isinstance(self.fees_conversion_rates, Mapping):
+            for value in self.fees_conversion_rates.values():
+                candidates.append(value)
+        for candidate in candidates:
+            rate = ExecutionSimulator._trade_cost_float(candidate)
+            if rate is not None and rate > 0.0:
+                return float(rate)
+        return None
+
+    def _fees_request_bnb_conversion(
+        self, *, symbol: Optional[str], settlement_currency: Optional[str]
+    ) -> None:
+        key = settlement_currency or "BNB"
+        now = time.time()
+        last = self._fees_conversion_requests.get(key)
+        if last is not None and (now - last) < 5.0:
+            return
+        self._fees_conversion_requests[key] = now
+        try:
+            logger.info(
+                "BNB settlement requires conversion",  # structured log
+                extra={
+                    "event": "fee_conversion_request",
+                    "symbol": symbol,
+                    "settlement_currency": settlement_currency or "BNB",
+                },
+            )
+        except Exception:
+            logger.info(
+                "BNB settlement requires conversion for symbol=%s currency=%s",
+                symbol,
+                settlement_currency or "BNB",
+            )
 
     def _refresh_slippage_share_info(self) -> None:
         getter = getattr(self, "_slippage_get_maker_taker_share_info", None)
@@ -3187,6 +3303,7 @@ class ExecutionSimulator:
         is_maker = liquidity_key == "maker"
         rate_bps = self._resolve_fee_rate_bps(symbol=symbol_value, is_maker=is_maker)
         fee_model = getattr(self, "fees", None)
+        commission_step_val = self._fees_commission_step(symbol_value)
 
         if rate_bps is not None:
             fee_amount = notional * (rate_bps / 1e4)
@@ -3203,19 +3320,85 @@ class ExecutionSimulator:
                     )
             if not math.isfinite(fee_amount) or fee_amount <= 0.0:
                 fee_amount = 0.0
-            return float(fee_amount)
+            fee_out = float(fee_amount)
+            if logger.isEnabledFor(logging.DEBUG):
+                extra = {
+                    "event": "trade_fee",
+                    "symbol": symbol_value,
+                    "liquidity": "maker" if is_maker else "taker",
+                    "fee": fee_out,
+                    "rate_bps": float(rate_bps),
+                }
+                if commission_step_val is not None:
+                    extra["commission_step"] = float(commission_step_val)
+                logger.debug("trade fee computed", extra=extra)
+            return fee_out
+
+        settlement_mode: Optional[str] = None
+        settlement_currency: Optional[str] = None
+        bnb_rate: Optional[float] = None
+        needs_conversion = False
+        if fee_model is not None:
+            resolve_settlement = getattr(fee_model, "_resolve_settlement_context", None)
+            if callable(resolve_settlement):
+                try:
+                    settlement_enabled, settlement_cfg = resolve_settlement(symbol_value)
+                except Exception:
+                    settlement_enabled = False
+                    settlement_cfg = {}
+                if settlement_enabled and isinstance(settlement_cfg, Mapping):
+                    settlement_mode = str(settlement_cfg.get("mode") or "").lower()
+                    settlement_currency = str(settlement_cfg.get("currency") or "").upper()
+                    if settlement_mode == "bnb" or settlement_currency == "BNB":
+                        bnb_rate = self._fees_fetch_bnb_conversion_rate(symbol_value)
+                        needs_conversion = bnb_rate is None
 
         if fee_model is not None:
             compute_fn = getattr(fee_model, "compute", None)
             if callable(compute_fn):
+                compute_kwargs = {
+                    "side": side,
+                    "price": price_val,
+                    "qty": qty_val,
+                    "liquidity": liquidity,
+                    "symbol": symbol_value,
+                }
+                if bnb_rate is not None:
+                    compute_kwargs["bnb_conversion_rate"] = bnb_rate
                 try:
-                    fee_val = compute_fn(
-                        side=side,
-                        price=price_val,
-                        qty=qty_val,
-                        liquidity=liquidity,
-                        symbol=symbol_value,
-                    )
+                    fee_val = compute_fn(return_details=True, **compute_kwargs)
+                except TypeError:
+                    try:
+                        fee_val = compute_fn(**compute_kwargs)
+                    except Exception:
+                        logger.debug(
+                            "fees.compute fallback failed for %s/%s",
+                            symbol_value,
+                            "maker" if is_maker else "taker",
+                            exc_info=True,
+                        )
+                    else:
+                        fee_num = ExecutionSimulator._trade_cost_float(fee_val)
+                        if fee_num is not None and fee_num > 0.0:
+                            fee_amount = float(fee_num)
+                            if needs_conversion:
+                                self._fees_request_bnb_conversion(
+                                    symbol=symbol_value,
+                                    settlement_currency=settlement_currency,
+                                )
+                            if logger.isEnabledFor(logging.DEBUG):
+                                extra = {
+                                    "event": "trade_fee",
+                                    "symbol": symbol_value,
+                                    "liquidity": "maker" if is_maker else "taker",
+                                    "fee": fee_amount,
+                                }
+                                step_val = self._fees_commission_step(symbol_value)
+                                if step_val is not None:
+                                    commission_step_val = float(step_val)
+                                    extra["commission_step"] = float(step_val)
+                                logger.debug("trade fee computed", extra=extra)
+                            return fee_amount
                 except Exception:
                     logger.debug(
                         "fees.compute fallback failed for %s/%s",
@@ -3224,9 +3407,64 @@ class ExecutionSimulator:
                         exc_info=True,
                     )
                 else:
-                    fee_num = ExecutionSimulator._trade_cost_float(fee_val)
-                    if fee_num is not None and fee_num > 0.0:
-                        return float(fee_num)
+                    fee_amount: Optional[float] = None
+                    conversion_used: Optional[float] = None
+                    if hasattr(fee_val, "fee"):
+                        fee_num = ExecutionSimulator._trade_cost_float(
+                            getattr(fee_val, "fee", None)
+                        )
+                        if fee_num is not None and fee_num > 0.0:
+                            fee_amount = float(fee_num)
+                        conversion_used = ExecutionSimulator._trade_cost_float(
+                            getattr(fee_val, "bnb_conversion_rate", None)
+                        )
+                        step_candidate = ExecutionSimulator._trade_cost_float(
+                            getattr(fee_val, "commission_step", None)
+                        )
+                        if step_candidate is not None and step_candidate > 0.0:
+                            commission_step_val = float(step_candidate)
+                        if (
+                            getattr(fee_val, "requires_bnb_conversion", False)
+                            and conversion_used is None
+                        ):
+                            self._fees_request_bnb_conversion(
+                                symbol=symbol_value,
+                                settlement_currency=getattr(
+                                    fee_val, "settlement_currency", settlement_currency
+                                ),
+                            )
+                        settlement_mode = getattr(fee_val, "settlement_mode", settlement_mode)
+                        settlement_currency = getattr(
+                            fee_val, "settlement_currency", settlement_currency
+                        )
+                    else:
+                        fee_num = ExecutionSimulator._trade_cost_float(fee_val)
+                        if fee_num is not None and fee_num > 0.0:
+                            fee_amount = float(fee_num)
+                            if needs_conversion:
+                                self._fees_request_bnb_conversion(
+                                    symbol=symbol_value,
+                                    settlement_currency=settlement_currency,
+                                )
+                    if fee_amount is not None and fee_amount > 0.0:
+                        fee_out = float(fee_amount)
+                        if logger.isEnabledFor(logging.DEBUG):
+                            extra = {
+                                "event": "trade_fee",
+                                "symbol": symbol_value,
+                                "liquidity": "maker" if is_maker else "taker",
+                                "fee": fee_out,
+                            }
+                            if commission_step_val is not None:
+                                extra["commission_step"] = float(commission_step_val)
+                            if conversion_used is not None:
+                                extra["bnb_conversion_rate"] = float(conversion_used)
+                            if settlement_mode:
+                                extra["settlement_mode"] = settlement_mode
+                            if settlement_currency:
+                                extra["settlement_currency"] = settlement_currency
+                            logger.debug("trade fee computed", extra=extra)
+                        return fee_out
 
         fallback_rate = self._fallback_fee_rate(symbol_value, is_maker)
         if fallback_rate is not None:
@@ -3239,7 +3477,19 @@ class ExecutionSimulator:
                 )
             fee_amount = notional * (fallback_rate / 1e4)
             if math.isfinite(fee_amount) and fee_amount > 0.0:
-                return float(fee_amount)
+                fee_out = float(fee_amount)
+                if logger.isEnabledFor(logging.DEBUG):
+                    extra = {
+                        "event": "trade_fee",
+                        "symbol": symbol_value,
+                        "liquidity": "maker" if is_maker else "taker",
+                        "fee": fee_out,
+                        "rate_bps": float(fallback_rate),
+                    }
+                    if commission_step_val is not None:
+                        extra["commission_step"] = float(commission_step_val)
+                    logger.debug("trade fee computed", extra=extra)
+                return fee_out
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
