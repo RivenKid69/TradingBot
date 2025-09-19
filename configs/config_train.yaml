@@ -52,6 +52,13 @@ fees:
   use_bnb_discount: false
   maker_discount_mult: 1.0
   taker_discount_mult: 1.0
+  maker_taker_share:
+    enabled: false
+    mode: "fixed"
+    maker_share_default: 0.5
+    spread_cost_maker_bps: 0.0
+    spread_cost_taker_bps: 0.0
+    taker_fee_override_bps: null
 
 slippage:
   k: 0.8

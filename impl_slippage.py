@@ -51,6 +51,9 @@ except Exception:  # pragma: no cover
         return None
 
 
+from services.costs import MakerTakerShareSettings
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -681,6 +684,8 @@ class SlippageImpl:
         self._dynamic_profile: Optional[_DynamicSpreadProfile] = None
         self._adv_store: Optional[ADVStore] = None
         self._adv_runtime_cfg: Optional[Any] = None
+        self._maker_taker_share_raw: Optional[Dict[str, Any]] = None
+        self.maker_taker_share_cfg: Optional[MakerTakerShareSettings] = None
         dyn_cfg_obj: Optional[DynamicSpreadConfig] = None
         adv_cfg_obj: Optional[Any] = None
         impact_cfg_obj: Optional[Any] = None
@@ -730,6 +735,19 @@ class SlippageImpl:
         if dyn_dict is not None:
             cfg_dict["dynamic"] = dict(dyn_dict)
             cfg_dict.setdefault("dynamic_spread", dict(dyn_dict))
+
+        share_block: Any = None
+        if run_config is not None:
+            if isinstance(run_config, Mapping):
+                share_block = run_config.get("maker_taker_share")
+            else:
+                share_block = getattr(run_config, "maker_taker_share", None)
+        share_cfg = MakerTakerShareSettings.parse(share_block)
+        self.maker_taker_share_cfg = share_cfg
+        if share_cfg is not None:
+            self._maker_taker_share_raw = share_cfg.as_dict()
+        elif isinstance(share_block, Mapping):
+            self._maker_taker_share_raw = dict(share_block)
 
         def _normalise_section(
             block: Any, cfg_cls: Optional[type]
