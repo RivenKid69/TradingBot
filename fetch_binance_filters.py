@@ -23,6 +23,24 @@ def main():
         print(f"ERROR: failed to fetch exchangeInfo: {e}", file=sys.stderr)
         sys.exit(1)
 
+    precision_keys = {
+        "baseAssetPrecision",
+        "quoteAssetPrecision",
+        "baseCommissionPrecision",
+        "quoteCommissionPrecision",
+        "quotePrecision",
+    }
+    for sym_data in normalized.values():
+        if not isinstance(sym_data, dict):
+            continue
+        for key in precision_keys:
+            if key not in sym_data:
+                continue
+            try:
+                sym_data[key] = int(sym_data[key])
+            except (TypeError, ValueError):
+                continue
+
     meta = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "source_dataset": "binance_exchange_filters",

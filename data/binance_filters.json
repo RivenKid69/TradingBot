@@ -17,7 +17,12 @@
         "maxPrice": "1000000",
         "minPrice": "0.01",
         "tickSize": "0.01"
-      }
+      },
+      "baseAssetPrecision": 8,
+      "baseCommissionPrecision": 8,
+      "quoteAssetPrecision": 8,
+      "quoteCommissionPrecision": 8,
+      "quotePrecision": 8
     },
     "ETHUSDT": {
       "LOT_SIZE": {
@@ -36,12 +41,17 @@
         "maxPrice": "1000000",
         "minPrice": "0.01",
         "tickSize": "0.01"
-      }
+      },
+      "baseAssetPrecision": 8,
+      "baseCommissionPrecision": 8,
+      "quoteAssetPrecision": 8,
+      "quoteCommissionPrecision": 8,
+      "quotePrecision": 8
     }
   },
   "metadata": {
-    "built_at": "2025-09-15T16:57:30.622478+00:00",
-    "source": "/api/v3/exchangeInfo",
-    "symbols_count": 2
+    "generated_at": "2025-09-19T20:48:45Z",
+    "source_dataset": "binance_exchange_filters",
+    "version": 1
   }
 }
