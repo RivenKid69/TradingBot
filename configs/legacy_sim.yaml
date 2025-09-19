@@ -5,21 +5,29 @@ filters:
   strict: true
 
 fees:
-  maker_bps: 1.0
-  taker_bps: 5.0
-  use_bnb_discount: false
-  maker_discount_mult: 1.0
-  taker_discount_mult: 1.0
+  path: null                     # Путь к JSON/YAML с ставками по символам; null → использовать data/fees/fees_by_symbol.json.
+  refresh_days: null             # Каденс проверки устаревания таблицы (в днях); null отключает проверку (по умолчанию).
+  maker_bps: 1.0                 # Базовая ставка мейкера в bps, когда нет записей в таблице (дефолт 1.0).
+  taker_bps: 5.0                 # Базовая ставка тейкера в bps, когда нет записей в таблице (дефолт 5.0).
+  use_bnb_discount: false        # Применять ли VIP-скидки Binance/BNB; false → множители остаются 1.0 (дефолт).
+  maker_discount_mult: 1.0       # Принудительный множитель скидки мейкера; null → авто (1.0 или 0.75 при скидке).
+  taker_discount_mult: 1.0       # Принудительный множитель скидки тейкера; null → авто (1.0 или 0.75 при скидке).
+  vip_tier: null                 # Номер VIP-уровня (int) для табличных ставок; null → использовать значения по умолчанию.
+  maker_share_default: null      # Override базовой доли maker [0..1]; null → использовать 0.5 из блока maker_taker_share.
+  spread_cost_maker_bps: null    # Override доп. издержек maker (bps) при разделении потока; null → 0.0 по умолчанию.
+  spread_cost_taker_bps: null    # Override доп. издержек taker (bps) при разделении потока; null → 0.0 по умолчанию.
+  taker_fee_override_bps: null   # Жёсткий override тейкерской комиссии (bps) после скидок; null → без override.
   maker_taker_share:
-    enabled: false
-    mode: "fixed"
-    maker_share_default: 0.5
-    spread_cost_maker_bps: 0.0
-    spread_cost_taker_bps: 0.0
-    taker_fee_override_bps: null
-    distance_to_mid: null
-    latency: null
-    coefficients: {}
+    enabled: false               # Включить расчёт доли maker/taker; false → использовать maker_share_default.
+    mode: "fixed"                # Режим: fixed | model | predictor; fixed → всегда брать maker_share_default.
+    maker_share_default: 0.5     # Базовая доля maker, когда модель неактивна/нет фичей (дефолт 0.5).
+    spread_cost_maker_bps: 0.0   # Доп. издержки maker (bps) сверх комиссии при активном разделе потока.
+    spread_cost_taker_bps: 0.0   # Доп. издержки taker (bps) сверх комиссии при активном разделе потока.
+    taker_fee_override_bps: null # Опциональный override тейкерской комиссии (bps) в активном режиме.
+    model:
+      distance_to_mid: null      # Фича distance-to-mid в bps или блок {value,min,max,fallback}; null → не используется.
+      latency: null              # Фича latency в мс или блок {value,min,max,fallback}; null → не используется.
+      coefficients: {}           # Линейные коэффициенты модели (intercept, distance_to_mid, latency, …); пусто = дефолт.
 
 funding:
   enabled: false
