@@ -14,6 +14,14 @@ execution:
   timeframe_ms: null
   use_latency_from: null
   latency_constant_ms: null
+  bar_capacity_base:
+    enabled: false           # Переключатель ограничения объёма сделок по ADV базовой валюты.
+    capacity_frac_of_ADV_base: 1.0  # Доля дневного ADV (1.0 = 100%), доступная в каждом баре после пересчёта.
+    adv_base_path: "data/liquidity/adv_base.json"  # JSON с дневным ADV по базовой валюте.
+    # Формат файла: {"meta": {...}, "data": {"SYMBOL": {"adv_base": <float>, "days": <int>,
+    #   "days_total": <int>, "last_day": "<ISO8601>"}, ...}}; значения указываются в базовой валюте.
+    floor_base: null         # Минимальный дневной ADV (в базовой валюте): используется как фолбек и нижняя граница.
+    timeframe_ms: null       # Необязательный override размера бара (в мс) для конвертации дневного ADV в per-bar.
   bridge:
     intrabar_price_model: null
     timeframe_ms: null

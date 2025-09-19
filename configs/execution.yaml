@@ -4,6 +4,12 @@ execution:
   timeframe_ms: null
   use_latency_from: null
   latency_constant_ms: null
+  bar_capacity_base:
+    enabled: false
+    capacity_frac_of_ADV_base: 1.0
+    adv_base_path: "data/liquidity/adv_base.json"
+    floor_base: null
+    timeframe_ms: null
   bridge:
     intrabar_price_model: null
     timeframe_ms: null
