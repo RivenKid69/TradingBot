@@ -127,6 +127,17 @@ python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT
 превысит допуск `--threshold` (по умолчанию 10%).
 Подробные шаги и критерии приёмки описаны в [docs/seasonality_QA.md](docs/seasonality_QA.md).
 
+### Обновление таблицы комиссий
+
+`scripts/refresh_fees.py` автоматизирует обновление `data/fees/fees_by_symbol.json`.
+Скрипт читает активные спот-символы из `exchangeInfo`, подтягивает ставки
+maker/taker через публичный endpoint Binance и пересобирает JSON c метаданными.
+Укажите `BINANCE_API_KEY`/`BINANCE_API_SECRET` (или аргументы `--api-key` /
+`--api-secret`), чтобы вместо публичного снимка использовать приватный
+endpoint `tradeFee`. Если Binance публикует CSV-файл, его можно передать через
+`--csv`. Режим `--dry-run` печатает пример диффа без перезаписи файла, а
+встроенная проверка предупреждает, если предыдущая версия моложе 30 дней.
+
 ### Offline REST budget configuration
 
 Файл `configs/offline.yaml` содержит общие параметры для офлайн‑скриптов,
