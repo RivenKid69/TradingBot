@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Mapping
 import logging
 import os
 import math
+import time
+from datetime import datetime, timezone
 import pandas as pd
 
 from execution_sim import ExecutionSimulator  # type: ignore
@@ -587,6 +589,16 @@ class ServiceBacktest:
             or getattr(sim, "_run_config", None)
         )
 
+        self._fees_expected_payload: Optional[Dict[str, Any]] = None
+        self._fees_metadata: Optional[Dict[str, Any]] = None
+        self._fees_enabled: bool = True
+        (
+            self._fees_expected_payload,
+            self._fees_metadata,
+            self._fees_enabled,
+        ) = self._resolve_fee_expected_info()
+        self._log_fee_metadata_warnings()
+
         if SlippageImpl is not None:
             slip_attached = callable(getattr(self.sim, "_slippage_get_trade_cost", None))
             if not slip_attached:
@@ -683,6 +695,15 @@ class ServiceBacktest:
             df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col
         )
 
+        expected_payload: Dict[str, Any] = (
+            dict(self._fees_expected_payload)
+            if isinstance(self._fees_expected_payload, Mapping)
+            else {}
+        )
+        fees_enabled = bool(self._fees_enabled)
+        share_expected_flag = False
+        fee_expected_flag = False
+
         total_trades = 0
         total_fill_sum = 0.0
         total_fill_count = 0
@@ -755,6 +776,33 @@ class ServiceBacktest:
                     component_sums[key] = component_sums.get(key, 0.0) + num
                     component_counts[key] = component_counts.get(key, 0) + 1
 
+        if fees_enabled and expected_payload:
+            default_share = self._safe_float(expected_payload.get("maker_share"))
+            if default_share is not None and not share_values:
+                share_values.append(default_share)
+                share_expected_flag = True
+            default_fee = self._safe_float(
+                expected_payload.get("expected_fee_bps")
+            )
+            if default_fee is None:
+                default_fee = self._safe_float(
+                    expected_payload.get("taker_fee_bps")
+                )
+            if default_fee is not None and not fee_values:
+                fee_values.append(default_fee)
+                fee_expected_flag = True
+            if not component_sums:
+                for key in (
+                    "maker_fee_bps",
+                    "taker_fee_bps",
+                    "expected_fee_bps",
+                ):
+                    fallback_val = self._safe_float(expected_payload.get(key))
+                    if fallback_val is None:
+                        continue
+                    component_sums[key] = float(fallback_val)
+                    component_counts[key] = 1
+
         if total_trades:
             if total_fill_count:
                 overall_avg = total_fill_sum / total_fill_count
@@ -771,6 +819,8 @@ class ServiceBacktest:
                     "service_backtest",
                     total_trades,
                 )
+        share_count = len(share_values)
+        fee_count = len(fee_values)
         def _avg(series: List[float]) -> Optional[float]:
             if not series:
                 return None
@@ -791,10 +841,11 @@ class ServiceBacktest:
             or spread_bps_avg is not None
             or component_avg
         ):
-            def _fmt(value: Optional[float]) -> str:
+            def _fmt(value: Optional[float], expected: bool = False) -> str:
                 if value is None:
                     return "None"
-                return f"{value:.4f}"
+                suffix = " (expected)" if expected else ""
+                return f"{value:.4f}{suffix}"
 
             comp_avg_repr = (
                 "{"
@@ -815,8 +866,8 @@ class ServiceBacktest:
             logger.info(
                 "%s: maker_share=%s fee_bps=%s spread_bps=%s cost_components_avg=%s cost_components_sum=%s",
                 "service_backtest",
-                _fmt(maker_share_avg),
-                _fmt(fee_bps_avg),
+                _fmt(maker_share_avg, share_expected_flag and share_count == 1),
+                _fmt(fee_bps_avg, fee_expected_flag and fee_count == 1),
                 _fmt(spread_bps_avg),
                 comp_avg_repr,
                 comp_sum_repr,
@@ -828,6 +879,156 @@ class ServiceBacktest:
         except Exception:
             pass
         return reports
+
+    def _resolve_fee_expected_info(
+        self,
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], bool]:
+        expected_payload: Optional[Dict[str, Any]] = None
+        metadata_payload: Optional[Dict[str, Any]] = None
+
+        getter = getattr(self.sim, "_fees_get_expected_info", None)
+        info_payload: Any = None
+        if callable(getter):
+            try:
+                info_payload = getter()
+            except Exception:
+                logger.debug(
+                    "service_backtest: failed to fetch fees expected info", exc_info=True
+                )
+        if isinstance(info_payload, Mapping):
+            expected_candidate = info_payload.get("expected")
+            if isinstance(expected_candidate, Mapping):
+                expected_payload = {k: v for k, v in expected_candidate.items()}
+            metadata_candidate = info_payload.get("metadata")
+            if isinstance(metadata_candidate, Mapping):
+                metadata_payload = {k: v for k, v in metadata_candidate.items()}
+
+        if expected_payload is None:
+            candidate = getattr(self.sim, "fees_expected_payload", None)
+            if isinstance(candidate, Mapping):
+                expected_payload = {k: v for k, v in candidate.items()}
+
+        if metadata_payload is None:
+            candidate = getattr(self.sim, "fees_metadata", None)
+            if isinstance(candidate, Mapping):
+                metadata_payload = {k: v for k, v in candidate.items()}
+
+        enabled = True
+        for source in (metadata_payload, getattr(self.sim, "fees_config_payload", None)):
+            if not isinstance(source, Mapping):
+                continue
+            flag = source.get("enabled")
+            if flag is None:
+                continue
+            try:
+                enabled = bool(flag)
+            except Exception:
+                continue
+            else:
+                break
+
+        if not enabled:
+            expected_payload = None
+
+        return expected_payload, metadata_payload, enabled
+
+    def _log_fee_metadata_warnings(self) -> None:
+        if not self._fees_enabled:
+            return
+        metadata = self._fees_metadata
+        if not isinstance(metadata, Mapping):
+            return
+        table_meta = metadata.get("table")
+        if not isinstance(table_meta, Mapping):
+            return
+        path = table_meta.get("path")
+        refresh_days = self._safe_float(table_meta.get("refresh_days"))
+        age_days = self._metadata_age_days(table_meta)
+        stale_flag = bool(table_meta.get("stale"))
+        error = table_meta.get("error")
+
+        warnings: List[str] = []
+        if isinstance(error, str) and error:
+            warnings.append(f"error={error}")
+        if refresh_days is not None and age_days is not None:
+            if age_days > refresh_days:
+                built_repr = table_meta.get("built_at")
+                detail = f"age={age_days:.1f}d refresh_days={refresh_days}"
+                if built_repr is not None:
+                    detail += f" built_at={built_repr}"
+                warnings.append(detail)
+        elif stale_flag:
+            detail = "metadata flagged as stale"
+            built_repr = table_meta.get("built_at")
+            if built_repr is not None:
+                detail += f" built_at={built_repr}"
+            if age_days is not None:
+                detail += f" age={age_days:.1f}d"
+            warnings.append(detail)
+
+        if not warnings:
+            return
+
+        logger.warning(
+            "%s: fees table %s appears stale (%s)",
+            "service_backtest",
+            path or "<unknown>",
+            "; ".join(warnings),
+        )
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(num):
+            return None
+        return float(num)
+
+    @staticmethod
+    def _parse_metadata_timestamp(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(num):
+                return None
+            return num
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                num = float(text)
+            except (TypeError, ValueError):
+                normalised = text
+                if normalised.endswith("Z"):
+                    normalised = normalised[:-1] + "+00:00"
+                try:
+                    dt = datetime.fromisoformat(normalised)
+                except Exception:
+                    return None
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            else:
+                if not math.isfinite(num):
+                    return None
+                return num
+        return None
+
+    def _metadata_age_days(self, meta: Mapping[str, Any]) -> Optional[float]:
+        age = self._safe_float(meta.get("age_days"))
+        if age is not None:
+            return max(age, 0.0)
+        built_ts = self._parse_metadata_timestamp(meta.get("built_at"))
+        if built_ts is None:
+            return None
+        return max((time.time() - built_ts) / 86400.0, 0.0)
 
 
 def from_config(
