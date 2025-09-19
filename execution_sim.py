@@ -31,6 +31,7 @@ import os
 import logging
 import threading
 import random
+import json
 from clock import now_ms
 
 try:
@@ -570,6 +571,16 @@ class ExecutionSimulator:
         self._adv_capacity_fraction: float = 1.0
         self._adv_bars_per_day_override: Optional[float] = None
         self._last_adv_bar_capacity: Optional[float] = None
+        self._bar_cap_base_enabled: bool = False
+        self._bar_cap_base_frac: Optional[float] = None
+        self._bar_cap_base_floor: Optional[float] = None
+        self._bar_cap_base_path: Optional[str] = None
+        self._bar_cap_base_timeframe_ms: Optional[int] = None
+        self._bar_cap_base_cache: Dict[str, float] = {}
+        self._bar_cap_base_cache_path: Optional[str] = None
+        self._bar_cap_base_loaded_ts: Optional[int] = None
+        self._bar_cap_base_meta: Dict[str, Any] = {}
+        self._bar_cap_base_warned_symbols: set[str] = set()
         self.run_id: str = str(getattr(run_config, "run_id", "sim") or "sim")
         self.step_ms: int = (
             int(getattr(run_config, "step_ms", 1000))
@@ -775,6 +786,84 @@ class ExecutionSimulator:
                     limit_val = 0
             self._trade_cost_debug_limit = int(limit_val)
         self._execution_intrabar_cfg: Dict[str, Any] = {}
+        bar_cap_base_cfg: Dict[str, Any] = {}
+
+        def _convert_to_plain_mapping(obj: Any) -> Dict[str, Any]:
+            if isinstance(obj, Mapping):
+                try:
+                    return {str(k): v for k, v in obj.items()}
+                except Exception:
+                    return dict(obj)
+            if hasattr(obj, "dict"):
+                try:
+                    data = obj.dict(exclude_unset=False)  # type: ignore[call-arg]
+                except Exception:
+                    data = {}
+                if isinstance(data, Mapping):
+                    return _convert_to_plain_mapping(data)
+                return {}
+            if hasattr(obj, "__dict__"):
+                try:
+                    return {
+                        str(k): v
+                        for k, v in vars(obj).items()
+                        if not str(k).startswith("_")
+                    }
+                except Exception:
+                    return {}
+            return {}
+
+        def _update_bar_capacity_cfg(candidate: Any) -> None:
+            mapping = _convert_to_plain_mapping(candidate)
+            if not mapping:
+                return
+            for raw_key, value in mapping.items():
+                try:
+                    key = str(raw_key)
+                except Exception:
+                    continue
+                key_lower = key.strip().lower()
+                if key_lower == "bar_capacity_base":
+                    _update_bar_capacity_cfg(value)
+                    continue
+                if key_lower == "extra":
+                    _update_bar_capacity_cfg(value)
+                    continue
+                if key_lower == "enabled":
+                    bar_cap_base_cfg["enabled"] = value
+                    continue
+                if key_lower in (
+                    "capacity_frac_of_adv_base",
+                    "capacity_fraction_of_adv_base",
+                    "capacity_frac_of_adv",
+                    "capacity_fraction_of_adv",
+                ):
+                    bar_cap_base_cfg["capacity_frac_of_ADV_base"] = value
+                    continue
+                if key_lower in (
+                    "floor_base",
+                    "floor",
+                    "adv_floor",
+                    "adv_floor_base",
+                ):
+                    bar_cap_base_cfg["floor_base"] = value
+                    continue
+                if key_lower in (
+                    "adv_base_path",
+                    "adv_path",
+                    "path",
+                    "dataset_path",
+                ):
+                    bar_cap_base_cfg["adv_base_path"] = value
+                    continue
+                if key_lower in (
+                    "timeframe_ms",
+                    "timeframe",
+                    "bar_timeframe_ms",
+                    "bar_timeframe",
+                ):
+                    bar_cap_base_cfg["timeframe_ms"] = value
+
         exec_cfg_sources: List[Any] = []
         if execution_config:
             exec_cfg_sources.append(execution_config)
@@ -806,6 +895,11 @@ class ExecutionSimulator:
                     payload = {}
             if payload:
                 self._execution_intrabar_cfg.update(payload)
+            _update_bar_capacity_cfg(payload)
+            _update_bar_capacity_cfg(cfg_src)
+
+        if bar_cap_base_cfg:
+            self.set_bar_capacity_base_config(**bar_cap_base_cfg)
 
         self._intrabar_price_model: Optional[str] = None
         self._intrabar_config_timeframe_ms: Optional[int] = None
@@ -1214,6 +1308,8 @@ class ExecutionSimulator:
     def set_symbol(self, symbol: str) -> None:
         self.symbol = str(symbol).upper()
         self._latency_symbol = self.symbol
+        self._reset_bar_capacity_base_cache()
+        self._last_adv_bar_capacity = None
 
     def set_ref_price(self, price: float) -> None:
         self._last_ref_price = float(price)
@@ -1269,6 +1365,90 @@ class ExecutionSimulator:
                 self._adv_bars_per_day_override = None
         self._last_adv_bar_capacity = None
 
+    def _reset_bar_capacity_base_cache(self) -> None:
+        self._bar_cap_base_cache = {}
+        self._bar_cap_base_cache_path = None
+        self._bar_cap_base_loaded_ts = None
+        self._bar_cap_base_meta = {}
+        self._bar_cap_base_warned_symbols.clear()
+
+    def set_bar_capacity_base_config(
+        self,
+        *,
+        enabled: Optional[bool] = None,
+        capacity_frac_of_ADV_base: Optional[float] = None,
+        floor_base: Optional[float] = None,
+        adv_base_path: Optional[str] = None,
+        timeframe_ms: Optional[int] = None,
+    ) -> None:
+        reset_cache = False
+        config_changed = False
+
+        if adv_base_path is not None:
+            try:
+                path_str = str(adv_base_path)
+            except Exception:
+                path_str = ""
+            path_str = path_str.strip()
+            if path_str:
+                path_val = os.path.expanduser(path_str)
+            else:
+                path_val = None
+            if path_val != self._bar_cap_base_path:
+                self._bar_cap_base_path = path_val
+                reset_cache = True
+                config_changed = True
+
+        if capacity_frac_of_ADV_base is not None:
+            try:
+                frac_val = float(capacity_frac_of_ADV_base)
+            except (TypeError, ValueError):
+                frac_val = None
+            else:
+                if not math.isfinite(frac_val):
+                    frac_val = None
+                elif frac_val < 0.0:
+                    frac_val = 0.0
+            if frac_val != self._bar_cap_base_frac:
+                self._bar_cap_base_frac = frac_val
+                config_changed = True
+
+        if floor_base is not None:
+            try:
+                floor_val = float(floor_base)
+            except (TypeError, ValueError):
+                floor_val = None
+            else:
+                if not math.isfinite(floor_val) or floor_val < 0.0:
+                    floor_val = None
+            if floor_val != self._bar_cap_base_floor:
+                self._bar_cap_base_floor = floor_val
+                config_changed = True
+
+        if timeframe_ms is not None:
+            try:
+                timeframe_val = int(timeframe_ms)
+            except (TypeError, ValueError):
+                timeframe_val = None
+            else:
+                if timeframe_val <= 0:
+                    timeframe_val = None
+            if timeframe_val != self._bar_cap_base_timeframe_ms:
+                self._bar_cap_base_timeframe_ms = timeframe_val
+                config_changed = True
+
+        if enabled is not None:
+            flag = bool(enabled)
+            if flag != self._bar_cap_base_enabled:
+                self._bar_cap_base_enabled = flag
+                config_changed = True
+                if not flag:
+                    reset_cache = True
+
+        if reset_cache or config_changed:
+            self._reset_bar_capacity_base_cache()
+            self._last_adv_bar_capacity = None
+
     def has_adv_store(self) -> bool:
         return self._adv_store is not None
 
@@ -1302,6 +1482,328 @@ class ExecutionSimulator:
             return None
         return val
 
+    def _load_adv_base_dataset(
+        self, path: str
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        dataset: Dict[str, float] = {}
+        meta: Dict[str, Any] = {}
+        if not path:
+            return dataset, meta
+        try:
+            safe_path = str(path)
+        except Exception:
+            return dataset, meta
+        safe_path = safe_path.strip()
+        if not safe_path:
+            return dataset, meta
+        meta["path"] = safe_path
+        load_ts = now_ms()
+        meta["load_ts"] = load_ts
+        try:
+            stat_info = os.stat(safe_path)
+        except FileNotFoundError:
+            logger.warning("ADV base dataset not found: %s", safe_path)
+            return dataset, meta
+        except OSError as exc:
+            logger.warning("Failed to access ADV base dataset %s: %s", safe_path, exc)
+            return dataset, meta
+        meta["mtime"] = getattr(stat_info, "st_mtime", None)
+        meta["size"] = getattr(stat_info, "st_size", None)
+        try:
+            with open(safe_path, "rb") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            logger.warning("ADV base dataset not found: %s", safe_path)
+            return dataset, meta
+        except OSError as exc:
+            logger.warning("Failed to read ADV base dataset %s: %s", safe_path, exc)
+            return dataset, meta
+        meta["size"] = len(raw)
+        if not raw:
+            return dataset, meta
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to parse ADV base dataset %s: %s", safe_path, exc)
+            return dataset, meta
+
+        def _as_mapping(obj: Any) -> Dict[str, Any]:
+            if isinstance(obj, Mapping):
+                try:
+                    return {str(k): v for k, v in obj.items()}
+                except Exception:
+                    return dict(obj)
+            return {}
+
+        candidates: List[Dict[str, Any]] = []
+        top_mapping = _as_mapping(payload)
+        if top_mapping:
+            candidates.append(top_mapping)
+            for key in ("data", "dataset", "symbols", "per_symbol", "values"):
+                sub_mapping = _as_mapping(top_mapping.get(key))
+                if sub_mapping:
+                    candidates.append(sub_mapping)
+        if isinstance(payload, Sequence) and not isinstance(
+            payload, (str, bytes, bytearray)
+        ):
+            for item in payload:
+                sub_mapping = _as_mapping(item)
+                if sub_mapping:
+                    candidates.append(sub_mapping)
+
+        preferred_keys = (
+            "adv_base",
+            "adv",
+            "daily_adv",
+            "quote",
+            "quote_value",
+            "daily_quote",
+            "value",
+            "capacity",
+        )
+
+        for candidate_map in candidates:
+            for raw_key, raw_value in candidate_map.items():
+                try:
+                    symbol_key = str(raw_key).strip().upper()
+                except Exception:
+                    continue
+                if not symbol_key:
+                    continue
+                numeric_val: Optional[float] = None
+                value = raw_value
+                if isinstance(value, Mapping):
+                    for pref_key in preferred_keys:
+                        if pref_key in value:
+                            try:
+                                numeric_val = float(value[pref_key])
+                            except (TypeError, ValueError):
+                                numeric_val = None
+                            else:
+                                if math.isfinite(numeric_val):
+                                    break
+                                numeric_val = None
+                    if numeric_val is None:
+                        for nested_val in value.values():
+                            try:
+                                numeric_val = float(nested_val)
+                            except (TypeError, ValueError):
+                                continue
+                            else:
+                                if math.isfinite(numeric_val):
+                                    break
+                                numeric_val = None
+                else:
+                    try:
+                        numeric_val = float(value)
+                    except (TypeError, ValueError):
+                        numeric_val = None
+                if numeric_val is None:
+                    continue
+                if not math.isfinite(numeric_val):
+                    continue
+                if numeric_val < 0.0:
+                    numeric_val = 0.0
+            dataset[symbol_key] = numeric_val
+        return dataset, meta
+
+    def _resolve_cap_base_per_bar(
+        self,
+        symbol: Optional[str],
+        timeframe_ms: Optional[int],
+    ) -> Optional[float]:
+        if not self._bar_cap_base_enabled:
+            return 0.0
+        path_val = self._bar_cap_base_path
+        if not path_val:
+            return 0.0
+        try:
+            path_key = str(path_val).strip()
+        except Exception:
+            return 0.0
+        if not path_key:
+            return 0.0
+
+        now_ts = now_ms()
+        cache_path = self._bar_cap_base_cache_path
+        loaded_ts = self._bar_cap_base_loaded_ts
+        cache_empty = not self._bar_cap_base_cache
+
+        reload_needed = cache_path != path_key
+        stat_info = None
+        if not reload_needed:
+            if loaded_ts is None:
+                reload_needed = True
+            else:
+                try:
+                    stat_info = os.stat(path_key)
+                except OSError:
+                    if cache_empty and now_ts - loaded_ts > 60_000:
+                        reload_needed = True
+                else:
+                    cached_meta = self._bar_cap_base_meta or {}
+                    cached_mtime = cached_meta.get("mtime")
+                    cached_size = cached_meta.get("size")
+                    stat_mtime = getattr(stat_info, "st_mtime", None)
+                    stat_size = getattr(stat_info, "st_size", None)
+                    if cached_mtime is not None:
+                        try:
+                            cached_mtime_val = float(cached_mtime)
+                        except (TypeError, ValueError):
+                            cached_mtime_val = None
+                        else:
+                            if (
+                                cached_mtime_val is not None
+                                and stat_mtime is not None
+                                and stat_mtime > cached_mtime_val
+                            ):
+                                reload_needed = True
+                    if not reload_needed and cached_size is not None:
+                        try:
+                            cached_size_val = int(cached_size)
+                        except (TypeError, ValueError):
+                            cached_size_val = None
+                        else:
+                            if (
+                                cached_size_val is not None
+                                and stat_size is not None
+                                and stat_size != cached_size_val
+                            ):
+                                reload_needed = True
+                    if (
+                        not reload_needed
+                        and cache_empty
+                        and loaded_ts is not None
+                        and now_ts - loaded_ts > 60_000
+                    ):
+                        reload_needed = True
+
+        if reload_needed:
+            dataset, meta = self._load_adv_base_dataset(path_key)
+            self._bar_cap_base_cache = dataset
+            self._bar_cap_base_meta = meta
+            self._bar_cap_base_cache_path = path_key
+            load_ts_val = meta.get("load_ts")
+            try:
+                self._bar_cap_base_loaded_ts = (
+                    int(load_ts_val) if load_ts_val is not None else now_ts
+                )
+            except (TypeError, ValueError):
+                self._bar_cap_base_loaded_ts = now_ts
+            if dataset:
+                self._bar_cap_base_warned_symbols.clear()
+            cache_empty = not dataset
+
+        dataset_map = self._bar_cap_base_cache
+        try:
+            sym_key = str(symbol if symbol is not None else self.symbol or "").upper()
+        except Exception:
+            sym_key = ""
+        if not sym_key:
+            return 0.0
+
+        raw_value = dataset_map.get(sym_key)
+        base_daily_val: Optional[float]
+        if raw_value is not None:
+            try:
+                base_daily_val = float(raw_value)
+            except (TypeError, ValueError):
+                base_daily_val = None
+            else:
+                if not math.isfinite(base_daily_val):
+                    base_daily_val = None
+                elif base_daily_val < 0.0:
+                    base_daily_val = 0.0
+        else:
+            base_daily_val = None
+
+        floor_daily = self._bar_cap_base_floor
+        if base_daily_val is None:
+            fallback_val: Optional[float] = None
+            if floor_daily is not None:
+                try:
+                    fallback_val = float(floor_daily)
+                except (TypeError, ValueError):
+                    fallback_val = None
+                else:
+                    if not math.isfinite(fallback_val) or fallback_val < 0.0:
+                        fallback_val = None
+            if fallback_val is None:
+                if sym_key and sym_key not in self._bar_cap_base_warned_symbols:
+                    logger.warning(
+                        "ADV base dataset missing symbol %s and floor is not configured",
+                        sym_key,
+                    )
+                    self._bar_cap_base_warned_symbols.add(sym_key)
+                return 0.0
+            base_daily_val = fallback_val
+            if sym_key and sym_key not in self._bar_cap_base_warned_symbols:
+                logger.warning(
+                    "ADV base dataset missing symbol %s; using floor %.6g",
+                    sym_key,
+                    base_daily_val,
+                )
+                self._bar_cap_base_warned_symbols.add(sym_key)
+        else:
+            self._bar_cap_base_warned_symbols.discard(sym_key)
+            if floor_daily is not None:
+                try:
+                    floor_val = float(floor_daily)
+                except (TypeError, ValueError):
+                    floor_val = None
+                else:
+                    if math.isfinite(floor_val):
+                        if floor_val < 0.0:
+                            floor_val = 0.0
+                        if base_daily_val < floor_val:
+                            base_daily_val = floor_val
+
+        frac_val = self._bar_cap_base_frac
+        if frac_val is None:
+            frac_float = 1.0
+        else:
+            try:
+                frac_float = float(frac_val)
+            except (TypeError, ValueError):
+                frac_float = 1.0
+            else:
+                if not math.isfinite(frac_float):
+                    frac_float = 1.0
+                elif frac_float < 0.0:
+                    frac_float = 0.0
+
+        timeframe_candidate: Optional[int]
+        if timeframe_ms is not None:
+            try:
+                timeframe_candidate = int(timeframe_ms)
+            except (TypeError, ValueError):
+                timeframe_candidate = None
+            else:
+                if timeframe_candidate <= 0:
+                    timeframe_candidate = None
+        else:
+            timeframe_candidate = None
+        if timeframe_candidate is None:
+            timeframe_candidate = self._bar_cap_base_timeframe_ms
+        if timeframe_candidate is None or timeframe_candidate <= 0:
+            timeframe_candidate = self._resolve_intrabar_timeframe(None)
+        if timeframe_candidate is None or timeframe_candidate <= 0:
+            return 0.0
+        try:
+            bars_per_day = 86_400_000.0 / float(timeframe_candidate)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(bars_per_day) or bars_per_day <= 0.0:
+            return 0.0
+
+        daily_capacity = base_daily_val * frac_float
+        capacity_per_bar = daily_capacity / bars_per_day
+        if not math.isfinite(capacity_per_bar):
+            return 0.0
+        if capacity_per_bar < 0.0:
+            capacity_per_bar = 0.0
+        return capacity_per_bar
+
     def _resolve_adv_bars_per_day(self, timeframe_ms: Optional[int]) -> Optional[float]:
         override = self._adv_bars_per_day_override
         if override is not None and override > 0.0 and math.isfinite(override):
@@ -1327,17 +1829,18 @@ class ExecutionSimulator:
         symbol: Optional[str],
         timeframe_ms: Optional[int],
     ) -> Optional[float]:
+        base_capacity = self._resolve_cap_base_per_bar(symbol, timeframe_ms)
         if not self._adv_enabled:
-            return None
+            return base_capacity
         store = self._adv_store
         if store is None:
-            return None
+            return base_capacity
         bars_per_day = self._resolve_adv_bars_per_day(timeframe_ms)
         if bars_per_day is None or bars_per_day <= 0.0:
-            return None
+            return base_capacity
         quote = self.get_bar_capacity_quote(symbol)
         if quote is None:
-            return None
+            return base_capacity
         capacity = quote / float(bars_per_day)
         frac = self._adv_capacity_fraction
         try:
@@ -1361,8 +1864,18 @@ class ExecutionSimulator:
                     floor_cap = floor_val / float(bars_per_day)
         if floor_cap is not None:
             capacity = max(capacity, floor_cap)
+        if base_capacity is not None:
+            try:
+                base_val = float(base_capacity)
+            except (TypeError, ValueError):
+                base_val = None
+            else:
+                if math.isfinite(base_val):
+                    if base_val < 0.0:
+                        base_val = 0.0
+                    capacity = max(capacity, base_val)
         if not math.isfinite(capacity):
-            return None
+            return base_capacity
         if capacity < 0.0:
             capacity = 0.0
         return capacity
