@@ -107,6 +107,75 @@ class SimExecutor(TradeExecutor):
         except Exception:
             return False
 
+    @staticmethod
+    def _fees_dict(cfg: Any) -> Dict[str, Any]:
+        if cfg is None:
+            return {}
+        if hasattr(cfg, "dict"):
+            try:
+                payload = cfg.dict(exclude_unset=False)  # type: ignore[call-arg]
+            except Exception:
+                payload = {}
+            else:
+                if isinstance(payload, dict):
+                    return dict(payload)
+        if isinstance(cfg, Mapping):
+            return dict(cfg)
+        try:
+            return dict(cfg)  # type: ignore[arg-type]
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _build_fee_config(
+        raw_cfg: Any,
+        *,
+        run_config: Any | None,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        payload = SimExecutor._fees_dict(raw_cfg)
+        if symbol and "symbol" not in payload:
+            payload["symbol"] = symbol
+
+        def _get_attr(source: Any, key: str) -> Any:
+            if source is None:
+                return None
+            if isinstance(source, Mapping):
+                return source.get(key)
+            return getattr(source, key, None)
+
+        share_block = payload.get("maker_taker_share")
+        if share_block is None and run_config is not None:
+            direct_share = _get_attr(run_config, "maker_taker_share")
+            if direct_share is not None:
+                if hasattr(direct_share, "dict"):
+                    try:
+                        share_payload = direct_share.dict(exclude_unset=False)  # type: ignore[call-arg]
+                    except Exception:
+                        share_payload = None
+                    else:
+                        if isinstance(share_payload, dict):
+                            direct_share = share_payload
+                payload["maker_taker_share"] = direct_share
+
+        override_keys = {
+            "maker_taker_share_enabled": "maker_taker_share_enabled",
+            "maker_taker_share_mode": "maker_taker_share_mode",
+            "maker_share_default": "maker_share_default",
+            "spread_cost_maker_bps": "spread_cost_maker_bps",
+            "spread_cost_taker_bps": "spread_cost_taker_bps",
+            "taker_fee_override_bps": "taker_fee_override_bps",
+        }
+        for attr_name, key in override_keys.items():
+            if key in payload:
+                continue
+            override_value = _get_attr(run_config, attr_name)
+            if override_value is None:
+                continue
+            payload[key] = override_value
+
+        return payload
+
     def __init__(
         self,
         sim: ExecutionSimulator,
@@ -199,7 +268,12 @@ class SimExecutor(TradeExecutor):
         if slippage is None:
             slippage = SlippageImpl.from_dict(rc_slippage, run_config=run_config)
         if fees is None:
-            fees = FeesImpl.from_dict(rc_fees)
+            fee_cfg_payload = self._build_fee_config(
+                rc_fees,
+                run_config=run_config,
+                symbol=str(symbol),
+            )
+            fees = FeesImpl.from_dict(fee_cfg_payload)
 
         dyn_cfg_source: Any = None
         if run_config is not None:
@@ -252,7 +326,12 @@ class SimExecutor(TradeExecutor):
         """
 
         q_impl = QuantizerImpl.from_dict(getattr(run_config, "quantizer", {}) or {})
-        f_impl = FeesImpl.from_dict(getattr(run_config, "fees", {}) or {})
+        fee_cfg_payload = SimExecutor._build_fee_config(
+            getattr(run_config, "fees", {}) or {},
+            run_config=run_config,
+            symbol=str(symbol),
+        )
+        f_impl = FeesImpl.from_dict(fee_cfg_payload)
         s_impl = SlippageImpl.from_dict(
             getattr(run_config, "slippage", {}) or {}, run_config=run_config
         )
