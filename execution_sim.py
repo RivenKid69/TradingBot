@@ -42,7 +42,7 @@ except Exception:  # pragma: no cover - fallback if module not found
         return default
 
 
-from utils.prometheus import Counter
+from utils.prometheus import Counter, Summary
 from config import DataDegradationConfig
 
 try:
@@ -78,6 +78,18 @@ _SIM_MULT_COUNTER = Counter(
     "sim_hour_of_week_multiplier_total",
     "Simulator liquidity multiplier applications per hour of week",
     ["hour"],
+)
+
+_FILLS_CAPPED_COUNT_BASE = Counter(
+    "fills_capped_count_base",
+    "Number of trades limited by base bar capacity",
+    ["symbol", "capacity_reason", "exec_status"],
+)
+
+_FILLS_CAPPED_BASE_RATIO = Summary(
+    "fills_capped_base_ratio",
+    "Fill ratio observed when base bar capacity limits execution",
+    ["symbol", "capacity_reason", "exec_status"],
 )
 
 try:
@@ -321,6 +333,10 @@ class ExecTrade:
     status: str = "FILLED"
     used_base_before: float = 0.0
     used_base_after: float = 0.0
+    cap_base_per_bar: float = 0.0
+    fill_ratio: float = 1.0
+    capacity_reason: str = ""
+    exec_status: str = "FILLED"
 
 
 @dataclass
@@ -349,6 +365,66 @@ class SimStepReport:
     latency_p50_ms: float = 0.0
     latency_p95_ms: float = 0.0
     execution_profile: str = ""
+    latency_timeout_ratio: float = 0.0
+    vol_raw: Optional[Dict[str, float]] = None
+    cap_base_per_bar: float = 0.0
+    used_base_before: float = 0.0
+    used_base_after: float = 0.0
+    fill_ratio: float = 1.0
+    capacity_reason: str = ""
+    exec_status: str = ""
+
+    def to_dict(self) -> dict:
+        trades_payload = []
+        for t in self.trades:
+            if isinstance(t, ExecTrade):
+                trades_payload.append(dict(t.__dict__))
+            else:
+                trades_payload.append(dict(getattr(t, "__dict__", {})))
+        return {
+            "trades": trades_payload,
+            "cancelled_ids": list(self.cancelled_ids),
+            "cancelled_reasons": {
+                int(k): str(v) for k, v in self.cancelled_reasons.items()
+            },
+            "new_order_ids": list(self.new_order_ids),
+            "fee_total": float(self.fee_total),
+            "new_order_pos": list(self.new_order_pos),
+            "funding_cashflow": float(self.funding_cashflow),
+            "funding_events": [fe.__dict__ for fe in self.funding_events],
+            "position_qty": float(self.position_qty),
+            "realized_pnl": float(self.realized_pnl),
+            "unrealized_pnl": float(self.unrealized_pnl),
+            "equity": float(self.equity),
+            "mark_price": float(self.mark_price),
+            "bid": float(self.bid),
+            "ask": float(self.ask),
+            "mtm_price": float(self.mtm_price),
+            "risk_events": [re.__dict__ for re in self.risk_events],
+            "risk_paused_until_ms": int(self.risk_paused_until_ms),
+            "spread_bps": (
+                float(self.spread_bps) if self.spread_bps is not None else None
+            ),
+            "vol_factor": (
+                float(self.vol_factor) if self.vol_factor is not None else None
+            ),
+            "liquidity": float(self.liquidity) if self.liquidity is not None else None,
+            "latency_p50_ms": float(self.latency_p50_ms),
+            "latency_p95_ms": float(self.latency_p95_ms),
+            "latency_timeout_ratio": float(self.latency_timeout_ratio),
+            "execution_profile": str(self.execution_profile),
+            "vol_raw": (
+                {str(k): float(v) for k, v in self.vol_raw.items()}
+                if isinstance(self.vol_raw, dict)
+                else None
+            ),
+            "cap_base_per_bar": float(self.cap_base_per_bar),
+            "used_base_before": float(self.used_base_before),
+            "used_base_after": float(self.used_base_after),
+            "fill_ratio": float(self.fill_ratio),
+            "capacity_reason": str(self.capacity_reason),
+            "exec_status": str(self.exec_status),
+        }
 
 
 @dataclass
@@ -1836,6 +1912,31 @@ class ExecutionSimulator:
         if cap_float < 0.0:
             cap_float = 0.0
         return cap_float
+
+    def _record_bar_capacity_metrics(
+        self,
+        *,
+        capacity_reason: str,
+        exec_status: str,
+        fill_ratio: float,
+    ) -> None:
+        if not capacity_reason:
+            return
+        labels = {
+            "symbol": str(self.symbol),
+            "capacity_reason": str(capacity_reason),
+            "exec_status": str(exec_status or ""),
+        }
+        try:
+            ratio_val = float(fill_ratio)
+        except (TypeError, ValueError):
+            ratio_val = 0.0
+        if not math.isfinite(ratio_val):
+            return
+        if ratio_val < 0.0:
+            ratio_val = 0.0
+        _FILLS_CAPPED_COUNT_BASE.labels(**labels).inc()
+        _FILLS_CAPPED_BASE_RATIO.labels(**labels).observe(ratio_val)
 
     def _resolve_adv_bars_per_day(self, timeframe_ms: Optional[int]) -> Optional[float]:
         override = self._adv_bars_per_day_override
@@ -3783,6 +3884,9 @@ class ExecutionSimulator:
                             _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
                         else:
                             cancelled_reasons[cid_int] = "BAR_CAPACITY_BASE"
+                        cap_val = float(cap_base_per_bar)
+                        capacity_reason = "BAR_CAPACITY_BASE"
+                        exec_status = "REJECTED_BY_CAPACITY"
                         trade = ExecTrade(
                             ts=ts,
                             side=side,
@@ -3801,9 +3905,18 @@ class ExecutionSimulator:
                             status="CANCELED",
                             used_base_before=used_base_now,
                             used_base_after=used_base_now,
+                            cap_base_per_bar=cap_val,
+                            fill_ratio=0.0,
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
                         )
                         trades.append(trade)
                         self._trade_log.append(trade)
+                        self._record_bar_capacity_metrics(
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                            fill_ratio=0.0,
+                        )
                         continue
                     qty_total = min(qty_total, remaining_total)
                     if qty_total <= 0.0:
@@ -3812,6 +3925,9 @@ class ExecutionSimulator:
                             _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
                         else:
                             cancelled_reasons[cid_int] = "BAR_CAPACITY_BASE"
+                        cap_val = float(cap_base_per_bar)
+                        capacity_reason = "BAR_CAPACITY_BASE"
+                        exec_status = "REJECTED_BY_CAPACITY"
                         trade = ExecTrade(
                             ts=ts,
                             side=side,
@@ -3830,9 +3946,18 @@ class ExecutionSimulator:
                             status="CANCELED",
                             used_base_before=used_base_now,
                             used_base_after=used_base_now,
+                            cap_base_per_bar=cap_val,
+                            fill_ratio=0.0,
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
                         )
                         trades.append(trade)
                         self._trade_log.append(trade)
+                        self._record_bar_capacity_metrics(
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                            fill_ratio=0.0,
+                        )
                         continue
                 else:
                     cap_base_per_bar = 0.0
@@ -3907,6 +4032,7 @@ class ExecutionSimulator:
                                 q_child = min(q_child, cap_val)
                     if q_child <= 0.0:
                         continue
+                    order_qty_base = max(0.0, float(q_child))
 
                     child_latency = self._intrabar_latency_ms(
                         p.lat_ms, child_offset_ms=child_offset
@@ -3991,19 +4117,22 @@ class ExecutionSimulator:
                     elif cap_enforced:
                         fill_qty_base = min(fill_qty_base, remaining_base)
 
-                    if cap_enforced and fill_qty_base <= 0.0:
-                        ts_zero = int(base_ts + lat_ms)
-                        cid_int = int(p.client_order_id)
-                        if cid_int not in cancelled_ids:
-                            _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
-                        else:
-                            cancelled_reasons[cid_int] = "BAR_CAPACITY_BASE"
-                        used_before = used_base_before_child
-                        trade = ExecTrade(
-                            ts=ts_zero,
-                            side=side,
-                            price=float(ref_child_price),
-                            qty=0.0,
+                        if cap_enforced and fill_qty_base <= 0.0:
+                            ts_zero = int(base_ts + lat_ms)
+                            cid_int = int(p.client_order_id)
+                            if cid_int not in cancelled_ids:
+                                _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
+                            else:
+                                cancelled_reasons[cid_int] = "BAR_CAPACITY_BASE"
+                            used_before = used_base_before_child
+                            capacity_reason = "BAR_CAPACITY_BASE"
+                            exec_status = "REJECTED_BY_CAPACITY"
+                            cap_val = float(cap_base_per_bar)
+                            trade = ExecTrade(
+                                ts=ts_zero,
+                                side=side,
+                                price=float(ref_child_price),
+                                qty=0.0,
                             notional=0.0,
                             liquidity="taker",
                             proto_type=atype,
@@ -4013,23 +4142,43 @@ class ExecutionSimulator:
                             latency_ms=int(p.lat_ms),
                             latency_spike=bool(p.spike),
                             tif=tif,
-                            ttl_steps=ttl_steps,
-                            status="CANCELED",
-                            used_base_before=used_before,
-                            used_base_after=used_before,
-                        )
-                        trades.append(trade)
-                        self._trade_log.append(trade)
-                        continue
+                                ttl_steps=ttl_steps,
+                                status="CANCELED",
+                                used_base_before=used_before,
+                                used_base_after=used_before,
+                                cap_base_per_bar=cap_val,
+                                fill_ratio=0.0,
+                                capacity_reason=capacity_reason,
+                                exec_status=exec_status,
+                            )
+                            trades.append(trade)
+                            self._trade_log.append(trade)
+                            self._record_bar_capacity_metrics(
+                                capacity_reason=capacity_reason,
+                                exec_status=exec_status,
+                                fill_ratio=0.0,
+                            )
+                            continue
 
-                    q_child = float(fill_qty_base)
-                    if q_child <= 0.0:
-                        continue
+                        q_child = float(fill_qty_base)
+                        if q_child <= 0.0:
+                            continue
 
-                    used_base_after_child = max(0.0, used_base_before_child + q_child)
-                    self._used_base_in_bar[symbol_key] = used_base_after_child
+                        cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
+                        if order_qty_base > 0.0:
+                            fill_ratio = max(0.0, min(1.0, q_child / order_qty_base))
+                        else:
+                            fill_ratio = 1.0 if q_child > 0.0 else 0.0
+                        capacity_reason = ""
+                        exec_status = "FILLED"
+                        if cap_enforced and order_qty_base > 0.0 and q_child + 1e-12 < order_qty_base:
+                            exec_status = "PARTIAL"
+                            capacity_reason = "BAR_CAPACITY_BASE"
 
-                    # базовая котировка
+                        used_base_after_child = max(0.0, used_base_before_child + q_child)
+                        self._used_base_in_bar[symbol_key] = used_base_after_child
+
+                        # базовая котировка
                     if VWAPExecutor is not None and isinstance(executor, VWAPExecutor):
                         self._vwap_on_tick(ts_fill, None, None)
                         base_price = (
@@ -4195,9 +4344,19 @@ class ExecutionSimulator:
                         ttl_steps=ttl_steps,
                         used_base_before=used_base_before_child,
                         used_base_after=used_base_after_child,
+                        cap_base_per_bar=cap_val,
+                        fill_ratio=float(fill_ratio),
+                        capacity_reason=capacity_reason,
+                        exec_status=exec_status,
                     )
                     trades.append(trade)
                     self._trade_log.append(trade)
+                    if capacity_reason:
+                        self._record_bar_capacity_metrics(
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                            fill_ratio=float(fill_ratio),
+                        )
                 continue
             # Определение направления и базовой цены для прочих типов
             is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
@@ -4626,6 +4785,34 @@ class ExecutionSimulator:
             vol_raw=self._last_vol_raw,
         )
 
+        if trades:
+            last_trade = trades[-1]
+            report.cap_base_per_bar = float(
+                getattr(last_trade, "cap_base_per_bar", 0.0)
+            )
+            report.used_base_before = float(
+                getattr(last_trade, "used_base_before", 0.0)
+            )
+            report.used_base_after = float(
+                getattr(last_trade, "used_base_after", 0.0)
+            )
+            report.fill_ratio = float(getattr(last_trade, "fill_ratio", 0.0))
+            report.capacity_reason = str(
+                getattr(last_trade, "capacity_reason", "") or ""
+            )
+            report.exec_status = str(getattr(last_trade, "exec_status", "") or "")
+        else:
+            cap_val = locals().get("cap_base_per_bar", 0.0)  # type: ignore[arg-type]
+            try:
+                report.cap_base_per_bar = float(cap_val)
+            except (TypeError, ValueError):
+                report.cap_base_per_bar = 0.0
+            report.used_base_before = 0.0
+            report.used_base_after = 0.0
+            report.fill_ratio = 0.0
+            report.capacity_reason = ""
+            report.exec_status = ""
+
         # логирование
         try:
             if self._logger is not None:
@@ -4859,6 +5046,9 @@ class ExecutionSimulator:
                             _cancel(cli_id, "BAR_CAPACITY_BASE")
                         else:
                             cancelled_reasons[int(cli_id)] = "BAR_CAPACITY_BASE"
+                        capacity_reason = "BAR_CAPACITY_BASE"
+                        exec_status = "REJECTED_BY_CAPACITY"
+                        cap_val = float(cap_base_per_bar)
                         trade = ExecTrade(
                             ts=ts,
                             side=side,
@@ -4877,9 +5067,18 @@ class ExecutionSimulator:
                             status="CANCELED",
                             used_base_before=used_base_now,
                             used_base_after=used_base_now,
+                            cap_base_per_bar=cap_val,
+                            fill_ratio=0.0,
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
                         )
                         trades.append(trade)
                         self._trade_log.append(trade)
+                        self._record_bar_capacity_metrics(
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                            fill_ratio=0.0,
+                        )
                         continue
                     qty_total = min(qty_total, remaining_total)
                     if qty_total <= 0.0:
@@ -4887,6 +5086,9 @@ class ExecutionSimulator:
                             _cancel(cli_id, "BAR_CAPACITY_BASE")
                         else:
                             cancelled_reasons[int(cli_id)] = "BAR_CAPACITY_BASE"
+                        capacity_reason = "BAR_CAPACITY_BASE"
+                        exec_status = "REJECTED_BY_CAPACITY"
+                        cap_val = float(cap_base_per_bar)
                         trade = ExecTrade(
                             ts=ts,
                             side=side,
@@ -4905,9 +5107,18 @@ class ExecutionSimulator:
                             status="CANCELED",
                             used_base_before=used_base_now,
                             used_base_after=used_base_now,
+                            cap_base_per_bar=cap_val,
+                            fill_ratio=0.0,
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
                         )
                         trades.append(trade)
                         self._trade_log.append(trade)
+                        self._record_bar_capacity_metrics(
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                            fill_ratio=0.0,
+                        )
                         continue
                 else:
                     cap_base_per_bar = 0.0
@@ -4968,6 +5179,7 @@ class ExecutionSimulator:
                                 q_child = min(q_child, cap_val)
                     if q_child <= 0.0:
                         continue
+                    order_qty_base = max(0.0, float(q_child))
 
                     # риск: дросселирование
                     if self.risk is not None:
@@ -5071,6 +5283,9 @@ class ExecutionSimulator:
                         else:
                             cancelled_reasons[int(cli_id)] = "BAR_CAPACITY_BASE"
                         used_before = used_base_before_child
+                        capacity_reason = "BAR_CAPACITY_BASE"
+                        exec_status = "REJECTED_BY_CAPACITY"
+                        cap_val = float(cap_base_per_bar)
                         trade = ExecTrade(
                             ts=ts_zero,
                             side=side,
@@ -5089,14 +5304,34 @@ class ExecutionSimulator:
                             status="CANCELED",
                             used_base_before=used_before,
                             used_base_after=used_before,
+                            cap_base_per_bar=cap_val,
+                            fill_ratio=0.0,
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
                         )
                         trades.append(trade)
                         self._trade_log.append(trade)
+                        self._record_bar_capacity_metrics(
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                            fill_ratio=0.0,
+                        )
                         continue
 
                     q_child = float(fill_qty_base)
                     if q_child <= 0.0:
                         continue
+
+                    cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
+                    if order_qty_base > 0.0:
+                        fill_ratio = max(0.0, min(1.0, q_child / order_qty_base))
+                    else:
+                        fill_ratio = 1.0 if q_child > 0.0 else 0.0
+                    capacity_reason = ""
+                    exec_status = "FILLED"
+                    if cap_enforced and order_qty_base > 0.0 and q_child + 1e-12 < order_qty_base:
+                        exec_status = "PARTIAL"
+                        capacity_reason = "BAR_CAPACITY_BASE"
 
                     used_base_after_child = max(0.0, used_base_before_child + q_child)
                     self._used_base_in_bar[symbol_key] = used_base_after_child
@@ -5248,9 +5483,19 @@ class ExecutionSimulator:
                         ttl_steps=ttl_steps,
                         used_base_before=used_base_before_child,
                         used_base_after=used_base_after_child,
+                        cap_base_per_bar=cap_val,
+                        fill_ratio=float(fill_ratio),
+                        capacity_reason=capacity_reason,
+                        exec_status=exec_status,
                     )
                     trades.append(trade)
                     self._trade_log.append(trade)
+                    if capacity_reason:
+                        self._record_bar_capacity_metrics(
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                            fill_ratio=float(fill_ratio),
+                        )
             else:
                 # пока другие типы не поддержаны — отменяем
                 _cancel(cli_id)

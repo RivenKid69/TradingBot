@@ -7,7 +7,7 @@ metrics calls do not fail in environments without Prometheus support.
 from __future__ import annotations
 
 try:  # pragma: no cover - simple import
-    from prometheus_client import Counter, Histogram  # type: ignore
+    from prometheus_client import Counter, Histogram, Summary  # type: ignore
 except Exception:  # pragma: no cover - fallback for missing dependency
     class _DummyCounter:
         def __init__(self, *args, **kwargs) -> None:
@@ -29,7 +29,13 @@ except Exception:  # pragma: no cover - fallback for missing dependency
         def observe(self, *args, **kwargs) -> None:
             pass
 
+    class _DummySummary(_DummyHistogram):
+        """Fallback Summary with Histogram-compatible API."""
+
+        pass
+
     Counter = _DummyCounter  # type: ignore
     Histogram = _DummyHistogram  # type: ignore
+    Summary = _DummySummary  # type: ignore
 
-__all__ = ["Counter", "Histogram"]
+__all__ = ["Counter", "Histogram", "Summary"]
