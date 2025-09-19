@@ -212,6 +212,12 @@ if MarketChild is None:
         liquidity_hint: Optional[float] = None
 
 
+try:
+    from adv_store import ADVStore
+except Exception:
+    ADVStore = None  # type: ignore
+
+
 if TakerExecutor is None:
 
     class TakerExecutor:  # type: ignore[override]
@@ -523,6 +529,7 @@ class ExecutionSimulator:
         seasonality_day_only: bool = False,
         seasonality_auto_reload: bool = False,
         data_degradation: Optional[DataDegradationConfig] = None,
+        adv_store: Optional["ADVStore"] = None,
         run_config: Any = None,
     ):
         self.symbol = str(symbol).upper()
@@ -558,6 +565,11 @@ class ExecutionSimulator:
         self._intrabar_timeframe_ms: Optional[int] = None
         self.run_config = run_config
         self._run_config = run_config
+        self._adv_store: Optional[ADVStore] = None
+        self._adv_enabled: bool = False
+        self._adv_capacity_fraction: float = 1.0
+        self._adv_bars_per_day_override: Optional[float] = None
+        self._last_adv_bar_capacity: Optional[float] = None
         self.run_id: str = str(getattr(run_config, "run_id", "sim") or "sim")
         self.step_ms: int = (
             int(getattr(run_config, "step_ms", 1000))
@@ -566,6 +578,51 @@ class ExecutionSimulator:
         )
         if self.step_ms <= 0:
             self.step_ms = 1
+        adv_cfg = getattr(run_config, "adv", None) if run_config is not None else None
+        adv_enabled_cfg = False
+        adv_fraction_cfg: Optional[float] = None
+        adv_bars_override_cfg: Optional[float] = None
+        if adv_cfg is not None:
+            adv_enabled_cfg = bool(getattr(adv_cfg, "enabled", False))
+            frac_attr = getattr(adv_cfg, "capacity_fraction", None)
+            if frac_attr is None:
+                extra_block = getattr(adv_cfg, "extra", None)
+                if isinstance(extra_block, Mapping):
+                    frac_attr = extra_block.get("capacity_fraction")
+            try:
+                frac_val = float(frac_attr) if frac_attr is not None else None
+            except (TypeError, ValueError):
+                frac_val = None
+            if frac_val is not None and math.isfinite(frac_val):
+                if frac_val < 0.0:
+                    frac_val = 0.0
+                adv_fraction_cfg = frac_val
+            bars_attr = getattr(adv_cfg, "bars_per_day_override", None)
+            if bars_attr is None:
+                extra_block = getattr(adv_cfg, "extra", None)
+                if isinstance(extra_block, Mapping):
+                    bars_attr = extra_block.get("bars_per_day_override")
+                    if bars_attr is None:
+                        bars_attr = extra_block.get("bars_per_day")
+            try:
+                bars_val = float(bars_attr) if bars_attr is not None else None
+            except (TypeError, ValueError):
+                bars_val = None
+            if bars_val is not None and math.isfinite(bars_val) and bars_val > 0.0:
+                adv_bars_override_cfg = bars_val
+        adv_store_obj = adv_store
+        if adv_enabled_cfg and adv_store_obj is None and ADVStore is not None and adv_cfg is not None:
+            try:
+                adv_store_obj = ADVStore(adv_cfg)
+            except Exception:
+                logger.exception("Failed to initialise ADVStore from run_config.adv")
+                adv_store_obj = None
+        self.set_adv_store(
+            adv_store_obj,
+            enabled=adv_enabled_cfg,
+            capacity_fraction=adv_fraction_cfg,
+            bars_per_day_override=adv_bars_override_cfg,
+        )
         if data_degradation is None:
             data_degradation = DataDegradationConfig.default()
         self.data_degradation = data_degradation
@@ -1164,6 +1221,171 @@ class ExecutionSimulator:
     def set_next_open_price(self, price: float) -> None:
         self._next_h1_open_price = float(price)
 
+    def set_adv_store(
+        self,
+        store: Optional[ADVStore],
+        *,
+        enabled: Optional[bool] = None,
+        capacity_fraction: Optional[float] = None,
+        bars_per_day_override: Optional[float] = None,
+    ) -> None:
+        """Attach or update ADV runtime configuration."""
+
+        self._adv_store = store
+        if store is not None:
+            try:
+                store.reset_runtime_state()
+            except Exception:
+                pass
+        if capacity_fraction is not None:
+            try:
+                frac_val = float(capacity_fraction)
+            except (TypeError, ValueError):
+                frac_val = None
+            else:
+                if math.isfinite(frac_val):
+                    if frac_val < 0.0:
+                        frac_val = 0.0
+                    self._adv_capacity_fraction = frac_val
+        if bars_per_day_override is not None:
+            try:
+                bpd_val = float(bars_per_day_override)
+            except (TypeError, ValueError):
+                bpd_val = None
+            else:
+                if not math.isfinite(bpd_val) or bpd_val <= 0.0:
+                    bpd_val = None
+                self._adv_bars_per_day_override = bpd_val
+        adv_enabled = self._adv_enabled
+        if enabled is not None:
+            adv_enabled = bool(enabled)
+        self._adv_enabled = bool(store) and bool(adv_enabled)
+        if store is None and enabled is None:
+            self._adv_enabled = False
+        if store is None:
+            if bars_per_day_override is not None:
+                self._adv_bars_per_day_override = None
+            elif not self._adv_enabled:
+                self._adv_bars_per_day_override = None
+        self._last_adv_bar_capacity = None
+
+    def has_adv_store(self) -> bool:
+        return self._adv_store is not None
+
+    def get_bar_capacity_quote(self, symbol: Optional[str] = None) -> Optional[float]:
+        store = self._adv_store
+        if store is None:
+            return None
+        try:
+            sym = str(symbol if symbol is not None else self.symbol or "").upper()
+        except Exception:
+            sym = ""
+        if not sym:
+            return None
+        try:
+            quote = store.get_bar_capacity_quote(sym)
+        except Exception:
+            quote = None
+        if quote is None:
+            default_q = store.default_quote
+            if default_q is None:
+                return None
+            try:
+                quote = float(default_q)
+            except (TypeError, ValueError):
+                return None
+        try:
+            val = float(quote)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(val) or val <= 0.0:
+            return None
+        return val
+
+    def _resolve_adv_bars_per_day(self, timeframe_ms: Optional[int]) -> Optional[float]:
+        override = self._adv_bars_per_day_override
+        if override is not None and override > 0.0 and math.isfinite(override):
+            return float(override)
+        tf_val: Optional[float]
+        if timeframe_ms is None:
+            timeframe_guess = self._resolve_intrabar_timeframe(None)
+            tf_val = float(timeframe_guess)
+        else:
+            try:
+                tf_val = float(timeframe_ms)
+            except (TypeError, ValueError):
+                tf_val = None
+        if tf_val is None or not math.isfinite(tf_val) or tf_val <= 0.0:
+            return None
+        bars = 86_400_000.0 / tf_val
+        if not math.isfinite(bars) or bars <= 0.0:
+            return None
+        return bars
+
+    def _adv_bar_capacity(
+        self,
+        symbol: Optional[str],
+        timeframe_ms: Optional[int],
+    ) -> Optional[float]:
+        if not self._adv_enabled:
+            return None
+        store = self._adv_store
+        if store is None:
+            return None
+        bars_per_day = self._resolve_adv_bars_per_day(timeframe_ms)
+        if bars_per_day is None or bars_per_day <= 0.0:
+            return None
+        quote = self.get_bar_capacity_quote(symbol)
+        if quote is None:
+            return None
+        capacity = quote / float(bars_per_day)
+        frac = self._adv_capacity_fraction
+        try:
+            frac_val = float(frac)
+        except (TypeError, ValueError):
+            frac_val = None
+        if frac_val is not None:
+            if not math.isfinite(frac_val) or frac_val < 0.0:
+                frac_val = None
+        if frac_val is not None:
+            capacity *= frac_val
+        floor_daily = store.floor_quote
+        floor_cap: Optional[float] = None
+        if floor_daily is not None:
+            try:
+                floor_val = float(floor_daily)
+            except (TypeError, ValueError):
+                floor_val = None
+            else:
+                if math.isfinite(floor_val) and floor_val > 0.0:
+                    floor_cap = floor_val / float(bars_per_day)
+        if floor_cap is not None:
+            capacity = max(capacity, floor_cap)
+        if not math.isfinite(capacity):
+            return None
+        if capacity < 0.0:
+            capacity = 0.0
+        return capacity
+
+    @staticmethod
+    def _combine_liquidity(
+        observed: Optional[float], adv_capacity: Optional[float]
+    ) -> Optional[float]:
+        result: Optional[float] = None
+        for value in (observed, adv_capacity):
+            if value is None:
+                continue
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(val):
+                continue
+            if val < 0.0:
+                val = 0.0
+            result = val if result is None else min(result, val)
+        return result
+
     def _default_spread_bps(self) -> Optional[float]:
         cfg = self.slippage_cfg
         if cfg is None:
@@ -1626,6 +1848,17 @@ class ExecutionSimulator:
             else:
                 if math.isfinite(value):
                     return value
+        if self._adv_enabled:
+            adv_cap = self._last_adv_bar_capacity
+            if adv_cap is None:
+                adv_cap = self._adv_bar_capacity(self.symbol, None)
+                if adv_cap is not None:
+                    adv_cap = max(0.0, float(adv_cap))
+                    self._last_adv_bar_capacity = adv_cap
+            if adv_cap is not None:
+                self._last_liquidity = self._combine_liquidity(
+                    self._last_liquidity, adv_cap
+                )
         default = self._default_spread_bps()
         if default is not None:
             return float(default)
@@ -1733,8 +1966,37 @@ class ExecutionSimulator:
             self._last_spread_bps = float(effective_spread) * mult
         else:
             self._last_spread_bps = None
-        liq_val = float(liquidity) if liquidity is not None else None
-        self._last_liquidity = liq_val * liq_mult if liq_val is not None else None
+        liq_val: Optional[float]
+        if liquidity is None:
+            liq_val = None
+        else:
+            try:
+                liq_val = float(liquidity)
+            except (TypeError, ValueError):
+                liq_val = None
+            else:
+                if not math.isfinite(liq_val):
+                    liq_val = None
+                elif liq_val < 0.0:
+                    liq_val = 0.0
+        if liq_val is not None:
+            liq_val *= liq_mult
+        timeframe_guess = self._resolve_intrabar_timeframe(ts_ms)
+        adv_capacity = self._adv_bar_capacity(self.symbol, timeframe_guess)
+        adv_capacity_scaled: Optional[float]
+        if adv_capacity is None:
+            adv_capacity_scaled = None
+        else:
+            adv_capacity_scaled = max(0.0, float(adv_capacity))
+            try:
+                mult_val = float(liq_mult)
+            except (TypeError, ValueError):
+                mult_val = 1.0
+            if not math.isfinite(mult_val) or mult_val <= 0.0:
+                mult_val = 1.0
+            adv_capacity_scaled *= mult_val
+        self._last_adv_bar_capacity = adv_capacity_scaled
+        self._last_liquidity = self._combine_liquidity(liq_val, adv_capacity_scaled)
         if ts_ms is not None and self._last_vol_factor is not None:
             ts_val = int(ts_ms)
             cache_value = self._select_cache_value(metrics, self._last_vol_factor)
@@ -3005,6 +3267,30 @@ class ExecutionSimulator:
                     q_child = float(child.qty)
                     if q_child <= 0.0:
                         continue
+                    hint_raw = getattr(child, "liquidity_hint", None)
+                    if hint_raw is not None:
+                        try:
+                            hint_val = float(hint_raw)
+                        except (TypeError, ValueError):
+                            hint_val = None
+                        else:
+                            if math.isfinite(hint_val):
+                                if hint_val < 0.0:
+                                    hint_val = 0.0
+                                q_child = min(q_child, hint_val)
+                    last_liq_cap = self._last_liquidity
+                    if last_liq_cap is not None:
+                        try:
+                            cap_val = float(last_liq_cap)
+                        except (TypeError, ValueError):
+                            cap_val = None
+                        else:
+                            if math.isfinite(cap_val):
+                                if cap_val < 0.0:
+                                    cap_val = 0.0
+                                q_child = min(q_child, cap_val)
+                    if q_child <= 0.0:
+                        continue
 
                     child_latency = self._intrabar_latency_ms(
                         p.lat_ms, child_offset_ms=child_offset
@@ -3225,6 +3511,20 @@ class ExecutionSimulator:
             is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
             side = "BUY" if is_buy else "SELL"
             qty = abs(float(getattr(proto, "volume_frac", 0.0)))
+            last_liq_cap = self._last_liquidity
+            if last_liq_cap is not None:
+                try:
+                    cap_val = float(last_liq_cap)
+                except (TypeError, ValueError):
+                    cap_val = None
+                else:
+                    if math.isfinite(cap_val):
+                        if cap_val < 0.0:
+                            cap_val = 0.0
+                        qty = min(qty, cap_val)
+                        if qty <= 0.0:
+                            _cancel(p.client_order_id)
+                            continue
             if side == "BUY":
                 base_price = self._last_ask if self._last_ask is not None else ref
             else:
@@ -3695,7 +3995,27 @@ class ExecutionSimulator:
         self._last_vol_factor = vf_val
         metrics = self._normalize_vol_metrics(vol_raw)
         self._last_vol_raw = metrics
-        self._last_liquidity = float(liquidity) if liquidity is not None else None
+        if liquidity is None:
+            incoming_liq = None
+        else:
+            try:
+                incoming_liq = float(liquidity)
+            except (TypeError, ValueError):
+                incoming_liq = None
+            else:
+                if not math.isfinite(incoming_liq):
+                    incoming_liq = None
+                elif incoming_liq < 0.0:
+                    incoming_liq = 0.0
+        timeframe_hint = bar_timeframe_ms
+        if timeframe_hint is None:
+            timeframe_hint = self._resolve_intrabar_timeframe(ts)
+        adv_capacity = self._adv_bar_capacity(self.symbol, timeframe_hint)
+        adv_capacity_norm = (
+            max(0.0, float(adv_capacity)) if adv_capacity is not None else None
+        )
+        self._last_adv_bar_capacity = adv_capacity_norm
+        self._last_liquidity = self._combine_liquidity(incoming_liq, adv_capacity_norm)
         self._last_ref_price = float(ref_price) if ref_price is not None else None
         self._last_bar_open = float(bar_open) if bar_open is not None else None
         self._last_bar_high = float(bar_high) if bar_high is not None else None
@@ -3862,6 +4182,30 @@ class ExecutionSimulator:
                     base_ts = int(ts + child_offset)
                     ts_fill = int(base_ts)
                     q_child = float(child.qty)
+                    if q_child <= 0.0:
+                        continue
+                    hint_raw = getattr(child, "liquidity_hint", None)
+                    if hint_raw is not None:
+                        try:
+                            hint_val = float(hint_raw)
+                        except (TypeError, ValueError):
+                            hint_val = None
+                        else:
+                            if math.isfinite(hint_val):
+                                if hint_val < 0.0:
+                                    hint_val = 0.0
+                                q_child = min(q_child, hint_val)
+                    last_liq_cap = self._last_liquidity
+                    if last_liq_cap is not None:
+                        try:
+                            cap_val = float(last_liq_cap)
+                        except (TypeError, ValueError):
+                            cap_val = None
+                        else:
+                            if math.isfinite(cap_val):
+                                if cap_val < 0.0:
+                                    cap_val = 0.0
+                                q_child = min(q_child, cap_val)
                     if q_child <= 0.0:
                         continue
 

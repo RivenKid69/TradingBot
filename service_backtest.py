@@ -18,12 +18,13 @@ reports = from_config(cfg, df)
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Mapping
 import logging
 import os
 import pandas as pd
 
 from execution_sim import ExecutionSimulator  # type: ignore
+from adv_store import ADVStore
 from sandbox.backtest_adapter import BacktestAdapter
 from sandbox.sim_adapter import SimAdapter
 from core_contracts import SignalPolicy
@@ -155,6 +156,122 @@ def _slippage_to_dict(cfg: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _log_adv_runtime_warnings(
+    store: ADVStore,
+    symbol: Any,
+    adv_cfg: Any,
+    *,
+    context: str,
+) -> None:
+    try:
+        sym = str(symbol).strip().upper() if symbol is not None else ""
+    except Exception:
+        sym = ""
+    path = store.path
+    if not path:
+        logger.warning(
+            "%s: ADV runtime enabled but dataset path is not configured; using default quote=%s",
+            context,
+            store.default_quote,
+        )
+    elif store.is_dataset_stale:
+        refresh_days = getattr(adv_cfg, "refresh_days", None)
+        logger.warning(
+            "%s: ADV dataset %s appears stale; refresh recommended (refresh_days=%s)",
+            context,
+            path,
+            refresh_days,
+        )
+    base_quote = store.get_adv_quote(sym) if sym else None
+    if base_quote is None:
+        default_q = store.default_quote
+        if default_q is not None:
+            logger.warning(
+                "%s: ADV quote missing for %s; falling back to default %.3f",
+                context,
+                sym or "<unknown>",
+                default_q,
+            )
+        else:
+            logger.warning(
+                "%s: ADV quote missing for %s and no default configured",
+                context,
+                sym or "<unknown>",
+            )
+
+
+def _configure_adv_runtime(
+    sim: ExecutionSimulator,
+    run_cfg: CommonRunConfig | None,
+    *,
+    context: str,
+) -> Optional[ADVStore]:
+    if run_cfg is None:
+        return None
+    adv_cfg = getattr(run_cfg, "adv", None)
+    if adv_cfg is None or not getattr(adv_cfg, "enabled", False):
+        return None
+    set_store = getattr(sim, "set_adv_store", None)
+    if not callable(set_store):
+        logger.warning(
+            "%s: ExecutionSimulator lacks set_adv_store(); ADV runtime disabled",
+            context,
+        )
+        return None
+    capacity_fraction = getattr(adv_cfg, "capacity_fraction", None)
+    bars_override = getattr(adv_cfg, "bars_per_day_override", None)
+    extra_block = getattr(adv_cfg, "extra", None)
+    if capacity_fraction is None and isinstance(extra_block, Mapping):
+        capacity_fraction = extra_block.get("capacity_fraction")
+    if bars_override is None and isinstance(extra_block, Mapping):
+        bars_override = extra_block.get("bars_per_day_override")
+        if bars_override is None:
+            bars_override = extra_block.get("bars_per_day")
+    existing_store: Optional[ADVStore] = None
+    has_store_fn = getattr(sim, "has_adv_store", None)
+    if callable(has_store_fn):
+        try:
+            if bool(has_store_fn()):
+                existing_store = getattr(sim, "_adv_store", None)
+        except Exception:
+            existing_store = None
+    if isinstance(existing_store, ADVStore):
+        try:
+            set_store(
+                existing_store,
+                enabled=True,
+                capacity_fraction=capacity_fraction,
+                bars_per_day_override=bars_override,
+            )
+        except Exception:
+            logger.exception(
+                "%s: failed to refresh ADV runtime settings on existing store",
+                context,
+            )
+        else:
+            _log_adv_runtime_warnings(
+                existing_store, getattr(sim, "symbol", None), adv_cfg, context
+            )
+        return existing_store
+    try:
+        store = ADVStore(adv_cfg)
+    except Exception:
+        logger.exception("%s: failed to initialise ADV store from config", context)
+        return None
+    try:
+        set_store(
+            store,
+            enabled=True,
+            capacity_fraction=capacity_fraction,
+            bars_per_day_override=bars_override,
+        )
+    except Exception:
+        logger.exception("%s: failed to attach ADV store to simulator", context)
+        return None
+    _log_adv_runtime_warnings(store, getattr(sim, "symbol", None), adv_cfg, context)
+    return store
+
+
 @dataclass
 class BacktestConfig:
     symbol: str
@@ -198,6 +315,9 @@ class ServiceBacktest:
         self.policy = policy
         self.sim = sim
         self.cfg = cfg
+        self._adv_store = _configure_adv_runtime(
+            sim, run_config, context="service_backtest"
+        )
         self._run_config = (
             run_config
             or getattr(sim, "run_config", None)
