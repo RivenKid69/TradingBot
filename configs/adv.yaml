@@ -1,0 +1,16 @@
+# Runtime ADV configuration defaults shared across run modes.
+#
+# Copy this block into your config and override the knobs as needed.
+adv: &adv_runtime_defaults
+  enabled: false                # Enable ADV dataset consumption at runtime.
+  path: null                    # Path to parquet/JSON file with ADV quotes (null disables IO).
+  dataset: null                 # Optional dataset identifier when ``path`` points to a directory.
+  window_days: 30               # Lookback window in days for rolling ADV aggregation.
+  refresh_days: 7               # Refresh cadence for ADV cache/materialised views (in days).
+  auto_refresh: true            # Refresh automatically when ``refresh_days`` elapsed.
+  missing_symbol_policy: warn   # warn|skip|error - behaviour when symbol quotes are missing.
+  default_quote: null           # Fallback ADV quote (quote currency) when symbol is missing.
+  floor_quote: null             # Lower bound applied to resolved ADV quotes (quote currency).
+  seasonality_path: null        # Optional path to seasonality multipliers applied to ADV.
+  seasonality_profile: null     # Profile key extracted from ``seasonality_path`` payload.
+  # Any additional keys are preserved in ``adv.extra`` for backwards compatibility.

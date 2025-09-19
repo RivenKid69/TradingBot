@@ -16,7 +16,13 @@ import logging
 from typing import Any, Dict, Mapping, Optional, Type, TypeVar, get_type_hints
 
 from core_errors import ConfigError
-from core_config import ComponentSpec, Components, CommonRunConfig, RetryConfig
+from core_config import (
+    ComponentSpec,
+    Components,
+    CommonRunConfig,
+    RetryConfig,
+    AdvRuntimeConfig,
+)
 from impl_quantizer import QuantizerImpl
 
 
@@ -113,6 +119,11 @@ def build_graph(components: Components, run_config: Optional[CommonRunConfig] = 
             else:
                 container["quantizer"] = quantizer
                 container[QuantizerImpl] = quantizer
+        adv_cfg = getattr(run_config, "adv", None)
+        if isinstance(adv_cfg, AdvRuntimeConfig):
+            container["adv_runtime_config"] = adv_cfg
+            container[AdvRuntimeConfig] = adv_cfg
+            container.setdefault("adv", adv_cfg)
     build_component("market_data", components.market_data, container)
     build_component("feature_pipe", components.feature_pipe, container)
     build_component("policy", components.policy, container)

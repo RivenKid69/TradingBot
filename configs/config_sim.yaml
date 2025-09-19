@@ -56,6 +56,20 @@ quantizer:
   auto_refresh_days: 30
   refresh_on_start: false
 
+# Runtime ADV dataset configuration (see ``configs/adv.yaml`` for documentation).
+adv:
+  enabled: false
+  path: null
+  dataset: null
+  window_days: 30
+  refresh_days: 7
+  auto_refresh: true
+  missing_symbol_policy: warn
+  default_quote: null
+  floor_quote: null
+  seasonality_path: null
+  seasonality_profile: null
+
 fees:
   maker_bps: 1.0
   taker_bps: 5.0

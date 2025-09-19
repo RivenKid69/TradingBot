@@ -295,6 +295,89 @@ class ExecutionRuntimeConfig(BaseModel):
         return super().dict(*args, **kwargs)
 
 
+class AdvRuntimeConfig(BaseModel):
+    """Runtime configuration for ADV/turnover data access."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable ADV dataset integration for runtime components.",
+    )
+    path: Optional[str] = Field(
+        default=None,
+        description="Path to the ADV dataset (parquet/json).",
+    )
+    dataset: Optional[str] = Field(
+        default=None,
+        description="Optional dataset identifier when ``path`` points to a directory.",
+    )
+    window_days: int = Field(
+        default=30,
+        ge=1,
+        description="Lookback window (days) used when aggregating ADV metrics.",
+    )
+    refresh_days: int = Field(
+        default=7,
+        ge=1,
+        description="How often to refresh cached ADV data (days).",
+    )
+    auto_refresh: bool = Field(
+        default=True,
+        description="Automatically refresh ADV data when ``refresh_days`` elapsed.",
+    )
+    missing_symbol_policy: Literal["warn", "skip", "error"] = Field(
+        default="warn",
+        description="Behaviour when ADV quote is missing for a symbol.",
+    )
+    floor_quote: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Lower bound applied to resolved ADV quote values.",
+    )
+    default_quote: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Fallback ADV quote when symbol data is unavailable.",
+    )
+    seasonality_path: Optional[str] = Field(
+        default=None,
+        description="Optional path to seasonality multipliers applied to ADV quotes.",
+    )
+    seasonality_profile: Optional[str] = Field(
+        default=None,
+        description="Profile key to extract from ``seasonality_path`` payload.",
+    )
+    extra: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Container for legacy knobs preserved for compatibility.",
+    )
+
+    class Config:
+        extra = "allow"
+
+    def dict(self, *args, **kwargs):  # type: ignore[override]
+        if "exclude_unset" not in kwargs:
+            kwargs["exclude_unset"] = False
+        payload = super().dict(*args, **kwargs)
+        return payload
+
+    @root_validator(pre=True)
+    def _capture_unknown(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(values, dict):
+            return values
+        known = set(cls.__fields__.keys())
+        extras = {k: values[k] for k in list(values.keys()) if k not in known}
+        if extras:
+            existing = values.get("extra")
+            merged: Dict[str, Any] = {}
+            if isinstance(existing, Mapping):
+                merged.update(existing)
+            merged.update(extras)
+            values["extra"] = merged
+            for key in extras:
+                values.pop(key, None)
+        return values
+
+
 class CommonRunConfig(BaseModel):
     run_id: Optional[str] = Field(
         default=None, description="Идентификатор запуска; если None — генерируется."
@@ -329,6 +412,7 @@ class CommonRunConfig(BaseModel):
     retry: RetryConfig = Field(default_factory=RetryConfig)
     state: StateConfig = Field(default_factory=StateConfig)
     risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
+    adv: AdvRuntimeConfig = Field(default_factory=AdvRuntimeConfig)
     latency: LatencyConfig = Field(default_factory=LatencyConfig)
     execution: ExecutionRuntimeConfig = Field(default_factory=ExecutionRuntimeConfig)
     components: Components
@@ -493,6 +577,25 @@ def _inject_quantizer_config(cfg: CommonRunConfig, data: Dict[str, Any]) -> None
     existing.update(q_dict)
 
 
+def _inject_adv_config(cfg: CommonRunConfig, data: Dict[str, Any]) -> None:
+    """Populate ``cfg.adv`` with structured configuration if present."""
+
+    adv_raw = data.get("adv")
+    if adv_raw is None:
+        return
+    if isinstance(adv_raw, AdvRuntimeConfig):
+        adv_cfg = adv_raw
+    else:
+        try:
+            adv_cfg = AdvRuntimeConfig.parse_obj(adv_raw)
+        except Exception:
+            adv_cfg = AdvRuntimeConfig()
+    try:
+        setattr(cfg, "adv", adv_cfg)
+    except Exception:
+        object.__setattr__(cfg, "adv", adv_cfg)
+
+
 def _inject_risk_config(cfg: CommonRunConfig, data: Dict[str, Any]) -> None:
     """Populate ``cfg.risk`` with structured configuration if present."""
 
@@ -531,6 +634,7 @@ def load_config(path: str) -> CommonRunConfig:
     cfg = cfg_cls.parse_obj(data)
     _set_seasonality_log_level(cfg)
     _inject_quantizer_config(cfg, data)
+    _inject_adv_config(cfg, data)
     _inject_risk_config(cfg, data)
     return cfg
 
@@ -552,6 +656,7 @@ def load_config_from_str(content: str) -> CommonRunConfig:
     cfg = cfg_cls.parse_obj(data)
     _set_seasonality_log_level(cfg)
     _inject_quantizer_config(cfg, data)
+    _inject_adv_config(cfg, data)
     _inject_risk_config(cfg, data)
     return cfg
 
@@ -583,6 +688,7 @@ __all__ = [
     "LatencyConfig",
     "ExecutionBridgeConfig",
     "ExecutionRuntimeConfig",
+    "AdvRuntimeConfig",
     "MonitoringThresholdsConfig",
     "MonitoringAlertConfig",
     "MonitoringConfig",
