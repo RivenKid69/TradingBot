@@ -24,6 +24,64 @@ def _to_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _to_optional_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        return float(str(v))
+    except Exception:
+        return None
+
+
+def _to_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        if math.isfinite(v):
+            return int(v)
+        return None
+    try:
+        text = str(v).strip()
+        if not text:
+            return None
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def _extract_precision_fields(filters: Dict[str, Any]) -> Tuple[Optional[int], float]:
+    quote_precision = _to_int(filters.get("quotePrecision"))
+
+    direct_step = _to_optional_float(filters.get("commission_step"))
+    if direct_step is not None and direct_step > 0:
+        return quote_precision, float(direct_step)
+
+    precision_candidates = (
+        filters.get("quoteCommissionPrecision"),
+        filters.get("commissionPrecision"),
+        filters.get("baseCommissionPrecision"),
+        filters.get("quoteAssetPrecision"),
+        filters.get("baseAssetPrecision"),
+        filters.get("quotePrecision"),
+        quote_precision,
+    )
+    for candidate in precision_candidates:
+        precision = _to_int(candidate)
+        if precision is None or precision < 0:
+            continue
+        step = float(10.0 ** (-precision))
+        if step > 0:
+            return quote_precision, step
+
+    return quote_precision, 0.0
+
+
 @dataclass
 class SymbolFilters:
     price_tick: float = 0.0
@@ -36,6 +94,8 @@ class SymbolFilters:
     # PERCENT_PRICE_BY_SIDE (spot) / PERCENT_PRICE (futures)
     multiplier_up: Optional[float] = None
     multiplier_down: Optional[float] = None
+    quote_precision: Optional[int] = None
+    commission_step: float = 0.0
 
     @classmethod
     def from_exchange_filters(cls, filters: Dict[str, Any]) -> "SymbolFilters":
@@ -43,6 +103,7 @@ class SymbolFilters:
         ls = filters.get("LOT_SIZE", {})
         mn = filters.get("MIN_NOTIONAL", {})
         ppbs = filters.get("PERCENT_PRICE_BY_SIDE", {}) or filters.get("PERCENT_PRICE", {})
+        quote_precision, commission_step = _extract_precision_fields(filters)
         return cls(
             price_tick=_to_float(pf.get("tickSize"), 0.0),
             price_min=_to_float(pf.get("minPrice"), 0.0),
@@ -53,6 +114,8 @@ class SymbolFilters:
             min_notional=_to_float(mn.get("minNotional"), 0.0),
             multiplier_up=_to_float(ppbs.get("multiplierUp"), None) if ppbs else None,
             multiplier_down=_to_float(ppbs.get("multiplierDown"), None) if ppbs else None,
+            quote_precision=quote_precision,
+            commission_step=commission_step,
         )
 
 
@@ -93,6 +156,21 @@ class Quantizer:
     # ------------ Публичные методы ------------
     def has_symbol(self, symbol: str) -> bool:
         return symbol in self._filters
+
+    def get_commission_step(self, symbol: str) -> float:
+        f = self._filters.get(symbol)
+        if not f:
+            return 0.0
+        step = float(f.commission_step or 0.0)
+        if step > 0:
+            return step
+        qp = f.quote_precision
+        if qp is not None and qp >= 0:
+            try:
+                return float(10.0 ** (-int(qp)))
+            except Exception:
+                return 0.0
+        return 0.0
 
     def quantize_price(self, symbol: str, price: Number) -> Number:
         f = self._filters.get(symbol)
