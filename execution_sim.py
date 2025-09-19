@@ -965,6 +965,16 @@ class ExecutionSimulator:
         self._vol_series: Dict[str, _VolSeriesState] = {}
         self._vol_stat_cache: Dict[str, Dict[str, float]] = {}
         self._vol_norm_metric: Optional[str] = None
+        self._dyn_spread_enabled: bool = False
+        self._dyn_spread_metric_key: Optional[str] = None
+        self._dyn_spread_alpha_bps: Optional[float] = None
+        self._dyn_spread_beta_coef: Optional[float] = None
+        self._dyn_spread_min_bps: Optional[float] = None
+        self._dyn_spread_max_bps: Optional[float] = None
+        self._dyn_spread_smoothing_alpha: Optional[float] = None
+        self._dyn_spread_fallback_bps: Optional[float] = None
+        self._dyn_spread_use_volatility: bool = False
+        self._dyn_spread_prev_ema: Optional[float] = None
         dyn_cfg_obj: Optional[Any] = None
         if self.slippage_cfg is not None:
             dyn_candidate = None
@@ -996,6 +1006,7 @@ class ExecutionSimulator:
                 metric_key = ""
             if metric_key:
                 self._vol_norm_metric = metric_key
+                self._dyn_spread_metric_key = metric_key
             window_val: Optional[int]
             try:
                 window_val = int(window_attr) if window_attr is not None else None
@@ -1019,6 +1030,54 @@ class ExecutionSimulator:
                 if clip_val < 0.0:
                     clip_val = abs(clip_val)
                 self._vol_zscore_clip = clip_val
+            enabled_attr = None
+            if isinstance(dyn_cfg_obj, Mapping):
+                enabled_attr = dyn_cfg_obj.get("enabled")
+            else:
+                enabled_attr = getattr(dyn_cfg_obj, "enabled", None)
+            try:
+                self._dyn_spread_enabled = bool(enabled_attr)
+            except Exception:
+                self._dyn_spread_enabled = False
+
+            def _dyn_value(*names: str) -> Any:
+                for name in names:
+                    if isinstance(dyn_cfg_obj, Mapping):
+                        if name in dyn_cfg_obj:
+                            return dyn_cfg_obj[name]
+                    else:
+                        if hasattr(dyn_cfg_obj, name):
+                            return getattr(dyn_cfg_obj, name)
+                return None
+
+            alpha_val = self._float_or_none(_dyn_value("alpha_bps", "alpha"))
+            if alpha_val is not None:
+                self._dyn_spread_alpha_bps = alpha_val
+            beta_val = self._float_or_none(_dyn_value("beta_coef", "beta"))
+            if beta_val is not None:
+                self._dyn_spread_beta_coef = beta_val
+            min_val = self._float_or_none(_dyn_value("min_spread_bps"))
+            if min_val is not None:
+                if min_val < 0.0:
+                    min_val = 0.0
+                self._dyn_spread_min_bps = min_val
+            max_val = self._float_or_none(_dyn_value("max_spread_bps"))
+            if max_val is not None:
+                if max_val < 0.0:
+                    max_val = 0.0
+                self._dyn_spread_max_bps = max_val
+            smooth_val = self._float_or_none(_dyn_value("smoothing_alpha"))
+            if smooth_val is not None:
+                if smooth_val <= 0.0:
+                    smooth_val = None
+                elif smooth_val >= 1.0:
+                    smooth_val = 1.0
+            self._dyn_spread_smoothing_alpha = smooth_val
+            fb_val = self._float_or_none(_dyn_value("fallback_spread_bps"))
+            if fb_val is not None and fb_val < 0.0:
+                fb_val = 0.0
+            self._dyn_spread_fallback_bps = fb_val
+            self._dyn_spread_use_volatility = bool(_dyn_value("use_volatility"))
 
         # исполнители
         self._execution_cfg = dict(execution_config or {})
@@ -2178,6 +2237,82 @@ class ExecutionSimulator:
             result = val if result is None else min(result, val)
         return result
 
+    @staticmethod
+    def _float_or_none(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(result):
+            return None
+        return result
+
+    @staticmethod
+    def _non_negative_float(value: Any) -> Optional[float]:
+        result = ExecutionSimulator._float_or_none(value)
+        if result is None:
+            return None
+        if result < 0.0:
+            result = 0.0
+        return result
+
+    @staticmethod
+    def _resolve_mid_from_inputs(
+        bid: Optional[float],
+        ask: Optional[float],
+        high: Optional[float],
+        low: Optional[float],
+        close: Optional[float],
+        trade: Optional[float],
+        ref: Optional[float],
+    ) -> Optional[float]:
+        if bid is not None and ask is not None:
+            mid_val = (bid + ask) * 0.5
+        elif high is not None and low is not None:
+            mid_val = (high + low) * 0.5
+        elif close is not None:
+            mid_val = close
+        elif trade is not None:
+            mid_val = trade
+        else:
+            mid_val = ref
+        mid = ExecutionSimulator._float_or_none(mid_val)
+        if mid is None:
+            return None
+        if mid <= 0.0:
+            return None
+        return mid
+
+    @staticmethod
+    def _compute_bar_range_ratios(
+        bar_high: Optional[float],
+        bar_low: Optional[float],
+        mid_price: Optional[float],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        high_val = ExecutionSimulator._float_or_none(bar_high)
+        low_val = ExecutionSimulator._float_or_none(bar_low)
+        mid_val = ExecutionSimulator._float_or_none(mid_price)
+        if high_val is None or low_val is None or mid_val is None:
+            return None, None
+        if mid_val <= 0.0:
+            return None, None
+        price_range = high_val - low_val
+        if not math.isfinite(price_range):
+            return None, None
+        if price_range < 0.0:
+            price_range = abs(price_range)
+        if price_range < 0.0:
+            price_range = 0.0
+        ratio = price_range / mid_val if mid_val > 0.0 else None
+        if ratio is None or not math.isfinite(ratio):
+            return None, None
+        if ratio < 0.0:
+            ratio = 0.0
+        ratio_bps = ratio * 1e4
+        return float(ratio), float(ratio_bps)
+
     def _default_spread_bps(self) -> Optional[float]:
         cfg = self.slippage_cfg
         if cfg is None:
@@ -3320,48 +3455,64 @@ class ExecutionSimulator:
         base_spread_bps: Optional[float],
         ts_ms: Optional[int],
         vol_factor: Optional[float],
+        range_ratio_bps: Optional[float] = None,
     ) -> Optional[float]:
-        def _safe_float(value: Any) -> Optional[float]:
-            if value is None:
-                return None
-            try:
-                out = float(value)
-            except (TypeError, ValueError):
-                return None
-            if not math.isfinite(out):
-                return None
-            return out
-
-        base_val = _safe_float(base_spread_bps)
+        base_val = self._float_or_none(base_spread_bps)
         if base_val is not None and base_val < 0.0:
             base_val = None
-        default_val = _safe_float(self._default_spread_bps())
+        default_val = self._float_or_none(self._default_spread_bps())
         if base_val is None:
             base_val = default_val
         if base_val is None:
             return None
 
-        bid = _safe_float(self._last_bid)
-        ask = _safe_float(self._last_ask)
-        bar_high = _safe_float(self._last_bar_high)
-        bar_low = _safe_float(self._last_bar_low)
+        bid = self._float_or_none(self._last_bid)
+        ask = self._float_or_none(self._last_ask)
+        bar_high = self._float_or_none(self._last_bar_high)
+        bar_low = self._float_or_none(self._last_bar_low)
+        bar_close = self._float_or_none(self._last_bar_close)
+        ref_price = self._float_or_none(self._last_ref_price)
 
-        mid_price: Optional[float]
-        if bid is not None and ask is not None:
-            mid_price = (bid + ask) * 0.5
-        elif bar_high is not None and bar_low is not None:
-            mid_price = (bar_high + bar_low) * 0.5
-        else:
-            mid_price = None
-        mid_price = _safe_float(mid_price)
-        if mid_price is not None and mid_price <= 0.0:
-            mid_price = None
-
+        mid_price = self._resolve_mid_from_inputs(
+            bid,
+            ask,
+            bar_high,
+            bar_low,
+            bar_close,
+            None,
+            ref_price,
+        )
         if mid_price is None:
             fallback = default_val if default_val is not None else base_val
             if fallback is None:
                 return None
             return float(fallback)
+
+        vol_metrics = None
+        if isinstance(self._last_vol_raw, Mapping):
+            try:
+                vol_metrics = dict(self._last_vol_raw)
+            except Exception:
+                vol_metrics = None
+
+        range_hint = self._non_negative_float(range_ratio_bps)
+        _, bar_range_bps = self._compute_bar_range_ratios(bar_high, bar_low, mid_price)
+        if range_hint is None:
+            range_hint = self._non_negative_float(bar_range_bps)
+
+        if self._dyn_spread_enabled:
+            dynamic_val = self._compute_dynamic_spread_override(
+                base_spread_bps=base_val,
+                default_spread_bps=default_val,
+                bar_high=bar_high,
+                bar_low=bar_low,
+                mid_price=mid_price,
+                vol_metrics=vol_metrics,
+                vol_factor=vol_factor,
+                range_ratio_bps_hint=range_hint,
+            )
+            if dynamic_val is not None:
+                base_val = dynamic_val
 
         getter_kwargs: Dict[str, Any] = {
             "symbol": self.symbol,
@@ -3379,12 +3530,6 @@ class ExecutionSimulator:
             getter_kwargs["bar_high"] = bar_high
         if bar_low is not None:
             getter_kwargs["bar_low"] = bar_low
-        vol_metrics = None
-        if isinstance(self._last_vol_raw, Mapping):
-            try:
-                vol_metrics = dict(self._last_vol_raw)
-            except Exception:
-                vol_metrics = None
         if vol_metrics is not None:
             getter_kwargs["vol_metrics"] = vol_metrics
 
@@ -3398,6 +3543,110 @@ class ExecutionSimulator:
                 if math.isfinite(candidate) and candidate >= 0.0:
                     base_val = candidate
         return float(base_val)
+
+    def _compute_dynamic_spread_override(
+        self,
+        *,
+        base_spread_bps: float,
+        default_spread_bps: Optional[float],
+        bar_high: Optional[float],
+        bar_low: Optional[float],
+        mid_price: Optional[float],
+        vol_metrics: Optional[Mapping[str, Any]],
+        vol_factor: Optional[float],
+        range_ratio_bps_hint: Optional[float],
+    ) -> Optional[float]:
+        if not self._dyn_spread_enabled:
+            return None
+
+        fallback_value = self._non_negative_float(self._dyn_spread_fallback_bps)
+        if fallback_value is None:
+            fallback_value = self._non_negative_float(default_spread_bps)
+        if fallback_value is None:
+            fallback_value = max(float(base_spread_bps), 0.0)
+
+        metric_key = (self._dyn_spread_metric_key or "range_ratio_bps").strip().lower()
+        if not metric_key:
+            metric_key = "range_ratio_bps"
+
+        def _coerce_value(source_key: str, raw: Any) -> Optional[float]:
+            candidate = self._non_negative_float(raw)
+            if candidate is None:
+                return None
+            if metric_key in {"range_ratio", "range"} and source_key == "range_ratio_bps":
+                return candidate / 1e4
+            if metric_key == "range_ratio_bps" and source_key in {"range_ratio", "range"}:
+                return candidate * 1e4
+            return candidate
+
+        metric_value: Optional[float] = None
+        if vol_metrics is not None and metric_key in vol_metrics:
+            metric_value = _coerce_value(metric_key, vol_metrics.get(metric_key))
+
+        if metric_value is None:
+            metric_value = _coerce_value("range_ratio_bps", range_ratio_bps_hint)
+
+        if metric_value is None and vol_metrics is not None:
+            for alias in ("range_ratio_bps", "range_ratio", "range"):
+                if alias == metric_key:
+                    continue
+                if alias not in vol_metrics:
+                    continue
+                metric_value = _coerce_value(alias, vol_metrics.get(alias))
+                if metric_value is not None:
+                    break
+
+        if metric_value is None:
+            range_ratio, range_ratio_bps = self._compute_bar_range_ratios(
+                bar_high, bar_low, mid_price
+            )
+            metric_value = _coerce_value("range_ratio", range_ratio)
+            if metric_value is None:
+                metric_value = _coerce_value("range_ratio_bps", range_ratio_bps)
+
+        if metric_value is None and self._dyn_spread_use_volatility:
+            metric_value = self._non_negative_float(vol_factor)
+
+        if metric_value is None:
+            return float(fallback_value)
+
+        alpha = self._float_or_none(self._dyn_spread_alpha_bps)
+        if alpha is None:
+            alpha = self._float_or_none(default_spread_bps)
+        if alpha is None:
+            alpha = float(base_spread_bps)
+        beta = self._float_or_none(self._dyn_spread_beta_coef)
+        if beta is None:
+            beta = 0.0
+
+        candidate = alpha + beta * metric_value
+        if not math.isfinite(candidate):
+            return float(fallback_value)
+
+        min_bps = self._float_or_none(self._dyn_spread_min_bps)
+        if min_bps is not None:
+            candidate = max(min_bps, candidate)
+        max_bps = self._float_or_none(self._dyn_spread_max_bps)
+        if max_bps is not None:
+            candidate = min(max_bps, candidate)
+
+        smoothing = self._dyn_spread_smoothing_alpha
+        if smoothing is not None:
+            prev = self._dyn_spread_prev_ema
+            if prev is None or not math.isfinite(prev):
+                ema_val = candidate
+            else:
+                ema_val = smoothing * candidate + (1.0 - smoothing) * prev
+            self._dyn_spread_prev_ema = float(ema_val)
+            candidate = ema_val
+        else:
+            self._dyn_spread_prev_ema = None
+
+        if not math.isfinite(candidate):
+            return float(fallback_value)
+        if candidate < 0.0:
+            candidate = 0.0
+        return float(candidate)
 
     def _report_spread_bps(self, spread_bps: Optional[float]) -> float:
         if spread_bps is not None:
@@ -3487,6 +3736,27 @@ class ExecutionSimulator:
         else:
             sbps = None
 
+        bar_open_val = self._float_or_none(bar_open)
+        bar_high_val = self._float_or_none(bar_high)
+        bar_low_val = self._float_or_none(bar_low)
+        close_candidate = bar_close
+        if close_candidate is None:
+            close_candidate = trade_price
+        bar_close_val = self._float_or_none(close_candidate)
+        trade_val = self._float_or_none(trade_price)
+        mid_for_range = self._resolve_mid_from_inputs(
+            self._last_bid,
+            self._last_ask,
+            bar_high_val,
+            bar_low_val,
+            bar_close_val,
+            trade_val,
+            self._last_ref_price,
+        )
+        range_ratio, range_ratio_bps = self._compute_bar_range_ratios(
+            bar_high_val, bar_low_val, mid_for_range
+        )
+
         vf_val: Optional[float]
         if vol_factor is not None:
             try:
@@ -3500,21 +3770,35 @@ class ExecutionSimulator:
             vf_val = None
         self._last_vol_factor = vf_val
 
-        metrics = self._normalize_vol_metrics(vol_raw)
+        metrics = self._normalize_vol_metrics(
+            vol_raw,
+            computed_range_ratio=range_ratio,
+            computed_range_ratio_bps=range_ratio_bps,
+        )
         self._last_vol_raw = metrics
 
-        self._last_bar_open = float(bar_open) if bar_open is not None else None
-        self._last_bar_high = float(bar_high) if bar_high is not None else None
-        self._last_bar_low = float(bar_low) if bar_low is not None else None
-        close_val = bar_close
-        if close_val is None:
-            close_val = trade_price
-        self._last_bar_close = float(close_val) if close_val is not None else None
+        range_ratio_bps_val: Optional[float] = None
+        if metrics is not None:
+            range_ratio_bps_val = self._non_negative_float(
+                metrics.get("range_ratio_bps")
+            )
+            if range_ratio_bps_val is None:
+                range_ratio_hint = self._non_negative_float(metrics.get("range_ratio"))
+                if range_ratio_hint is not None:
+                    range_ratio_bps_val = range_ratio_hint * 1e4
+        if range_ratio_bps_val is None:
+            range_ratio_bps_val = self._non_negative_float(range_ratio_bps)
+
+        self._last_bar_open = bar_open_val
+        self._last_bar_high = bar_high_val
+        self._last_bar_low = bar_low_val
+        self._last_bar_close = bar_close_val
 
         effective_spread = self._compute_effective_spread_bps(
             base_spread_bps=sbps,
             ts_ms=ts_ms,
             vol_factor=self._last_vol_factor,
+            range_ratio_bps=range_ratio_bps_val,
         )
         if effective_spread is not None:
             try:
@@ -4180,7 +4464,11 @@ class ExecutionSimulator:
         return stats
 
     def _normalize_vol_metrics(
-        self, metrics: Optional[Mapping[str, Any]]
+        self,
+        metrics: Optional[Mapping[str, Any]],
+        *,
+        computed_range_ratio: Optional[float] = None,
+        computed_range_ratio_bps: Optional[float] = None,
     ) -> Optional[Dict[str, float]]:
         if not metrics:
             return None
@@ -4224,6 +4512,23 @@ class ExecutionSimulator:
             ratio = ratio_bps / 1e4 if ratio_bps is not None else 0.0
             normalized.setdefault("range_ratio", ratio)
             normalized.setdefault("range", ratio)
+        ratio_hint = self._float_or_none(computed_range_ratio)
+        if ratio_hint is not None:
+            if ratio_hint < 0.0:
+                ratio_hint = 0.0
+        ratio_bps_hint = self._float_or_none(computed_range_ratio_bps)
+        if ratio_bps_hint is not None:
+            if ratio_bps_hint < 0.0:
+                ratio_bps_hint = 0.0
+        if ratio_hint is not None and ratio_bps_hint is None:
+            ratio_bps_hint = ratio_hint * 1e4
+        if ratio_bps_hint is not None and ratio_hint is None:
+            ratio_hint = ratio_bps_hint / 1e4
+        if ratio_hint is not None:
+            normalized.setdefault("range", ratio_hint)
+            normalized.setdefault("range_ratio", ratio_hint)
+        if ratio_bps_hint is not None:
+            normalized.setdefault("range_ratio_bps", ratio_bps_hint)
         stat_targets = set()
         if self._vol_norm_metric and self._vol_norm_metric in normalized:
             stat_targets.add(self._vol_norm_metric)
@@ -5805,8 +6110,42 @@ class ExecutionSimulator:
         else:
             vf_val = None
         self._last_vol_factor = vf_val
-        metrics = self._normalize_vol_metrics(vol_raw)
+        bar_open_val = self._float_or_none(bar_open)
+        bar_high_val = self._float_or_none(bar_high)
+        bar_low_val = self._float_or_none(bar_low)
+        ref_val = self._float_or_none(ref_price)
+        close_candidate = bar_close if bar_close is not None else ref_val
+        bar_close_val = self._float_or_none(close_candidate)
+        trade_val = self._float_or_none(trade_price)
+        mid_for_range = self._resolve_mid_from_inputs(
+            self._last_bid,
+            self._last_ask,
+            bar_high_val,
+            bar_low_val,
+            bar_close_val,
+            trade_val,
+            self._last_ref_price,
+        )
+        range_ratio, range_ratio_bps = self._compute_bar_range_ratios(
+            bar_high_val, bar_low_val, mid_for_range
+        )
+        metrics = self._normalize_vol_metrics(
+            vol_raw,
+            computed_range_ratio=range_ratio,
+            computed_range_ratio_bps=range_ratio_bps,
+        )
         self._last_vol_raw = metrics
+        range_ratio_bps_val: Optional[float] = None
+        if metrics is not None:
+            range_ratio_bps_val = self._non_negative_float(
+                metrics.get("range_ratio_bps")
+            )
+            if range_ratio_bps_val is None:
+                ratio_hint = self._non_negative_float(metrics.get("range_ratio"))
+                if ratio_hint is not None:
+                    range_ratio_bps_val = ratio_hint * 1e4
+        if range_ratio_bps_val is None:
+            range_ratio_bps_val = self._non_negative_float(range_ratio_bps)
         if liquidity is None:
             incoming_liq = None
         else:
@@ -5828,12 +6167,11 @@ class ExecutionSimulator:
         )
         self._last_adv_bar_capacity = adv_capacity_norm
         self._last_liquidity = self._combine_liquidity(incoming_liq, adv_capacity_norm)
-        self._last_ref_price = float(ref_price) if ref_price is not None else None
-        self._last_bar_open = float(bar_open) if bar_open is not None else None
-        self._last_bar_high = float(bar_high) if bar_high is not None else None
-        self._last_bar_low = float(bar_low) if bar_low is not None else None
-        close_val = bar_close if bar_close is not None else self._last_ref_price
-        self._last_bar_close = float(close_val) if close_val is not None else None
+        self._last_ref_price = ref_val
+        self._last_bar_open = bar_open_val
+        self._last_bar_high = bar_high_val
+        self._last_bar_low = bar_low_val
+        self._last_bar_close = bar_close_val
         base_spread: Optional[float] = None
         if (
             compute_spread_bps_from_quotes is not None
@@ -5851,6 +6189,7 @@ class ExecutionSimulator:
             base_spread_bps=base_spread,
             ts_ms=ts,
             vol_factor=self._last_vol_factor,
+            range_ratio_bps=range_ratio_bps_val,
         )
         if bar_timeframe_ms is not None:
             self.set_intrabar_timeframe_ms(bar_timeframe_ms)
