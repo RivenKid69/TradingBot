@@ -27,6 +27,7 @@ The resulting YAML fragment will look similar to::
         min_spread_bps: 3.281905
         max_spread_bps: 9.834627
         smoothing_alpha: null
+        fallback_spread_bps: 4.732551
         vol_metric: range_ratio_bps
         clip_percentiles: [5.0, 95.0]
 
@@ -37,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -132,12 +134,23 @@ def _prepare_dataframe(
     high = pd.to_numeric(result["high"], errors="coerce")
     low = pd.to_numeric(result["low"], errors="coerce")
     mid_clean = pd.to_numeric(result["mid"], errors="coerce")
+
     price_range = high - low
-    price_range = price_range.where(price_range >= 0, price_range.abs())
-    ratio = price_range / mid_clean
-    ratio = ratio.where(mid_clean > 0.0)
-    ratio = ratio.replace([np.inf, -np.inf], np.nan)
-    ratio = ratio.where(ratio >= 0.0)
+    price_range = price_range.astype(float)
+    price_range = price_range.where(np.isfinite(price_range))
+    inverted_mask = price_range < 0.0
+    if inverted_mask.any():
+        price_range = price_range.where(~inverted_mask, price_range.abs())
+    price_range = price_range.where(price_range >= 0.0, 0.0)
+
+    ratio = pd.Series(np.nan, index=result.index, dtype=float)
+    valid_mid = mid_clean > 0.0
+    valid_range = price_range.notna()
+    valid_mask = valid_mid & valid_range
+    ratio.loc[valid_mask] = price_range.loc[valid_mask] / mid_clean.loc[valid_mask]
+    ratio = ratio.where(np.isfinite(ratio))
+    ratio = ratio.clip(lower=0.0)
+
     result = result.assign(range_ratio_bps=ratio * 1e4)
     return result
 
@@ -177,19 +190,28 @@ def _linear_regression(x: pd.Series, y: pd.Series) -> Tuple[float, float]:
 
 
 def _fallback_parameters(volatility: pd.Series, spread: pd.Series) -> Tuple[float, float]:
-    spread_median = float(np.nanmedian(spread)) if len(spread) else 0.0
-    if len(volatility) == 0:
+    spread_numeric = pd.to_numeric(spread, errors="coerce")
+    spread_numeric = spread_numeric.replace([np.inf, -np.inf], np.nan)
+    spread_clean = spread_numeric.dropna()
+    spread_median = float(np.nanmedian(spread_clean)) if len(spread_clean) else 0.0
+
+    vol_numeric = pd.to_numeric(volatility, errors="coerce")
+    vol_numeric = vol_numeric.replace([np.inf, -np.inf], np.nan)
+    valid = vol_numeric.notna() & (vol_numeric > 0.0)
+    if not valid.any():
+        return spread_median, 0.0
+
+    aligned = pd.DataFrame({"spread": spread_numeric, "vol": vol_numeric})
+    aligned = aligned.loc[valid]
+    aligned = aligned.dropna()
+    if aligned.empty:
         return spread_median, 0.0
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        ratio = spread / volatility
+        ratio = aligned["spread"] / aligned["vol"]
     ratio = ratio.replace([np.inf, -np.inf], np.nan).dropna()
-    if len(ratio) == 0:
-        beta = 0.0
-    else:
-        beta = float(np.nanmedian(ratio))
-    alpha = spread_median
-    return alpha, beta
+    beta = float(np.nanmedian(ratio)) if not ratio.empty else 0.0
+    return spread_median, beta
 
 
 def _derive_spread_bounds(
@@ -312,40 +334,53 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
         volatility = _select_volatility(df, args.volatility_metric)
 
-        valid_mask = spread_series.notna() & volatility.notna()
-        spread_series = spread_series[valid_mask]
-        volatility = volatility[valid_mask]
+    spread_series = pd.to_numeric(spread_series, errors="coerce")
+    spread_series = spread_series.replace([np.inf, -np.inf], np.nan)
+    volatility = pd.to_numeric(volatility, errors="coerce")
+    volatility = volatility.replace([np.inf, -np.inf], np.nan)
 
-        if len(spread_series) < 2:
-            fallback_reason = "Not enough samples after filtering"
+    paired = pd.DataFrame({"spread": spread_series, "vol": volatility})
+    spread_series = paired["spread"]
+    volatility = paired["vol"]
+
+    spread_non_nan = spread_series.dropna()
+    if fallback_reason is None and len(spread_non_nan) < 2:
+        fallback_reason = "Not enough samples after filtering"
 
     clipped_volatility = _clip_percentiles(volatility, args.clip_lower, args.clip_upper)
+    regression_df = pd.DataFrame({"vol": clipped_volatility, "spread": spread_series})
+    regression_df = regression_df.replace([np.inf, -np.inf], np.nan).dropna()
 
     success = False
     if fallback_reason is None:
-        cleaned_vol = clipped_volatility.astype(float).replace([np.inf, -np.inf], np.nan)
-        cleaned_vol = cleaned_vol.dropna()
-        cleaned_spread = spread_series.astype(float).replace([np.inf, -np.inf], np.nan)
-        cleaned_spread = cleaned_spread.dropna()
-        has_variance = len(cleaned_vol) >= 2 and not np.isclose(
-            float(cleaned_vol.max()), float(cleaned_vol.min())
-        )
-        if cleaned_spread.empty or not has_variance:
-            fallback_reason = "Volatility samples degenerate after clipping"
+        if len(regression_df) < 2:
+            fallback_reason = "Insufficient paired samples after clipping"
         else:
-            try:
-                alpha, beta = _linear_regression(clipped_volatility, spread_series)
-                success = True
-            except (np.linalg.LinAlgError, ValueError) as exc:
-                print(f"Regression failed: {exc}", file=sys.stderr)
-                fallback_reason = "Regression failure"
+            vol_values = regression_df["vol"].astype(float)
+            spread_values = regression_df["spread"].astype(float)
+            has_variance = not np.isclose(float(vol_values.max()), float(vol_values.min()))
+            if not has_variance:
+                fallback_reason = "Volatility samples degenerate after clipping"
+            elif spread_values.isna().all():
+                fallback_reason = "Spread samples invalid after cleaning"
+            else:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", np.RankWarning)
+                        alpha, beta = _linear_regression(vol_values, spread_values)
+                    if not (np.isfinite(alpha) and np.isfinite(beta)):
+                        raise ValueError("Non-finite regression coefficients")
+                    success = True
+                except (np.linalg.LinAlgError, ValueError, np.RankWarning) as exc:
+                    print(f"Regression failed: {exc}", file=sys.stderr)
+                    fallback_reason = "Regression failure"
 
     if not success:
         alpha, beta = _fallback_parameters(clipped_volatility, spread_series)
 
     print("Dynamic spread calibration")
     print("----------------------------")
-    print(f"Samples used: {len(spread_series)}")
+    print(f"Samples used: {len(regression_df)}")
     print(f"Volatility metric: {args.volatility_metric}")
     print(f"Percentile clip: [{args.clip_lower}, {args.clip_upper}]")
     print(f"alpha (bps): {alpha:.6f}")
@@ -353,8 +388,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if fallback_reason is not None:
         print(f"(values derived from fallback heuristics: {fallback_reason})")
 
+    bounds_input = (
+        regression_df["spread"] if not regression_df.empty else spread_series.dropna()
+    )
     derived_min, derived_max = _derive_spread_bounds(
-        spread_series, args.clip_lower, args.clip_upper
+        bounds_input, args.clip_lower, args.clip_upper
     )
     min_spread = (
         float(args.min_spread_bps)
@@ -378,6 +416,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     if smoothing_alpha is not None:
         print(f"smoothing alpha: {smoothing_alpha:.6f}")
 
+    fallback_spread = float(max(alpha, 0.0))
+    if min_spread is not None:
+        fallback_spread = max(fallback_spread, float(min_spread))
+    if max_spread is not None:
+        fallback_spread = min(fallback_spread, float(max_spread))
+
     if args.output:
         fragment = {
             "slippage": {
@@ -391,6 +435,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     if max_spread is not None
                     else None,
                     "smoothing_alpha": smoothing_alpha,
+                    "fallback_spread_bps": float(fallback_spread),
                     "vol_metric": args.volatility_metric,
                     "clip_percentiles": [
                         float(args.clip_lower),
