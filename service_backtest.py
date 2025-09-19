@@ -92,26 +92,28 @@ def _extract_dynamic_slippage_cfg(
         )
     if dyn_block is None:
         return None
+    payload: Optional[Dict[str, Any]] = None
     if isinstance(dyn_block, dict):
-        return dict(dyn_block)
+        payload = dict(dyn_block)
     if hasattr(dyn_block, "dict"):
         try:
             data = dyn_block.dict()  # type: ignore[attr-defined]
         except Exception:
             data = None
         if isinstance(data, dict):
-            return dict(data)
+            payload = dict(data)
     if hasattr(dyn_block, "model_dump"):
         try:
             data = dyn_block.model_dump()  # type: ignore[attr-defined]
         except Exception:
             data = None
         if isinstance(data, dict):
-            return dict(data)
-    try:
-        return dict(dyn_block)
-    except Exception:
-        pass
+            payload = dict(data)
+    if payload is None:
+        try:
+            payload = dict(dyn_block)
+        except Exception:
+            payload = None
     result: Dict[str, Any] = {}
     for key in (
         "enabled",
@@ -128,7 +130,34 @@ def _extract_dynamic_slippage_cfg(
     ):
         if hasattr(dyn_block, key):
             result[key] = getattr(dyn_block, key)
-    return result or None
+    if payload is None:
+        payload = result if result else None
+    if not payload:
+        return None
+
+    mapped = dict(payload)
+
+    def _propagate(primary: str, *aliases: str) -> None:
+        val = None
+        for key in (primary, *aliases):
+            if key in mapped and mapped[key] is not None:
+                val = mapped[key]
+                break
+        if val is None:
+            return
+        mapped[primary] = val
+        for alias in aliases:
+            mapped.setdefault(alias, val)
+
+    _propagate("alpha_bps", "alpha", "base_bps")
+    _propagate("beta_coef", "beta", "alpha_vol")
+    _propagate("min_spread_bps", "min_bps")
+    _propagate("max_spread_bps", "max_bps")
+    _propagate("smoothing_alpha", "smoothing")
+    _propagate("vol_metric", "volatility_metric")
+    _propagate("vol_window", "volatility_window")
+
+    return mapped or None
 
 
 def _slippage_to_dict(cfg: Any) -> Optional[Dict[str, Any]]:
@@ -664,11 +693,8 @@ class ServiceBacktest:
         dyn_spread_cfg = self.cfg.dynamic_spread_config
         if dyn_spread_cfg is None:
             dyn_spread_cfg = _extract_dynamic_slippage_cfg(self._run_config)
-        sim_spread_getter = getattr(self.sim, "get_spread_bps", None)
-        if not callable(sim_spread_getter):
-            sim_spread_getter = getattr(self.sim, "_slippage_get_spread", None)
-        if callable(sim_spread_getter):
-            dyn_spread_cfg = {}
+        if dyn_spread_cfg is not None:
+            dyn_spread_cfg = dict(dyn_spread_cfg)
 
         self._bt = BacktestAdapter(
             policy=self.policy,
