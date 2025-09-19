@@ -1060,6 +1060,66 @@ class FeesImpl:
         }
 
     def attach_to(self, sim) -> None:
+        config_payload = dict(self.model_payload)
+        raw_table = config_payload.get("symbol_fee_table")
+        symbol_table: Dict[str, Any] = {}
+        if isinstance(raw_table, Mapping):
+            for symbol, payload in raw_table.items():
+                if not isinstance(symbol, str):
+                    continue
+                if isinstance(payload, Mapping):
+                    symbol_table[symbol.upper()] = {k: v for k, v in payload.items()}
+                else:
+                    symbol_table[symbol.upper()] = payload
+
+        quantizer = getattr(sim, "quantizer", None)
+        getter = getattr(quantizer, "get_commission_step", None)
+        if callable(getter):
+            symbols_to_update = set(symbol_table.keys())
+            sim_symbol = getattr(sim, "symbol", None)
+            if isinstance(sim_symbol, str):
+                symbols_to_update.add(sim_symbol.upper())
+            for symbol_key in symbols_to_update:
+                try:
+                    step_raw = getter(symbol_key)
+                except Exception:
+                    continue
+                step_val = _safe_non_negative_float(step_raw)
+                if step_val is None or step_val <= 0.0:
+                    continue
+                entry_payload = symbol_table.get(symbol_key, {})
+                if isinstance(entry_payload, Mapping):
+                    entry = {k: v for k, v in entry_payload.items()}
+                else:
+                    entry = {}
+                existing_step = _safe_non_negative_float(entry.get("commission_step"))
+                if existing_step is None or existing_step <= 0.0:
+                    entry["commission_step"] = float(step_val)
+                quant_block = entry.get("quantizer")
+                if isinstance(quant_block, Mapping):
+                    quant_payload = {k: v for k, v in quant_block.items()}
+                else:
+                    quant_payload = {}
+                quant_step = _safe_non_negative_float(quant_payload.get("commission_step"))
+                if quant_step is None or quant_step <= 0.0:
+                    quant_payload["commission_step"] = float(step_val)
+                entry["quantizer"] = quant_payload
+                symbol_table[symbol_key] = entry
+        if symbol_table:
+            config_payload["symbol_fee_table"] = symbol_table
+
+        if FeesModel is not None and self.cfg.enabled:
+            try:
+                self._model = FeesModel.from_dict(copy.deepcopy(config_payload))
+            except Exception:
+                logger.debug(
+                    "Failed to rebuild FeesModel with simulator context", exc_info=True
+                )
+
+        self.model_payload = config_payload
+        if symbol_table:
+            self.symbol_fee_table = {k: dict(v) for k, v in symbol_table.items() if isinstance(v, Mapping)}
+
         if self._model is not None:
             setattr(sim, "fees", self._model)
         share_payload = None

@@ -1,7 +1,7 @@
 import pytest
 
 from impl_fees import FeesImpl
-from fees import FeesModel
+from fees import FeeComputation, FeesModel
 
 
 def test_rounding_nested_options_normalized():
@@ -159,4 +159,54 @@ def test_bnb_settlement_converts_with_rounding():
         bnb_conversion_rate=200.0,
     )
     assert fee_bnb == pytest.approx(0.0001)
+
+
+def test_fee_compute_return_details():
+    model = FeesModel.from_dict(
+        {
+            "maker_bps": 10,
+            "taker_bps": 10,
+            "settlement": {"mode": "bnb", "currency": "BNB"},
+            "symbol_fee_table": {
+                "BTCUSDT": {
+                    "maker_bps": 10,
+                    "taker_bps": 10,
+                    "quantizer": {"commission_step": 0.0001},
+                }
+            },
+        }
+    )
+
+    details_quote = model.compute(
+        side="BUY",
+        price=100.0,
+        qty=0.123456,
+        liquidity="maker",
+        symbol="BTCUSDT",
+        return_details=True,
+    )
+
+    assert isinstance(details_quote, FeeComputation)
+    assert details_quote.fee == pytest.approx(0.0124)
+    assert details_quote.fee_before_rounding == pytest.approx(0.0123456)
+    assert details_quote.commission_step == pytest.approx(0.0001)
+    assert details_quote.rounding_step == pytest.approx(0.0001)
+    assert details_quote.rounding_enabled is True
+    assert details_quote.use_bnb_settlement is True
+    assert details_quote.requires_bnb_conversion is True
+
+    details_bnb = model.compute(
+        side="BUY",
+        price=100.0,
+        qty=0.123456,
+        liquidity="maker",
+        symbol="BTCUSDT",
+        bnb_conversion_rate=200.0,
+        return_details=True,
+    )
+
+    assert isinstance(details_bnb, FeeComputation)
+    assert details_bnb.fee == pytest.approx(0.0001)
+    assert details_bnb.bnb_conversion_rate == pytest.approx(200.0)
+    assert details_bnb.requires_bnb_conversion is False
 
