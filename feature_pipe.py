@@ -36,7 +36,7 @@ class SignalQualitySnapshot:
 class _SymbolMetricsState:
     prev_close: Optional[float] = None
     returns: Deque[float] = field(default_factory=deque)
-    volumes: Deque[float] = field(default_factory=deque)
+    volumes: Deque[float] = field(default_factory=deque)  # quote currency turnover
     sum_returns: float = 0.0
     sum_sq_returns: float = 0.0
 
@@ -80,7 +80,7 @@ class SignalQualityMetrics:
     sigma_window:
         Window size used to compute the standard deviation of returns.
     vol_median_window:
-        Window size used to compute the rolling median of volumes.
+        Window size used to compute the rolling median of quote currency volumes.
     """
 
     def __init__(self, sigma_window: int, vol_median_window: int) -> None:
@@ -129,14 +129,28 @@ class SignalQualityMetrics:
 
         state.prev_close = close
 
-        volume_source = bar.volume_quote if bar.volume_quote is not None else bar.volume_base
-        if volume_source is not None:
+        volume_quote_value: Optional[float] = None
+        if bar.volume_quote is not None:
             try:
-                volume_value = float(volume_source)
+                volume_quote_value = float(bar.volume_quote)
             except (TypeError, ValueError, InvalidOperation):
-                volume_value = None
-            if volume_value is not None and isfinite(volume_value):
-                self._append_volume(state, float(volume_value))
+                volume_quote_value = None
+        elif bar.volume_base is not None:
+            try:
+                volume_base_value = float(bar.volume_base)
+            except (TypeError, ValueError, InvalidOperation):
+                volume_base_value = None
+            if (
+                volume_base_value is not None
+                and isfinite(volume_base_value)
+                and volume_base_value > 0.0
+            ):
+                derived_quote_value = volume_base_value * close
+                if isfinite(derived_quote_value):
+                    volume_quote_value = derived_quote_value
+
+        if volume_quote_value is not None and volume_quote_value > 0.0 and isfinite(volume_quote_value):
+            self._append_volume(state, volume_quote_value)
 
         snapshot = self._snapshot(sym, state)
         self._latest[sym] = snapshot
@@ -154,6 +168,8 @@ class SignalQualityMetrics:
         state.sum_sq_returns += value * value
 
     def _append_volume(self, state: _SymbolMetricsState, value: float) -> None:
+        if value <= 0.0 or not isfinite(value):
+            return
         if len(state.volumes) == self.vol_median_window:
             state.volumes.popleft()
 
