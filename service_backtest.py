@@ -686,6 +686,11 @@ class ServiceBacktest:
         total_trades = 0
         total_fill_sum = 0.0
         total_fill_count = 0
+        share_values: List[float] = []
+        fee_values: List[float] = []
+        spread_values: List[float] = []
+        component_sums: Dict[str, float] = {}
+        component_counts: Dict[str, int] = {}
         for rep in reports:
             if not isinstance(rep, dict):
                 continue
@@ -713,6 +718,43 @@ class ServiceBacktest:
             total_fill_sum += per_fill_sum
             total_fill_count += per_fill_count
 
+            maker_share_raw = rep.get("maker_share")
+            fee_bps_raw = rep.get("expected_fee_bps")
+            spread_bps_raw = rep.get("expected_spread_bps")
+            try:
+                maker_share_val = float(maker_share_raw)
+            except (TypeError, ValueError):
+                maker_share_val = None
+            else:
+                if math.isfinite(maker_share_val):
+                    share_values.append(maker_share_val)
+            try:
+                fee_val = float(fee_bps_raw)
+            except (TypeError, ValueError):
+                fee_val = None
+            else:
+                if math.isfinite(fee_val):
+                    fee_values.append(fee_val)
+            try:
+                spread_val = float(spread_bps_raw)
+            except (TypeError, ValueError):
+                spread_val = None
+            else:
+                if math.isfinite(spread_val):
+                    spread_values.append(spread_val)
+
+            components = rep.get("expected_cost_components")
+            if isinstance(components, Mapping):
+                for key, value in components.items():
+                    try:
+                        num = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(num):
+                        continue
+                    component_sums[key] = component_sums.get(key, 0.0) + num
+                    component_counts[key] = component_counts.get(key, 0) + 1
+
         if total_trades:
             if total_fill_count:
                 overall_avg = total_fill_sum / total_fill_count
@@ -729,6 +771,57 @@ class ServiceBacktest:
                     "service_backtest",
                     total_trades,
                 )
+        def _avg(series: List[float]) -> Optional[float]:
+            if not series:
+                return None
+            return sum(series) / len(series)
+
+        maker_share_avg = _avg(share_values)
+        fee_bps_avg = _avg(fee_values)
+        spread_bps_avg = _avg(spread_values)
+        component_avg: Dict[str, float] = {}
+        for key, total in component_sums.items():
+            count = component_counts.get(key, 0)
+            if count > 0:
+                component_avg[key] = total / count
+
+        if (
+            maker_share_avg is not None
+            or fee_bps_avg is not None
+            or spread_bps_avg is not None
+            or component_avg
+        ):
+            def _fmt(value: Optional[float]) -> str:
+                if value is None:
+                    return "None"
+                return f"{value:.4f}"
+
+            comp_avg_repr = (
+                "{"
+                + ", ".join(
+                    f"{k}={component_avg[k]:.4f}" for k in sorted(component_avg)
+                )
+                + "}"
+                if component_avg
+                else "{}"
+            )
+            comp_sum_repr = (
+                "{"
+                + ", ".join(f"{k}={component_sums[k]:.4f}" for k in sorted(component_sums))
+                + "}"
+                if component_sums
+                else "{}"
+            )
+            logger.info(
+                "%s: maker_share=%s fee_bps=%s spread_bps=%s cost_components_avg=%s cost_components_sum=%s",
+                "service_backtest",
+                _fmt(maker_share_avg),
+                _fmt(fee_bps_avg),
+                _fmt(spread_bps_avg),
+                comp_avg_repr,
+                comp_sum_repr,
+            )
+
         try:
             if getattr(self.sim, "_logger", None):
                 self.sim._logger.flush()

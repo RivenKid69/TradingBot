@@ -378,6 +378,10 @@ class SimStepReport:
     fill_ratio: float = 1.0
     capacity_reason: str = ""
     exec_status: str = ""
+    maker_share: float = 0.0
+    expected_fee_bps: float = 0.0
+    expected_spread_bps: Optional[float] = None
+    expected_cost_components: Dict[str, Optional[float]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         trades_payload = []
@@ -386,6 +390,21 @@ class SimStepReport:
                 trades_payload.append(dict(t.__dict__))
             else:
                 trades_payload.append(dict(getattr(t, "__dict__", {})))
+        cost_components: Dict[str, Optional[float]] = {}
+        if isinstance(self.expected_cost_components, Mapping):
+            for key, value in self.expected_cost_components.items():
+                name = str(key)
+                if value is None:
+                    cost_components[name] = None
+                    continue
+                try:
+                    num = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(num):
+                    cost_components[name] = None
+                    continue
+                cost_components[name] = float(num)
         return {
             "trades": trades_payload,
             "cancelled_ids": list(self.cancelled_ids),
@@ -429,6 +448,14 @@ class SimStepReport:
             "fill_ratio": float(self.fill_ratio),
             "capacity_reason": str(self.capacity_reason),
             "exec_status": str(self.exec_status),
+            "maker_share": float(self.maker_share),
+            "expected_fee_bps": float(self.expected_fee_bps),
+            "expected_spread_bps": (
+                float(self.expected_spread_bps)
+                if self.expected_spread_bps is not None
+                else None
+            ),
+            "expected_cost_components": cost_components,
         }
 
 
@@ -2674,6 +2701,103 @@ class ExecutionSimulator:
             return 0.0
         return float(fee_val)
 
+    def _expected_cost_snapshot(
+        self,
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Dict[str, Optional[float]]]:
+        share_cfg = getattr(self, "_maker_taker_share_cfg", None)
+        share_enabled = bool(getattr(self, "_maker_taker_share_enabled", False))
+        share_default = float(getattr(self, "_expected_maker_share", 0.0))
+        share_candidate: Any = None
+        if isinstance(share_cfg, Mapping):
+            share_candidate = share_cfg.get("maker_share")
+            if share_candidate is None:
+                share_candidate = share_cfg.get("maker_share_default")
+        maker_share_val = ExecutionSimulator._trade_cost_share(
+            share_candidate, share_default
+        )
+        try:
+            maker_share_out = float(maker_share_val)
+        except (TypeError, ValueError):
+            maker_share_out = None
+        if maker_share_out is not None:
+            if not math.isfinite(maker_share_out) or maker_share_out < 0.0:
+                maker_share_out = 0.0
+            elif maker_share_out > 1.0:
+                maker_share_out = 1.0
+        if not share_enabled:
+            maker_share_out = 0.0 if maker_share_out is None else float(maker_share_out)
+
+        expected_fee_candidate: Any = getattr(self, "_expected_fee_bps", None)
+        if isinstance(share_cfg, Mapping) and share_cfg.get("expected_fee_bps") is not None:
+            expected_fee_candidate = share_cfg.get("expected_fee_bps")
+        expected_fee_val = ExecutionSimulator._trade_cost_float(expected_fee_candidate)
+        expected_fee_out: Optional[float]
+        if expected_fee_val is None or not math.isfinite(expected_fee_val):
+            expected_fee_out = None
+        else:
+            expected_fee_out = max(0.0, float(expected_fee_val))
+        if not share_enabled:
+            expected_fee_out = 0.0 if expected_fee_out is not None else 0.0
+
+        spread_maker_val: Optional[float] = None
+        spread_taker_val: Optional[float] = None
+        if isinstance(share_cfg, Mapping):
+            spread_maker_val = ExecutionSimulator._trade_cost_float(
+                share_cfg.get("spread_cost_maker_bps")
+            )
+            spread_taker_val = ExecutionSimulator._trade_cost_float(
+                share_cfg.get("spread_cost_taker_bps")
+            )
+        expected_spread_val = self._blend_expected_spread(
+            taker_bps=spread_taker_val,
+            maker_bps=spread_maker_val,
+            maker_share=maker_share_out if share_enabled else None,
+        )
+        if expected_spread_val is None:
+            expected_spread_val = self._blend_expected_spread(
+                taker_bps=self._last_spread_bps,
+                maker_share=maker_share_out if share_enabled else None,
+            )
+        expected_spread_out: Optional[float]
+        if expected_spread_val is None:
+            expected_spread_out = None
+        else:
+            try:
+                spread_num = float(expected_spread_val)
+            except (TypeError, ValueError):
+                expected_spread_out = None
+            else:
+                if math.isfinite(spread_num):
+                    expected_spread_out = max(0.0, spread_num)
+                else:
+                    expected_spread_out = None
+        if not share_enabled:
+            expected_spread_out = None
+
+        components: Dict[str, Optional[float]] = {}
+        if expected_fee_out is not None:
+            components["fee_bps"] = float(expected_fee_out)
+        else:
+            components["fee_bps"] = 0.0 if share_enabled else 0.0
+        if expected_spread_out is not None:
+            components["spread_bps"] = float(expected_spread_out)
+        total_val = 0.0
+        total_count = 0
+        for value in components.values():
+            if value is None:
+                continue
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(num):
+                continue
+            total_val += num
+            total_count += 1
+        if total_count:
+            components["total_bps"] = float(total_val)
+        return maker_share_out, expected_fee_out, expected_spread_out, components
+
     def _log_trade_cost_debug(
         self,
         *,
@@ -2689,6 +2813,21 @@ class ExecutionSimulator:
         limit = int(self._trade_cost_debug_limit)
         if limit > 0 and self._trade_cost_debug_logged >= limit:
             return
+        metrics = getattr(trade_cost, "metrics", None)
+        if isinstance(metrics, dict):
+            _, fee_bps, spread_bps, components = self._expected_cost_snapshot()
+            if fee_bps is not None and "fee_bps" not in metrics:
+                try:
+                    metrics["fee_bps"] = float(fee_bps)
+                except (TypeError, ValueError):
+                    metrics.setdefault("fee_bps", None)
+            if spread_bps is not None and "spread_bps" not in metrics:
+                try:
+                    metrics["spread_bps"] = float(spread_bps)
+                except (TypeError, ValueError):
+                    metrics.setdefault("spread_bps", None)
+            if components and "expected_cost_components" not in metrics:
+                metrics["expected_cost_components"] = dict(components)
         try:
             qty_val = float(qty)
         except (TypeError, ValueError):
@@ -5117,6 +5256,30 @@ class ExecutionSimulator:
             report.fill_ratio = 0.0
             report.capacity_reason = ""
             report.exec_status = ""
+
+        maker_share_val, expected_fee_bps, expected_spread_bps, cost_components = (
+            self._expected_cost_snapshot()
+        )
+        if maker_share_val is not None:
+            try:
+                report.maker_share = float(maker_share_val)
+            except (TypeError, ValueError):
+                report.maker_share = 0.0
+        else:
+            report.maker_share = 0.0
+        if expected_fee_bps is not None:
+            try:
+                report.expected_fee_bps = float(expected_fee_bps)
+            except (TypeError, ValueError):
+                report.expected_fee_bps = 0.0
+        else:
+            report.expected_fee_bps = 0.0
+        report.expected_spread_bps = (
+            float(expected_spread_bps)
+            if expected_spread_bps is not None
+            else None
+        )
+        report.expected_cost_components = dict(cost_components)
 
         # логирование
         try:
