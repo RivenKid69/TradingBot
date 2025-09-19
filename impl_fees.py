@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Any, Mapping, Tuple
 
+from adapters.binance_spot_private import AccountFeeInfo, fetch_account_fee_info
+
 try:
     from fees import FeesModel
 except Exception:  # pragma: no cover
@@ -23,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _FEE_TABLE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _DEFAULT_FEE_TABLE_PATH = Path("data") / "fees" / "fees_by_symbol.json"
+_DEFAULT_BINANCE_SAPI_BASE = "https://api.binance.com"
 
 
 def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -43,6 +46,16 @@ def _safe_positive_int(value: Any) -> Optional[int]:
     if num < 0:
         return None
     return num
+
+
+def _safe_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    return text or None
 
 
 def _normalise_path(value: Any) -> Optional[str]:
@@ -79,6 +92,7 @@ class FeesConfig:
     fee_rounding_step: Optional[float] = None
     symbol_fee_table: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    account_info: Dict[str, Any] = field(default_factory=dict)
     maker_taker_share: Optional[Dict[str, Any]] = None
     maker_taker_share_enabled: Optional[bool] = None
     maker_taker_share_mode: Optional[str] = None
@@ -91,6 +105,12 @@ class FeesConfig:
     maker_taker_share_cfg: Optional[MakerTakerShareSettings] = field(
         init=False, default=None
     )
+    account_info_enabled: bool = field(init=False, default=False)
+    account_info_endpoint: Optional[str] = field(init=False, default=None)
+    account_info_recv_window_ms: Optional[int] = field(init=False, default=None)
+    account_info_timeout_s: Optional[float] = field(init=False, default=None)
+    account_info_api_key: Optional[str] = field(init=False, default=None)
+    account_info_api_secret: Optional[str] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
@@ -140,6 +160,33 @@ class FeesConfig:
             self.metadata = dict(self.metadata)
         else:
             self.metadata = {}
+
+        account_info_cfg: Dict[str, Any] = {}
+        if isinstance(self.account_info, Mapping):
+            account_info_cfg.update(self.account_info)
+        self.account_info = account_info_cfg
+        enabled_flag = account_info_cfg.get("enabled")
+        if enabled_flag is None and account_info_cfg.get("enable") is not None:
+            enabled_flag = account_info_cfg.get("enable")
+        self.account_info_enabled = bool(enabled_flag)
+        endpoint = account_info_cfg.get("endpoint") or account_info_cfg.get("base_url")
+        endpoint_str = _safe_str(endpoint)
+        if endpoint_str:
+            endpoint_str = endpoint_str.rstrip("/")
+        self.account_info_endpoint = endpoint_str
+        recv_candidate = account_info_cfg.get("recv_window_ms")
+        if recv_candidate is None:
+            recv_candidate = account_info_cfg.get("recv_window")
+        self.account_info_recv_window_ms = _safe_positive_int(recv_candidate)
+        timeout_candidate = account_info_cfg.get("timeout_s")
+        if timeout_candidate is None:
+            timeout_candidate = account_info_cfg.get("timeout")
+        timeout_value = _safe_float(timeout_candidate)
+        if timeout_value is not None and timeout_value <= 0.0:
+            timeout_value = None
+        self.account_info_timeout_s = timeout_value
+        self.account_info_api_key = _safe_str(account_info_cfg.get("api_key"))
+        self.account_info_api_secret = _safe_str(account_info_cfg.get("api_secret"))
 
         share_payload: Dict[str, Any] = {}
         if isinstance(self.maker_taker_share, Mapping):
@@ -211,6 +258,18 @@ class FeesImpl:
         self.symbol_fee_table: Dict[str, Any] = {}
         self._table_account_overrides: Dict[str, Any] = {}
         self._table_share_raw: Optional[Dict[str, Any]] = None
+        self.account_fee_info: AccountFeeInfo | None = None
+        self.account_fee_overrides: Dict[str, Any] = {}
+        self.account_fee_status: str = "disabled"
+        self.account_fee_error: Optional[str] = None
+        self.account_fee_endpoint: Optional[str] = None
+        self.account_fee_recv_window: Optional[int] = None
+        self.account_fee_timeout: Optional[float] = None
+        self._account_fee_applied: Dict[str, bool] = {
+            "vip_tier": False,
+            "maker_bps": False,
+            "taker_bps": False,
+        }
 
         table_payload = self._load_symbol_fee_table()
         table_from_file = table_payload.get("table", {}) if table_payload else {}
@@ -251,6 +310,12 @@ class FeesImpl:
         self.maker_taker_share_cfg = share_cfg
         self.maker_taker_share_raw = share_raw if share_cfg is None else share_cfg.as_dict()
 
+        if cfg.account_info_enabled:
+            info = self._load_account_fee_info()
+            if info is not None:
+                self.account_fee_info = info
+                self.account_fee_overrides = info.to_fee_overrides()
+
         self._maker_discount_mult = float(cfg.maker_discount_mult)
         self._taker_discount_mult = float(cfg.taker_discount_mult)
         self._use_bnb_discount = bool(cfg.use_bnb_discount)
@@ -269,10 +334,23 @@ class FeesImpl:
             if vip_candidate is not None:
                 vip_tier = vip_candidate
         if vip_tier is None:
+            account_vip = _safe_positive_int(self.account_fee_overrides.get("vip_tier"))
+            if account_vip is not None:
+                vip_tier = account_vip
+                self._account_fee_applied["vip_tier"] = True
+        if vip_tier is None:
             vip_tier = 0
 
         maker_bps = float(cfg.maker_bps)
         taker_bps = float(cfg.taker_bps)
+        account_maker_bps = _safe_float(self.account_fee_overrides.get("maker_bps"))
+        if account_maker_bps is not None:
+            maker_bps = account_maker_bps
+            self._account_fee_applied["maker_bps"] = True
+        account_taker_bps = _safe_float(self.account_fee_overrides.get("taker_bps"))
+        if account_taker_bps is not None:
+            taker_bps = account_taker_bps
+            self._account_fee_applied["taker_bps"] = True
 
         self.base_fee_bps: Dict[str, float] = {
             "maker_fee_bps": maker_bps * self._maker_discount_mult,
@@ -344,6 +422,32 @@ class FeesImpl:
         if self._table_share_raw is not None:
             table_meta.setdefault("share_from_file", self._table_share_raw)
         meta["table"] = table_meta
+        account_meta: Dict[str, Any] = {
+            "enabled": bool(self.cfg.account_info_enabled),
+            "status": self.account_fee_status,
+        }
+        if self.cfg.account_info_enabled:
+            if self.account_fee_endpoint is not None:
+                account_meta["endpoint"] = self.account_fee_endpoint
+            if self.account_fee_recv_window is not None:
+                account_meta["recv_window_ms"] = int(self.account_fee_recv_window)
+            if self.account_fee_timeout is not None:
+                account_meta["timeout_s"] = float(self.account_fee_timeout)
+            account_meta["applied"] = dict(self._account_fee_applied)
+            if self.account_fee_info is not None:
+                if self.account_fee_info.vip_tier is not None:
+                    account_meta.setdefault("vip_tier", int(self.account_fee_info.vip_tier))
+                if self.account_fee_info.maker_bps is not None:
+                    account_meta.setdefault("maker_bps", float(self.account_fee_info.maker_bps))
+                if self.account_fee_info.taker_bps is not None:
+                    account_meta.setdefault("taker_bps", float(self.account_fee_info.taker_bps))
+                if self.account_fee_info.update_time_ms is not None:
+                    account_meta.setdefault(
+                        "update_time_ms", int(self.account_fee_info.update_time_ms)
+                    )
+            if self.account_fee_error is not None:
+                account_meta["error"] = self.account_fee_error
+        meta["account_fetch"] = account_meta
         meta["inline_symbol_count"] = len(self.inline_symbol_fee_table)
         meta["symbol_fee_table_used"] = len(self.symbol_fee_table)
         meta["maker_bps"] = float(self.cfg.maker_bps)
@@ -527,6 +631,62 @@ class FeesImpl:
         self.table_metadata = meta
         return payload
 
+    def _load_account_fee_info(self) -> AccountFeeInfo | None:
+        self.account_fee_status = "pending"
+        base_url = self.cfg.account_info_endpoint
+        if base_url:
+            self.account_fee_endpoint = base_url
+        else:
+            self.account_fee_endpoint = _DEFAULT_BINANCE_SAPI_BASE
+
+        recv_window = self.cfg.account_info_recv_window_ms
+        if recv_window is None or recv_window <= 0:
+            recv_window = 5_000
+        self.account_fee_recv_window = recv_window
+
+        timeout_s = self.cfg.account_info_timeout_s
+        if timeout_s is None or timeout_s <= 0.0:
+            timeout_s = 10.0
+        self.account_fee_timeout = timeout_s
+
+        api_key = _safe_str(self.cfg.account_info_api_key) or _safe_str(
+            os.environ.get("BINANCE_API_KEY")
+        )
+        api_secret = _safe_str(self.cfg.account_info_api_secret) or _safe_str(
+            os.environ.get("BINANCE_API_SECRET")
+        )
+
+        if not api_key or not api_secret:
+            self.account_fee_status = "missing_credentials"
+            logger.warning(
+                "Account info fetch enabled but API credentials are missing; skipping"
+            )
+            return None
+
+        try:
+            info = fetch_account_fee_info(
+                api_key=api_key,
+                api_secret=api_secret,
+                base_url=base_url,
+                recv_window_ms=recv_window,
+                timeout=timeout_s,
+            )
+        except Exception as exc:  # pragma: no cover - network/auth failures
+            self.account_fee_status = "error"
+            self.account_fee_error = f"{exc.__class__.__name__}: {exc}"
+            logger.warning("Failed to fetch Binance account info: %s", exc, exc_info=True)
+            return None
+
+        self.account_fee_status = "ok"
+        self.account_fee_error = None
+        logger.info(
+            "Fetched Binance account fees: vip_tier=%s maker_bps=%s taker_bps=%s",
+            info.vip_tier,
+            info.maker_bps,
+            info.taker_bps,
+        )
+        return info
+
     @property
     def model(self):
         return self._model
@@ -617,6 +777,13 @@ class FeesImpl:
                 metadata = dict(block)
                 break
 
+        account_info_cfg = None
+        for key in ("account_info", "account_fetch"):
+            block = d.get(key)
+            if isinstance(block, Mapping):
+                account_info_cfg = dict(block)
+                break
+
         path = None
         for key in ("path", "fees_path", "symbol_fee_path"):
             candidate = d.get(key)
@@ -643,6 +810,7 @@ class FeesImpl:
                 fee_rounding_step=fee_rounding_step,
                 symbol_fee_table=symbol_table,
                 metadata=metadata,
+                account_info=account_info_cfg or {},
                 maker_taker_share=share_payload,
                 maker_taker_share_enabled=share_enabled,
                 maker_taker_share_mode=share_mode,
