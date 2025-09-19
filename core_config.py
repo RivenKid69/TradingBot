@@ -338,6 +338,16 @@ class AdvRuntimeConfig(BaseModel):
         ge=0.0,
         description="Fallback ADV quote when symbol data is unavailable.",
     )
+    capacity_fraction: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="Fraction of per-bar ADV capacity used for execution sizing.",
+    )
+    bars_per_day_override: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Override for bars-per-day when deriving per-bar ADV capacity.",
+    )
     seasonality_path: Optional[str] = Field(
         default=None,
         description="Optional path to seasonality multipliers applied to ADV quotes.",
