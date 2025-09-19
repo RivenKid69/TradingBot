@@ -96,3 +96,67 @@ def test_fees_model_rounding_from_nested_only():
     assert model.rounding.get("step") == pytest.approx(0.25)
     assert model.rounding.get("enabled") is True
 
+
+def test_symbol_commission_step_rounds_up():
+    model = FeesModel.from_dict(
+        {
+            "maker_bps": 10,
+            "taker_bps": 10,
+            "symbol_fee_table": {
+                "BTCUSDT": {
+                    "maker_bps": 10,
+                    "taker_bps": 10,
+                    "quantizer": {"commission_step": 0.0001},
+                }
+            },
+        }
+    )
+
+    fee = model.compute(
+        side="BUY",
+        price=100.0,
+        qty=0.123456,
+        liquidity="maker",
+        symbol="BTCUSDT",
+    )
+
+    assert fee == pytest.approx(0.0124)
+
+
+def test_bnb_settlement_converts_with_rounding():
+    model = FeesModel.from_dict(
+        {
+            "maker_bps": 10,
+            "taker_bps": 10,
+            "settlement": {"mode": "bnb", "currency": "BNB"},
+            "symbol_fee_table": {
+                "BTCUSDT": {
+                    "maker_bps": 10,
+                    "taker_bps": 10,
+                    "quantizer": {"commission_step": 0.0001},
+                }
+            },
+        }
+    )
+
+    # Without conversion rate the result stays in quote currency with step rounding.
+    fee_quote = model.compute(
+        side="SELL",
+        price=100.0,
+        qty=0.123456,
+        liquidity="taker",
+        symbol="BTCUSDT",
+    )
+    assert fee_quote == pytest.approx(0.0124)
+
+    # When conversion is provided the fee is converted to BNB and rounded up to the tick.
+    fee_bnb = model.compute(
+        side="SELL",
+        price=100.0,
+        qty=0.123456,
+        liquidity="taker",
+        symbol="BTCUSDT",
+        bnb_conversion_rate=200.0,
+    )
+    assert fee_bnb == pytest.approx(0.0001)
+
