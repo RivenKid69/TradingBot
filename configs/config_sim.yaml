@@ -91,6 +91,9 @@ fees:
     spread_cost_maker_bps: 0.0
     spread_cost_taker_bps: 0.0
     taker_fee_override_bps: null
+    distance_to_mid: null        # Значение в bps или блок {value,min,max,fallback}
+    latency: null                # Значение в мс или блок {value,min,max,fallback}
+    coefficients: {}
 
 slippage:
   k: 0.8
