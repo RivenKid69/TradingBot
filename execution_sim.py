@@ -5707,6 +5707,7 @@ class ExecutionSimulator:
         new_order_pos: List[int] = []
         fee_total: float = 0.0
         risk_events_buffer: List[RiskEvent] = []  # type: ignore[var-annotated]
+        filter_rejections_step: List[Dict[str, Any]] = []
 
         ts = int(now_ts or now_ms())
         ref = self._ref(ref_price)
@@ -5758,6 +5759,15 @@ class ExecutionSimulator:
                 )
                 if rejection is not None or qty_total <= 0.0:
                     self._log_filter_rejection(rejection)
+                    if rejection is not None:
+                        filter_rejections_step.append(
+                            {
+                                "which": str(rejection.code),
+                                "detail": rejection.as_dict(),
+                                "client_order_id": int(p.client_order_id),
+                                "order_type": "MARKET",
+                            }
+                        )
                     reason_code = (
                         rejection.code if rejection is not None else "FILTER"
                     )
@@ -6451,6 +6461,15 @@ class ExecutionSimulator:
                 )
                 if rejection is not None or qty_q <= 0.0:
                     self._log_filter_rejection(rejection)
+                    if rejection is not None:
+                        filter_rejections_step.append(
+                            {
+                                "which": str(rejection.code),
+                                "detail": rejection.as_dict(),
+                                "client_order_id": int(p.client_order_id),
+                                "order_type": "LIMIT",
+                            }
+                        )
                     reason_code = (
                         rejection.code if rejection is not None else "FILTER"
                     )
@@ -6762,6 +6781,10 @@ class ExecutionSimulator:
         )
         report.expected_cost_components = dict(cost_components)
 
+        if filter_rejections_step:
+            report.status = "REJECTED_BY_FILTER"
+            report.reason = {"rejections": list(filter_rejections_step)}
+
         # логирование
         try:
             if self._logger is not None:
@@ -6918,6 +6941,7 @@ class ExecutionSimulator:
         new_order_ids: list[int] = []
         new_order_pos: list[int] = []
         fee_total: float = 0.0
+        filter_rejections_step: List[Dict[str, Any]] = []
 
         # --- обработать действия ---
         acts = list(actions or [])
@@ -6987,6 +7011,15 @@ class ExecutionSimulator:
                 )
                 if rejection is not None or qty_total <= 0.0:
                     self._log_filter_rejection(rejection)
+                    if rejection is not None:
+                        filter_rejections_step.append(
+                            {
+                                "which": str(rejection.code),
+                                "detail": rejection.as_dict(),
+                                "client_order_id": int(cli_id),
+                                "order_type": "MARKET",
+                            }
+                        )
                     reason_code = (
                         rejection.code if rejection is not None else "FILTER"
                     )
@@ -7524,7 +7557,7 @@ class ExecutionSimulator:
                 pass
 
         # финальный отчёт
-        return ExecReport(
+        report = ExecReport(
             trades=trades,
             cancelled_ids=cancelled_ids,
             cancelled_reasons=cancelled_reasons,
@@ -7548,6 +7581,10 @@ class ExecutionSimulator:
             liquidity=self._last_liquidity,
             execution_profile=str(getattr(self, "execution_profile", "")),
         )
+        if filter_rejections_step:
+            report.status = "REJECTED_BY_FILTER"
+            report.reason = {"rejections": list(filter_rejections_step)}
+        return report
 
     def stop(self) -> None:
         if self._stopped:
