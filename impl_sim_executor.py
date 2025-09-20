@@ -456,7 +456,8 @@ class SimExecutor(TradeExecutor):
     def execute(self, order: Order) -> ExecReport:
         """
         Синхронно исполняет ордер через ExecutionSimulator и возвращает первый ExecReport.
-        Если сделок не было — возвращает ExecReport с нулевым qty и статусом 'NONE' (в рамках схемы compat).
+        Если сделок не было — возвращает ExecReport с нулевым qty и статусом 'NONE'
+        (совместимый fallback). Отказы фильтров отражаются как ExecStatus.REJECTED.
         """
         atype, proto = self._order_to_action(order)
 
@@ -484,8 +485,24 @@ class SimExecutor(TradeExecutor):
             run_id=self._run_id,
             client_order_id=str(getattr(order, "client_order_id", "") or ""),
         )
-        # Возвращаем первый отчёт; при необходимости вызывающая сторона может получить остальные из d
-        return core_reports[0] if core_reports else ExecReport.from_dict({
+        if core_reports:
+            return core_reports[0]
+
+        status_val = str(getattr(rep, "status", "") or d.get("status") or "").upper()
+        if status_val == "REJECTED_BY_FILTER":
+            # compat-шлюз строит REJECTED-заглушку, если сделки отсутствуют
+            reject_reports = sim_report_dict_to_core_exec_reports(
+                d,
+                symbol=self._ctx.symbol,
+                run_id=self._run_id,
+                client_order_id=str(getattr(order, "client_order_id", "") or ""),
+            )
+            if reject_reports:
+                return reject_reports[0]
+
+        # Возвращаем первый отчёт; при необходимости вызывающая сторона может получить остальные из d.
+        # Для остальных случаев сохраняем прежний NONE-fallback.
+        return ExecReport.from_dict({
             "ts": int(order.ts),
             "symbol": self._ctx.symbol,
             "side": "BUY" if float(order.quantity) >= 0 else "SELL",

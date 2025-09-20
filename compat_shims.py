@@ -85,6 +85,79 @@ def _attach_capacity_meta(meta: Dict[str, Any], source: Mapping[str, Any]) -> No
         meta["bar_capacity_base"] = capacity_meta
 
 
+def _normalize_filter_reason(reason: Any) -> Optional[Any]:
+    if reason is None:
+        return None
+    if isinstance(reason, Mapping):
+        normalized: Dict[str, Any] = {}
+        for key, value in reason.items():
+            normalized[str(key)] = _normalize_filter_reason(value)
+        return normalized
+    if isinstance(reason, list):
+        return [_normalize_filter_reason(item) for item in reason]
+    return reason
+
+
+def _extract_reason_price(reason: Any) -> Optional[float]:
+    if isinstance(reason, Mapping):
+        for key, value in reason.items():
+            key_lower = str(key).lower()
+            if key_lower in {"price", "ref_price", "limit_price", "match_price"}:
+                hint = _float_or_none(value)
+                if hint is not None:
+                    return hint
+            nested = _extract_reason_price(value)
+            if nested is not None:
+                return nested
+    elif isinstance(reason, list):
+        for item in reason:
+            nested = _extract_reason_price(item)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _attach_filter_reason_meta(report: CoreExecReport, reason: Any) -> None:
+    if reason is None:
+        return
+    meta = dict(report.meta or {})
+    meta["filter_rejection"] = _normalize_filter_reason(reason)
+    report.meta = meta
+
+
+def _make_reject_report(
+    parent: Dict[str, Any],
+    *,
+    symbol: str,
+    run_id: str,
+    client_order_id: Optional[str],
+    reason: Any,
+) -> CoreExecReport:
+    normalized_reason = _normalize_filter_reason(reason)
+    price_hint = _extract_reason_price(normalized_reason)
+    trade_stub: Dict[str, Any] = {
+        "price": price_hint if price_hint is not None else "0",
+        "qty": "0",
+        "status": "REJECTED",
+        "exec_status": "REJECTED",
+    }
+    if client_order_id:
+        trade_stub["client_order_id"] = client_order_id
+    if normalized_reason is not None:
+        trade_stub["reason"] = _normalize_filter_reason(normalized_reason)
+    report = trade_dict_to_core_exec_report(
+        trade_stub,
+        parent=parent,
+        symbol=symbol,
+        run_id=run_id,
+        client_order_id=client_order_id,
+    )
+    report.exec_status = ExecStatus.REJECTED
+    report.quantity = Decimal("0")
+    _attach_filter_reason_meta(report, normalized_reason)
+    return report
+
+
 def _derive_exec_status(trade: Dict[str, Any]) -> Tuple[ExecStatus, Optional[str]]:
     raw = _get(trade, "exec_status", default=None)
     if raw is None:
@@ -278,6 +351,22 @@ def sim_report_dict_to_core_exec_reports(
         trade_dict_to_core_exec_report(t, parent=d, symbol=symbol, run_id=run_id, client_order_id=client_order_id)
         for t in trades_src
     ]
+    status_val = str(d.get("status") or "").upper()
+    if status_val == "REJECTED_BY_FILTER":
+        reason_payload = d.get("reason")
+        if not reports or all(t.quantity == Decimal("0") for t in reports):
+            return [
+                _make_reject_report(
+                    d,
+                    symbol=symbol,
+                    run_id=run_id,
+                    client_order_id=client_order_id,
+                    reason=reason_payload,
+                )
+            ]
+        if reason_payload is not None:
+            for report in reports:
+                _attach_filter_reason_meta(report, reason_payload)
     # Если у сделок нет индивидуальной комиссии, а в отчёте есть fee_total — распределим
     if reports and all((t.fee is None or t.fee == Decimal("0")) for t in reports):
         total_fee = _dec(d.get("fee_total", "0"))
