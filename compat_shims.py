@@ -90,10 +90,32 @@ def _normalize_filter_reason(reason: Any) -> Optional[Any]:
         return None
     if isinstance(reason, Mapping):
         normalized: Dict[str, Any] = {}
+        primary = reason.get("primary")
+        which = reason.get("which") if primary is None else None
+        if primary is not None:
+            normalized["primary"] = str(primary)
+        elif which is not None:
+            normalized["primary"] = str(which)
+        details = None
+        if "details" in reason:
+            details = _normalize_filter_reason(reason.get("details"))
+            normalized["details"] = details
+        elif "detail" in reason:
+            details = _normalize_filter_reason(reason.get("detail"))
+            normalized["details"] = details
+        if "extra" in reason:
+            normalized["extra"] = _normalize_filter_reason(reason.get("extra"))
+        if "rejections" in reason:
+            normalized["rejections"] = _normalize_filter_reason(reason.get("rejections"))
+        if "counts" in reason:
+            normalized["counts"] = _normalize_filter_reason(reason.get("counts"))
         for key, value in reason.items():
-            normalized[str(key)] = _normalize_filter_reason(value)
+            key_str = str(key)
+            if key_str in normalized:
+                continue
+            normalized[key_str] = _normalize_filter_reason(value)
         return normalized
-    if isinstance(reason, list):
+    if isinstance(reason, (list, tuple, set)):
         return [_normalize_filter_reason(item) for item in reason]
     return reason
 

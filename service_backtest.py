@@ -18,7 +18,7 @@ reports = from_config(cfg, df)
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Mapping
+from typing import Any, Dict, List, Optional, Mapping, Sequence
 import logging
 import os
 import math
@@ -493,6 +493,92 @@ def _yield_bar_capacity_meta(report: Mapping[str, Any]) -> List[Mapping[str, Any
     return collected
 
 
+def _iter_filter_rejection_entries(reason: Any) -> Sequence[Mapping[str, Any]]:
+    entries: List[Mapping[str, Any]] = []
+    if isinstance(reason, Mapping):
+        rejections = reason.get("rejections")
+        if isinstance(rejections, Sequence) and not isinstance(
+            rejections, (str, bytes, bytearray)
+        ):
+            for entry in rejections:
+                entries.extend(_iter_filter_rejection_entries(entry))
+        details_val = reason.get("details")
+        if isinstance(details_val, Mapping) and "rejections" in details_val:
+            entries.extend(_iter_filter_rejection_entries(details_val))
+        detail_val = reason.get("detail")
+        if detail_val is not None:
+            entries.extend(_iter_filter_rejection_entries(detail_val))
+        extra_val = reason.get("extra")
+        if extra_val is not None:
+            entries.extend(_iter_filter_rejection_entries(extra_val))
+        primary = reason.get("primary")
+        if primary is not None:
+            if not (
+                isinstance(details_val, Mapping) and "rejections" in details_val
+            ):
+                entries.append(reason)
+        elif "which" in reason:
+            entries.append(reason)
+    elif isinstance(reason, Sequence) and not isinstance(
+        reason, (str, bytes, bytearray)
+    ):
+        for item in reason:
+            entries.extend(_iter_filter_rejection_entries(item))
+    return entries
+
+
+def _extract_filter_rejection_counts(reason: Any) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    if isinstance(reason, Mapping):
+        counts_block = reason.get("counts")
+        if isinstance(counts_block, Mapping):
+            for key, value in counts_block.items():
+                try:
+                    counts[str(key)] = counts.get(str(key), 0) + int(value)
+                except (TypeError, ValueError):
+                    continue
+        for nested_key in ("details", "detail", "extra"):
+            nested = reason.get(nested_key)
+            nested_counts = _extract_filter_rejection_counts(nested)
+            for code, value in nested_counts.items():
+                counts[code] = counts.get(code, 0) + value
+    elif isinstance(reason, Sequence) and not isinstance(
+        reason, (str, bytes, bytearray)
+    ):
+        for item in reason:
+            nested_counts = _extract_filter_rejection_counts(item)
+            for code, value in nested_counts.items():
+                counts[code] = counts.get(code, 0) + value
+    return counts
+
+
+def _collect_filter_rejection_counts(target: Dict[str, int], reason: Any) -> bool:
+    if reason is None:
+        return False
+    collected = False
+    for entry in _iter_filter_rejection_entries(reason):
+        if not isinstance(entry, Mapping):
+            continue
+        primary = entry.get("primary") or entry.get("which")
+        if primary is None:
+            continue
+        key = str(primary)
+        target[key] = target.get(key, 0) + 1
+        collected = True
+    if collected:
+        return True
+    counts_payload = _extract_filter_rejection_counts(reason)
+    if not counts_payload:
+        return False
+    for key, value in counts_payload.items():
+        try:
+            inc = int(value)
+        except (TypeError, ValueError):
+            continue
+        target[key] = target.get(key, 0) + inc
+    return True
+
+
 def _configure_adv_runtime(
     sim: ExecutionSimulator,
     run_cfg: CommonRunConfig | None,
@@ -738,6 +824,7 @@ class ServiceBacktest:
         spread_values: List[float] = []
         component_sums: Dict[str, float] = {}
         component_counts: Dict[str, int] = {}
+        reason_counts: Dict[str, int] = {}
         for rep in reports:
             if not isinstance(rep, dict):
                 continue
@@ -801,6 +888,17 @@ class ServiceBacktest:
                         continue
                     component_sums[key] = component_sums.get(key, 0.0) + num
                     component_counts[key] = component_counts.get(key, 0) + 1
+
+            reason_payload = rep.get("reason")
+            collected_reasons = _collect_filter_rejection_counts(
+                reason_counts, reason_payload
+            )
+            if not collected_reasons:
+                meta_payload = rep.get("meta")
+                if isinstance(meta_payload, Mapping):
+                    _collect_filter_rejection_counts(
+                        reason_counts, meta_payload.get("filter_rejection")
+                    )
 
         if fees_enabled and expected_payload:
             default_share = self._safe_float(expected_payload.get("maker_share"))
@@ -899,20 +997,12 @@ class ServiceBacktest:
                 comp_sum_repr,
             )
 
-        summary: Optional[Mapping[str, int]] = None
-        getter = getattr(self.sim, "get_filter_rejection_summary", None)
-        if callable(getter):
-            try:
-                summary_candidate = getter()
-            except Exception:
-                summary_candidate = None
-            if summary_candidate:
-                summary = dict(summary_candidate)
-        if summary:
+        if reason_counts:
+            reason_summary = dict(sorted(reason_counts.items()))
             logger.info(
                 "%s: filter_rejections=%s",
                 "service_backtest",
-                summary,
+                reason_summary,
             )
             cleared = False
             clearer = getattr(self.sim, "clear_filter_rejection_summary", None)
@@ -930,6 +1020,38 @@ class ServiceBacktest:
                         counts_attr.clear()
                     except Exception:
                         pass
+        else:
+            summary: Optional[Mapping[str, int]] = None
+            getter = getattr(self.sim, "get_filter_rejection_summary", None)
+            if callable(getter):
+                try:
+                    summary_candidate = getter()
+                except Exception:
+                    summary_candidate = None
+                if summary_candidate:
+                    summary = dict(summary_candidate)
+            if summary:
+                logger.info(
+                    "%s: filter_rejections=%s",
+                    "service_backtest",
+                    summary,
+                )
+                cleared = False
+                clearer = getattr(self.sim, "clear_filter_rejection_summary", None)
+                if callable(clearer):
+                    try:
+                        clearer()
+                    except Exception:
+                        pass
+                    else:
+                        cleared = True
+                if not cleared:
+                    counts_attr = getattr(self.sim, "_filter_rejection_counts", None)
+                    if hasattr(counts_attr, "clear"):
+                        try:
+                            counts_attr.clear()
+                        except Exception:
+                            pass
 
         try:
             if getattr(self.sim, "_logger", None):

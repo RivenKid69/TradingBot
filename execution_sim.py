@@ -5303,6 +5303,84 @@ class ExecutionSimulator:
         return None
 
     @staticmethod
+    def _normalize_reason_component(component: Any) -> Any:
+        if isinstance(component, Mapping):
+            normalized: Dict[str, Any] = {}
+            for key, value in component.items():
+                normalized[str(key)] = ExecutionSimulator._normalize_reason_component(value)
+            return normalized
+        if isinstance(component, Sequence) and not isinstance(
+            component, (str, bytes, bytearray)
+        ):
+            return [ExecutionSimulator._normalize_reason_component(item) for item in component]
+        return component
+
+    @classmethod
+    def _build_reason_payload(
+        cls,
+        primary: str,
+        *,
+        details: Any = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"primary": str(primary)}
+        if details is not None:
+            payload["details"] = cls._normalize_reason_component(details)
+        if extra:
+            normalized_extra: Dict[str, Any] = {}
+            for key, value in extra.items():
+                if value is None:
+                    continue
+                normalized_extra[str(key)] = cls._normalize_reason_component(value)
+            if normalized_extra:
+                payload["extra"] = normalized_extra
+        return payload
+
+    @classmethod
+    def _make_filter_rejection_entry(
+        cls,
+        reason: FilterRejectionReason,
+        *,
+        client_order_id: int | str | None = None,
+        order_type: Optional[str] = None,
+        source: Optional[str] = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        detail_payload = reason.as_dict()
+        primary = str(detail_payload.get("code", reason.code))
+        extra_payload: Dict[str, Any] = {}
+        if client_order_id is not None:
+            try:
+                extra_payload["client_order_id"] = int(client_order_id)
+            except (TypeError, ValueError):
+                extra_payload["client_order_id"] = client_order_id
+        if order_type:
+            extra_payload["order_type"] = str(order_type)
+        if source:
+            extra_payload["source"] = str(source)
+        if extra:
+            for key, value in extra.items():
+                if value is None:
+                    continue
+                extra_payload[str(key)] = value
+        if extra_payload:
+            return cls._build_reason_payload(primary, details=detail_payload, extra=extra_payload)
+        return cls._build_reason_payload(primary, details=detail_payload)
+
+    @staticmethod
+    def _summarize_rejection_counts(entries: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            primary = entry.get("primary") or entry.get("which")
+            if primary is None:
+                continue
+            key = str(primary)
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    @staticmethod
     def _log_filter_rejection(reason: Optional[FilterRejectionReason]) -> None:
         if reason is None:
             return
@@ -5967,12 +6045,11 @@ class ExecutionSimulator:
                     self._log_filter_rejection(rejection)
                     if rejection is not None:
                         filter_rejections_step.append(
-                            {
-                                "which": str(rejection.code),
-                                "detail": rejection.as_dict(),
-                                "client_order_id": int(p.client_order_id),
-                                "order_type": "MARKET",
-                            }
+                            self._make_filter_rejection_entry(
+                                rejection,
+                                client_order_id=p.client_order_id,
+                                order_type="MARKET",
+                            )
                         )
                         self._record_filter_rejection(rejection, "MARKET")
                     reason_code = (
@@ -6448,12 +6525,11 @@ class ExecutionSimulator:
                     if quant_rejection is not None:
                         self._log_filter_rejection(quant_rejection)
                         filter_rejections_step.append(
-                            {
-                                "which": str(quant_rejection.code),
-                                "detail": quant_rejection.as_dict(),
-                                "client_order_id": int(p.client_order_id),
-                                "order_type": "MARKET_CHILD",
-                            }
+                            self._make_filter_rejection_entry(
+                                quant_rejection,
+                                client_order_id=p.client_order_id,
+                                order_type="MARKET_CHILD",
+                            )
                         )
                         self._record_filter_rejection(quant_rejection, "MARKET")
                         _cancel(p.client_order_id, "REJECTED_BY_FILTER")
@@ -6696,12 +6772,11 @@ class ExecutionSimulator:
                     self._log_filter_rejection(rejection)
                     if rejection is not None:
                         filter_rejections_step.append(
-                            {
-                                "which": str(rejection.code),
-                                "detail": rejection.as_dict(),
-                                "client_order_id": int(p.client_order_id),
-                                "order_type": "LIMIT",
-                            }
+                            self._make_filter_rejection_entry(
+                                rejection,
+                                client_order_id=p.client_order_id,
+                                order_type="LIMIT",
+                            )
                         )
                         self._record_filter_rejection(rejection, "LIMIT")
                     reason_code = (
@@ -7017,7 +7092,14 @@ class ExecutionSimulator:
 
         if filter_rejections_step:
             report.status = "REJECTED_BY_FILTER"
-            report.reason = {"rejections": list(filter_rejections_step)}
+            entries = list(filter_rejections_step)
+            counts = self._summarize_rejection_counts(entries)
+            extra_payload = {"counts": counts} if counts else None
+            report.reason = self._build_reason_payload(
+                "FILTER_REJECTION",
+                details={"rejections": entries},
+                extra=extra_payload,
+            )
 
         # логирование
         try:
@@ -7247,12 +7329,11 @@ class ExecutionSimulator:
                     self._log_filter_rejection(rejection)
                     if rejection is not None:
                         filter_rejections_step.append(
-                            {
-                                "which": str(rejection.code),
-                                "detail": rejection.as_dict(),
-                                "client_order_id": int(cli_id),
-                                "order_type": "MARKET",
-                            }
+                            self._make_filter_rejection_entry(
+                                rejection,
+                                client_order_id=cli_id,
+                                order_type="MARKET",
+                            )
                         )
                         self._record_filter_rejection(rejection, "MARKET")
                     reason_code = (
@@ -7701,12 +7782,11 @@ class ExecutionSimulator:
                     if quant_rejection is not None:
                         self._log_filter_rejection(quant_rejection)
                         filter_rejections_step.append(
-                            {
-                                "which": str(quant_rejection.code),
-                                "detail": quant_rejection.as_dict(),
-                                "client_order_id": int(cli_id),
-                                "order_type": "MARKET_CHILD",
-                            }
+                            self._make_filter_rejection_entry(
+                                quant_rejection,
+                                client_order_id=cli_id,
+                                order_type="MARKET_CHILD",
+                            )
                         )
                         self._record_filter_rejection(quant_rejection, "MARKET")
                         _cancel(cli_id, "REJECTED_BY_FILTER")
@@ -7844,7 +7924,14 @@ class ExecutionSimulator:
         )
         if filter_rejections_step:
             report.status = "REJECTED_BY_FILTER"
-            report.reason = {"rejections": list(filter_rejections_step)}
+            entries = list(filter_rejections_step)
+            counts = self._summarize_rejection_counts(entries)
+            extra_payload = {"counts": counts} if counts else None
+            report.reason = self._build_reason_payload(
+                "FILTER_REJECTION",
+                details={"rejections": entries},
+                extra=extra_payload,
+            )
         return report
 
     def stop(self) -> None:
