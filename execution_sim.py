@@ -105,6 +105,24 @@ _FILTER_REJECT_COUNT = Counter(
     ["symbol", "reason"],
 )
 
+_QUANTIZED_PRICE_COUNTER = Counter(
+    "sim_quantized_price_total",
+    "Orders with price adjusted by quantizer",
+    ["symbol", "order_type"],
+)
+
+_QUANTIZED_QTY_COUNTER = Counter(
+    "sim_quantized_qty_total",
+    "Orders with quantity adjusted by quantizer",
+    ["symbol", "order_type"],
+)
+
+_FILTER_DEVIATION_COUNTER = Counter(
+    "sim_filter_deviation_total",
+    "Orders deviating from exchange filters",
+    ["symbol", "order_type", "reason"],
+)
+
 try:
     import numpy as np
 except Exception:  # минимальная замена на случай отсутствия numpy на этапе интеграции
@@ -5368,6 +5386,102 @@ class ExecutionSimulator:
         return cls._build_reason_payload(primary, details=detail_payload)
 
     @staticmethod
+    def _order_check_to_filter_reason(result: Any | None) -> Optional[FilterRejectionReason]:
+        if result is None:
+            return None
+        reason_code = getattr(result, "reason_code", None)
+        if not reason_code:
+            return None
+        message = str(getattr(result, "reason", "") or "")
+        details = getattr(result, "details", None)
+        constraint = dict(details) if isinstance(details, Mapping) else {}
+        return FilterRejectionReason(code=str(reason_code), message=message, constraint=constraint)
+
+    def _record_quantization_metrics(
+        self,
+        *,
+        order_type: str,
+        raw_price: float,
+        raw_qty: float,
+        result: Any,
+    ) -> None:
+        symbol = str(self.symbol or "").upper()
+        order_label = str(order_type or "UNKNOWN")
+        tolerance = 1e-12
+        try:
+            price_quantized = float(getattr(result, "price", raw_price))
+        except (TypeError, ValueError):
+            price_quantized = float(raw_price)
+        try:
+            qty_quantized = float(getattr(result, "qty", raw_qty))
+        except (TypeError, ValueError):
+            qty_quantized = float(raw_qty)
+
+        if math.isfinite(raw_price) and math.isfinite(price_quantized):
+            if abs(price_quantized - raw_price) > tolerance:
+                try:
+                    _QUANTIZED_PRICE_COUNTER.labels(
+                        symbol=symbol, order_type=order_label
+                    ).inc()
+                except Exception:
+                    pass
+        if math.isfinite(raw_qty) and math.isfinite(qty_quantized):
+            if abs(qty_quantized - raw_qty) > tolerance:
+                try:
+                    _QUANTIZED_QTY_COUNTER.labels(
+                        symbol=symbol, order_type=order_label
+                    ).inc()
+                except Exception:
+                    pass
+
+        reason_code = getattr(result, "reason_code", None)
+        if reason_code:
+            try:
+                _FILTER_DEVIATION_COUNTER.labels(
+                    symbol=symbol,
+                    order_type=order_label,
+                    reason=str(reason_code),
+                ).inc()
+            except Exception:
+                pass
+
+    def _invoke_quantize_order(
+        self,
+        *,
+        side: str,
+        price: float,
+        qty: float,
+        ref_price: float,
+        enforce_ppbs: bool,
+        order_type: str,
+    ) -> Optional[Any]:
+        symbol = self.symbol
+        quantizer = self.quantizer
+        if symbol is None or not quantizer:
+            return None
+        quantize_order = getattr(quantizer, "quantize_order", None)
+        if not callable(quantize_order):
+            return None
+        try:
+            return quantize_order(
+                symbol,
+                side,
+                float(price),
+                float(qty),
+                float(ref_price),
+                enforce_ppbs=enforce_ppbs,
+            )
+        except Exception as exc:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "quantize_order failed for %s order (symbol=%s): %s",
+                    order_type,
+                    symbol,
+                    exc,
+                )
+            return None
+
+    @staticmethod
     def _summarize_rejection_counts(entries: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
         counts: Dict[str, int] = {}
         for entry in entries:
@@ -5423,6 +5537,47 @@ class ExecutionSimulator:
         Применить LOT_SIZE / MIN_NOTIONAL для рыночной заявки.
         Возвращает квантованное qty и причину отклонения (если есть).
         """
+        qty_raw = abs(float(qty))
+        filters = self._current_symbol_filters()
+        validations_enabled = bool(self.strict_filters and filters is not None)
+        ref_val = self._finite_float(ref_price)
+        price_for_quant = (
+            float(ref_val)
+            if ref_val is not None and math.isfinite(ref_val)
+            else 0.0
+        )
+
+        result = self._invoke_quantize_order(
+            side=side,
+            price=price_for_quant,
+            qty=qty_raw,
+            ref_price=price_for_quant,
+            enforce_ppbs=False,
+            order_type="MARKET",
+        )
+
+        if result is not None:
+            self._record_quantization_metrics(
+                order_type="MARKET",
+                raw_price=price_for_quant,
+                raw_qty=qty_raw,
+                result=result,
+            )
+            try:
+                qty_quantized = float(getattr(result, "qty", qty_raw))
+            except (TypeError, ValueError):
+                qty_quantized = float(qty_raw)
+            reason = self._order_check_to_filter_reason(result)
+            if reason is not None and validations_enabled:
+                return qty_quantized, reason
+            return qty_quantized, None
+
+        return self._apply_filters_market_legacy(side, qty, ref_price)
+
+    def _apply_filters_market_legacy(
+        self, side: str, qty: float, ref_price: Optional[float]
+    ) -> tuple[float, Optional[FilterRejectionReason]]:
+        """Запасной путь для случаев без quantize_order."""
         qty_raw = abs(float(qty))
         quantizer = self.quantizer
         filters = self._current_symbol_filters()
@@ -5584,6 +5739,53 @@ class ExecutionSimulator:
         Применить PRICE_FILTER / LOT_SIZE / MIN_NOTIONAL / PPBS к лимитной заявке.
         Возвращает (price, qty, причина отклонения).
         """
+        price_raw = float(price)
+        qty_raw = abs(float(qty))
+        filters = self._current_symbol_filters()
+        validations_enabled = bool(self.strict_filters and filters is not None)
+        ref_ppbs = self._resolve_filter_reference(ref_price)
+        enforce_ppbs = bool(self.enforce_ppbs and validations_enabled)
+        ref_for_quant = (
+            float(ref_ppbs)
+            if ref_ppbs is not None and math.isfinite(ref_ppbs)
+            else price_raw
+        )
+
+        result = self._invoke_quantize_order(
+            side=side,
+            price=price_raw,
+            qty=qty_raw,
+            ref_price=ref_for_quant,
+            enforce_ppbs=enforce_ppbs,
+            order_type="LIMIT",
+        )
+
+        if result is not None:
+            self._record_quantization_metrics(
+                order_type="LIMIT",
+                raw_price=price_raw,
+                raw_qty=qty_raw,
+                result=result,
+            )
+            try:
+                price_quantized = float(getattr(result, "price", price_raw))
+            except (TypeError, ValueError):
+                price_quantized = float(price_raw)
+            try:
+                qty_quantized = float(getattr(result, "qty", qty_raw))
+            except (TypeError, ValueError):
+                qty_quantized = float(qty_raw)
+            reason = self._order_check_to_filter_reason(result)
+            if reason is not None and validations_enabled:
+                return price_quantized, qty_quantized, reason
+            return price_quantized, qty_quantized, None
+
+        return self._apply_filters_limit_legacy(side, price, qty, ref_price)
+
+    def _apply_filters_limit_legacy(
+        self, side: str, price: float, qty: float, ref_price: Optional[float]
+    ) -> Tuple[float, float, Optional[FilterRejectionReason]]:
+        """Запасной путь для случаев без quantize_order."""
         price_raw = float(price)
         qty_raw = abs(float(qty))
         quantizer = self.quantizer
@@ -5849,55 +6051,40 @@ class ExecutionSimulator:
         if symbol is None or not quantizer:
             return float(qty), None
 
-        quantize_order = getattr(quantizer, "quantize_order", None)
-        if not callable(quantize_order):
-            return float(qty), None
-
         ref_val = self._finite_float(ref_price)
-        if ref_val is None or ref_val <= 0.0:
-            price_for_quant = None
-            enforce_ppbs = False
-        else:
-            price_for_quant = float(ref_val)
-            filters_snapshot = self._current_symbol_filters()
-            validations_enabled = bool(self.strict_filters and filters_snapshot is not None)
-            enforce_ppbs = bool(self.enforce_ppbs and validations_enabled)
-
-        if price_for_quant is None:
+        if ref_val is None or ref_val <= 0.0 or not math.isfinite(ref_val):
             return float(qty), None
 
-        try:
-            result = quantize_order(
-                symbol,
-                side,
-                price_for_quant,
-                float(qty),
-                price_for_quant,
-                enforce_ppbs=enforce_ppbs,
-            )
-        except Exception as exc:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "quantize_order failed for child order (symbol=%s): %s",
-                    symbol,
-                    exc,
-                )
+        filters_snapshot = self._current_symbol_filters()
+        validations_enabled = bool(self.strict_filters and filters_snapshot is not None)
+        enforce_ppbs = bool(self.enforce_ppbs and validations_enabled)
+        qty_raw = abs(float(qty))
+
+        result = self._invoke_quantize_order(
+            side=side,
+            price=float(ref_val),
+            qty=qty_raw,
+            ref_price=float(ref_val),
+            enforce_ppbs=enforce_ppbs,
+            order_type="MARKET_CHILD",
+        )
+        if result is None:
             return float(qty), None
+
+        self._record_quantization_metrics(
+            order_type="MARKET_CHILD",
+            raw_price=float(ref_val),
+            raw_qty=qty_raw,
+            result=result,
+        )
 
         try:
             new_qty = float(getattr(result, "qty", qty))
         except (TypeError, ValueError):
             new_qty = float(qty)
 
-        reason_code = getattr(result, "reason_code", None)
-        if reason_code:
-            details = getattr(result, "details", None)
-            message = str(getattr(result, "reason", "") or "")
-            rejection = FilterRejectionReason(
-                code=str(reason_code),
-                message=message,
-                constraint=dict(details) if isinstance(details, Mapping) else {},
-            )
+        rejection = self._order_check_to_filter_reason(result)
+        if rejection is not None and validations_enabled:
             return new_qty, rejection
 
         return new_qty, None
