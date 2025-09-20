@@ -169,6 +169,7 @@ class RestBudgetSession:
         self._base_session = session or requests.Session()
         self._owns_session = session is None
         self._thread_local = threading.local()
+        self._thread_local.last_response_metadata = None
         self._session_lock = threading.Lock()
         self._child_sessions: "weakref.WeakSet[requests.Session]" = weakref.WeakSet()
 
@@ -1097,6 +1098,32 @@ class RestBudgetSession:
             return "connection"
         return exc.__class__.__name__
 
+    def _store_last_response_metadata(self, metadata: Mapping[str, Any] | None) -> None:
+        if metadata is None:
+            self._thread_local.last_response_metadata = None
+        else:
+            self._thread_local.last_response_metadata = dict(metadata)
+
+    def get_last_response_metadata(self) -> dict[str, Any] | None:
+        metadata = getattr(self._thread_local, "last_response_metadata", None)
+        if isinstance(metadata, Mapping):
+            return dict(metadata)
+        return None
+
+    @staticmethod
+    def _extract_binance_weights(headers: Mapping[str, Any]) -> dict[str, Any]:
+        weights: dict[str, Any] = {}
+        for raw_key, raw_value in headers.items():
+            key = str(raw_key).lower()
+            if key.startswith("x-mbx-used-weight") or key.startswith("x-mbx-order-count"):
+                value: Any
+                try:
+                    value = float(raw_value)
+                except (TypeError, ValueError):
+                    value = str(raw_value)
+                weights[key] = value
+        return weights
+
     @staticmethod
     def _extract_body(resp: requests.Response) -> Any:
         try:
@@ -1368,6 +1395,8 @@ class RestBudgetSession:
         key = self._resolve_endpoint_key("GET", url, override)
         stats_key = self._normalize_endpoint_key(key) or key
 
+        self._store_last_response_metadata(None)
+
         cache_key: str | None = None
         cache_hit = False
         if self._cache_mode != "off" and self._cache_dir is not None:
@@ -1376,6 +1405,19 @@ class RestBudgetSession:
             )
             if cache_hit:
                 self._record_cache_hit(stats_key)
+                self._store_last_response_metadata(
+                    {
+                        "method": "GET",
+                        "url": url,
+                        "params": dict(params) if isinstance(params, Mapping) else None,
+                        "headers": {},
+                        "binance_weights": {},
+                        "cache_hit": True,
+                        "endpoint": key,
+                        "budget": override,
+                        "tokens": float(tokens),
+                    }
+                )
                 return cached_payload
             if cache_key is not None:
                 self._record_cache_miss(stats_key)
@@ -1438,6 +1480,21 @@ class RestBudgetSession:
 
             monitoring.record_http_success(status)
             payload = self._extract_body(resp)
+            response_headers = dict(resp.headers)
+            metadata = {
+                "method": "GET",
+                "url": resp.url or url,
+                "params": dict(params) if isinstance(params, Mapping) else None,
+                "headers": response_headers,
+                "binance_weights": self._extract_binance_weights(response_headers),
+                "cache_hit": False,
+                "endpoint": key,
+                "budget": override,
+                "tokens": float(tokens),
+                "status": status,
+                "retry_after": retry_after,
+            }
+            self._store_last_response_metadata(metadata)
             if cache_key is not None and self._cache_store(cache_key, payload):
                 self._record_cache_store(stats_key)
             return payload

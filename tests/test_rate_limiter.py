@@ -86,7 +86,7 @@ def test_exponential_backoff():
 # --- BinancePublicClient REST integration ---
 
 @pytest.mark.parametrize(
-    "method_name, kwargs, response, expected_url, expected_budget, expected_result",
+    "method_name, kwargs, response, expected_url, expected_budget, expected_tokens, expected_result",
     [
         (
             "get_exchange_filters",
@@ -103,6 +103,7 @@ def test_exponential_backoff():
             },
             "https://api.binance.com/api/v3/exchangeInfo",
             "exchangeInfo",
+            10.0,
             {"BTCUSDT": {"PRICE_FILTER": {"tickSize": "0.1"}}},
         ),
         (
@@ -111,6 +112,7 @@ def test_exponential_backoff():
             [[1, 2, 3]],
             "https://api.binance.com/api/v3/klines",
             "klines",
+            10.0,
             [[1, 2, 3]],
         ),
         (
@@ -119,6 +121,7 @@ def test_exponential_backoff():
             [[1, 2, 3]],
             "https://fapi.binance.com/fapi/v1/markPriceKlines",
             "markPriceKlines",
+            10.0,
             [[1, 2, 3]],
         ),
         (
@@ -127,6 +130,7 @@ def test_exponential_backoff():
             [{"symbol": "BTCUSDT"}],
             "https://fapi.binance.com/fapi/v1/fundingRate",
             "fundingRate",
+            1.0,
             [{"symbol": "BTCUSDT"}],
         ),
         (
@@ -135,6 +139,7 @@ def test_exponential_backoff():
             {"symbol": "BTCUSDT", "price": "123.45"},
             "https://api.binance.com/api/v3/ticker/price",
             "tickerPrice",
+            1.0,
             Decimal("123.45"),
         ),
     ],
@@ -145,6 +150,7 @@ def test_binance_public_uses_rest_session_budget(
     response: object,
     expected_url: str,
     expected_budget: str,
+    expected_tokens: float,
     expected_result: object,
 ):
     session = MagicMock()
@@ -159,6 +165,7 @@ def test_binance_public_uses_rest_session_budget(
     args, call_kwargs = session.get.call_args
     assert args == (expected_url,)
     assert call_kwargs["budget"] == expected_budget
+    assert call_kwargs["tokens"] == pytest.approx(expected_tokens)
     assert call_kwargs["timeout"] == client.timeout
     params = call_kwargs["params"]
     assert isinstance(params, dict)
@@ -186,6 +193,7 @@ def test_get_book_ticker_uses_budget_and_cache():
     args, kwargs = session.get.call_args
     assert args == ("https://api.binance.com/api/v3/ticker/bookTicker",)
     assert kwargs["budget"] == "bookTicker"
+    assert kwargs["tokens"] == pytest.approx(1.0)
     assert kwargs["params"]["symbol"] == "BTCUSDT"
 
     # Second call should hit the cache and avoid a REST request
@@ -214,6 +222,7 @@ def test_get_book_ticker_multiple_symbols():
     args, kwargs = session.get.call_args
     params = kwargs["params"]
     assert json.loads(params["symbols"]) == ["BTCUSDT", "ETHUSDT"]
+    assert kwargs["tokens"] == pytest.approx(2.0)
 
     # Cached result should satisfy subsequent single-symbol calls without REST
     session.get.reset_mock()
@@ -234,6 +243,7 @@ def test_get_last_price_uses_cache():
     args, kwargs = session.get.call_args
     assert args == ("https://api.binance.com/api/v3/ticker/price",)
     assert kwargs["budget"] == "tickerPrice"
+    assert kwargs["tokens"] == pytest.approx(1.0)
     assert kwargs["params"]["symbol"] == "BTCUSDT"
 
     session.get.return_value = {"symbol": "BTCUSDT", "price": "999"}
@@ -258,7 +268,20 @@ def test_get_spread_bps_prefers_book_ticker():
     assert session.get.call_count == 1
     args, kwargs = session.get.call_args
     assert args == ("https://api.binance.com/api/v3/ticker/bookTicker",)
-    assert kwargs["budget"] == "bookTicker"
+    assert kwargs["tokens"] == pytest.approx(1.0)
+
+
+def test_last_weight_headers_exposed():
+    session = MagicMock()
+    session.get.return_value = {"serverTime": 0}
+    session.get_last_response_metadata.return_value = {
+        "binance_weights": {"x-mbx-used-weight-1m": 123.0}
+    }
+    client = binance_public.BinancePublicClient(session=session)
+
+    client.get_server_time()
+
+    assert client.last_weight_headers == {"x-mbx-used-weight-1m": 123.0}
 
 
 def test_get_spread_bps_falls_back_to_range():
