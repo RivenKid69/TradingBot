@@ -5759,6 +5759,71 @@ class ExecutionSimulator:
 
         return price_quantized, qty_quantized, None
 
+    def _quantize_child_execution(
+        self,
+        *,
+        side: str,
+        ref_price: Optional[float],
+        qty: float,
+    ) -> Tuple[float, Optional[FilterRejectionReason]]:
+        symbol = self.symbol
+        quantizer = self.quantizer
+        if symbol is None or not quantizer:
+            return float(qty), None
+
+        quantize_order = getattr(quantizer, "quantize_order", None)
+        if not callable(quantize_order):
+            return float(qty), None
+
+        ref_val = self._finite_float(ref_price)
+        if ref_val is None or ref_val <= 0.0:
+            price_for_quant = None
+            enforce_ppbs = False
+        else:
+            price_for_quant = float(ref_val)
+            filters_snapshot = self._current_symbol_filters()
+            validations_enabled = bool(self.strict_filters and filters_snapshot is not None)
+            enforce_ppbs = bool(self.enforce_ppbs and validations_enabled)
+
+        if price_for_quant is None:
+            return float(qty), None
+
+        try:
+            result = quantize_order(
+                symbol,
+                side,
+                price_for_quant,
+                float(qty),
+                price_for_quant,
+                enforce_ppbs=enforce_ppbs,
+            )
+        except Exception as exc:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "quantize_order failed for child order (symbol=%s): %s",
+                    symbol,
+                    exc,
+                )
+            return float(qty), None
+
+        try:
+            new_qty = float(getattr(result, "qty", qty))
+        except (TypeError, ValueError):
+            new_qty = float(qty)
+
+        reason_code = getattr(result, "reason_code", None)
+        if reason_code:
+            details = getattr(result, "details", None)
+            message = str(getattr(result, "reason", "") or "")
+            rejection = FilterRejectionReason(
+                code=str(reason_code),
+                message=message,
+                constraint=dict(details) if isinstance(details, Mapping) else {},
+            )
+            return new_qty, rejection
+
+        return new_qty, None
+
     def _build_limit_action(self, side: str, qty: float) -> Optional[ActionProto]:
         """Build a LIMIT ActionProto around the mid price."""
         if MidOffsetLimitExecutor is None:
@@ -6194,22 +6259,22 @@ class ExecutionSimulator:
                     elif cap_enforced:
                         fill_qty_base = min(fill_qty_base, remaining_base)
 
-                        if cap_enforced and fill_qty_base <= 0.0:
-                            ts_zero = int(base_ts + lat_ms)
-                            cid_int = int(p.client_order_id)
-                            if cid_int not in cancelled_ids:
-                                _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
-                            else:
-                                cancelled_reasons[cid_int] = "BAR_CAPACITY_BASE"
-                            used_before = used_base_before_child
-                            capacity_reason = "BAR_CAPACITY_BASE"
-                            exec_status = "REJECTED_BY_CAPACITY"
-                            cap_val = float(cap_base_per_bar)
-                            trade = ExecTrade(
-                                ts=ts_zero,
-                                side=side,
-                                price=float(ref_child_price),
-                                qty=0.0,
+                    if cap_enforced and fill_qty_base <= 0.0:
+                        ts_zero = int(base_ts + lat_ms)
+                        cid_int = int(p.client_order_id)
+                        if cid_int not in cancelled_ids:
+                            _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
+                        else:
+                            cancelled_reasons[cid_int] = "BAR_CAPACITY_BASE"
+                        used_before = used_base_before_child
+                        capacity_reason = "BAR_CAPACITY_BASE"
+                        exec_status = "REJECTED_BY_CAPACITY"
+                        cap_val = float(cap_base_per_bar)
+                        trade = ExecTrade(
+                            ts=ts_zero,
+                            side=side,
+                            price=float(ref_child_price),
+                            qty=0.0,
                             notional=0.0,
                             liquidity="taker",
                             proto_type=atype,
@@ -6219,43 +6284,29 @@ class ExecutionSimulator:
                             latency_ms=int(p.lat_ms),
                             latency_spike=bool(p.spike),
                             tif=tif,
-                                ttl_steps=ttl_steps,
-                                status="CANCELED",
-                                used_base_before=used_before,
-                                used_base_after=used_before,
-                                cap_base_per_bar=cap_val,
-                                fill_ratio=0.0,
-                                capacity_reason=capacity_reason,
-                                exec_status=exec_status,
-                            )
-                            trades.append(trade)
-                            self._trade_log.append(trade)
-                            self._record_bar_capacity_metrics(
-                                capacity_reason=capacity_reason,
-                                exec_status=exec_status,
-                                fill_ratio=0.0,
-                            )
-                            continue
+                            ttl_steps=ttl_steps,
+                            status="CANCELED",
+                            used_base_before=used_before,
+                            used_base_after=used_before,
+                            cap_base_per_bar=cap_val,
+                            fill_ratio=0.0,
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                        )
+                        trades.append(trade)
+                        self._trade_log.append(trade)
+                        self._record_bar_capacity_metrics(
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                            fill_ratio=0.0,
+                        )
+                        continue
 
-                        q_child = float(fill_qty_base)
-                        if q_child <= 0.0:
-                            continue
+                    q_child = float(fill_qty_base)
+                    if q_child <= 0.0:
+                        continue
 
-                        cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
-                        if order_qty_base > 0.0:
-                            fill_ratio = max(0.0, min(1.0, q_child / order_qty_base))
-                        else:
-                            fill_ratio = 1.0 if q_child > 0.0 else 0.0
-                        capacity_reason = ""
-                        exec_status = "FILLED"
-                        if cap_enforced and order_qty_base > 0.0 and q_child + 1e-12 < order_qty_base:
-                            exec_status = "PARTIAL"
-                            capacity_reason = "BAR_CAPACITY_BASE"
-
-                        used_base_after_child = max(0.0, used_base_before_child + q_child)
-                        self._used_base_in_bar[symbol_key] = used_base_after_child
-
-                        # базовая котировка
+                    # базовая котировка
                     if VWAPExecutor is not None and isinstance(executor, VWAPExecutor):
                         self._vwap_on_tick(ts_fill, None, None)
                         base_price = (
@@ -6389,6 +6440,46 @@ class ExecutionSimulator:
                             )
                             self._intrabar_debug_logged += 1
 
+                    quant_qty, quant_rejection = self._quantize_child_execution(
+                        side=side,
+                        ref_price=ref_child_price,
+                        qty=fill_qty_base,
+                    )
+                    if quant_rejection is not None:
+                        self._log_filter_rejection(quant_rejection)
+                        filter_rejections_step.append(
+                            {
+                                "which": str(quant_rejection.code),
+                                "detail": quant_rejection.as_dict(),
+                                "client_order_id": int(p.client_order_id),
+                                "order_type": "MARKET_CHILD",
+                            }
+                        )
+                        self._record_filter_rejection(quant_rejection, "MARKET")
+                        _cancel(p.client_order_id, "REJECTED_BY_FILTER")
+                        break
+
+                    fill_qty_base = max(0.0, float(quant_qty))
+                    if fill_qty_base <= 0.0:
+                        continue
+
+                    q_child = float(fill_qty_base)
+                    cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
+                    if order_qty_base > 0.0:
+                        fill_ratio = max(0.0, min(1.0, q_child / order_qty_base))
+                    else:
+                        fill_ratio = 1.0 if q_child > 0.0 else 0.0
+                    capacity_reason = ""
+                    exec_status = "FILLED"
+                    if cap_enforced and order_qty_base > 0.0 and q_child + 1e-12 < order_qty_base:
+                        exec_status = "PARTIAL"
+                        capacity_reason = "BAR_CAPACITY_BASE"
+
+                    used_base_after_child = max(0.0, used_base_before_child + q_child)
+                    self._used_base_in_bar[symbol_key] = used_base_after_child
+
+                    trade_notional = float(filled_price) * q_child
+
                     # комиссия
                     fee = self._compute_trade_fee(
                         side=side,
@@ -6409,7 +6500,7 @@ class ExecutionSimulator:
                         side=side,
                         price=filled_price,
                         qty=q_child,
-                        notional=filled_price * q_child,
+                        notional=trade_notional,
                         liquidity="taker",
                         proto_type=atype,
                         client_order_id=p.client_order_id,
@@ -7488,20 +7579,6 @@ class ExecutionSimulator:
                     if q_child <= 0.0:
                         continue
 
-                    cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
-                    if order_qty_base > 0.0:
-                        fill_ratio = max(0.0, min(1.0, q_child / order_qty_base))
-                    else:
-                        fill_ratio = 1.0 if q_child > 0.0 else 0.0
-                    capacity_reason = ""
-                    exec_status = "FILLED"
-                    if cap_enforced and order_qty_base > 0.0 and q_child + 1e-12 < order_qty_base:
-                        exec_status = "PARTIAL"
-                        capacity_reason = "BAR_CAPACITY_BASE"
-
-                    used_base_after_child = max(0.0, used_base_before_child + q_child)
-                    self._used_base_in_bar[symbol_key] = used_base_after_child
-
                     ts_fill = int(base_ts + lat_ms)
                     # цена исполнения
                     if VWAPExecutor is not None and isinstance(executor, VWAPExecutor):
@@ -7616,6 +7693,46 @@ class ExecutionSimulator:
                             )
                             self._intrabar_debug_logged += 1
 
+                    quant_qty, quant_rejection = self._quantize_child_execution(
+                        side=side,
+                        ref_price=ref_child_price,
+                        qty=fill_qty_base,
+                    )
+                    if quant_rejection is not None:
+                        self._log_filter_rejection(quant_rejection)
+                        filter_rejections_step.append(
+                            {
+                                "which": str(quant_rejection.code),
+                                "detail": quant_rejection.as_dict(),
+                                "client_order_id": int(cli_id),
+                                "order_type": "MARKET_CHILD",
+                            }
+                        )
+                        self._record_filter_rejection(quant_rejection, "MARKET")
+                        _cancel(cli_id, "REJECTED_BY_FILTER")
+                        break
+
+                    fill_qty_base = max(0.0, float(quant_qty))
+                    if fill_qty_base <= 0.0:
+                        continue
+
+                    q_child = float(fill_qty_base)
+                    cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
+                    if order_qty_base > 0.0:
+                        fill_ratio = max(0.0, min(1.0, q_child / order_qty_base))
+                    else:
+                        fill_ratio = 1.0 if q_child > 0.0 else 0.0
+                    capacity_reason = ""
+                    exec_status = "FILLED"
+                    if cap_enforced and order_qty_base > 0.0 and q_child + 1e-12 < order_qty_base:
+                        exec_status = "PARTIAL"
+                        capacity_reason = "BAR_CAPACITY_BASE"
+
+                    used_base_after_child = max(0.0, used_base_before_child + q_child)
+                    self._used_base_in_bar[symbol_key] = used_base_after_child
+
+                    trade_notional = float(filled_price) * q_child
+
                     # комиссия
                     fee = self._compute_trade_fee(
                         side=side,
@@ -7637,7 +7754,7 @@ class ExecutionSimulator:
                         side=side,
                         price=filled_price,
                         qty=q_child,
-                        notional=filled_price * q_child,
+                        notional=trade_notional,
                         liquidity="taker",
                         proto_type=getattr(atype, "value", 0),
                         client_order_id=int(cli_id),
