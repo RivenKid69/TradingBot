@@ -33,9 +33,10 @@ from sandbox.sim_adapter import SimAdapter
 from core_contracts import SignalPolicy
 from services.utils_config import snapshot_config  # сохранение снапшота конфига
 from services.utils_sandbox import read_df
-from core_config import CommonRunConfig
+from core_config import CommonRunConfig, ExecutionProfile
 from impl_quantizer import QuantizerImpl
 import di_registry
+from impl_sim_executor import SimExecutor
 
 
 try:  # pragma: no cover - optional dependency in sandbox setups
@@ -750,6 +751,63 @@ class ServiceBacktest:
             run_config
             or getattr(sim, "run_config", None)
             or getattr(sim, "_run_config", None)
+        )
+
+        exec_cfg_block = getattr(self._run_config, "execution", None)
+        default_profile_cfg = (
+            getattr(self._run_config, "execution_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
+            if self._run_config is not None
+            else ExecutionProfile.MKT_OPEN_NEXT_H1
+        )
+        (
+            entry_mode,
+            exec_profile,
+            clip_to_bar_enabled,
+            strict_open_fill,
+        ) = SimExecutor.configure_simulator_execution(
+            self.sim,
+            exec_cfg_block,
+            default_profile=default_profile_cfg,
+        )
+        SimExecutor.apply_execution_profile(
+            self.sim,
+            exec_profile,
+            getattr(self._run_config, "execution_params", None)
+            if self._run_config is not None
+            else None,
+        )
+
+        ws_dedup_cfg = (
+            getattr(self._run_config, "ws_dedup", None)
+            if self._run_config is not None
+            else None
+        )
+        dedup_enabled_val = (
+            SimExecutor._bool_or_none(getattr(ws_dedup_cfg, "enabled", None))
+            if ws_dedup_cfg is not None
+            else None
+        )
+        dedup_enabled = bool(dedup_enabled_val) if dedup_enabled_val is not None else False
+        dedup_log_val = (
+            SimExecutor._bool_or_none(getattr(ws_dedup_cfg, "log_skips", None))
+            if ws_dedup_cfg is not None
+            else None
+        )
+        dedup_log_skips = bool(dedup_log_val) if dedup_log_val is not None else False
+        dedup_persist = None
+        if ws_dedup_cfg is not None:
+            dedup_persist = getattr(ws_dedup_cfg, "persist_path", None)
+
+        logger.info(
+            "Backtest execution runtime: entry_mode=%s profile=%s clip_to_bar=%s strict_open_fill=%s "
+            "ws_dedup(enabled=%s, persist=%s, log_skips=%s)",
+            getattr(entry_mode, "value", entry_mode),
+            str(exec_profile),
+            bool(clip_to_bar_enabled),
+            bool(strict_open_fill),
+            dedup_enabled,
+            str(dedup_persist) if dedup_persist not in (None, "") else None,
+            dedup_log_skips,
         )
 
         quantizer_impl: Optional[QuantizerImpl] = None
