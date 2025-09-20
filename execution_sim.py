@@ -5349,24 +5349,52 @@ class ExecutionSimulator:
         quantizer = self.quantizer
         filters = self._current_symbol_filters()
         validations_enabled = bool(self.strict_filters and filters is not None)
-        reason: Optional[FilterRejectionReason] = None
+        tolerance = 1e-12
 
-        qty_quantized = float(qty_raw)
-        if quantizer is not None:
+        quant_result: Any = None
+        quantize_order = getattr(quantizer, "quantize_order", None)
+        if callable(quantize_order):
+            ref_val = self._finite_float(ref_price)
+            price_for_quant = ref_val if ref_val is not None else 0.0
             try:
-                qty_quantized = float(quantizer.quantize_qty(self.symbol, qty_raw))
-            except Exception as exc:
-                reason = FilterRejectionReason(
-                    code="LOT_SIZE",
-                    message="quantize_qty failed",
-                    constraint={"error": str(exc), "quantity": qty_raw},
+                quant_result = quantize_order(
+                    self.symbol,
+                    side,
+                    price_for_quant,
+                    qty_raw,
+                    price_for_quant,
+                    enforce_ppbs=False,
                 )
-                return 0.0, reason
+            except Exception as exc:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "quantize_order failed for MARKET order (symbol=%s): %s",
+                        self.symbol,
+                        exc,
+                    )
+                quant_result = None
+
+        if quant_result is not None:
+            try:
+                qty_quantized = float(getattr(quant_result, "qty", qty_raw))
+            except (TypeError, ValueError):
+                qty_quantized = qty_raw
+        else:
+            qty_quantized = float(qty_raw)
+            if quantizer is not None:
+                try:
+                    qty_quantized = float(quantizer.quantize_qty(self.symbol, qty_raw))
+                except Exception as exc:
+                    reason = FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="quantize_qty failed",
+                        constraint={"error": str(exc), "quantity": qty_raw},
+                    )
+                    return 0.0, reason
 
         if not validations_enabled or filters is None:
             return qty_quantized, None
 
-        tolerance = 1e-12
         if qty_raw <= 0.0:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
@@ -5391,6 +5419,26 @@ class ExecutionSimulator:
                 constraint={"max_qty": filters.qty_max, "quantity": qty_raw},
             )
             return 0.0, reason
+
+        if quant_result is not None:
+            reason_code = getattr(quant_result, "reason_code", None)
+            if reason_code:
+                details = getattr(quant_result, "details", None)
+                message = str(getattr(quant_result, "reason", "") or "")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "quantize_order rejected MARKET order (symbol=%s): %s %s",
+                        self.symbol,
+                        reason_code,
+                        message,
+                    )
+                reason = FilterRejectionReason(
+                    code=str(reason_code),
+                    message=message,
+                    constraint=dict(details) if isinstance(details, Mapping) else {},
+                )
+                return qty_quantized, reason
+            return qty_quantized, None
 
         ref_val = self._finite_float(ref_price)
         if ref_val is None or ref_val <= 0.0:
@@ -5463,33 +5511,70 @@ class ExecutionSimulator:
         quantizer = self.quantizer
         filters = self._current_symbol_filters()
         validations_enabled = bool(self.strict_filters and filters is not None)
+        tolerance = 1e-12
+        ref_ppbs = self._resolve_filter_reference(ref_price)
+        enforce_ppbs = bool(self.enforce_ppbs and validations_enabled)
 
-        price_quantized = float(price_raw)
-        qty_quantized = float(qty_raw)
-        if quantizer is not None:
+        quant_result: Any = None
+        quantize_order = getattr(quantizer, "quantize_order", None)
+        if callable(quantize_order):
             try:
-                price_quantized = float(self.quantizer.quantize_price(self.symbol, price_raw))
-            except Exception as exc:
-                reason = FilterRejectionReason(
-                    code="PRICE_FILTER",
-                    message="quantize_price failed",
-                    constraint={"error": str(exc), "price": price_raw},
+                quant_result = quantize_order(
+                    self.symbol,
+                    side,
+                    price_raw,
+                    qty_raw,
+                    ref_ppbs if ref_ppbs is not None else price_raw,
+                    enforce_ppbs=enforce_ppbs,
                 )
-                return 0.0, 0.0, reason
+            except Exception as exc:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "quantize_order failed for LIMIT order (symbol=%s): %s",
+                        self.symbol,
+                        exc,
+                    )
+                quant_result = None
+
+        if quant_result is not None:
             try:
-                qty_quantized = float(self.quantizer.quantize_qty(self.symbol, qty_raw))
-            except Exception as exc:
-                reason = FilterRejectionReason(
-                    code="LOT_SIZE",
-                    message="quantize_qty failed",
-                    constraint={"error": str(exc), "quantity": qty_raw},
-                )
-                return price_quantized, 0.0, reason
+                price_quantized = float(getattr(quant_result, "price", price_raw))
+            except (TypeError, ValueError):
+                price_quantized = float(price_raw)
+            try:
+                qty_quantized = float(getattr(quant_result, "qty", qty_raw))
+            except (TypeError, ValueError):
+                qty_quantized = float(qty_raw)
+        else:
+            price_quantized = float(price_raw)
+            qty_quantized = float(qty_raw)
+            if quantizer is not None:
+                try:
+                    price_quantized = float(
+                        self.quantizer.quantize_price(self.symbol, price_raw)
+                    )
+                except Exception as exc:
+                    reason = FilterRejectionReason(
+                        code="PRICE_FILTER",
+                        message="quantize_price failed",
+                        constraint={"error": str(exc), "price": price_raw},
+                    )
+                    return 0.0, 0.0, reason
+                try:
+                    qty_quantized = float(
+                        self.quantizer.quantize_qty(self.symbol, qty_raw)
+                    )
+                except Exception as exc:
+                    reason = FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="quantize_qty failed",
+                        constraint={"error": str(exc), "quantity": qty_raw},
+                    )
+                    return price_quantized, 0.0, reason
 
         if not validations_enabled or filters is None:
             return price_quantized, qty_quantized, None
 
-        tolerance = 1e-12
         if price_raw <= 0.0 or not math.isfinite(price_raw):
             reason = FilterRejectionReason(
                 code="PRICE_FILTER",
@@ -5560,6 +5645,26 @@ class ExecutionSimulator:
                 )
                 return price_quantized, 0.0, reason
 
+        if quant_result is not None:
+            reason_code = getattr(quant_result, "reason_code", None)
+            if reason_code:
+                details = getattr(quant_result, "details", None)
+                message = str(getattr(quant_result, "reason", "") or "")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "quantize_order rejected LIMIT order (symbol=%s): %s %s",
+                        self.symbol,
+                        reason_code,
+                        message,
+                    )
+                reason = FilterRejectionReason(
+                    code=str(reason_code),
+                    message=message,
+                    constraint=dict(details) if isinstance(details, Mapping) else {},
+                )
+                return price_quantized, qty_quantized, reason
+            return price_quantized, qty_quantized, None
+
         price_for_notional = price_quantized if price_quantized > 0.0 else price_raw
         if price_for_notional <= 0.0 or not math.isfinite(price_for_notional):
             reason = FilterRejectionReason(
@@ -5616,7 +5721,6 @@ class ExecutionSimulator:
             qty_quantized = qty_for_notional
 
         if self.enforce_ppbs:
-            ref_ppbs = self._resolve_filter_reference(ref_price)
             if ref_ppbs is not None and ref_ppbs > 0.0:
                 ppbs_ok = True
                 if quantizer is not None:
