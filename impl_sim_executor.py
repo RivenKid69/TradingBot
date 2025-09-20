@@ -25,7 +25,7 @@ from core_contracts import TradeExecutor
 from compat_shims import sim_report_dict_to_core_exec_reports
 from execution_sim import ExecutionSimulator, SimStepReport  # type: ignore
 from action_proto import ActionProto, ActionType
-from core_config import ExecutionProfile, ExecutionParams
+from core_config import ExecutionProfile, ExecutionParams, ExecutionEntryMode
 from config import DataDegradationConfig
 
 # новые компонентные имплементации
@@ -182,6 +182,277 @@ class SimExecutor(TradeExecutor):
         return payload
 
     @staticmethod
+    def _coerce_execution_profile(
+        value: Any,
+        default: ExecutionProfile,
+    ) -> ExecutionProfile:
+        if isinstance(value, ExecutionProfile):
+            return value
+        if isinstance(value, str):
+            text = value.strip().upper().replace("-", "_").replace(" ", "_")
+            if text in ExecutionProfile.__members__:
+                return ExecutionProfile[text]
+        return default
+
+    @staticmethod
+    def _bool_or_none(value: Any) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(num):
+                return None
+            return bool(int(num))
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if not text:
+                return None
+            if text in {"1", "true", "yes", "y", "on"}:
+                return True
+            if text in {"0", "false", "no", "n", "off"}:
+                return False
+            return None
+        try:
+            return bool(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _coerce_execution_entry_mode(
+        value: Any,
+    ) -> tuple[ExecutionEntryMode | None, ExecutionProfile | None]:
+        if value is None:
+            return None, None
+        if isinstance(value, ExecutionEntryMode):
+            return value, None
+        if isinstance(value, ExecutionProfile):
+            return None, value
+        text: Optional[str]
+        try:
+            text = str(value)
+        except Exception:
+            text = None
+        if not text:
+            return None, None
+        normalized_text = text.strip()
+        if not normalized_text:
+            return None, None
+        lowered = normalized_text.lower()
+        try:
+            enum_val = ExecutionEntryMode(lowered)
+        except ValueError:
+            enum_val = None
+        if enum_val is not None:
+            return enum_val, None
+
+        alias_map: Dict[str, tuple[ExecutionEntryMode | None, ExecutionProfile | None]] = {
+            "market": (ExecutionEntryMode.DEFAULT, ExecutionProfile.MKT_OPEN_NEXT_H1),
+            "mkt": (ExecutionEntryMode.DEFAULT, ExecutionProfile.MKT_OPEN_NEXT_H1),
+            "mkt_open_next_h1": (ExecutionEntryMode.DEFAULT, ExecutionProfile.MKT_OPEN_NEXT_H1),
+            "open": (ExecutionEntryMode.DEFAULT, ExecutionProfile.MKT_OPEN_NEXT_H1),
+            "open_next": (ExecutionEntryMode.DEFAULT, ExecutionProfile.MKT_OPEN_NEXT_H1),
+            "next_open": (ExecutionEntryMode.DEFAULT, ExecutionProfile.MKT_OPEN_NEXT_H1),
+            "vwap": (ExecutionEntryMode.DEFAULT, ExecutionProfile.VWAP_CURRENT_H1),
+            "vwap_current_h1": (ExecutionEntryMode.DEFAULT, ExecutionProfile.VWAP_CURRENT_H1),
+            "current_vwap": (ExecutionEntryMode.DEFAULT, ExecutionProfile.VWAP_CURRENT_H1),
+            "limit": (ExecutionEntryMode.STRICT, ExecutionProfile.LIMIT_MID_BPS),
+            "limit_mid": (ExecutionEntryMode.STRICT, ExecutionProfile.LIMIT_MID_BPS),
+            "limit_mid_bps": (ExecutionEntryMode.STRICT, ExecutionProfile.LIMIT_MID_BPS),
+            "mid_limit": (ExecutionEntryMode.STRICT, ExecutionProfile.LIMIT_MID_BPS),
+            "strict": (ExecutionEntryMode.STRICT, ExecutionProfile.LIMIT_MID_BPS),
+            "legacy": (ExecutionEntryMode.DEFAULT, None),
+        }
+        if lowered in alias_map:
+            return alias_map[lowered]
+
+        profile_key = normalized_text.replace("-", "_").replace(" ", "_").upper()
+        if profile_key in ExecutionProfile.__members__:
+            return None, ExecutionProfile[profile_key]
+
+        return None, None
+
+    @staticmethod
+    def resolve_execution_runtime_settings(
+        execution_cfg: Any,
+        *,
+        default_profile: ExecutionProfile | None = None,
+    ) -> tuple[ExecutionEntryMode, ExecutionProfile, bool, bool]:
+        profile_default = SimExecutor._coerce_execution_profile(
+            default_profile or ExecutionProfile.MKT_OPEN_NEXT_H1,
+            ExecutionProfile.MKT_OPEN_NEXT_H1,
+        )
+        entry_mode = ExecutionEntryMode.DEFAULT
+        resolved_profile = profile_default
+        clip_enabled = True
+        strict_open_fill = False
+
+        cfg_obj = execution_cfg
+        entry_mode_raw: Any = None
+        clip_cfg: Any = None
+        if isinstance(cfg_obj, Mapping):
+            entry_mode_raw = cfg_obj.get("entry_mode")
+            clip_cfg = cfg_obj.get("clip_to_bar")
+        else:
+            entry_mode_raw = getattr(cfg_obj, "entry_mode", None)
+            clip_cfg = getattr(cfg_obj, "clip_to_bar", None)
+
+        mode_candidate, profile_override = SimExecutor._coerce_execution_entry_mode(entry_mode_raw)
+        if mode_candidate is not None:
+            entry_mode = mode_candidate
+        if profile_override is not None:
+            resolved_profile = profile_override
+        else:
+            if isinstance(entry_mode_raw, ExecutionProfile):
+                resolved_profile = entry_mode_raw
+            elif isinstance(entry_mode_raw, str):
+                profile_key = (
+                    entry_mode_raw.strip().replace("-", "_").replace(" ", "_").upper()
+                )
+                if profile_key in ExecutionProfile.__members__:
+                    resolved_profile = ExecutionProfile[profile_key]
+
+        clip_enabled_val: bool | None = None
+        strict_val: bool | None = None
+        if clip_cfg is not None:
+            if isinstance(clip_cfg, Mapping):
+                clip_enabled_val = SimExecutor._bool_or_none(clip_cfg.get("enabled"))
+                strict_val = SimExecutor._bool_or_none(clip_cfg.get("strict_open_fill"))
+            else:
+                clip_enabled_val = SimExecutor._bool_or_none(
+                    getattr(clip_cfg, "enabled", None)
+                )
+                strict_val = SimExecutor._bool_or_none(
+                    getattr(clip_cfg, "strict_open_fill", None)
+                )
+        if clip_enabled_val is not None:
+            clip_enabled = clip_enabled_val
+        if strict_val is not None:
+            strict_open_fill = strict_val
+
+        return entry_mode, resolved_profile, clip_enabled, strict_open_fill
+
+    @staticmethod
+    def _apply_entry_mode_to_sim(
+        sim: ExecutionSimulator,
+        entry_mode: ExecutionEntryMode | None,
+    ) -> None:
+        if entry_mode is None:
+            return
+        value = entry_mode.value if hasattr(entry_mode, "value") else str(entry_mode)
+        for attr in ("execution_entry_mode", "_execution_entry_mode"):
+            try:
+                setattr(sim, attr, value)
+            except Exception:
+                continue
+
+    @staticmethod
+    def _apply_clip_settings_to_sim(
+        sim: ExecutionSimulator,
+        enabled: bool,
+        strict_open_fill: bool,
+    ) -> None:
+        for attr in ("clip_to_bar_enabled", "_clip_to_bar_enabled"):
+            try:
+                setattr(sim, attr, bool(enabled))
+            except Exception:
+                continue
+        for attr in (
+            "clip_to_bar_strict_open_fill",
+            "_clip_to_bar_strict_open_fill",
+        ):
+            try:
+                setattr(sim, attr, bool(strict_open_fill))
+            except Exception:
+                continue
+
+    @staticmethod
+    def configure_simulator_execution(
+        sim: ExecutionSimulator,
+        execution_cfg: Any,
+        *,
+        default_profile: ExecutionProfile | None = None,
+    ) -> tuple[ExecutionEntryMode, ExecutionProfile, bool, bool]:
+        entry_mode, profile, clip_enabled, strict_open_fill = (
+            SimExecutor.resolve_execution_runtime_settings(
+                execution_cfg, default_profile=default_profile
+            )
+        )
+        SimExecutor._apply_entry_mode_to_sim(sim, entry_mode)
+        SimExecutor._apply_clip_settings_to_sim(sim, clip_enabled, strict_open_fill)
+        return entry_mode, profile, clip_enabled, strict_open_fill
+
+    @staticmethod
+    def _execution_params_dict(params: Any) -> Dict[str, Any]:
+        if params is None:
+            return {}
+        if isinstance(params, Mapping):
+            try:
+                return dict(params)
+            except Exception:
+                return {}
+        for attr in ("model_dump", "dict"):
+            if hasattr(params, attr):
+                try:
+                    method = getattr(params, attr)
+                    payload = method(exclude_unset=False)  # type: ignore[call-arg]
+                except TypeError:
+                    try:
+                        payload = method()  # type: ignore[misc]
+                    except Exception:
+                        payload = None
+                except Exception:
+                    payload = None
+                if isinstance(payload, Mapping):
+                    try:
+                        return dict(payload)
+                    except Exception:
+                        return {}
+        try:
+            return dict(params)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _set_execution_profile_on_sim(
+        sim: ExecutionSimulator,
+        profile: ExecutionProfile,
+        params: Any,
+    ) -> None:
+        payload = SimExecutor._execution_params_dict(params)
+        profile_text = str(profile)
+        setter = getattr(sim, "set_execution_profile", None)
+        if callable(setter):
+            try:
+                setter(profile_text, payload)
+            except Exception:
+                pass
+        try:
+            setattr(sim, "execution_profile", profile_text)
+        except Exception:
+            pass
+        try:
+            setattr(sim, "execution_params", payload)
+        except Exception:
+            pass
+
+    @staticmethod
+    def apply_execution_profile(
+        sim: ExecutionSimulator,
+        profile: ExecutionProfile | str | None,
+        params: Any,
+    ) -> None:
+        coerced = SimExecutor._coerce_execution_profile(
+            profile if profile is not None else ExecutionProfile.MKT_OPEN_NEXT_H1,
+            ExecutionProfile.MKT_OPEN_NEXT_H1,
+        )
+        SimExecutor._set_execution_profile_on_sim(sim, coerced, params)
+
+    @staticmethod
     def _attach_quantizer_via_api(
         sim: ExecutionSimulator,
         quantizer: QuantizerImpl,
@@ -253,10 +524,14 @@ class SimExecutor(TradeExecutor):
         rc_fees = getattr(run_config, "fees", {}) if run_config else {}
         rc_degradation = getattr(run_config, "data_degradation", {}) if run_config else {}
         self._no_trade_cfg = getattr(run_config, "no_trade", {}) if run_config else {}
-        self._exec_profile: ExecutionProfile = (
+        raw_exec_profile = (
             getattr(run_config, "execution_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
             if run_config is not None
             else ExecutionProfile.MKT_OPEN_NEXT_H1
+        )
+        self._exec_profile: ExecutionProfile = SimExecutor._coerce_execution_profile(
+            raw_exec_profile,
+            ExecutionProfile.MKT_OPEN_NEXT_H1,
         )
         self._exec_params: ExecutionParams = (
             getattr(run_config, "execution_params", ExecutionParams())
@@ -283,6 +558,17 @@ class SimExecutor(TradeExecutor):
                 setattr(self._sim, "_execution_runtime_cfg", self._execution_cfg)
             except Exception:
                 pass
+
+        (
+            self._entry_mode,
+            self._exec_profile,
+            self._clip_to_bar_enabled,
+            self._strict_open_fill,
+        ) = SimExecutor.configure_simulator_execution(
+            self._sim,
+            self._execution_cfg,
+            default_profile=self._exec_profile,
+        )
         if data_degradation is None:
             data_degradation = (
                 DataDegradationConfig.from_dict(rc_degradation)
@@ -351,14 +637,11 @@ class SimExecutor(TradeExecutor):
         if fees is not None:
             fees.attach_to(self._sim)
 
-        try:
-            if hasattr(self._sim, "set_execution_profile"):
-                self._sim.set_execution_profile(str(self._exec_profile), self._exec_params.dict())
-            else:
-                setattr(self._sim, "execution_profile", str(self._exec_profile))
-                setattr(self._sim, "execution_params", self._exec_params.dict())
-        except Exception:
-            pass
+        SimExecutor.apply_execution_profile(
+            self._sim,
+            self._exec_profile,
+            self._exec_params,
+        )
 
     @staticmethod
     def from_config(
@@ -419,6 +702,23 @@ class SimExecutor(TradeExecutor):
                 setattr(sim, "_execution_runtime_cfg", execution_cfg)
             except Exception:
                 pass
+
+        default_profile = SimExecutor._coerce_execution_profile(
+            getattr(run_config, "execution_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
+            if run_config is not None
+            else ExecutionProfile.MKT_OPEN_NEXT_H1,
+            ExecutionProfile.MKT_OPEN_NEXT_H1,
+        )
+        _, resolved_profile, _, _ = SimExecutor.configure_simulator_execution(
+            sim,
+            execution_cfg,
+            default_profile=default_profile,
+        )
+        SimExecutor.apply_execution_profile(
+            sim,
+            resolved_profile,
+            getattr(run_config, "execution_params", None) if run_config is not None else None,
+        )
 
         if q_impl is not None:
             attached = SimExecutor._attach_quantizer_via_api(sim, q_impl)
