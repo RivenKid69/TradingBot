@@ -15,6 +15,8 @@ impl_sim_executor.py
 
 from __future__ import annotations
 from dataclasses import dataclass
+import logging
+import math
 from decimal import Decimal
 from typing import Dict, Optional, Sequence, Mapping, List, Any
 
@@ -32,6 +34,9 @@ from impl_fees import FeesImpl, FeesConfig
 from impl_slippage import SlippageImpl, SlippageCfg
 from impl_latency import LatencyImpl, LatencyCfg
 from impl_risk_basic import RiskBasicImpl, RiskBasicCfg
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -250,6 +255,7 @@ class SimExecutor(TradeExecutor):
 
         if quantizer is None:
             quantizer = QuantizerImpl.from_dict(rc_quantizer)
+        self._quantizer_impl: QuantizerImpl | None = quantizer
         if risk is None:
             risk = RiskBasicImpl.from_dict(rc_risk)
         if latency is None:
@@ -452,6 +458,136 @@ class SimExecutor(TradeExecutor):
         setattr(proto, "client_tag", getattr(order, "client_order_id", "") or "")
         return ActionType.MARKET, proto
 
+    def _quantizer_precheck_enabled(self) -> bool:
+        quantizer = self._quantizer_impl
+        if quantizer is None:
+            return False
+        cfg = getattr(quantizer, "cfg", None)
+        if cfg is None:
+            return False
+        strict = bool(getattr(cfg, "strict", False))
+        enforce_ppbs = bool(getattr(cfg, "enforce_percent_price_by_side", False))
+        return strict or enforce_ppbs
+
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(num):
+            return None
+        return num
+
+    def _build_precheck_rejection(
+        self,
+        order: Order,
+        *,
+        reason_code: Optional[str],
+        reason_message: Optional[str],
+        details: Optional[Mapping[str, Any]],
+        quantized_price: float,
+        quantized_qty: float,
+        price: float | None,
+        ref_price: float | None,
+        signed_qty: float,
+    ) -> ExecReport:
+        report = SimStepReport()
+        report.status = "REJECTED_BY_FILTER"
+        report.exec_status = "REJECTED"
+        report.execution_profile = str(self._exec_profile)
+        price_hint = price if price is not None else ref_price
+
+        def _safe_float(value: Any) -> float:
+            try:
+                if value is None:
+                    return 0.0
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        report.position_qty = _safe_float(getattr(self._sim, "position_qty", 0.0))
+        report.realized_pnl = _safe_float(getattr(self._sim, "realized_pnl_cum", 0.0))
+        report.unrealized_pnl = _safe_float(getattr(self._sim, "unrealized_pnl", 0.0))
+        report.equity = _safe_float(getattr(self._sim, "equity", 0.0))
+        report.mark_price = _safe_float(price_hint)
+        report.mtm_price = report.mark_price
+        report.bid = _safe_float(getattr(self._sim, "_last_bid", 0.0))
+        report.ask = _safe_float(getattr(self._sim, "_last_ask", 0.0))
+        report.latency_p50_ms = _safe_float(getattr(self._sim, "latency_p50_ms", 0.0))
+        report.latency_p95_ms = _safe_float(getattr(self._sim, "latency_p95_ms", 0.0))
+        report.latency_timeout_ratio = _safe_float(
+            getattr(self._sim, "latency_timeout_ratio", 0.0)
+        )
+        report.vol_factor = getattr(self._sim, "_last_vol_factor", None)
+        report.liquidity = getattr(self._sim, "_last_liquidity", None)
+
+        detail_payload: Dict[str, Any] = {
+            "code": str(reason_code or "FILTER"),
+            "price": quantized_price,
+            "qty": quantized_qty,
+            "original_price": price_hint,
+            "original_qty": abs(float(signed_qty)),
+            "side": str(order.side),
+        }
+        if reason_message:
+            detail_payload["message"] = str(reason_message)
+        if details:
+            try:
+                detail_payload["constraint"] = dict(details)
+            except Exception:
+                detail_payload["constraint"] = details
+        if ref_price is not None:
+            detail_payload["ref_price"] = ref_price
+        rejection_entry: Dict[str, Any] = {
+            "which": str(reason_code or "FILTER"),
+            "detail": detail_payload,
+            "order_type": str(order.order_type),
+            "source": "quantizer_precheck",
+        }
+        client_id = getattr(order, "client_order_id", None)
+        if client_id:
+            rejection_entry["client_order_id"] = str(client_id)
+        report.reason = {"rejections": [rejection_entry]}
+
+        payload = report.to_dict()
+        core_reports = sim_report_dict_to_core_exec_reports(
+            payload,
+            symbol=self._ctx.symbol,
+            run_id=self._run_id,
+            client_order_id=str(client_id or ""),
+        )
+        if core_reports:
+            return core_reports[0]
+
+        return ExecReport.from_dict(
+            {
+                "ts": int(order.ts),
+                "symbol": self._ctx.symbol,
+                "side": "BUY"
+                if str(order.side).upper().endswith("BUY")
+                else "SELL",
+                "order_type": str(order.order_type),
+                "price": float(price_hint or 0.0),
+                "quantity": 0.0,
+                "fee": 0.0,
+                "fee_asset": None,
+                "pnl": 0.0,
+                "exec_status": "REJECTED",
+                "liquidity": "UNKNOWN",
+                "client_order_id": str(client_id or ""),
+                "order_id": None,
+                "meta": {
+                    "filter_rejection": report.reason,
+                    "execution_profile": str(self._exec_profile),
+                },
+                "execution_profile": str(self._exec_profile),
+                "run_id": self._run_id,
+            }
+        )
+
     # ---- интерфейс TradeExecutor ----
     def execute(self, order: Order) -> ExecReport:
         """
@@ -459,6 +595,106 @@ class SimExecutor(TradeExecutor):
         Если сделок не было — возвращает ExecReport с нулевым qty и статусом 'NONE'
         (совместимый fallback). Отказы фильтров отражаются как ExecStatus.REJECTED.
         """
+        symbol = self._ctx.symbol
+        side_str = str(order.side)
+        order_type_str = str(order.order_type)
+        qty_val = float(order.quantity)
+        signed_qty = abs(qty_val)
+        if side_str.upper().endswith("SELL"):
+            signed_qty = -signed_qty
+
+        explicit_price = self._float_or_none(getattr(order, "price", None))
+        last_ref_raw = getattr(self._sim, "_last_ref_price", None)
+        last_ref_price = self._float_or_none(last_ref_raw)
+        price_for_check = explicit_price if explicit_price is not None else last_ref_price
+        ref_for_check = last_ref_price if last_ref_price is not None else price_for_check
+
+        validation_result: Any | None = None
+        quantizer = self._quantizer_impl
+        if (
+            quantizer is not None
+            and hasattr(quantizer, "validate_order")
+            and self._quantizer_precheck_enabled()
+            and price_for_check is not None
+            and ref_for_check is not None
+        ):
+            cfg = getattr(quantizer, "cfg", None)
+            enforce_ppbs = bool(getattr(cfg, "enforce_percent_price_by_side", False)) if cfg is not None else False
+            try:
+                validation_result = quantizer.validate_order(
+                    symbol,
+                    side_str,
+                    float(price_for_check),
+                    float(signed_qty),
+                    ref_price=float(ref_for_check),
+                    enforce_ppbs=enforce_ppbs,
+                )
+            except Exception as exc:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Quantizer pre-check failed for order %s (%s): %s",
+                        getattr(order, "client_order_id", ""),
+                        symbol,
+                        exc,
+                        exc_info=True,
+                    )
+
+        if validation_result is not None:
+            accepted = bool(getattr(validation_result, "accepted", True))
+            quantized_price = self._float_or_none(getattr(validation_result, "price", price_for_check))
+            if quantized_price is None:
+                quantized_price = float(price_for_check or 0.0)
+            quantized_qty = self._float_or_none(getattr(validation_result, "qty", abs(signed_qty)))
+            if quantized_qty is None:
+                quantized_qty = abs(float(signed_qty))
+            if not accepted:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Quantizer pre-check rejected order %s (%s %s): code=%s reason=%s",
+                        getattr(order, "client_order_id", ""),
+                        side_str,
+                        order_type_str,
+                        getattr(validation_result, "reason_code", None),
+                        getattr(validation_result, "reason", None),
+                    )
+                return self._build_precheck_rejection(
+                    order,
+                    reason_code=getattr(validation_result, "reason_code", None),
+                    reason_message=getattr(validation_result, "reason", None),
+                    details=getattr(validation_result, "details", None),
+                    quantized_price=float(quantized_price),
+                    quantized_qty=float(quantized_qty),
+                    price=price_for_check,
+                    ref_price=ref_for_check,
+                    signed_qty=float(signed_qty),
+                )
+
+            price_changed = (
+                price_for_check is not None
+                and quantized_price is not None
+                and not math.isclose(
+                    float(quantized_price),
+                    float(price_for_check),
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            )
+            qty_changed = not math.isclose(
+                float(quantized_qty),
+                float(abs(signed_qty)),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            if (price_changed or qty_changed) and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Quantizer pre-check adjusted order %s: price %s -> %s, qty %s -> %s",
+                    getattr(order, "client_order_id", ""),
+                    price_for_check,
+                    quantized_price,
+                    abs(signed_qty),
+                    quantized_qty,
+                )
+
         atype, proto = self._order_to_action(order)
 
         # обновим символ и реф. цену в симуляторе, если нужно
@@ -467,10 +703,18 @@ class SimExecutor(TradeExecutor):
         except Exception:
             pass
 
+        if getattr(order, "price", None) is not None:
+            try:
+                ref_price_arg = float(order.price)
+            except (TypeError, ValueError):
+                ref_price_arg = explicit_price
+        else:
+            ref_price_arg = last_ref_raw
+
         # прогон шага симуляции с одним действием
         rep: SimStepReport = self._sim.run_step(
             ts=int(order.ts),
-            ref_price=float(order.price) if getattr(order, "price", None) is not None else getattr(self._sim, "_last_ref_price", None),
+            ref_price=ref_price_arg,
             bid=None,
             ask=None,
             vol_factor=None,
@@ -505,8 +749,8 @@ class SimExecutor(TradeExecutor):
         return ExecReport.from_dict({
             "ts": int(order.ts),
             "symbol": self._ctx.symbol,
-            "side": "BUY" if float(order.quantity) >= 0 else "SELL",
-            "order_type": "MARKET" if str(order.order_type).upper().endswith("MARKET") else "LIMIT",
+            "side": "BUY" if side_str.upper().endswith("BUY") else "SELL",
+            "order_type": "MARKET" if order_type_str.upper().endswith("MARKET") else "LIMIT",
             "price": float(order.price) if getattr(order, "price", None) is not None else 0.0,
             "quantity": 0.0,
             "fee": 0.0,
