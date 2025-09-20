@@ -166,6 +166,7 @@ class QuantizerImpl:
     def __init__(self, cfg: QuantizerConfig) -> None:
         self.cfg = cfg
         self._quantizer = None
+        self._filters_raw: Dict[str, Dict[str, Any]] = {}
         filters_path = cfg.resolved_filters_path()
         if not cfg.filters_path:
             cfg.filters_path = filters_path
@@ -239,22 +240,72 @@ class QuantizerImpl:
                 )
             return
 
+        self._filters_raw = dict(filters)
         self._quantizer = Quantizer(filters, strict=bool(cfg.strict))
 
     @property
     def quantizer(self):
         return self._quantizer
 
-    def attach_to(self, sim, *, strict: Optional[bool] = None, enforce_percent_price_by_side: Optional[bool] = None) -> None:
+    def attach_to(
+        self,
+        sim,
+        *,
+        strict: Optional[bool] = None,
+        enforce_percent_price_by_side: Optional[bool] = None,
+    ) -> None:
         """Подключает квантайзер к симулятору."""
         if strict is not None:
             self.cfg.strict = bool(strict)
         if enforce_percent_price_by_side is not None:
             self.cfg.enforce_percent_price_by_side = bool(enforce_percent_price_by_side)
+
         if self._quantizer is not None:
-            setattr(sim, "quantizer", self._quantizer)
-        setattr(sim, "enforce_ppbs", bool(self.cfg.enforce_percent_price_by_side))
-        setattr(sim, "strict_filters", bool(self.cfg.strict))
+            try:
+                setattr(sim, "quantizer", self._quantizer)
+            except Exception:
+                pass
+
+        filters_attached = False
+        warn_message: Optional[str] = None
+        if self._filters_raw:
+            if hasattr(sim, "filters"):
+                try:
+                    setattr(sim, "filters", dict(self._filters_raw))
+                    filters_attached = True
+                except Exception as exc:
+                    warn_message = (
+                        f"Failed to attach quantizer filters to {type(sim).__name__}: {exc}"
+                    )
+            else:
+                warn_message = (
+                    f"Simulator {type(sim).__name__} has no 'filters' attribute; strict filter enforcement disabled"
+                )
+        else:
+            warn_message = (
+                f"Quantizer filters are unavailable; strict filter enforcement disabled for {type(sim).__name__}"
+            )
+
+        if filters_attached:
+            try:
+                setattr(sim, "enforce_ppbs", bool(self.cfg.enforce_percent_price_by_side))
+            except Exception:
+                pass
+            try:
+                setattr(sim, "strict_filters", bool(self.cfg.strict))
+            except Exception:
+                pass
+        else:
+            if warn_message:
+                logger.warning(warn_message)
+            try:
+                setattr(sim, "enforce_ppbs", False)
+            except Exception:
+                pass
+            try:
+                setattr(sim, "strict_filters", False)
+            except Exception:
+                pass
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "QuantizerImpl":
