@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import math
 import random
 import tempfile
 import threading
@@ -610,6 +611,55 @@ class RestBudgetSession:
             return path
         return key
 
+    _CACHE_PARAM_ALIASES: Mapping[str, str] = {
+        "symbol": "symbol",
+        "symbols": "symbols",
+        "pair": "symbol",
+        "trading_pair": "symbol",
+        "base": "symbol",
+        "quote": "symbol",
+        "interval": "interval",
+        "timeframe": "interval",
+        "tick_interval": "interval",
+        "granularity": "interval",
+        "start": "start",
+        "start_time": "startTime",
+        "starttime": "startTime",
+        "start_ts": "startTime",
+        "starttimestamp": "startTime",
+        "from": "startTime",
+        "end": "end",
+        "end_time": "endTime",
+        "endtime": "endTime",
+        "end_ts": "endTime",
+        "endtimestamp": "endTime",
+        "to": "endTime",
+        "from_id": "fromId",
+        "fromid": "fromId",
+        "page": "page",
+        "offset": "offset",
+        "limit": "limit",
+        "window": "window",
+        "date": "date",
+        "day": "date",
+    }
+
+    _CACHE_PARAM_ORDER: tuple[str, ...] = (
+        "symbol",
+        "symbols",
+        "interval",
+        "startTime",
+        "endTime",
+        "start",
+        "end",
+        "fromId",
+        "limit",
+        "page",
+        "offset",
+        "window",
+        "date",
+    )
+
     def _make_cache_key(
         self,
         method: str,
@@ -619,12 +669,78 @@ class RestBudgetSession:
     ) -> str:
         prepared = requests.Request(method.upper(), url, params=params).prepare()
         canonical_url = prepared.url or url
-        digest = hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()
+        parsed = urllib.parse.urlsplit(canonical_url)
+
         base = self._normalize_endpoint_key(endpoint_key) or endpoint_key or method.upper()
-        safe_base = self._sanitize_cache_token(base.replace(" ", "_"))
-        if not safe_base:
-            safe_base = method.upper()
-        return f"{safe_base}_{digest}"
+        base = base.replace(" ", "_")
+        safe_base = self._sanitize_cache_token(base) or method.upper()
+
+        # Collect parameters from the explicit ``params`` mapping and the canonical URL.
+        values: dict[str, list[str]] = defaultdict(list)
+
+        def _normalise_key(key: str) -> str:
+            canon = self._CACHE_PARAM_ALIASES.get(key)
+            if canon is not None:
+                return canon
+            lower = key.lower()
+            return self._CACHE_PARAM_ALIASES.get(lower, key)
+
+        def _append_value(target: dict[str, list[str]], key: str, value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _append_value(target, key, item)
+                return
+            text = str(value).strip()
+            if not text:
+                return
+            canon_key = _normalise_key(str(key))
+            bucket = target.setdefault(canon_key, [])
+            if text not in bucket:
+                bucket.append(text)
+
+        if isinstance(params, Mapping):
+            for key, value in params.items():
+                _append_value(values, str(key), value)
+
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+            _append_value(values, key, value)
+
+        parts = [safe_base]
+        used_keys: set[str] = set()
+        for name in self._CACHE_PARAM_ORDER:
+            bucket = values.get(name)
+            if not bucket:
+                continue
+            used_keys.add(name)
+            cleaned = "-".join(
+                filter(
+                    None,
+                    (
+                        self._sanitize_cache_token(val.replace(" ", "_"))
+                        for val in bucket
+                    ),
+                )
+            )
+            if cleaned:
+                parts.append(f"{name}_{cleaned}")
+
+        remaining_keys = {
+            key
+            for key in values.keys()
+            if key not in used_keys and key not in self._CACHE_PARAM_ALIASES.values()
+        }
+
+        if len(parts) == 1:
+            # No human-friendly tokens detected; fall back to digesting the canonical URL.
+            digest = hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()
+            parts.append(digest)
+        elif remaining_keys:
+            digest = hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()
+            parts.append(digest[:12])
+
+        return "__".join(parts)
 
     def _cache_path(self, key: str) -> Path | None:
         if self._cache_dir is None:
@@ -634,49 +750,78 @@ class RestBudgetSession:
             safe_key = "cache_entry"
         return self._cache_dir / f"{safe_key}.json"
 
-    def _cache_lookup(self, key: str, ttl_days: float | None = None) -> Any | None:
-        path = self._cache_path(key)
+    def _cache_lookup(
+        self,
+        method: str,
+        url: str,
+        params: Mapping[str, Any] | None,
+        endpoint_key: str,
+        *,
+        load_payload: bool = True,
+    ) -> tuple[str | None, Any | None, bool]:
+        if self._cache_mode == "off" or self._cache_dir is None:
+            return None, None, False
+
+        cache_key = self._make_cache_key(method, url, params, endpoint_key)
+        path = self._cache_path(cache_key)
         if path is None:
-            return None
+            return cache_key, None, False
+
+        meta = self._get_endpoint_cache_meta(endpoint_key)
+        ttl_days = None
+        if meta is not None:
+            ttl_candidate = meta.get("min_refresh_days")
+            if ttl_candidate is not None:
+                ttl_days = self._coerce_positive_float(ttl_candidate)
+        if ttl_days is None:
+            ttl_days = self._cache_ttl_days
+
         try:
             stat = path.stat()
         except FileNotFoundError:
-            return None
-        ttl = self._coerce_positive_float(ttl_days) if ttl_days is not None else self._cache_ttl_days
-        if ttl is not None:
-            ttl_seconds = ttl * 86_400.0
+            return cache_key, None, False
+
+        if ttl_days is not None:
+            ttl_seconds = ttl_days * 86_400.0
             if ttl_seconds <= 0.0:
-                return None
+                return cache_key, None, False
             age = time.time() - stat.st_mtime
             if age > ttl_seconds:
-                return None
+                return cache_key, None, False
+
+        if not load_payload:
+            return cache_key, None, True
+
         try:
             with path.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                payload = json.load(f)
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Failed to read cache file %s: %s", path, exc)
             try:
                 path.unlink()
             except OSError:
                 pass
-            return None
+            return cache_key, None, False
+        return cache_key, payload, True
 
-    def _cache_store(self, key: str, payload: Any) -> None:
+    def _cache_store(self, key: str, payload: Any) -> bool:
+        if self._cache_mode != "read_write":
+            return False
         path = self._cache_path(key)
         if path is None:
-            return
+            return False
         try:
             encoded = json.dumps(payload, ensure_ascii=False)
         except (TypeError, ValueError):
             logger.debug("Skipping cache store for %s: payload not JSON-serializable", key)
-            return
+            return False
         path.parent.mkdir(parents=True, exist_ok=True)
         prefix = f".{path.stem}."
         try:
             fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=prefix, suffix=".tmp")
         except OSError as exc:
             logger.warning("Failed to create cache temp file in %s: %s", path.parent, exc)
-            return
+            return False
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
                 tmp_file.write(encoded)
@@ -687,6 +832,27 @@ class RestBudgetSession:
                 os.remove(tmp_name)
             except OSError:
                 pass
+            return False
+        return True
+
+    def is_cached(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        params: Mapping[str, Any] | None = None,
+        endpoint: str | None = None,
+        budget: str | None = None,
+    ) -> bool:
+        """Return ``True`` when a fresh cache entry exists for the request."""
+
+        method_upper = method.upper()
+        override = endpoint or budget
+        key = self._resolve_endpoint_key(method_upper, url, override)
+        _, _, hit = self._cache_lookup(
+            method_upper, url, params, key, load_payload=False
+        )
+        return hit
     def _next_jitter(self) -> float:
         if self._jitter_max_ms <= 0.0:
             return 0.0
@@ -938,6 +1104,51 @@ class RestBudgetSession:
         except ValueError:
             return resp.text
 
+    @staticmethod
+    def _normalize_checkpoint_symbol(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text.upper() if text else None
+
+    @staticmethod
+    def _normalize_checkpoint_range(value: Any) -> list[int] | None:
+        if value is None:
+            return None
+        start: Any
+        end: Any
+        if isinstance(value, Mapping):
+            if "start" in value:
+                start = value.get("start")
+            else:
+                start = value.get("start_ms", value.get("from"))
+            if "end" in value:
+                end = value.get("end")
+            else:
+                end = value.get("end_ms", value.get("to"))
+        elif isinstance(value, (list, tuple)) and len(value) == 2:
+            start, end = value
+        else:
+            return None
+        try:
+            start_int = int(start)
+            end_int = int(end)
+        except (TypeError, ValueError):
+            return None
+        return [start_int, end_int]
+
+    @staticmethod
+    def _coerce_progress_pct(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            pct = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(pct) or math.isinf(pct):
+            return None
+        return max(0.0, min(pct, 100.0))
+
     def load_checkpoint(self) -> Any | None:
         """Return checkpoint payload when resume is enabled."""
 
@@ -951,17 +1162,62 @@ class RestBudgetSession:
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Failed to read checkpoint %s: %s", self._checkpoint_path, exc)
             return None
+
+        if isinstance(payload, Mapping):
+            data_part = payload.get("data", payload)
+            if isinstance(data_part, Mapping):
+                base: dict[str, Any] = dict(data_part)
+                base["data"] = dict(data_part)
+            else:
+                base = {"data": data_part}
+            last_symbol = self._normalize_checkpoint_symbol(payload.get("last_symbol"))
+            last_range = self._normalize_checkpoint_range(payload.get("last_range"))
+            progress_pct = self._coerce_progress_pct(payload.get("progress_pct"))
+            saved_at = payload.get("saved_at")
+            version = payload.get("version")
+            meta = {
+                "last_symbol": last_symbol,
+                "last_range": last_range,
+                "progress_pct": progress_pct,
+                "saved_at": saved_at,
+                "version": version,
+            }
+            base.setdefault("last_symbol", last_symbol)
+            base.setdefault("last_range", last_range)
+            base.setdefault("progress_pct", progress_pct)
+            base.setdefault("checkpoint_saved_at", saved_at)
+            base.setdefault("checkpoint_version", version)
+            base["_checkpoint"] = meta
+            payload = base
+
         with self._stats_lock:
             self._checkpoint_loads += 1
         return payload
 
-    def save_checkpoint(self, data: Any) -> None:
+    def save_checkpoint(
+        self,
+        data: Any,
+        *,
+        last_symbol: Any | None = None,
+        last_range: Any | None = None,
+        progress_pct: Any | None = None,
+    ) -> None:
         """Persist *data* atomically when checkpointing is enabled."""
 
         if not self._checkpoint_enabled or not self._checkpoint_path:
             return
+
+        payload = {
+            "version": 2,
+            "saved_at": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
+            "data": data,
+            "last_symbol": self._normalize_checkpoint_symbol(last_symbol),
+            "last_range": self._normalize_checkpoint_range(last_range),
+            "progress_pct": self._coerce_progress_pct(progress_pct),
+        }
+
         try:
-            encoded = json.dumps(data, ensure_ascii=False)
+            encoded = json.dumps(payload, ensure_ascii=False)
         except (TypeError, ValueError):
             logger.warning("Checkpoint payload is not JSON serialisable: %r", data)
             return
@@ -1113,27 +1369,16 @@ class RestBudgetSession:
         stats_key = self._normalize_endpoint_key(key) or key
 
         cache_key: str | None = None
+        cache_hit = False
         if self._cache_mode != "off" and self._cache_dir is not None:
-            cache_key = self._make_cache_key("GET", url, params, key)
-            cache_meta = self._get_endpoint_cache_meta(key)
-            min_refresh_days = None
-            if cache_meta is not None:
-                min_refresh_days = cache_meta.get("min_refresh_days")
-            if min_refresh_days is not None:
-                cached_payload = self._cache_lookup(cache_key, ttl_days=min_refresh_days)
-                if cached_payload is not None:
-                    self._record_cache_hit(stats_key)
-                    return cached_payload
-                self._record_cache_miss(stats_key)
-            cached_payload = self._cache_lookup(cache_key)
-            if cached_payload is not None:
+            cache_key, cached_payload, cache_hit = self._cache_lookup(
+                "GET", url, params, key
+            )
+            if cache_hit:
                 self._record_cache_hit(stats_key)
                 return cached_payload
-            self._record_cache_miss(stats_key)
-
-        should_store_cache = (
-            cache_key is not None and self._cache_mode == "read_write"
-        )
+            if cache_key is not None:
+                self._record_cache_miss(stats_key)
 
         attempt = 0
 
@@ -1193,8 +1438,7 @@ class RestBudgetSession:
 
             monitoring.record_http_success(status)
             payload = self._extract_body(resp)
-            if should_store_cache and cache_key is not None:
-                self._cache_store(cache_key, payload)
+            if cache_key is not None and self._cache_store(cache_key, payload):
                 self._record_cache_store(stats_key)
             return payload
 
@@ -1236,6 +1480,9 @@ class RestBudgetSession:
             total_wait = float(sum(wait_seconds.values()))
             total_requests = int(sum(self._request_counts.values()))
             total_retries = int(sum(self.retry_counts.values()))
+            cache_hits_total = int(sum(self._cache_hits.values()))
+            cache_misses_total = int(sum(self._cache_misses.values()))
+            cache_stores_total = int(sum(self._cache_stores.values()))
             elapsed = max(time.monotonic() - self._stats_started, 1e-9)
             avg_qps = float(total_requests / elapsed) if total_requests else 0.0
             return {
@@ -1246,6 +1493,11 @@ class RestBudgetSession:
                 "cache_hits": dict(self._cache_hits),
                 "cache_misses": dict(self._cache_misses),
                 "cache_stores": dict(self._cache_stores),
+                "cache_totals": {
+                    "hits": cache_hits_total,
+                    "misses": cache_misses_total,
+                    "stores": cache_stores_total,
+                },
                 "waits": dict(self.wait_counts),
                 "wait_seconds": wait_seconds,
                 "cooldowns": dict(self.cooldown_counts),
