@@ -64,6 +64,7 @@ try:
         get_liquidity_multiplier,
         load_hourly_seasonality,
         watch_seasonality_file,
+        next_bar_open_ms,
     )
 except Exception:  # pragma: no cover - fallback when running as standalone file
     import pathlib
@@ -76,6 +77,7 @@ except Exception:  # pragma: no cover - fallback when running as standalone file
         get_liquidity_multiplier,
         load_hourly_seasonality,
         watch_seasonality_file,
+        next_bar_open_ms,
     )
 
 logger = logging.getLogger(__name__)
@@ -673,6 +675,29 @@ class Pending:
 
 
 @dataclass
+class PendingOrderState:
+    proto: ActionProto
+    client_order_id: int
+    side: str
+    qty: float
+    ref_price: Optional[float]
+    submitted_ts: int
+    strict: bool = False
+    risk_events: List["RiskEvent"] = field(default_factory=list)  # type: ignore[name-defined]
+    cancel_reason: Optional[str] = None
+
+
+@dataclass
+class _NextBarSnapshot:
+    ts_open: Optional[int] = None
+    timeframe_ms: Optional[int] = None
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
+
+
+@dataclass
 class _VolSeriesState:
     values: Deque[float] = field(default_factory=deque)
     sum: float = 0.0
@@ -838,6 +863,26 @@ class ExecutionSimulator:
         self._intrabar_debug_logged: int = 0
         self._trade_cost_debug_logged: int = 0
         self._trade_cost_debug_limit: int = 100
+        self._entry_mode: str = "default"
+        self._strict_open_fill: bool = False
+        self._clip_next_bar: bool = True
+        self._pending_next_open: Dict[str, PendingOrderState] = {}
+        self._next_open_ready_trades: List[ExecTrade] = []
+        self._next_open_ready_fee_total: float = 0.0
+        self._next_open_ready_risk_events: List[RiskEvent] = []  # type: ignore[name-defined]
+        self._next_open_ready_status: Optional[str] = None
+        self._next_open_ready_reason: Optional[Mapping[str, Any]] = None
+        self._next_open_cancelled: List[int] = []
+        self._next_open_cancelled_reasons: Dict[int, str] = {}
+        self._next_open_new_orders: List[int] = []
+        self._next_open_snapshot: Optional[_NextBarSnapshot] = None
+        self._next_open_last_flush_ts: Optional[int] = None
+        self._next_open_expected_ts: Optional[int] = None
+        self._next_open_metrics: Dict[str, int] = {
+            "submitted": 0,
+            "filled": 0,
+            "cancelled": 0,
+        }
 
         def _convert_to_plain_mapping(obj: Any) -> Dict[str, Any]:
             if isinstance(obj, Mapping):
@@ -1306,6 +1351,10 @@ class ExecutionSimulator:
             if rc_exec is not None:
                 exec_cfg_sources.append(rc_exec)
 
+        entry_mode_cfg: Any = None
+        clip_enabled_cfg: Any = None
+        strict_open_cfg: Any = None
+
         for cfg_src in exec_cfg_sources:
             payload: Dict[str, Any] = {}
             if isinstance(cfg_src, Mapping):
@@ -1329,6 +1378,20 @@ class ExecutionSimulator:
                     payload = {}
             if payload:
                 self._execution_intrabar_cfg.update(payload)
+                if entry_mode_cfg is None and "entry_mode" in payload:
+                    entry_mode_cfg = payload.get("entry_mode")
+                clip_payload = payload.get("clip_to_bar")
+                if clip_payload is not None:
+                    clip_map = _convert_to_plain_mapping(clip_payload)
+                    if clip_map:
+                        if clip_enabled_cfg is None and "enabled" in clip_map:
+                            clip_enabled_cfg = self._bool_from_any(
+                                clip_map.get("enabled")
+                            )
+                        if strict_open_cfg is None and "strict_open_fill" in clip_map:
+                            strict_open_cfg = self._bool_from_any(
+                                clip_map.get("strict_open_fill")
+                            )
             _update_bar_capacity_cfg(payload)
             _update_bar_capacity_cfg(cfg_src)
 
@@ -1416,6 +1479,12 @@ class ExecutionSimulator:
                 if dbg_val < 0:
                     dbg_val = 0
                 self._intrabar_debug_max_logs = dbg_val
+
+        self._configure_entry_mode(
+            entry_mode_cfg,
+            clip_to_bar=clip_enabled_cfg,
+            strict_open_fill=strict_open_cfg,
+        )
 
         if run_config is not None:
             timing_cfg = getattr(run_config, "timing", None)
@@ -1724,10 +1793,35 @@ class ExecutionSimulator:
         self._liq_val_sum: List[float] = [0.0] * HOURS_IN_WEEK
         self._liq_count: List[int] = [0] * HOURS_IN_WEEK
 
+        # Ensure that any explicitly requested execution profile or parameters
+        # are applied consistently at construction time.  ``set_execution_profile``
+        # is responsible for normalising the profile name (e.g. uppercasing) and
+        # configuring the entry mode, including the new ``next_bar_open`` flow.
+        # When no profile/params are supplied this call is effectively a
+        # no-op beyond reasserting defaults.
+        if execution_profile is not None or execution_params is not None:
+            profile_arg = self.execution_profile or str(execution_profile or "")
+            self.set_execution_profile(profile_arg, self.execution_params)
+
     def set_execution_profile(self, profile: str, params: dict | None = None) -> None:
         """Установить профиль исполнения и параметры."""
         self.execution_profile = str(profile).upper()
         self.execution_params = dict(params or {})
+        params_map = dict(self.execution_params)
+        entry_mode_param = params_map.get("entry_mode")
+        if entry_mode_param is None and self.execution_profile == "MKT_OPEN_NEXT_H1":
+            entry_mode_param = "next_bar_open"
+        clip_cfg = params_map.get("clip_to_bar")
+        clip_enabled_param: Optional[bool] = None
+        strict_param: Optional[bool] = None
+        if isinstance(clip_cfg, Mapping):
+            clip_enabled_param = self._bool_from_any(clip_cfg.get("enabled"))
+            strict_param = self._bool_from_any(clip_cfg.get("strict_open_fill"))
+        self._configure_entry_mode(
+            entry_mode_param,
+            clip_to_bar=clip_enabled_param,
+            strict_open_fill=strict_param,
+        )
         if self.execution_profile == "LIMIT_MID_BPS":
             self.limit_offset_bps = float(
                 self.execution_params.get("limit_offset_bps", 0.0)
@@ -1735,6 +1829,574 @@ class ExecutionSimulator:
             self.ttl_steps = int(self.execution_params.get("ttl_steps", 0))
             self.tif = str(self.execution_params.get("tif", "GTC")).upper()
         self._build_executor()
+
+    def _configure_entry_mode(
+        self,
+        entry_mode: Any,
+        *,
+        clip_to_bar: Optional[bool] = None,
+        strict_open_fill: Optional[bool] = None,
+    ) -> None:
+        mode_value = entry_mode
+        if hasattr(mode_value, "value"):
+            try:
+                mode_value = getattr(mode_value, "value")
+            except Exception:
+                pass
+        if mode_value is None:
+            mode_text = self._entry_mode or "default"
+        else:
+            try:
+                mode_text = str(mode_value)
+            except Exception:
+                mode_text = "default"
+        normalized = mode_text.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"strict", "limit"}:
+            resolved = "strict"
+        elif normalized in {
+            "next_bar_open",
+            "next_bar",
+            "next_open",
+            "open_next",
+            "next_bar_entry",
+        }:
+            resolved = "next_bar_open"
+        elif normalized in {"default", "market", "legacy", ""}:
+            resolved = "default"
+        else:
+            resolved = self._entry_mode or "default"
+        prev_mode = getattr(self, "_entry_mode", "default")
+        object.__setattr__(self, "_entry_mode", resolved)
+        if clip_to_bar is not None:
+            object.__setattr__(self, "_clip_next_bar", bool(clip_to_bar))
+        if strict_open_fill is not None:
+            object.__setattr__(self, "_strict_open_fill", bool(strict_open_fill))
+        if self._entry_mode == "next_bar_open" and self._strict_open_fill:
+            object.__setattr__(self, "_intrabar_price_model", None)
+        if prev_mode != self._entry_mode:
+            if self._entry_mode != "next_bar_open":
+                self._pending_next_open.clear()
+                self._next_open_ready_trades.clear()
+                object.__setattr__(self, "_next_open_ready_fee_total", 0.0)
+                self._next_open_ready_risk_events.clear()
+                self._next_open_cancelled.clear()
+                self._next_open_cancelled_reasons.clear()
+                self._next_open_new_orders.clear()
+                object.__setattr__(self, "_next_open_snapshot", None)
+                object.__setattr__(self, "_next_open_last_flush_ts", None)
+                object.__setattr__(self, "_next_open_expected_ts", None)
+        if self._entry_mode != "next_bar_open":
+            return
+        if not self._clip_next_bar:
+            object.__setattr__(self, "_clip_next_bar", False)
+
+    @staticmethod
+    def _bool_from_any(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return bool(int(value))
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if not text:
+                return None
+            if text in {"1", "true", "yes", "on", "y"}:
+                return True
+            if text in {"0", "false", "no", "off", "n"}:
+                return False
+        return None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        special_entry = {"execution_entry_mode", "_execution_entry_mode"}
+        special_clip = {"clip_to_bar_enabled", "_clip_to_bar_enabled"}
+        special_strict = {
+            "clip_to_bar_strict_open_fill",
+            "_clip_to_bar_strict_open_fill",
+        }
+        if name in special_entry:
+            object.__setattr__(self, name, value)
+            self._configure_entry_mode(value)
+            return
+        if name in special_clip:
+            bool_val = bool(value) if value is not None else False
+            object.__setattr__(self, name, bool_val)
+            self._configure_entry_mode(self._entry_mode, clip_to_bar=bool_val)
+            return
+        if name in special_strict:
+            bool_val = bool(value) if value is not None else False
+            object.__setattr__(self, name, bool_val)
+            self._configure_entry_mode(self._entry_mode, strict_open_fill=bool_val)
+            return
+        object.__setattr__(self, name, value)
+
+    def _update_next_open_context(
+        self,
+        *,
+        ts_ms: Optional[int],
+        bar_open: Optional[float],
+        bar_high: Optional[float],
+        bar_low: Optional[float],
+        bar_close: Optional[float],
+        timeframe_ms: Optional[int],
+    ) -> None:
+        if getattr(self, "_entry_mode", "default") != "next_bar_open":
+            return
+        if ts_ms is None:
+            return
+        prev_snapshot = getattr(self, "_next_open_snapshot", None)
+        prev_expected = getattr(self, "_next_open_expected_ts", None)
+        snapshot = _NextBarSnapshot(
+            ts_open=int(ts_ms),
+            timeframe_ms=(
+                int(timeframe_ms)
+                if timeframe_ms is not None
+                and isinstance(timeframe_ms, (int, float))
+                else None
+            ),
+            open=self._float_or_none(bar_open),
+            high=self._float_or_none(bar_high),
+            low=self._float_or_none(bar_low),
+            close=self._float_or_none(bar_close),
+        )
+        object.__setattr__(self, "_next_open_snapshot", snapshot)
+        timeframe_hint = snapshot.timeframe_ms
+        if timeframe_hint is None:
+            tf_candidates = [
+                getattr(self, "_intrabar_timeframe_ms", None),
+                getattr(self, "_intrabar_config_timeframe_ms", None),
+                getattr(self, "_timing_timeframe_ms", None),
+            ]
+            for candidate in tf_candidates:
+                if candidate is not None:
+                    try:
+                        timeframe_hint = int(candidate)
+                    except (TypeError, ValueError):
+                        timeframe_hint = None
+                    if timeframe_hint is not None and timeframe_hint > 0:
+                        break
+        expected_new: Optional[int] = None
+        if timeframe_hint is not None and timeframe_hint > 0:
+            try:
+                expected_new = next_bar_open_ms(int(ts_ms), int(timeframe_hint))
+            except Exception:
+                expected_new = None
+        object.__setattr__(self, "_next_open_expected_ts", expected_new)
+        if not self._pending_next_open:
+            return
+        ts_val: Optional[int] = None
+        if ts_ms is not None:
+            try:
+                ts_val = int(ts_ms)
+            except (TypeError, ValueError):
+                ts_val = None
+        expected_ts = prev_expected if prev_expected is not None else expected_new
+        should_flush = False
+        if ts_val is not None:
+            if expected_ts is not None:
+                try:
+                    expected_val = int(expected_ts)
+                except (TypeError, ValueError):
+                    expected_val = None
+                else:
+                    if ts_val >= expected_val:
+                        should_flush = True
+            else:
+                prev_ts: Optional[int] = None
+                if prev_snapshot is not None:
+                    try:
+                        prev_ts = (
+                            int(prev_snapshot.ts_open)
+                            if getattr(prev_snapshot, "ts_open", None) is not None
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        prev_ts = None
+                if prev_ts is None or ts_val >= prev_ts:
+                    should_flush = True
+        if not should_flush:
+            return
+        last_flush = getattr(self, "_next_open_last_flush_ts", None)
+        if last_flush is not None and ts_val is not None and last_flush == ts_val:
+            return
+        (
+            trades,
+            cancelled,
+            cancelled_reasons,
+            status,
+            reason,
+            risk_events,
+            fee_total,
+        ) = self._flush_next_open_orders(snapshot)
+        if trades:
+            self._next_open_ready_trades.extend(trades)
+            object.__setattr__(
+                self,
+                "_next_open_ready_fee_total",
+                self._next_open_ready_fee_total + fee_total,
+            )
+            self._next_open_metrics["filled"] = self._next_open_metrics.get("filled", 0) + len(trades)
+        if cancelled:
+            self._next_open_cancelled.extend(cancelled)
+            self._next_open_cancelled_reasons.update(cancelled_reasons)
+            self._next_open_metrics["cancelled"] = self._next_open_metrics.get("cancelled", 0) + len(cancelled)
+        if risk_events:
+            self._next_open_ready_risk_events.extend(risk_events)
+        if status:
+            self._next_open_ready_status = status
+        if reason is not None:
+            self._next_open_ready_reason = reason
+        object.__setattr__(self, "_next_open_last_flush_ts", int(ts_ms))
+
+    def _flush_next_open_orders(
+        self, snapshot: _NextBarSnapshot
+    ) -> Tuple[
+        List[ExecTrade],
+        List[int],
+        Dict[int, str],
+        Optional[str],
+        Optional[Mapping[str, Any]],
+        List["RiskEvent"],
+        float,
+    ]:
+        trades: List[ExecTrade] = []
+        cancelled: List[int] = []
+        cancelled_reasons: Dict[int, str] = {}
+        risk_events: List[RiskEvent] = []  # type: ignore[var-annotated]
+        fee_total = 0.0
+        open_price = self._float_or_none(snapshot.open)
+        high_price = self._float_or_none(snapshot.high)
+        low_price = self._float_or_none(snapshot.low)
+        ts = int(snapshot.ts_open or now_ms())
+        if open_price is None or not math.isfinite(open_price):
+            for state in self._pending_next_open.values():
+                cancelled.append(state.client_order_id)
+                cancelled_reasons[state.client_order_id] = "NO_BAR_OPEN"
+                risk_events.extend(state.risk_events)
+            self._pending_next_open.clear()
+            return trades, cancelled, cancelled_reasons, "CANCELED_NEXT_BAR", {"code": "MISSING_BAR_OPEN"}, risk_events, fee_total
+        cap_base_per_bar = self._reset_bar_capacity_if_needed(ts)
+        cap_enforced = bool(
+            self._bar_cap_base_enabled and cap_base_per_bar is not None and cap_base_per_bar > 0.0
+        )
+        cap_value = float(cap_base_per_bar) if cap_base_per_bar is not None else 0.0
+        symbol_key = str(self.symbol).upper() if self.symbol is not None else ""
+        used_base_now = max(0.0, float(self._used_base_in_bar.get(symbol_key, 0.0)))
+
+        def _clip_price(value: float) -> Tuple[float, bool]:
+            if not self._clip_next_bar:
+                return value, False
+            clipped = float(value)
+            clipped_flag = False
+            if low_price is not None and math.isfinite(low_price) and clipped < low_price:
+                clipped = float(low_price)
+                clipped_flag = True
+            if high_price is not None and math.isfinite(high_price) and clipped > high_price:
+                clipped = float(high_price)
+                clipped_flag = True
+            return clipped, clipped_flag
+
+        for key, state in list(self._pending_next_open.items()):
+            requested_qty = max(0.0, float(state.qty))
+            qty_total = requested_qty
+            risk_events.extend(state.risk_events)
+            if qty_total <= 0.0:
+                cancelled.append(state.client_order_id)
+                cancelled_reasons[state.client_order_id] = "ZERO_QTY"
+                self._pending_next_open.pop(key, None)
+                continue
+            if cap_enforced:
+                remaining = max(0.0, cap_value - used_base_now)
+                if remaining <= 0.0:
+                    cancelled.append(state.client_order_id)
+                    cancelled_reasons[state.client_order_id] = "BAR_CAPACITY_BASE"
+                    self._pending_next_open.pop(key, None)
+                    continue
+                if qty_total > remaining:
+                    qty_total = remaining
+            sbps = self._last_spread_bps
+            vf = self._last_vol_factor
+            liq = self._last_liquidity
+            filled_price = float(open_price)
+            slip_bps = 0.0
+            if not state.strict:
+                trade_cost = None
+                fallback_slip = None
+                if self.slippage_cfg is not None:
+                    trade_cost = self._compute_dynamic_trade_cost_bps(
+                        side=state.side,
+                        qty=qty_total,
+                        spread_bps=sbps,
+                        base_price=open_price,
+                        liquidity=liq,
+                        vol_factor=vf,
+                        order_seq=None,
+                        bar_close_ts=getattr(self, "_last_bar_close_ts", None),
+                    )
+                    if trade_cost is None and estimate_slippage_bps is not None:
+                        fallback_slip = estimate_slippage_bps(
+                            spread_bps=sbps,
+                            size=qty_total,
+                            liquidity=liq,
+                            vol_factor=vf,
+                            cfg=self.slippage_cfg,
+                        )
+                if trade_cost is not None:
+                    slip_bps = self._trade_cost_expected_bps(trade_cost)
+                    filled_price = self._apply_trade_cost_price(
+                        side=state.side,
+                        pre_slip_price=open_price,
+                        trade_cost=trade_cost,
+                    )
+                    self._log_trade_cost_debug(
+                        context="next_open",
+                        side=state.side,
+                        qty=qty_total,
+                        pre_price=open_price,
+                        final_price=filled_price,
+                        trade_cost=trade_cost,
+                    )
+                elif fallback_slip is not None:
+                    blended = self._blend_expected_spread(taker_bps=fallback_slip)
+                    if blended is None:
+                        slip_bps = float(fallback_slip)
+                    else:
+                        slip_bps = float(blended)
+                    if apply_slippage_price is not None:
+                        filled_price = apply_slippage_price(
+                            side=state.side,
+                            quote_price=open_price,
+                            slippage_bps=slip_bps,
+                        )
+            clipped_price, _ = _clip_price(float(filled_price))
+            filled_price = float(clipped_price)
+            used_before = used_base_now
+            used_after = used_before + qty_total
+            if cap_enforced:
+                self._used_base_in_bar[symbol_key] = used_after
+                used_base_now = used_after
+            trade_notional = filled_price * qty_total
+            fee = self._compute_trade_fee(
+                side=state.side,
+                price=filled_price,
+                qty=qty_total,
+                liquidity="taker",
+            )
+            fee_total += float(fee)
+            self.fees_cum += float(fee)
+            _ = self._apply_trade_inventory(side=state.side, price=filled_price, qty=qty_total)
+            tif = str(getattr(state.proto, "tif", "GTC")).upper()
+            ttl_steps = int(getattr(state.proto, "ttl_steps", 0))
+            fill_ratio = 1.0
+            exec_status = "FILLED"
+            capacity_reason = ""
+            if requested_qty > 0.0:
+                fill_ratio = max(0.0, min(1.0, qty_total / requested_qty))
+                if fill_ratio + 1e-12 < 1.0 and cap_enforced:
+                    capacity_reason = "BAR_CAPACITY_BASE"
+                    exec_status = "PARTIAL"
+            trade = ExecTrade(
+                ts=ts,
+                side=state.side,
+                price=filled_price,
+                qty=qty_total,
+                notional=trade_notional,
+                liquidity="taker",
+                proto_type=int(getattr(ActionType, "MARKET", ActionType.MARKET)),
+                client_order_id=state.client_order_id,
+                fee=float(fee),
+                slippage_bps=float(slip_bps),
+                spread_bps=self._report_spread_bps(sbps),
+                latency_ms=0,
+                latency_spike=False,
+                tif=tif,
+                ttl_steps=ttl_steps,
+                used_base_before=used_before,
+                used_base_after=used_after,
+                cap_base_per_bar=cap_value if cap_enforced else 0.0,
+                fill_ratio=float(fill_ratio),
+                capacity_reason=capacity_reason,
+                exec_status=exec_status,
+            )
+            trades.append(trade)
+            self._trade_log.append(trade)
+            self._pending_next_open.pop(key, None)
+        status = "FILLED_NEXT_BAR" if trades else ("CANCELED_NEXT_BAR" if cancelled else None)
+        reason_payload = None
+        if status == "FILLED_NEXT_BAR":
+            reason_payload = {"code": "NEXT_BAR_OPEN"}
+        elif status == "CANCELED_NEXT_BAR" and not reason_payload:
+            reason_payload = {"code": "NEXT_BAR_CANCELLED"}
+        return trades, cancelled, cancelled_reasons, status, reason_payload, risk_events, fee_total
+
+    def _pop_ready_next_open(
+        self,
+        *,
+        now_ts: Optional[int],
+        ref_price: Optional[float],
+        bid: Optional[float],
+        ask: Optional[float],
+        bar_open: Optional[float],
+        bar_high: Optional[float],
+        bar_low: Optional[float],
+        bar_close: Optional[float],
+    ) -> ExecReport:
+        ts = int(now_ts or now_ms())
+        trades = list(self._next_open_ready_trades)
+        self._next_open_ready_trades.clear()
+        fee_total = float(self._next_open_ready_fee_total)
+        object.__setattr__(self, "_next_open_ready_fee_total", 0.0)
+        cancelled_ids = list(self._next_open_cancelled)
+        cancelled_reasons = dict(self._next_open_cancelled_reasons)
+        self._next_open_cancelled.clear()
+        self._next_open_cancelled_reasons = {}
+        new_order_ids = list(self._next_open_new_orders)
+        self._next_open_new_orders = []
+        risk_events_all: List[RiskEvent] = list(self._next_open_ready_risk_events)  # type: ignore[var-annotated]
+        self._next_open_ready_risk_events.clear()
+        status = self._next_open_ready_status
+        reason = self._next_open_ready_reason
+        self._next_open_ready_status = None
+        self._next_open_ready_reason = None
+        pending_before = bool(self._pending_next_open)
+        cancelled_before = len(cancelled_ids)
+        expected_ts = getattr(self, "_next_open_expected_ts", None)
+        last_flush = getattr(self, "_next_open_last_flush_ts", None)
+        if (
+            self._pending_next_open
+            and expected_ts is not None
+            and ts >= int(expected_ts)
+            and (last_flush is None or int(last_flush) < int(expected_ts))
+        ):
+            for state in list(self._pending_next_open.values()):
+                cancelled_ids.append(state.client_order_id)
+                cancelled_reasons[state.client_order_id] = "NO_BAR_DATA"
+                risk_events_all.extend(state.risk_events)
+            self._pending_next_open.clear()
+            status = "CANCELED_NEXT_BAR"
+            reason = {"code": "MISSING_NEXT_BAR"}
+            added_cancelled = len(cancelled_ids) - cancelled_before
+            if added_cancelled > 0:
+                self._next_open_metrics["cancelled"] = (
+                    self._next_open_metrics.get("cancelled", 0) + added_cancelled
+                )
+        if self._pending_next_open and not trades:
+            if status is None:
+                status = "PENDING_NEXT_BAR"
+            if reason is None:
+                reason = {"code": "WAITING_NEXT_BAR"}
+        ref = self._float_or_none(ref_price)
+        funding_cashflow = 0.0
+        funding_events_list: List[FundingEvent] = []  # type: ignore[var-annotated]
+        if self.funding is not None:
+            try:
+                fc, events = self.funding.accrue(
+                    position_qty=self.position_qty, mark_price=ref, now_ts_ms=ts
+                )
+            except Exception:
+                fc, events = (0.0, [])
+            funding_cashflow = float(fc)
+            funding_events_list = list(events or [])
+            self.funding_cum += float(fc)
+        mark_p = self._mark_price(ref=ref, bid=bid, ask=ask)
+        unrl = self._unrealized_pnl(mark_p)
+        eq = float(self.realized_pnl_cum + unrl - self.fees_cum + self.funding_cum)
+        if self._trade_log:
+            r_chk, u_chk = self._recompute_pnl_from_log(mark_p)
+            assert abs((self.realized_pnl_cum + unrl) - (r_chk + u_chk)) < 1e-6
+        risk_paused_until = 0
+        if self.risk is not None:
+            try:
+                self.risk.on_mark(ts_ms=ts, equity=eq)
+                risk_events_all.extend(self.risk.pop_events())
+                risk_paused_until = int(self.risk.paused_until_ms)
+            except Exception:
+                pass
+        lat_stats = {"p50_ms": 0.0, "p95_ms": 0.0, "timeout_rate": 0.0}
+        if self.latency is not None:
+            try:
+                lat_stats = self.latency.stats()
+                self.latency.reset_stats()
+            except Exception:
+                lat_stats = {"p50_ms": 0.0, "p95_ms": 0.0, "timeout_rate": 0.0}
+        report = SimStepReport(
+            trades=trades,
+            cancelled_ids=cancelled_ids,
+            cancelled_reasons=cancelled_reasons,
+            new_order_ids=new_order_ids,
+            fee_total=fee_total,
+            new_order_pos=[],
+            funding_cashflow=funding_cashflow,
+            funding_events=funding_events_list,  # type: ignore
+            position_qty=float(self.position_qty),
+            realized_pnl=float(self.realized_pnl_cum),
+            unrealized_pnl=float(unrl),
+            equity=float(eq),
+            mark_price=float(mark_p if mark_p is not None else 0.0),
+            bid=float(bid) if bid is not None else 0.0,
+            ask=float(ask) if ask is not None else 0.0,
+            mtm_price=float(mark_p if mark_p is not None else 0.0),
+            risk_events=risk_events_all,  # type: ignore
+            risk_paused_until_ms=int(risk_paused_until),
+            spread_bps=self._last_spread_bps,
+            vol_factor=self._last_vol_factor,
+            liquidity=self._last_liquidity,
+            latency_p50_ms=float(lat_stats.get("p50_ms", 0.0)),
+            latency_p95_ms=float(lat_stats.get("p95_ms", 0.0)),
+            latency_timeout_ratio=float(lat_stats.get("timeout_rate", 0.0)),
+            execution_profile=str(getattr(self, "execution_profile", "")),
+            vol_raw=self._last_vol_raw,
+        )
+        if trades:
+            last_trade = trades[-1]
+            report.cap_base_per_bar = float(getattr(last_trade, "cap_base_per_bar", 0.0))
+            report.used_base_before = float(getattr(last_trade, "used_base_before", 0.0))
+            report.used_base_after = float(getattr(last_trade, "used_base_after", 0.0))
+            report.fill_ratio = float(getattr(last_trade, "fill_ratio", 0.0))
+            report.capacity_reason = str(getattr(last_trade, "capacity_reason", "") or "")
+            report.exec_status = str(getattr(last_trade, "exec_status", "") or "")
+        else:
+            report.cap_base_per_bar = 0.0
+            report.used_base_before = 0.0
+            report.used_base_after = 0.0
+            report.fill_ratio = 0.0
+            report.capacity_reason = ""
+            report.exec_status = ""
+        maker_share_val, expected_fee_bps, expected_spread_bps, cost_components = (
+            self._expected_cost_snapshot()
+        )
+        if maker_share_val is not None:
+            try:
+                report.maker_share = float(maker_share_val)
+            except (TypeError, ValueError):
+                report.maker_share = 0.0
+        if expected_fee_bps is not None:
+            try:
+                report.expected_fee_bps = float(expected_fee_bps)
+            except (TypeError, ValueError):
+                report.expected_fee_bps = 0.0
+        report.expected_spread_bps = (
+            float(expected_spread_bps)
+            if expected_spread_bps is not None
+            else None
+        )
+        report.expected_cost_components = dict(cost_components)
+        if not status:
+            if pending_before:
+                status = "PENDING_NEXT_BAR"
+                if reason is None:
+                    reason = {"code": "WAITING_NEXT_BAR"}
+            elif cancelled_ids and not trades:
+                status = "CANCELED_NEXT_BAR"
+                if reason is None:
+                    reason = {"code": "NEXT_BAR_CANCELLED"}
+        if status is not None:
+            report.status = str(status)
+        if reason is not None:
+            report.reason = reason
+        return report
 
     def set_quantizer(self, q: Quantizer) -> None:
         self.quantizer = q
@@ -4279,6 +4941,15 @@ class ExecutionSimulator:
             if price_tick is not None and qty_tick is not None:
                 self._vwap_on_tick(int(ts_ms), float(price_tick), float(qty_tick))
 
+        self._update_next_open_context(
+            ts_ms=ts_ms,
+            bar_open=bar_open_val,
+            bar_high=bar_high_val,
+            bar_low=bar_low_val,
+            bar_close=bar_close_val,
+            timeframe_ms=None,
+        )
+
     def set_intrabar_timeframe_ms(self, timeframe_ms: Optional[int]) -> None:
         """Сохранить продолжительность бара для intrabar-логики."""
         if timeframe_ms is None:
@@ -5223,7 +5894,85 @@ class ExecutionSimulator:
         return float(realized), float(unrl)
 
     # ---- очередь ----
+    def _submit_next_open(
+        self, proto: ActionProto, now_ts: Optional[int] = None
+    ) -> int:
+        cid = self._next_cli_id
+        self._next_cli_id += 1
+        atype = int(getattr(proto, "action_type", ActionType.HOLD))
+        if atype != ActionType.MARKET:
+            return cid
+        vol = float(getattr(proto, "volume_frac", 0.0))
+        side = "BUY" if vol > 0.0 else "SELL"
+        qty_raw = abs(vol)
+        if qty_raw <= 0.0:
+            return cid
+        ts = int(now_ts or now_ms())
+        ref_market = self._float_or_none(self._last_ref_price)
+        if ref_market is None or ref_market <= 0.0:
+            self._next_open_cancelled.append(cid)
+            self._next_open_cancelled_reasons[cid] = "NO_REF_PRICE"
+            return cid
+        qty_total, rejection = self._apply_filters_market(side, qty_raw, ref_market)
+        if rejection is not None or qty_total <= 0.0:
+            self._log_filter_rejection(rejection)
+            if rejection is not None:
+                self._record_filter_rejection(rejection, "MARKET")
+            reason_code = rejection.code if rejection is not None else "FILTER"
+            self._next_open_cancelled.append(cid)
+            self._next_open_cancelled_reasons[cid] = str(reason_code)
+            return cid
+        qty_total = float(qty_total)
+        risk_events_local: List[RiskEvent] = []  # type: ignore[var-annotated]
+        if self.risk is not None:
+            portfolio_total = None
+            try:
+                ref_val = float(ref_market)
+            except (TypeError, ValueError):
+                ref_val = None
+            else:
+                if math.isfinite(ref_val) and ref_val > 0.0:
+                    portfolio_total = abs(float(self.position_qty)) * ref_val
+            adj_qty = self.risk.pre_trade_adjust(
+                ts_ms=ts,
+                side=side,
+                intended_qty=qty_total,
+                price=ref_market,
+                position_qty=self.position_qty,
+                total_notional=portfolio_total,
+            )
+            qty_total = float(adj_qty)
+            for event in self.risk.pop_events():
+                if isinstance(event, RiskEvent):  # type: ignore[name-defined]
+                    risk_events_local.append(event)
+        if qty_total <= 0.0:
+            self._next_open_cancelled.append(cid)
+            self._next_open_cancelled_reasons[cid] = "RISK"
+            return cid
+        side_key = side.upper()
+        if self._pending_next_open:
+            for prev_state in list(self._pending_next_open.values()):
+                self._next_open_cancelled.append(prev_state.client_order_id)
+                self._next_open_cancelled_reasons[prev_state.client_order_id] = "SUPERSEDED"
+            self._pending_next_open.clear()
+        state = PendingOrderState(
+            proto=proto,
+            client_order_id=cid,
+            side=side_key,
+            qty=qty_total,
+            ref_price=ref_market,
+            submitted_ts=ts,
+            strict=bool(self._strict_open_fill),
+            risk_events=list(risk_events_local),
+        )
+        self._pending_next_open[side_key] = state
+        self._next_open_metrics["submitted"] = self._next_open_metrics.get("submitted", 0) + 1
+        self._next_open_new_orders.append(cid)
+        return cid
+
     def submit(self, proto: ActionProto, now_ts: Optional[int] = None) -> int:
+        if getattr(self, "_entry_mode", "default") == "next_bar_open":
+            return self._submit_next_open(proto, now_ts=now_ts)
         cid = self._next_cli_id
         self._next_cli_id += 1
         lat_ms = 0
@@ -6128,6 +6877,17 @@ class ExecutionSimulator:
     def pop_ready(
         self, now_ts: Optional[int] = None, ref_price: Optional[float] = None
     ) -> ExecReport:
+        if getattr(self, "_entry_mode", "default") == "next_bar_open":
+            return self._pop_ready_next_open(
+                now_ts=now_ts,
+                ref_price=ref_price,
+                bid=self._last_bid,
+                ask=self._last_ask,
+                bar_open=self._last_bar_open,
+                bar_high=self._last_bar_high,
+                bar_low=self._last_bar_low,
+                bar_close=self._last_bar_close,
+            )
         """Execute all actions whose latency has elapsed.
 
         The execution path is completely deterministic: child order timing and
@@ -7436,6 +8196,14 @@ class ExecutionSimulator:
             self._vwap_on_tick(int(ts), float(price_tick), float(qty_tick))
         if self._last_vol_factor is not None:
             self._update_latency_volatility(int(ts), self._last_vol_factor, metrics)
+        self._update_next_open_context(
+            ts_ms=ts,
+            bar_open=bar_open_val,
+            bar_high=bar_high_val,
+            bar_low=bar_low_val,
+            bar_close=bar_close_val,
+            timeframe_ms=bar_timeframe_ms,
+        )
 
         # --- инициализация аккамуляторов ---
         trades: list[ExecTrade] = []
@@ -7448,6 +8216,22 @@ class ExecutionSimulator:
 
         # --- обработать действия ---
         acts = list(actions or [])
+        if getattr(self, "_entry_mode", "default") == "next_bar_open":
+            for atype, proto in acts:
+                if str(
+                    getattr(atype, "name", getattr(atype, "__class__", type(atype)))
+                ).upper().endswith("MARKET") or str(atype).upper().endswith("MARKET"):
+                    self._submit_next_open(proto, now_ts=ts)
+            return self._pop_ready_next_open(
+                now_ts=ts,
+                ref_price=ref_price,
+                bid=self._last_bid,
+                ask=self._last_ask,
+                bar_open=bar_open_val,
+                bar_high=bar_high_val,
+                bar_low=bar_low_val,
+                bar_close=bar_close_val,
+            )
         if str(getattr(self, "execution_profile", "")).upper() == "LIMIT_MID_BPS":
             for atype, proto in acts:
                 if str(
