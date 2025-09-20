@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
+import signal
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +35,9 @@ from binance_public import BinancePublicClient
 from services.rest_budget import RestBudgetSession
 from utils.time import hour_of_week
 from utils_time import parse_time_to_ms
+
+
+logger = logging.getLogger(__name__)
 
 
 INTERVAL_TO_MS: Mapping[str, int] = {
@@ -81,7 +86,28 @@ class FetchTask:
             "interval": self.interval,
             "start_ms": int(self.start_ms),
             "bars": int(self.bars),
+            "end_ms": int(self.end_exclusive()),
         }
+
+    def end_exclusive(self) -> int:
+        step_ms = INTERVAL_TO_MS[self.interval]
+        return int(self.start_ms + max(self.bars, 0) * step_ms)
+
+    def range_tuple(self) -> Tuple[int, int]:
+        return int(self.start_ms), self.end_exclusive()
+
+
+@dataclass(frozen=True)
+class PlannedFetch:
+    task: FetchTask
+    cached: bool = False
+
+
+@dataclass
+class PlanResult:
+    tasks: List[PlannedFetch]
+    datasets: Dict[Tuple[str, str], pd.DataFrame]
+    summary: Dict[str, Any]
 
 
 def load_ohlcv(path: Path) -> pd.DataFrame:
@@ -182,10 +208,10 @@ def _load_rest_config(path: str | None) -> dict[str, Any]:
         with Path(path).open("r", encoding="utf-8") as f:
             payload = yaml.safe_load(f) or {}
     except FileNotFoundError:
-        print(f"[WARN] rest budget config not found: {path}")
+        logger.warning("rest budget config not found: %s", path)
         return {}
     except Exception as exc:  # pragma: no cover - defensive
-        print(f"[WARN] failed to load rest budget config {path}: {exc}")
+        logger.warning("failed to load rest budget config %s: %s", path, exc)
         return {}
     if not isinstance(payload, MutableMapping):
         return {}
@@ -334,59 +360,182 @@ def _merge_frames(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFram
     return merged
 
 
-def _prepare_tasks(
+def _infer_chunk_days(step_ms: int, limit: int) -> int:
+    bars = max(int(limit), 1)
+    try:
+        span_ms = int(step_ms) * bars
+    except OverflowError:  # pragma: no cover - defensive
+        span_ms = step_ms
+    approx_days = span_ms // 86_400_000
+    return max(int(approx_days), 1)
+
+
+def _build_kline_request(
+    client: BinancePublicClient,
     *,
+    market: str,
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int,
+) -> Tuple[str, Dict[str, Any]]:
+    if market == "spot":
+        base = client.e.spot_base
+        path = "/api/v3/klines"
+    else:
+        base = client.e.futures_base
+        path = "/fapi/v1/klines"
+    url = f"{base}{path}"
+    params: Dict[str, Any] = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": int(limit),
+    }
+    params["startTime"] = int(start_ms)
+    params["endTime"] = int(end_ms)
+    return url, params
+
+
+def _plan_fetch_tasks(
+    session: RestBudgetSession,
+    client: BinancePublicClient,
+    *,
+    market: str,
     symbols: Sequence[str],
     intervals: Sequence[str],
     start_ms: int,
     end_ms: int,
     limit: int,
     cache_dir: Path,
-) -> Tuple[List[FetchTask], Dict[Tuple[str, str], pd.DataFrame], Dict[str, Any]]:
+) -> PlanResult:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    tasks: List[FetchTask] = []
+    planned: List[PlannedFetch] = []
     datasets: Dict[Tuple[str, str], pd.DataFrame] = {}
     summary: Dict[str, Any] = {
         "total_missing": 0,
+        "total_tasks": 0,
+        "cached_tasks": 0,
+        "cached_bars": 0,
         "per_pair": {},
+        "symbols": list(symbols),
+        "intervals": list(intervals),
+        "start_ms": int(start_ms),
+        "end_ms": int(end_ms),
+        "limit": int(limit),
+        "market": market,
     }
+
+    window_ranges: Dict[str, List[Tuple[int, int]]] = {}
+    aligned_bounds: Dict[str, Tuple[int, int]] = {}
+    for interval in intervals:
+        step_ms = INTERVAL_TO_MS[interval]
+        aligned_start, aligned_end = _align_range(start_ms, end_ms, step_ms)
+        aligned_bounds[interval] = (aligned_start, aligned_end)
+        chunk_days = _infer_chunk_days(step_ms, limit)
+        windows = split_time_range(aligned_start, aligned_end, chunk_days=chunk_days)
+        ranges: List[Tuple[int, int]] = []
+        for win_start, win_stop in windows:
+            if win_stop <= win_start:
+                continue
+            inclusive_end = win_stop - step_ms
+            if inclusive_end < win_start:
+                continue
+            ranges.append((win_start, inclusive_end))
+        if not ranges:
+            candidate_end = aligned_end - step_ms
+            if candidate_end >= aligned_start:
+                ranges.append((aligned_start, candidate_end))
+        window_ranges[interval] = ranges
+
     for symbol in symbols:
         for interval in intervals:
             step_ms = INTERVAL_TO_MS[interval]
-            aligned_start, aligned_end = _align_range(start_ms, end_ms, step_ms)
+            aligned_start, aligned_end = aligned_bounds[interval]
             cache_path = _cache_path(cache_dir, symbol, interval)
             df = _load_cache(cache_path)
             datasets[(symbol, interval)] = df
+
             ranges = list(
                 _iter_missing_ranges(
                     df, start_ms=aligned_start, end_ms=aligned_end, step_ms=step_ms
                 )
             )
+            chunked_ranges: List[Tuple[int, int]] = []
+            for rng_start, rng_end in ranges:
+                for win_start, win_end in window_ranges[interval]:
+                    if rng_end < win_start or rng_start > win_end:
+                        continue
+                    chunk_start = max(rng_start, win_start)
+                    chunk_end = min(rng_end, win_end)
+                    if chunk_end < chunk_start:
+                        continue
+                    chunked_ranges.append((chunk_start, chunk_end))
+
             pair_tasks = _split_ranges_to_tasks(
-                ranges,
+                chunked_ranges,
                 step_ms=step_ms,
                 limit=limit,
                 symbol=symbol,
                 interval=interval,
             )
-            tasks.extend(pair_tasks)
-            missing_bars = sum(task.bars for task in pair_tasks)
-            existing_bars = int(
-                ((df["ts_ms"].astype("int64") >= aligned_start)
-                & (df["ts_ms"].astype("int64") < aligned_end)).sum()
-            )
+
+            pair_missing = sum(task.bars for task in pair_tasks)
+            if not df.empty:
+                ts_series = pd.to_numeric(df["ts_ms"], errors="coerce").dropna().astype("int64")
+                mask = (ts_series >= aligned_start) & (ts_series < aligned_end)
+                existing_bars = int(mask.sum())
+            else:
+                existing_bars = 0
+
+            cached_tasks = 0
+            cached_bars = 0
+            for task in pair_tasks:
+                end_exclusive = task.end_exclusive()
+                if end_exclusive <= task.start_ms:
+                    planned.append(PlannedFetch(task, cached=False))
+                    continue
+                end_param = end_exclusive - 1
+                url, params = _build_kline_request(
+                    client,
+                    market=market,
+                    symbol=task.symbol,
+                    interval=task.interval,
+                    start_ms=task.start_ms,
+                    end_ms=end_param,
+                    limit=min(limit, task.bars),
+                )
+                cached = False
+                try:
+                    cached = bool(
+                        session.is_cached(
+                            url,
+                            method="GET",
+                            params=params,
+                            budget="klines",
+                        )
+                    )
+                except Exception:  # pragma: no cover - cache inspection best effort
+                    cached = False
+                if cached:
+                    cached_tasks += 1
+                    cached_bars += task.bars
+                planned.append(PlannedFetch(task, cached=cached))
+
+            summary["total_missing"] += pair_missing
+            summary["total_tasks"] += len(pair_tasks)
+            summary["cached_tasks"] += cached_tasks
+            summary["cached_bars"] += cached_bars
             summary["per_pair"][f"{symbol}_{interval}"] = {
-                "missing_bars": missing_bars,
+                "missing_bars": pair_missing,
                 "existing_bars": existing_bars,
+                "tasks": len(pair_tasks),
+                "cached_tasks": cached_tasks,
+                "cached_bars": cached_bars,
             }
-            summary["total_missing"] += missing_bars
-    tasks.sort(key=lambda t: (t.symbol, t.interval, t.start_ms))
-    summary["total_tasks"] = len(tasks)
-    summary["symbols"] = list(symbols)
-    summary["intervals"] = list(intervals)
-    summary["start_ms"] = int(start_ms)
-    summary["end_ms"] = int(end_ms)
-    return tasks, datasets, summary
+
+    planned.sort(key=lambda item: (item.task.symbol, item.task.interval, item.task.start_ms))
+    return PlanResult(planned, datasets, summary)
 
 
 def _determine_start_index(
@@ -421,17 +570,56 @@ def _save_checkpoint(
     signature: Mapping[str, Any],
     current: FetchTask | None = None,
     completed: bool = False,
-) -> None:
+    last_symbol: str | None = None,
+    last_range: Tuple[int, int] | None = None,
+) -> Dict[str, Any]:
+    safe_total = max(int(total), 0)
+    safe_position = int(position)
+    if safe_total > 0:
+        safe_position = max(0, min(safe_position, safe_total))
+    else:
+        safe_position = max(0, safe_position)
+
     payload: dict[str, Any] = {
-        "task_index": int(position),
-        "tasks_total": int(total),
+        "task_index": safe_position,
+        "tasks_total": safe_total,
         "signature": dict(signature),
     }
+
+    normalized_symbol = last_symbol.strip().upper() if isinstance(last_symbol, str) else None
+    normalized_range = tuple(int(x) for x in last_range) if last_range is not None else None
+
     if current is not None:
         payload["current"] = current.to_checkpoint()
+        normalized_symbol = current.symbol.upper()
+        normalized_range = current.range_tuple()
+
     if completed:
         payload["completed"] = True
-    session.save_checkpoint(payload)
+
+    if safe_total <= 0:
+        progress_pct = 100.0 if completed else None
+    else:
+        progress_pct = (safe_position / safe_total) * 100.0
+        if completed:
+            progress_pct = 100.0
+    if progress_pct is not None:
+        payload["progress_pct"] = progress_pct
+
+    session.save_checkpoint(
+        payload,
+        last_symbol=normalized_symbol,
+        last_range=list(normalized_range) if normalized_range is not None else None,
+        progress_pct=progress_pct,
+    )
+
+    return {
+        "payload": payload,
+        "last_symbol": normalized_symbol,
+        "last_range": list(normalized_range) if normalized_range is not None else None,
+        "progress_pct": progress_pct,
+        "completed": completed,
+    }
 
 
 def _write_dataset(path: Path, df: pd.DataFrame) -> None:
@@ -477,6 +665,9 @@ def _plan_description(summary: Mapping[str, Any]) -> str:
 
 
 def main() -> None:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
     parser = argparse.ArgumentParser(description="Extract liquidity seasonality multipliers")
     parser.add_argument(
         "--data",
@@ -549,7 +740,7 @@ def main() -> None:
 
     fetch_enabled = bool(args.start and args.end)
     if not fetch_enabled and args.dry_run:
-        print("[WARN] --dry-run ignored because --start/--end are not provided")
+        logger.warning("--dry-run ignored because --start/--end are not provided")
         args.dry_run = False
 
     symbols = _resolve_symbols(args.symbols)
@@ -565,31 +756,11 @@ def main() -> None:
         if not symbols:
             raise SystemExit("No symbols provided and default universe is empty")
 
-        tasks, datasets, summary = _prepare_tasks(
-            symbols=symbols,
-            intervals=intervals,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            limit=max(1, args.limit),
-            cache_dir=cache_dir,
-        )
+        limit = max(1, int(args.limit))
+        checkpoint_path = args.checkpoint_path.strip() or str(cache_dir / "checkpoint.json")
 
-        plan_signature = {
-            "symbols": list(symbols),
-            "intervals": list(intervals),
-            "start_ms": int(start_ms),
-            "end_ms": int(end_ms),
-            "limit": int(max(1, args.limit)),
-            "market": args.market,
-        }
-
-        if args.dry_run:
-            print(_plan_description(summary))
-            return
-
-        checkpoint_path = args.checkpoint_path.strip()
-        if not checkpoint_path:
-            checkpoint_path = str(cache_dir / "checkpoint.json")
+        datasets: Dict[Tuple[str, str], pd.DataFrame] = {}
+        session_stats: Dict[str, Any] | None = None
 
         with RestBudgetSession(
             rest_cfg,
@@ -599,22 +770,56 @@ def main() -> None:
             resume_from_checkpoint=args.resume_from_checkpoint,
         ) as session:
             client = BinancePublicClient(session=session)
-
-            def _fetch_single(t: FetchTask) -> pd.DataFrame:
-                step_ms = INTERVAL_TO_MS[t.interval]
-                end_exclusive = t.start_ms + t.bars * step_ms
-                end_param = end_exclusive - 1
-                raw = client.get_klines(
-                    market=args.market,
-                    symbol=t.symbol,
-                    interval=t.interval,
-                    start_ms=t.start_ms,
-                    end_ms=end_param,
-                    limit=min(args.limit, t.bars),
-                )
-                return _raw_to_df(raw, t.symbol, t.interval)
-
             try:
+                plan_result = _plan_fetch_tasks(
+                    session,
+                    client,
+                    market=args.market,
+                    symbols=symbols,
+                    intervals=intervals,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    limit=limit,
+                    cache_dir=cache_dir,
+                )
+                summary = plan_result.summary
+                logger.info("Fetch plan summary: %s", _plan_description(summary))
+
+                if args.dry_run:
+                    session_stats = session.stats()
+                    logger.info(
+                        "REST session stats: %s",
+                        json.dumps(session_stats, ensure_ascii=False),
+                    )
+                    return
+
+                datasets = plan_result.datasets
+                tasks_with_meta = plan_result.tasks
+                tasks = [item.task for item in tasks_with_meta]
+
+                plan_signature = {
+                    "symbols": list(symbols),
+                    "intervals": list(intervals),
+                    "start_ms": int(start_ms),
+                    "end_ms": int(end_ms),
+                    "limit": int(limit),
+                    "market": args.market,
+                }
+
+                def _fetch_single(t: FetchTask) -> pd.DataFrame:
+                    step_ms = INTERVAL_TO_MS[t.interval]
+                    end_exclusive = t.start_ms + t.bars * step_ms
+                    end_param = end_exclusive - 1
+                    raw = client.get_klines(
+                        market=args.market,
+                        symbol=t.symbol,
+                        interval=t.interval,
+                        start_ms=t.start_ms,
+                        end_ms=end_param,
+                        limit=min(limit, t.bars),
+                    )
+                    return _raw_to_df(raw, t.symbol, t.interval)
+
                 checkpoint_payload = (
                     session.load_checkpoint() if args.resume_from_checkpoint else None
                 )
@@ -623,64 +828,139 @@ def main() -> None:
                     signature=plan_signature,
                     total_tasks=len(tasks),
                 )
-                batch_pref = int(getattr(session, "batch_size", 0) or 0)
-                worker_pref = int(getattr(session, "max_workers", 0) or 0)
-                batch_size = max(1, batch_pref or worker_pref or 1)
 
-                _save_checkpoint(
+                last_symbol_saved: str | None = None
+                last_range_saved: Tuple[int, int] | None = None
+                if isinstance(checkpoint_payload, Mapping):
+                    symbol_candidate = checkpoint_payload.get("last_symbol")
+                    if isinstance(symbol_candidate, str):
+                        symbol_text = symbol_candidate.strip().upper()
+                        last_symbol_saved = symbol_text or None
+                    range_candidate = checkpoint_payload.get("last_range")
+                    if isinstance(range_candidate, Sequence) and len(range_candidate) == 2:
+                        try:
+                            start_range = int(range_candidate[0])
+                            end_range = int(range_candidate[1])
+                        except (TypeError, ValueError):
+                            last_range_saved = None
+                        else:
+                            last_range_saved = (start_range, end_range)
+
+                checkpoint_state: Dict[str, Any] = {
+                    "payload": None,
+                    "last_symbol": last_symbol_saved,
+                    "last_range": list(last_range_saved) if last_range_saved is not None else None,
+                    "progress_pct": None,
+                    "completed": False,
+                }
+
+                state = _save_checkpoint(
                     session,
                     position=start_index,
                     total=len(tasks),
                     signature=plan_signature,
+                    last_symbol=last_symbol_saved,
+                    last_range=last_range_saved,
                 )
+                checkpoint_state.update(state)
 
-                idx = start_index
-                while idx < len(tasks):
-                    batch = tasks[idx : idx + batch_size]
-                    futures: List[Tuple[int, FetchTask, Future[pd.DataFrame]]] = []
-                    for offset, task in enumerate(batch):
-                        absolute = idx + offset
-                        _save_checkpoint(
-                            session,
-                            position=absolute,
-                            total=len(tasks),
-                            signature=plan_signature,
-                            current=task,
+                handled_signals: Dict[int, Any] = {}
+
+                def _handle_signal(signum: int, frame: Any | None) -> None:  # pragma: no cover - signal handler
+                    payload = checkpoint_state.get("payload")
+                    if isinstance(payload, Mapping):
+                        session.save_checkpoint(
+                            payload,
+                            last_symbol=checkpoint_state.get("last_symbol"),
+                            last_range=checkpoint_state.get("last_range"),
+                            progress_pct=checkpoint_state.get("progress_pct"),
                         )
-                        future = session.submit(_fetch_single, task)
-                        futures.append((absolute, task, future))
+                    if signum == getattr(signal, "SIGINT", None):
+                        raise KeyboardInterrupt
+                    raise SystemExit(128 + int(signum))
 
-                    for absolute, task, future in futures:
+                for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+                    if sig is None:
+                        continue
+                    try:
+                        handled_signals[sig] = signal.getsignal(sig)
+                        signal.signal(sig, _handle_signal)
+                    except (ValueError, OSError):  # pragma: no cover - platform dependent
+                        handled_signals.pop(sig, None)
+
+                try:
+                    batch_pref = int(getattr(session, "batch_size", 0) or 0)
+                    worker_pref = int(getattr(session, "max_workers", 0) or 0)
+                    batch_size = max(1, batch_pref or worker_pref or 1)
+
+                    idx = start_index
+                    last_symbol_seen = last_symbol_saved
+                    last_range_seen = last_range_saved
+
+                    while idx < len(tasks):
+                        batch = tasks[idx : idx + batch_size]
+                        futures: List[Tuple[int, FetchTask, Future[pd.DataFrame]]] = []
+                        for offset, task in enumerate(batch):
+                            absolute = idx + offset
+                            state = _save_checkpoint(
+                                session,
+                                position=absolute,
+                                total=len(tasks),
+                                signature=plan_signature,
+                                current=task,
+                            )
+                            checkpoint_state.update(state)
+                            future = session.submit(_fetch_single, task)
+                            futures.append((absolute, task, future))
+
+                        for absolute, task, future in futures:
+                            try:
+                                fetched = future.result()
+                            except Exception as exc:  # pragma: no cover - network dependent
+                                raise RuntimeError(
+                                    f"Failed to fetch {task.symbol} {task.interval} starting at {task.start_ms}: {exc}"
+                                ) from exc
+                            key = (task.symbol, task.interval)
+                            datasets[key] = _merge_frames(datasets[key], fetched)
+                            cache_path = _cache_path(cache_dir, task.symbol, task.interval)
+                            _write_dataset(cache_path, datasets[key])
+                            last_symbol_seen = task.symbol.upper()
+                            last_range_seen = task.range_tuple()
+                            state = _save_checkpoint(
+                                session,
+                                position=absolute + 1,
+                                total=len(tasks),
+                                signature=plan_signature,
+                                last_symbol=last_symbol_seen,
+                                last_range=last_range_seen,
+                            )
+                            checkpoint_state.update(state)
+
+                        idx += max(len(batch), 1)
+
+                    final_state = _save_checkpoint(
+                        session,
+                        position=len(tasks),
+                        total=len(tasks),
+                        signature=plan_signature,
+                        last_symbol=last_symbol_seen,
+                        last_range=last_range_seen,
+                        completed=True,
+                    )
+                    checkpoint_state.update(final_state)
+                finally:
+                    for sig, previous in handled_signals.items():
                         try:
-                            fetched = future.result()
-                        except Exception as exc:  # pragma: no cover - network dependent
-                            raise RuntimeError(
-                                f"Failed to fetch {task.symbol} {task.interval} starting at {task.start_ms}: {exc}"
-                            ) from exc
-                        key = (task.symbol, task.interval)
-                        datasets[key] = _merge_frames(datasets[key], fetched)
-                        cache_path = _cache_path(cache_dir, task.symbol, task.interval)
-                        _write_dataset(cache_path, datasets[key])
-                        _save_checkpoint(
-                            session,
-                            position=absolute + 1,
-                            total=len(tasks),
-                            signature=plan_signature,
-                            current=task,
-                        )
+                            signal.signal(sig, previous)
+                        except (ValueError, OSError):  # pragma: no cover - platform dependent
+                            pass
 
-                    idx += max(len(batch), 1)
-
-                _save_checkpoint(
-                    session,
-                    position=len(tasks),
-                    total=len(tasks),
-                    signature=plan_signature,
-                    completed=True,
-                )
-
+                session_stats = session.stats()
             finally:
                 client.close()
+
+        if session_stats is not None:
+            logger.info("REST session stats: %s", json.dumps(session_stats, ensure_ascii=False))
 
         df = _combine_datasets(datasets, start_ms=start_ms, end_ms=end_ms)
         if df.empty:
@@ -703,8 +983,8 @@ def main() -> None:
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(out_data, f, indent=2)
     checksum_path = write_checksum(data_path)
-    print(f"Saved liquidity seasonality to {args.out}")
-    print(f"Input data checksum written to {checksum_path}")
+    logger.info("Saved liquidity seasonality to %s", args.out)
+    logger.info("Input data checksum written to %s", checksum_path)
 
 
 if __name__ == "__main__":
