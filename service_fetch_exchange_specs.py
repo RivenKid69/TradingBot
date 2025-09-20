@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import signal
+import tempfile
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, Sequence
+from typing import Any, Callable, Dict, Iterable, Mapping, Sequence
 
 from services.rest_budget import RestBudgetSession, iter_time_chunks
 
@@ -63,6 +65,41 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(d, exist_ok=True)
 
 
+def _write_json_atomic(path: str, payload: Mapping[str, Any] | Sequence[Any]) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".exchange_specs_", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            json.dump(payload, tmp_file, ensure_ascii=False, indent=2)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
+def _normalize_symbol_list(raw: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in raw:
+        text = str(item).strip().upper()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ordered
+
+
+def _iter_symbol_chunks(symbols: Sequence[str], chunk_size: int) -> Iterable[list[str]]:
+    step = max(1, int(chunk_size) if chunk_size else 1)
+    for idx in range(0, len(symbols), step):
+        yield list(symbols[idx : idx + step])
+
+
 def run(
     market: str = "futures",
     symbols: Sequence[str] | str | None = None,
@@ -75,6 +112,7 @@ def run(
     session: RestBudgetSession | None = None,
     checkpoint_listener: Callable[[Dict[str, Any]], None] | None = None,
     install_signal_handlers: bool = True,
+    chunk_size: int | None = None,
 ) -> Dict[str, Dict[str, float]]:
     """Fetch Binance exchangeInfo and store minimal specs JSON.
 
@@ -91,24 +129,85 @@ def run(
     """
 
     session = session or RestBudgetSession({})
-    data = session.get(
-        _endpoint(market),
-        endpoint=_endpoint_key(market),
-        budget="exchangeInfo",
-        tokens=10.0,
-    )
-    if not isinstance(data, dict):
-        raise RuntimeError("Unexpected exchangeInfo response")
 
     if isinstance(symbols, str):
         requested = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     else:
         requested = [s.strip().upper() for s in (symbols or []) if s.strip()]
 
+    checkpoint = session.load_checkpoint()
+    restored_order: list[str] = []
+    if isinstance(checkpoint, Mapping):
+        saved = checkpoint.get("order") or checkpoint.get("symbols")
+        if isinstance(saved, Sequence):
+            restored_order = _normalize_symbol_list(saved)
+
+    chunk_size_val = max(1, int(chunk_size)) if chunk_size and chunk_size > 0 else None
+
+    if requested:
+        target_symbols = _normalize_symbol_list(requested)
+    elif restored_order:
+        target_symbols = restored_order
+    else:
+        target_symbols = []
+
+    url = _endpoint(market)
+    endpoint_key = _endpoint_key(market)
+    exchange_chunks_total = 1
+
+    symbol_entries: list[Mapping[str, Any]] = []
+    if target_symbols and chunk_size_val:
+        exchange_chunks_total = max(1, math.ceil(len(target_symbols) / chunk_size_val))
+        for chunk in _iter_symbol_chunks(target_symbols, chunk_size_val):
+            params: dict[str, Any]
+            if len(chunk) == 1:
+                params = {"symbol": chunk[0]}
+            else:
+                params = {"symbols": json.dumps(chunk)}
+            cached = session.is_cached(
+                url,
+                params=params,
+                endpoint=endpoint_key,
+                budget="exchangeInfo",
+            )
+            if cached:
+                print(f"Using cached exchangeInfo chunk of {len(chunk)} symbols")
+            payload = session.get(
+                url,
+                params=params,
+                endpoint=endpoint_key,
+                budget="exchangeInfo",
+                tokens=10.0,
+            )
+            if isinstance(payload, Mapping):
+                items = payload.get("symbols")
+                if isinstance(items, list):
+                    symbol_entries.extend(
+                        [item for item in items if isinstance(item, Mapping)]
+                    )
+    else:
+        payload = session.get(
+            url,
+            endpoint=endpoint_key,
+            budget="exchangeInfo",
+            tokens=10.0,
+        )
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("Unexpected exchangeInfo response")
+        items = payload.get("symbols")
+        if isinstance(items, list):
+            symbol_entries = [item for item in items if isinstance(item, Mapping)]
+
+        # When the full snapshot was fetched chunking degenerates to a single request.
+        exchange_chunks_total = 1
+
+    if not symbol_entries:
+        raise RuntimeError("No exchangeInfo symbols returned")
+
     by_symbol: Dict[str, Dict[str, float]] = {}
-    for s in data.get("symbols", []):
+    for s in symbol_entries:
         sym = str(s.get("symbol", "")).upper()
-        if requested and sym not in requested:
+        if target_symbols and sym not in target_symbols:
             continue
         tick_size = 0.0
         step_size = 0.0
@@ -123,16 +222,20 @@ def run(
                 min_notional = float(
                     f.get("minNotional", f.get("notional", 0.0))
                 )
+        if not sym:
+            continue
         by_symbol[sym] = {
             "tickSize": tick_size,
             "stepSize": step_size,
             "minNotional": min_notional,
         }
 
-    symbols_order = list(by_symbol.keys())
+    if target_symbols:
+        symbols_order = [sym for sym in target_symbols if sym in by_symbol]
+    else:
+        symbols_order = list(by_symbol.keys())
     avg_quote_vol: Dict[str, float] = {}
 
-    checkpoint = session.load_checkpoint()
     start_index = 0
     if isinstance(checkpoint, dict) and symbols_order:
         saved_order = checkpoint.get("order") or checkpoint.get("symbols")
@@ -164,22 +267,63 @@ def run(
         rng = random.Random()
         rng.shuffle(symbols_order)
 
-    handled_signals: dict[int, Any] = {}
-    checkpoint_payload: Dict[str, Any] = {}
+    end_ms = int(time.time() * 1000)
+    window_ms = max(1, int(days)) * 86_400_000
+    start_ms = end_ms - window_ms
+    limit = max(1, min(int(days), 1500))
 
-    def _update_checkpoint(position: int, *, symbol: str | None = None, completed: bool = False) -> None:
+    chunk_windows = list(iter_time_chunks(start_ms, end_ms, chunk_days=30))
+    if not chunk_windows:
+        chunk_windows = [(start_ms, end_ms)]
+
+    handled_signals: dict[int, Any] = {}
+    checkpoint_payload: Dict[str, Any] | None = None
+    state: Dict[str, Any] = {
+        "position": start_index,
+        "last_symbol": symbols_order[start_index - 1] if start_index > 0 else None,
+    }
+
+    batch_pref = int(getattr(session, "batch_size", 0) or 0)
+    worker_pref = int(getattr(session, "max_workers", 0) or 0)
+    batch_size = max(1, batch_pref or worker_pref or 1)
+    total_symbols = len(symbols_order)
+    batches_total = max(1, math.ceil(total_symbols / batch_size)) if total_symbols else 1
+
+    def _save_checkpoint(position: int, *, last_symbol: str | None, completed: bool = False) -> None:
         nonlocal checkpoint_payload
+        state["position"] = position
+        state["last_symbol"] = last_symbol
+        done_pct = 100.0 if completed else (100.0 * position / total_symbols if total_symbols else 0.0)
+        batches_completed = 0
+        if total_symbols:
+            batches_completed = min(batches_total, math.ceil(position / batch_size))
+        if completed:
+            batches_completed = batches_total
         payload: Dict[str, Any] = {
             "order": symbols_order,
             "position": position,
             "avg_quote_vol": {k: float(v) for k, v in avg_quote_vol.items()},
+            "chunks": {
+                "completed": batches_completed,
+                "total": batches_total,
+                "size": batch_size,
+            },
+            "exchange_info": {
+                "chunk_size": chunk_size_val or len(symbols_order) or 0,
+                "chunks_total": exchange_chunks_total,
+            },
+            "done_pct": done_pct,
+            "last_symbol": last_symbol,
         }
-        if symbol is not None:
-            payload["current_symbol"] = symbol
         if completed:
             payload["completed"] = True
         checkpoint_payload = payload
-        session.save_checkpoint(checkpoint_payload)
+        session.save_checkpoint(
+            payload,
+            last_symbol=last_symbol,
+            last_range=(start_ms, end_ms),
+            progress_pct=done_pct,
+        )
         if checkpoint_listener is not None:
             try:
                 checkpoint_listener(dict(payload))
@@ -187,12 +331,12 @@ def run(
                 pass
 
     def _handle_signal(signum: int, frame: Any | None) -> None:  # pragma: no cover - signal handler
-        session.save_checkpoint(checkpoint_payload)
+        _save_checkpoint(state["position"], last_symbol=state.get("last_symbol"))
         if signum == getattr(signal, "SIGINT", None):
             raise KeyboardInterrupt
         raise SystemExit(128 + signum)
 
-    _update_checkpoint(start_index)
+    _save_checkpoint(start_index, last_symbol=state.get("last_symbol"), completed=total_symbols == 0)
 
     if install_signal_handlers:
         for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
@@ -203,19 +347,6 @@ def run(
                 signal.signal(sig, _handle_signal)
             except (ValueError, OSError):  # pragma: no cover - platform dependent
                 handled_signals.pop(sig, None)
-
-    end_ms = int(time.time() * 1000)
-    window_ms = max(1, int(days)) * 86_400_000
-    start_ms = end_ms - window_ms
-    limit = max(1, min(int(days), 1500))
-
-    chunk_windows = list(iter_time_chunks(start_ms, end_ms, chunk_days=30))
-    if not chunk_windows:
-        chunk_windows = [(start_ms, end_ms)]
-
-    batch_pref = int(getattr(session, "batch_size", 0) or 0)
-    worker_pref = int(getattr(session, "max_workers", 0) or 0)
-    batch_size = max(1, batch_pref or worker_pref or 1)
 
     def _fetch_symbol_volume(symbol: str) -> float:
         sym = str(symbol).upper()
@@ -262,15 +393,22 @@ def run(
             futures: list[tuple[int, str, Any]] = []
             for offset, sym in enumerate(batch):
                 absolute = idx + offset
-                _update_checkpoint(absolute, symbol=sym)
                 future = session.submit(_fetch_symbol_volume, sym)
                 futures.append((absolute, sym, future))
+            last_symbol = None
+            last_position = idx
             for absolute, sym, future in futures:
                 try:
                     avg_quote_vol[sym] = float(future.result())
                 except Exception:
                     avg_quote_vol[sym] = 0.0
-                _update_checkpoint(absolute + 1, symbol=sym)
+                last_symbol = sym
+                last_position = absolute + 1
+            _save_checkpoint(
+                last_position,
+                last_symbol=last_symbol,
+                completed=last_position >= total_symbols,
+            )
             idx += max(len(batch), 1)
     finally:
         if install_signal_handlers:
@@ -280,7 +418,7 @@ def run(
                 except (ValueError, OSError):  # pragma: no cover - platform dependent
                     pass
 
-    _update_checkpoint(len(symbols_order), completed=True)
+    _save_checkpoint(len(symbols_order), last_symbol=symbols_order[-1] if symbols_order else None, completed=True)
 
     if volume_threshold > 0.0:
         before = len(by_symbol)
@@ -296,8 +434,7 @@ def run(
 
     if volume_out:
         _ensure_dir(volume_out)
-        with open(volume_out, "w", encoding="utf-8") as f:
-            json.dump(avg_quote_vol, f, ensure_ascii=False, indent=2)
+        _write_json_atomic(volume_out, avg_quote_vol)
 
     meta = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
@@ -307,8 +444,7 @@ def run(
     payload = {"metadata": meta, "specs": by_symbol}
 
     _ensure_dir(out)
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    _write_json_atomic(out, payload)
     print(f"Saved {len(by_symbol)} symbols to {out}")
     return by_symbol
 

@@ -6,7 +6,7 @@ import os
 import signal
 import sys
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Tuple
 
 from service_fetch_exchange_specs import _endpoint_key, _klines_endpoint_key, run
 from services.rest_budget import RestBudgetSession, iter_time_chunks
@@ -70,7 +70,12 @@ def _resolve_symbols_for_plan(
     return [], "unknown"
 
 
-def _plan_dry_run(args: argparse.Namespace, session: RestBudgetSession) -> dict[str, Any]:
+def _plan_dry_run(
+    args: argparse.Namespace,
+    session: RestBudgetSession,
+    *,
+    chunk_size: int,
+) -> dict[str, Any]:
     symbols, source = _resolve_symbols_for_plan(args, session)
     now_ms = int(time.time() * 1000)
     window_ms = max(1, int(args.days)) * 86_400_000
@@ -82,7 +87,10 @@ def _plan_dry_run(args: argparse.Namespace, session: RestBudgetSession) -> dict[
 
     exchange_key = _endpoint_key(args.market)
     klines_key = _klines_endpoint_key(args.market)
-    session.plan_request(exchange_key, count=1, tokens=1.0)
+    chunk_size = max(1, int(chunk_size) if chunk_size else 1)
+    symbol_count = len(symbols)
+    exchange_calls = 1 if symbol_count == 0 else (symbol_count + chunk_size - 1) // chunk_size
+    session.plan_request(exchange_key, count=exchange_calls, tokens=10.0)
 
     klines_requests = len(symbols) * chunk_count
     if klines_requests > 0:
@@ -92,16 +100,114 @@ def _plan_dry_run(args: argparse.Namespace, session: RestBudgetSession) -> dict[
         "mode": "dry_run",
         "symbol_count": len(symbols),
         "symbol_source": source,
+        "chunk_size": chunk_size,
+        "exchange_chunks": exchange_calls,
         "chunk_windows": chunk_count,
         "requests": {
-            exchange_key: 1,
+            exchange_key: exchange_calls,
             klines_key: klines_requests,
         },
-        "total_requests": 1 + klines_requests,
+        "total_requests": exchange_calls + klines_requests,
     }
     if not symbols and source == "unknown":
         plan["notes"] = "symbol list unavailable; provide --symbols or checkpoint"
     return plan
+
+
+def _load_rest_budget_config(path: str) -> Tuple[dict[str, Any], dict[str, Any]]:
+    config_path = path.strip()
+    if not config_path:
+        return {}, {}
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            payload = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        print(f"[WARN] rest budget config not found: {config_path}", file=sys.stderr)
+        return {}, {}
+    except Exception as exc:  # pragma: no cover - defensive CLI warning
+        print(
+            f"[WARN] failed to load rest budget config {config_path}: {exc}",
+            file=sys.stderr,
+        )
+        return {}, {}
+
+    if not isinstance(payload, Mapping):
+        print(
+            f"[WARN] rest budget config {config_path} must be a mapping, got {type(payload).__name__}",
+            file=sys.stderr,
+        )
+        return {}, {}
+
+    rest_cfg_raw: Mapping[str, Any] | None = None
+    if isinstance(payload.get("rest_budget"), Mapping):
+        rest_cfg_raw = payload["rest_budget"]  # type: ignore[index]
+    else:
+        rest_cfg_raw = payload
+
+    script_cfg: dict[str, Any] = {}
+    if isinstance(payload.get("fetch_exchange_specs"), Mapping):
+        script_cfg = dict(payload["fetch_exchange_specs"])  # type: ignore[index]
+    elif isinstance(rest_cfg_raw, Mapping) and isinstance(
+        rest_cfg_raw.get("fetch_exchange_specs"), Mapping
+    ):
+        script_cfg = dict(rest_cfg_raw["fetch_exchange_specs"])  # type: ignore[index]
+
+    rest_session_cfg: Mapping[str, Any] | None = None
+    if isinstance(rest_cfg_raw, Mapping):
+        if isinstance(rest_cfg_raw.get("session"), Mapping):
+            rest_session_cfg = rest_cfg_raw["session"]  # type: ignore[index]
+        elif isinstance(rest_cfg_raw.get("config"), Mapping):
+            rest_session_cfg = rest_cfg_raw["config"]  # type: ignore[index]
+        else:
+            rest_session_cfg = rest_cfg_raw
+
+    return (dict(rest_session_cfg) if rest_session_cfg else {}), script_cfg
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    return number
+
+
+def _resolve_chunk_size(script_cfg: Mapping[str, Any], rest_cfg: Mapping[str, Any]) -> int:
+    candidates: list[Any] = []
+    if "chunk_size" in script_cfg:
+        candidates.append(script_cfg["chunk_size"])
+    if "max_symbols_per_request" in script_cfg:
+        candidates.append(script_cfg["max_symbols_per_request"])
+    chunk_cfg = script_cfg.get("chunk")
+    if isinstance(chunk_cfg, Mapping):
+        candidates.extend(
+            [
+                chunk_cfg.get("size"),
+                chunk_cfg.get("chunk_size"),
+                chunk_cfg.get("max_symbols"),
+            ]
+        )
+
+    endpoints_cfg = rest_cfg.get("endpoints")
+    if isinstance(endpoints_cfg, Mapping):
+        exchange_cfg = endpoints_cfg.get("exchangeInfo")
+        if isinstance(exchange_cfg, Mapping):
+            candidates.extend(
+                [
+                    exchange_cfg.get("chunk_size"),
+                    exchange_cfg.get("max_symbols"),
+                    exchange_cfg.get("max_symbols_per_request"),
+                ]
+            )
+
+    for value in candidates:
+        number = _coerce_positive_int(value)
+        if number is not None:
+            return number
+    return 200
 
 
 def main() -> None:
@@ -167,23 +273,8 @@ def main() -> None:
             "enabled": True,
             "resume_from_checkpoint": resume_flag,
         }
-    rest_cfg: dict[str, object] = {}
-    config_path = str(args.rest_budget_config or "").strip()
-    if config_path:
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                loaded = yaml.safe_load(f) or {}
-            if isinstance(loaded, dict):
-                rest_cfg = dict(loaded)
-            else:
-                raise TypeError("rest budget config must be a mapping")
-        except FileNotFoundError:
-            print(f"[WARN] rest budget config not found: {config_path}", file=sys.stderr)
-        except Exception as exc:  # pragma: no cover - best effort CLI warning
-            print(
-                f"[WARN] failed to load rest budget config {config_path}: {exc}",
-                file=sys.stderr,
-            )
+    rest_cfg, script_cfg = _load_rest_budget_config(str(args.rest_budget_config or ""))
+    chunk_size = _resolve_chunk_size(script_cfg, rest_cfg)
 
     if checkpoint_cfg:
         existing = rest_cfg.get("checkpoint")
@@ -196,7 +287,7 @@ def main() -> None:
 
     with RestBudgetSession(rest_cfg) as session:
         if args.dry_run:
-            plan = _plan_dry_run(args, session)
+            plan = _plan_dry_run(args, session, chunk_size=chunk_size)
             stats = session.stats()
             stats["plan"] = plan
             print(json.dumps(stats, ensure_ascii=False))
@@ -237,6 +328,7 @@ def main() -> None:
                 session=session,
                 checkpoint_listener=_checkpoint_listener,
                 install_signal_handlers=False,
+                chunk_size=chunk_size,
             )
         finally:
             for sig, handler in handled_signals.items():
