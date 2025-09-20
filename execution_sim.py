@@ -22,7 +22,7 @@ ExecutionSimulator v2
 Важно: этот модуль НЕ добавляет комиссии и слиппедж — они будут подключены отдельными шагами.
 """
 
-from collections import deque
+from collections import Counter as CounterSummary, deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping, Callable, Deque
 import hashlib
@@ -96,6 +96,12 @@ _FILLS_CAPPED_BASE_RATIO = Summary(
     "fills_capped_base_ratio",
     "Fill ratio observed when base bar capacity limits execution",
     ["symbol", "capacity_reason", "exec_status"],
+)
+
+_FILTER_REJECTION_COUNTER = Counter(
+    "sim_filter_rejections_total",
+    "Number of simulator orders rejected by exchange filters",
+    ["filter_type"],
 )
 
 try:
@@ -813,6 +819,7 @@ class ExecutionSimulator:
         self._intrabar_debug_logged: int = 0
         self._trade_cost_debug_logged: int = 0
         self._trade_cost_debug_limit: int = 100
+        self._filter_rejection_summary: CounterSummary[str] = CounterSummary()
 
         def _convert_to_plain_mapping(obj: Any) -> Dict[str, Any]:
             if isinstance(obj, Mapping):
@@ -5301,6 +5308,26 @@ class ExecutionSimulator:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Filter rejection: %s", reason)
 
+    def _record_filter_rejection(self, code: Optional[str]) -> None:
+        label = (str(code).strip().upper() if code is not None else "") or "UNKNOWN"
+        try:
+            _FILTER_REJECTION_COUNTER.labels(filter_type=label).inc()
+        except Exception:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Failed to increment filter rejection counter for %s", label, exc_info=True
+                )
+        self._filter_rejection_summary[label] += 1
+
+    def reset_filter_rejection_summary(self) -> None:
+        self._filter_rejection_summary.clear()
+
+    def get_filter_rejection_summary(self, *, reset: bool = False) -> Dict[str, int]:
+        snapshot = {k: int(v) for k, v in self._filter_rejection_summary.items() if int(v) > 0}
+        if reset:
+            self._filter_rejection_summary.clear()
+        return snapshot
+
     def _apply_filters_market(
         self, side: str, qty: float, ref_price: Optional[float]
     ) -> tuple[float, Optional[FilterRejectionReason]]:
@@ -5314,6 +5341,10 @@ class ExecutionSimulator:
         validations_enabled = bool(self.strict_filters and filters is not None)
         reason: Optional[FilterRejectionReason] = None
 
+        def _reject(value: float, cause: FilterRejectionReason) -> tuple[float, Optional[FilterRejectionReason]]:
+            self._record_filter_rejection(cause.code)
+            return value, cause
+
         qty_quantized = float(qty_raw)
         if quantizer is not None:
             try:
@@ -5324,7 +5355,7 @@ class ExecutionSimulator:
                     message="quantize_qty failed",
                     constraint={"error": str(exc), "quantity": qty_raw},
                 )
-                return 0.0, reason
+                return _reject(0.0, reason)
 
         if not validations_enabled or filters is None:
             return qty_quantized, None
@@ -5336,7 +5367,7 @@ class ExecutionSimulator:
                 message="Quantity is not positive",
                 constraint={"quantity": qty_raw},
             )
-            return 0.0, reason
+            return _reject(0.0, reason)
 
         min_qty = filters.min_qty_threshold
         if min_qty > 0.0 and qty_raw + tolerance < min_qty:
@@ -5345,7 +5376,7 @@ class ExecutionSimulator:
                 message="Quantity below minimum",
                 constraint={"min_qty": min_qty, "step": filters.qty_step, "quantity": qty_raw},
             )
-            return 0.0, reason
+            return _reject(0.0, reason)
 
         if filters.qty_max < float("inf") and qty_raw - tolerance > filters.qty_max:
             reason = FilterRejectionReason(
@@ -5353,7 +5384,7 @@ class ExecutionSimulator:
                 message="Quantity above maximum",
                 constraint={"max_qty": filters.qty_max, "quantity": qty_raw},
             )
-            return 0.0, reason
+            return _reject(0.0, reason)
 
         ref_val = self._finite_float(ref_price)
         if ref_val is None or ref_val <= 0.0:
@@ -5363,7 +5394,7 @@ class ExecutionSimulator:
                     message="Reference price unavailable",
                     constraint={"min_notional": filters.min_notional},
                 )
-                return 0.0, reason
+                return _reject(0.0, reason)
             return qty_quantized, None
 
         if filters.min_notional <= 0.0:
@@ -5385,7 +5416,7 @@ class ExecutionSimulator:
                         "quantity": qty_quantized,
                     },
                 )
-                return 0.0, reason
+                return _reject(0.0, reason)
             except Exception as exc:
                 reason = FilterRejectionReason(
                     code="MIN_NOTIONAL",
@@ -5396,7 +5427,7 @@ class ExecutionSimulator:
                         "price": ref_val,
                     },
                 )
-                return 0.0, reason
+                return _reject(0.0, reason)
 
         notional = abs(ref_val * qty_for_notional)
         if not math.isfinite(notional) or notional + tolerance < filters.min_notional:
@@ -5410,7 +5441,7 @@ class ExecutionSimulator:
                     "notional": notional,
                 },
             )
-            return 0.0, reason
+            return _reject(0.0, reason)
 
         return qty_for_notional, None
 
@@ -5429,6 +5460,12 @@ class ExecutionSimulator:
 
         price_quantized = float(price_raw)
         qty_quantized = float(qty_raw)
+
+        def _reject(
+            price_value: float, qty_value: float, cause: FilterRejectionReason
+        ) -> Tuple[float, float, Optional[FilterRejectionReason]]:
+            self._record_filter_rejection(cause.code)
+            return price_value, qty_value, cause
         if quantizer is not None:
             try:
                 price_quantized = float(self.quantizer.quantize_price(self.symbol, price_raw))
@@ -5438,7 +5475,7 @@ class ExecutionSimulator:
                     message="quantize_price failed",
                     constraint={"error": str(exc), "price": price_raw},
                 )
-                return 0.0, 0.0, reason
+                return _reject(0.0, 0.0, reason)
             try:
                 qty_quantized = float(self.quantizer.quantize_qty(self.symbol, qty_raw))
             except Exception as exc:
@@ -5447,7 +5484,7 @@ class ExecutionSimulator:
                     message="quantize_qty failed",
                     constraint={"error": str(exc), "quantity": qty_raw},
                 )
-                return price_quantized, 0.0, reason
+                return _reject(price_quantized, 0.0, reason)
 
         if not validations_enabled or filters is None:
             return price_quantized, qty_quantized, None
@@ -5459,7 +5496,7 @@ class ExecutionSimulator:
                 message="Price is not positive",
                 constraint={"price": price_raw},
             )
-            return 0.0, 0.0, reason
+            return _reject(0.0, 0.0, reason)
 
         if filters.price_min > 0.0 and price_raw + tolerance < filters.price_min:
             reason = FilterRejectionReason(
@@ -5467,7 +5504,7 @@ class ExecutionSimulator:
                 message="Price below minimum",
                 constraint={"min_price": filters.price_min, "price": price_raw},
             )
-            return 0.0, 0.0, reason
+            return _reject(0.0, 0.0, reason)
 
         if math.isfinite(filters.price_max) and filters.price_max > 0.0:
             if price_raw - tolerance > filters.price_max:
@@ -5476,7 +5513,7 @@ class ExecutionSimulator:
                     message="Price above maximum",
                     constraint={"max_price": filters.price_max, "price": price_raw},
                 )
-                return 0.0, 0.0, reason
+                return _reject(0.0, 0.0, reason)
 
         if filters.price_tick > 0.0:
             snapped = math.floor(price_raw / filters.price_tick) * filters.price_tick
@@ -5486,7 +5523,7 @@ class ExecutionSimulator:
                     message="Price not aligned to tick",
                     constraint={"tick": filters.price_tick, "price": price_raw},
                 )
-                return 0.0, 0.0, reason
+                return _reject(0.0, 0.0, reason)
 
         if qty_raw <= 0.0:
             reason = FilterRejectionReason(
@@ -5494,7 +5531,7 @@ class ExecutionSimulator:
                 message="Quantity is not positive",
                 constraint={"quantity": qty_raw},
             )
-            return price_quantized, 0.0, reason
+            return _reject(price_quantized, 0.0, reason)
 
         min_qty = filters.min_qty_threshold
         if min_qty > 0.0 and qty_raw + tolerance < min_qty:
@@ -5503,7 +5540,7 @@ class ExecutionSimulator:
                 message="Quantity below minimum",
                 constraint={"min_qty": min_qty, "step": filters.qty_step, "quantity": qty_raw},
             )
-            return price_quantized, 0.0, reason
+            return _reject(price_quantized, 0.0, reason)
 
         if filters.qty_max < float("inf") and qty_raw - tolerance > filters.qty_max:
             reason = FilterRejectionReason(
@@ -5511,7 +5548,7 @@ class ExecutionSimulator:
                 message="Quantity above maximum",
                 constraint={"max_qty": filters.qty_max, "quantity": qty_raw},
             )
-            return price_quantized, 0.0, reason
+            return _reject(price_quantized, 0.0, reason)
 
         if filters.qty_step > 0.0:
             snapped_qty = math.floor(qty_raw / filters.qty_step) * filters.qty_step
@@ -5521,7 +5558,7 @@ class ExecutionSimulator:
                     message="Quantity not aligned to step",
                     constraint={"step": filters.qty_step, "quantity": qty_raw},
                 )
-                return price_quantized, 0.0, reason
+                return _reject(price_quantized, 0.0, reason)
 
         price_for_notional = price_quantized if price_quantized > 0.0 else price_raw
         if price_for_notional <= 0.0 or not math.isfinite(price_for_notional):
@@ -5530,7 +5567,7 @@ class ExecutionSimulator:
                 message="Effective price is invalid",
                 constraint={"price": price_for_notional},
             )
-            return 0.0, 0.0, reason
+            return _reject(0.0, 0.0, reason)
 
         if filters.min_notional > 0.0:
             qty_for_notional = qty_quantized
@@ -5551,7 +5588,7 @@ class ExecutionSimulator:
                             "quantity": qty_quantized,
                         },
                     )
-                    return price_quantized, 0.0, reason
+                    return _reject(price_quantized, 0.0, reason)
                 except Exception as exc:
                     reason = FilterRejectionReason(
                         code="MIN_NOTIONAL",
@@ -5562,7 +5599,7 @@ class ExecutionSimulator:
                             "price": price_for_notional,
                         },
                     )
-                    return price_quantized, 0.0, reason
+                    return _reject(price_quantized, 0.0, reason)
             notional = abs(price_for_notional * qty_for_notional)
             if not math.isfinite(notional) or notional + tolerance < filters.min_notional:
                 reason = FilterRejectionReason(
@@ -5575,7 +5612,7 @@ class ExecutionSimulator:
                         "notional": notional,
                     },
                 )
-                return price_quantized, 0.0, reason
+                return _reject(price_quantized, 0.0, reason)
             qty_quantized = qty_for_notional
 
         if self.enforce_ppbs:
@@ -5614,7 +5651,7 @@ class ExecutionSimulator:
                             "multiplier_down": filters.multiplier_down,
                         },
                     )
-                    return price_quantized, 0.0, reason
+                    return _reject(price_quantized, 0.0, reason)
 
         return price_quantized, qty_quantized, None
 
@@ -5761,6 +5798,7 @@ class ExecutionSimulator:
                     reason_code = (
                         rejection.code if rejection is not None else "FILTER"
                     )
+                    self._record_filter_rejection(reason_code)
                     _cancel(p.client_order_id, reason_code)
                     continue
 
@@ -6454,6 +6492,7 @@ class ExecutionSimulator:
                     reason_code = (
                         rejection.code if rejection is not None else "FILTER"
                     )
+                    self._record_filter_rejection(reason_code)
                     _cancel(p.client_order_id, reason_code)
                     continue
 
@@ -6990,6 +7029,7 @@ class ExecutionSimulator:
                     reason_code = (
                         rejection.code if rejection is not None else "FILTER"
                     )
+                    self._record_filter_rejection(reason_code)
                     _cancel(cli_id, reason_code)
                     continue
 
