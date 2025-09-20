@@ -122,7 +122,8 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 @dataclass
 class QuantizerConfig:
     path: str
-    strict: bool = True
+    strict_filters: bool = True
+    quantize_mode: str = "inward"
     enforce_percent_price_by_side: bool = True  # передаётся в симулятор как enforce_ppbs
     filters_path: str = ""
     auto_refresh_days: int = 30
@@ -130,6 +131,16 @@ class QuantizerConfig:
 
     def resolved_filters_path(self) -> str:
         return self.filters_path or self.path
+
+    @property
+    def strict(self) -> bool:
+        """Backward compatibility accessor for legacy strict flag."""
+
+        return self.strict_filters
+
+    @strict.setter
+    def strict(self, value: bool) -> None:
+        self.strict_filters = bool(value)
 
 
 @dataclass
@@ -201,6 +212,8 @@ class QuantizerImpl:
         self._filters_raw: Dict[str, Dict[str, Any]] = {}
         self._symbol_filters_map: Dict[str, SymbolFilters] = {}
         self._symbol_filters_view: Mapping[str, SymbolFilters] = MappingProxyType(self._symbol_filters_map)
+        self._filters_metadata: Dict[str, Any] = {}
+        self._filters_metadata_view: Mapping[str, Any] = MappingProxyType(self._filters_metadata)
         self._validation_fallback_warned = False
         filters_path = cfg.resolved_filters_path()
         if not cfg.filters_path:
@@ -256,6 +269,63 @@ class QuantizerImpl:
             missing,
         )
 
+        symbol_count = len(filters or {})
+        filters_mtime = _file_mtime(filters_path)
+        metadata_payload: Dict[str, Any] = {
+            "path": filters_path,
+            "symbol_count": symbol_count,
+            "missing": bool(missing),
+            "stale": bool(stale),
+        }
+        if age_days is not None:
+            try:
+                metadata_payload["age_days"] = float(age_days)
+            except (TypeError, ValueError):
+                pass
+        if filters_mtime is not None:
+            try:
+                metadata_payload["mtime"] = float(filters_mtime)
+                metadata_payload["mtime_iso"] = datetime.fromtimestamp(
+                    float(filters_mtime), tz=timezone.utc
+                ).isoformat()
+            except Exception:
+                metadata_payload["mtime"] = float(filters_mtime)
+        if size_bytes is not None:
+            try:
+                metadata_payload["size_bytes"] = int(size_bytes)
+            except (TypeError, ValueError):
+                pass
+        if sha256 is not None:
+            metadata_payload["sha256"] = sha256
+        if meta_dict:
+            try:
+                metadata_payload["source"] = dict(meta_dict)
+            except Exception:
+                metadata_payload["source"] = meta_dict
+
+        self._filters_metadata.clear()
+        self._filters_metadata.update(metadata_payload)
+        strict_active = bool(self.cfg.strict_filters and symbol_count > 0)
+        enforce_active = bool(
+            self.cfg.enforce_percent_price_by_side and symbol_count > 0
+        )
+        enriched_metadata = self._refresh_runtime_metadata(
+            strict_active=strict_active,
+            enforce_active=enforce_active,
+        )
+        mtime_repr = (
+            enriched_metadata.get("mtime_iso")
+            or enriched_metadata.get("mtime")
+            or "n/a"
+        )
+        logger.info(
+            "Quantizer filters metadata: path=%s mtime=%s symbols=%s strict_filters_active=%s",
+            filters_path,
+            mtime_repr,
+            symbol_count,
+            enriched_metadata.get("strict_filters_active", False),
+        )
+
         age = float(age_days) if age_days is not None else float("nan")
         try:
             monitoring.filters_age_days.set(age)
@@ -276,7 +346,7 @@ class QuantizerImpl:
             return
 
         self._filters_raw = dict(filters)
-        self._quantizer = Quantizer(filters, strict=bool(cfg.strict))
+        self._quantizer = Quantizer(filters, strict=bool(cfg.strict_filters))
         filters_map = getattr(self._quantizer, "_filters", None)
         if isinstance(filters_map, dict):
             self._symbol_filters_map.clear()
@@ -289,6 +359,10 @@ class QuantizerImpl:
     @property
     def symbol_filters(self) -> Mapping[str, SymbolFilters]:
         return self._symbol_filters_view
+
+    @property
+    def filters_metadata(self) -> Mapping[str, Any]:
+        return self._filters_metadata_view
 
     def validate_order(
         self,
@@ -367,18 +441,68 @@ class QuantizerImpl:
         except Exception:
             pass
 
-        if self._quantizer is not None:
+        quantizer = self._quantizer
+        if quantizer is not None:
             try:
-                setattr(sim, "quantizer", self._quantizer)
+                setattr(sim, "quantizer", quantizer)
             except Exception:
                 pass
 
+        filters_payload: Optional[Dict[str, Dict[str, Any]]] = None
+        if self._filters_raw:
+            filters_payload = dict(self._filters_raw)
+
+        strict_active = bool(self.cfg.strict_filters and filters_payload is not None)
+        enforce_active = bool(
+            self.cfg.enforce_percent_price_by_side and filters_payload is not None
+        )
+        metadata_view = self._refresh_runtime_metadata(
+            strict_active=strict_active,
+            enforce_active=enforce_active,
+        )
+        metadata_for_sim = dict(metadata_view) if metadata_view else {}
+
+        try:
+            setattr(sim, "quantize_mode", str(self.cfg.quantize_mode))
+        except Exception:
+            pass
+        if metadata_for_sim:
+            try:
+                setattr(sim, "quantizer_metadata", dict(metadata_for_sim))
+            except Exception:
+                pass
+
+        attach_api = getattr(sim, "attach_quantizer", None)
+        if callable(attach_api):
+            try:
+                attach_api(
+                    quantizer=quantizer,
+                    filters=filters_payload,
+                    strict_filters=strict_active,
+                    enforce_ppbs=enforce_active,
+                    metadata=dict(metadata_for_sim) if metadata_for_sim else None,
+                    quantize_mode=str(self.cfg.quantize_mode),
+                )
+            except TypeError:
+                logger.debug(
+                    "Simulator %s.attach_quantizer signature mismatch; falling back to legacy attachment",
+                    type(sim).__name__,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Simulator %s.attach_quantizer failed: %s; falling back to legacy attachment",
+                    type(sim).__name__,
+                    exc,
+                )
+            else:
+                return
+
         filters_attached = False
         warn_message: Optional[str] = None
-        if self._filters_raw:
+        if filters_payload is not None:
             if hasattr(sim, "filters"):
                 try:
-                    setattr(sim, "filters", dict(self._filters_raw))
+                    setattr(sim, "filters", dict(filters_payload))
                     filters_attached = True
                 except Exception as exc:
                     warn_message = (
@@ -390,29 +514,64 @@ class QuantizerImpl:
                 )
         else:
             warn_message = (
-                f"Quantizer filters are unavailable; strict filter enforcement disabled for {type(sim).__name__}"
+                f"Quantizer filters are unavailable; permissive mode enabled for {type(sim).__name__}"
             )
 
-        if filters_attached:
+        if warn_message:
+            logger.warning(warn_message)
+
+        try:
+            setattr(sim, "enforce_ppbs", enforce_active if filters_attached else False)
+        except Exception:
+            pass
+        try:
+            setattr(sim, "strict_filters", strict_active if filters_attached else False)
+        except Exception:
+            pass
+
+        if metadata_for_sim:
             try:
-                setattr(sim, "enforce_ppbs", bool(self.cfg.enforce_percent_price_by_side))
+                metadata_for_sim = dict(metadata_for_sim)
+                metadata_for_sim["strict_filters_active"] = bool(
+                    strict_active if filters_attached else False
+                )
+                metadata_for_sim["enforce_percent_price_by_side_active"] = bool(
+                    enforce_active if filters_attached else False
+                )
+                setattr(sim, "quantizer_metadata", metadata_for_sim)
             except Exception:
                 pass
-            try:
-                setattr(sim, "strict_filters", bool(self.cfg.strict))
-            except Exception:
-                pass
-        else:
-            if warn_message:
-                logger.warning(warn_message)
-            try:
-                setattr(sim, "enforce_ppbs", False)
-            except Exception:
-                pass
-            try:
-                setattr(sim, "strict_filters", False)
-            except Exception:
-                pass
+
+        self._refresh_runtime_metadata(
+            strict_active=bool(strict_active if filters_attached else False),
+            enforce_active=bool(enforce_active if filters_attached else False),
+        )
+
+    def _refresh_runtime_metadata(
+        self,
+        *,
+        strict_active: bool,
+        enforce_active: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        metadata = dict(self._filters_metadata)
+        if enforce_active is None:
+            enforce_active = bool(
+                self.cfg.enforce_percent_price_by_side and strict_active
+            )
+        metadata.update(
+            {
+                "strict_filters": bool(self.cfg.strict_filters),
+                "strict_filters_active": bool(strict_active),
+                "enforce_percent_price_by_side": bool(
+                    self.cfg.enforce_percent_price_by_side
+                ),
+                "enforce_percent_price_by_side_active": bool(enforce_active),
+                "quantize_mode": str(self.cfg.quantize_mode),
+            }
+        )
+        self._filters_metadata.clear()
+        self._filters_metadata.update(metadata)
+        return metadata
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "QuantizerImpl":
@@ -426,10 +585,21 @@ class QuantizerImpl:
         auto_refresh = max(_as_int(d.get("auto_refresh_days", 30), 30), 0)
         refresh_on_start = _as_bool(d.get("refresh_on_start"), False)
 
+        strict_filters_raw = d.get("strict_filters")
+        if strict_filters_raw is None and "strict" in d:
+            strict_filters_raw = d.get("strict")
+        strict_filters = _as_bool(strict_filters_raw, True)
+
+        quantize_mode_raw = d.get("quantize_mode", "inward")
+        quantize_mode = str(quantize_mode_raw).strip() or "inward"
+
+        enforce_ppbs = _as_bool(d.get("enforce_percent_price_by_side"), True)
+
         return QuantizerImpl(QuantizerConfig(
             path=path,
-            strict=bool(d.get("strict", True)),
-            enforce_percent_price_by_side=bool(d.get("enforce_percent_price_by_side", True)),
+            strict_filters=bool(strict_filters),
+            quantize_mode=quantize_mode,
+            enforce_percent_price_by_side=bool(enforce_ppbs),
             filters_path=filters_path,
             auto_refresh_days=auto_refresh,
             refresh_on_start=refresh_on_start,
