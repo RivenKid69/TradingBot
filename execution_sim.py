@@ -22,6 +22,7 @@ ExecutionSimulator v2
 Важно: этот модуль НЕ добавляет комиссии и слиппедж — они будут подключены отдельными шагами.
 """
 
+import collections
 from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping, Callable, Deque
@@ -96,6 +97,12 @@ _FILLS_CAPPED_BASE_RATIO = Summary(
     "fills_capped_base_ratio",
     "Fill ratio observed when base bar capacity limits execution",
     ["symbol", "capacity_reason", "exec_status"],
+)
+
+_FILTER_REJECT_COUNT = Counter(
+    "sim_filter_reject_total",
+    "Filter rejections by type",
+    ["symbol", "reason"],
 )
 
 try:
@@ -945,6 +952,7 @@ class ExecutionSimulator:
         self._stopped = False
         self._cancelled_on_submit: List[int] = []
         self._ttl_orders: List[Tuple[int, int]] = []
+        self._filter_rejection_counts: collections.Counter[str] = collections.Counter()
 
         # квантайзер и «сырые» фильтры — опционально
         self.filters: Dict[str, Dict[str, Any]] = {}
@@ -5301,6 +5309,35 @@ class ExecutionSimulator:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Filter rejection: %s", reason)
 
+    def _record_filter_rejection(
+        self, reason: Optional[FilterRejectionReason], order_type: str
+    ) -> None:
+        if reason is None:
+            return
+        code = str(getattr(reason, "code", "") or "UNKNOWN")
+        symbol = str(self.symbol or "").upper()
+        try:
+            _FILTER_REJECT_COUNT.labels(symbol=symbol, reason=code).inc()
+        except Exception:
+            pass
+        try:
+            self._filter_rejection_counts[code] += 1
+        except Exception:
+            # initialise on demand if attribute missing or corrupted
+            self._filter_rejection_counts = collections.Counter({code: 1})
+
+    def get_filter_rejection_summary(self) -> collections.Counter[str]:
+        try:
+            return collections.Counter(self._filter_rejection_counts)
+        except Exception:
+            return collections.Counter()
+
+    def clear_filter_rejection_summary(self) -> None:
+        try:
+            self._filter_rejection_counts.clear()
+        except Exception:
+            self._filter_rejection_counts = collections.Counter()
+
     def _apply_filters_market(
         self, side: str, qty: float, ref_price: Optional[float]
     ) -> tuple[float, Optional[FilterRejectionReason]]:
@@ -5768,6 +5805,7 @@ class ExecutionSimulator:
                                 "order_type": "MARKET",
                             }
                         )
+                        self._record_filter_rejection(rejection, "MARKET")
                     reason_code = (
                         rejection.code if rejection is not None else "FILTER"
                     )
@@ -6470,6 +6508,7 @@ class ExecutionSimulator:
                                 "order_type": "LIMIT",
                             }
                         )
+                        self._record_filter_rejection(rejection, "LIMIT")
                     reason_code = (
                         rejection.code if rejection is not None else "FILTER"
                     )
@@ -7020,6 +7059,7 @@ class ExecutionSimulator:
                                 "order_type": "MARKET",
                             }
                         )
+                        self._record_filter_rejection(rejection, "MARKET")
                     reason_code = (
                         rejection.code if rejection is not None else "FILTER"
                     )

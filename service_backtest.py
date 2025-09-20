@@ -899,6 +899,38 @@ class ServiceBacktest:
                 comp_sum_repr,
             )
 
+        summary: Optional[Mapping[str, int]] = None
+        getter = getattr(self.sim, "get_filter_rejection_summary", None)
+        if callable(getter):
+            try:
+                summary_candidate = getter()
+            except Exception:
+                summary_candidate = None
+            if summary_candidate:
+                summary = dict(summary_candidate)
+        if summary:
+            logger.info(
+                "%s: filter_rejections=%s",
+                "service_backtest",
+                summary,
+            )
+            cleared = False
+            clearer = getattr(self.sim, "clear_filter_rejection_summary", None)
+            if callable(clearer):
+                try:
+                    clearer()
+                except Exception:
+                    pass
+                else:
+                    cleared = True
+            if not cleared:
+                counts_attr = getattr(self.sim, "_filter_rejection_counts", None)
+                if hasattr(counts_attr, "clear"):
+                    try:
+                        counts_attr.clear()
+                    except Exception:
+                        pass
+
         try:
             if getattr(self.sim, "_logger", None):
                 self.sim._logger.flush()
