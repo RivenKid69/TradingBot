@@ -51,6 +51,8 @@ class TokenBucket:
     tokens: float | None = None
     last_ts: float = field(default_factory=time.monotonic)
     cooldown_until: float = 0.0
+    configured_rps: float = field(init=False)
+    configured_burst: float = field(init=False)
     _lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -58,13 +60,15 @@ class TokenBucket:
     def __post_init__(self) -> None:
         self.rps = float(self.rps)
         self.burst = float(self.burst)
-        self.enabled = self.rps > 0.0 and self.burst > 0.0
-        if self.tokens is None:
-            self.tokens = float(self.burst)
-        else:
-            self.tokens = float(self.tokens)
-        if not self.enabled:
-            self.tokens = float(self.burst)
+        self.configured_rps = self.rps
+        self.configured_burst = self.burst
+        tokens = float(self.burst if self.tokens is None else self.tokens)
+        enabled = self.rps > 0.0 and self.burst > 0.0
+        with self._lock:
+            self.enabled = enabled
+            self.tokens = float(self.burst if not enabled else tokens)
+            self.last_ts = float(self.last_ts)
+            self.cooldown_until = float(self.cooldown_until)
 
     def _refill(self, now: float) -> None:
         if not self.enabled:
@@ -117,6 +121,30 @@ class TokenBucket:
         now = float(time.monotonic() if now is None else now)
         with self._lock:
             self.cooldown_until = max(self.cooldown_until, now + seconds)
+
+    def adjust_rate(
+        self,
+        *,
+        rps: float | None = None,
+        burst: float | None = None,
+        update_configured: bool = False,
+    ) -> None:
+        """Adjust the bucket limits while keeping state consistent."""
+
+        new_rps = self.rps if rps is None else max(float(rps), 0.0)
+        new_burst = self.burst if burst is None else max(float(burst), 0.0)
+        with self._lock:
+            self.rps = new_rps
+            self.burst = new_burst
+            if update_configured:
+                self.configured_rps = new_rps
+                self.configured_burst = new_burst
+            self.enabled = self.rps > 0.0 and self.burst > 0.0
+            current_tokens = float(self.tokens if self.tokens is not None else 0.0)
+            if not self.enabled:
+                self.tokens = float(self.burst)
+            else:
+                self.tokens = min(current_tokens, self.burst)
 
 
 class RestBudgetSession:
@@ -227,6 +255,12 @@ class RestBudgetSession:
 
         global_cfg = _get_attr(cfg, "global_", _get_attr(cfg, "global", None))
 
+        dynamic_headers_value = _get_attr(cfg, "dynamic_from_headers", None)
+        if dynamic_headers_value is None and global_cfg is not None:
+            dynamic_headers_value = _get_attr(global_cfg, "dynamic_from_headers", None)
+        dynamic_flag = self._interpret_bool(dynamic_headers_value)
+        self._dynamic_from_headers = bool(dynamic_flag) if dynamic_flag is not None else False
+
         jitter_value = _get_attr(cfg, "jitter_ms", None)
         if jitter_value is None:
             jitter_value = _get_attr(cfg, "jitter", None)
@@ -267,22 +301,39 @@ class RestBudgetSession:
         retry_cfg = _get_attr(cfg, "retry", None)
         self._retry_cfg = self._parse_retry_cfg(retry_cfg)
 
-        self._global_bucket = self._make_bucket(global_cfg) if self._enabled else None
+        baseline_global = self._make_bucket(global_cfg) if self._enabled else None
+        self._baseline_global_bucket: TokenBucket | None = baseline_global
+        self._global_bucket = (
+            TokenBucket(
+                rps=baseline_global.configured_rps,
+                burst=baseline_global.configured_burst,
+            )
+            if baseline_global is not None
+            else None
+        )
 
         self._endpoint_buckets: MutableMapping[str, TokenBucket] = {}
+        self._baseline_endpoint_buckets: MutableMapping[str, TokenBucket] = {}
         endpoints_cfg = _get_attr(cfg, "endpoints", {}) or {}
         if isinstance(endpoints_cfg, Mapping):
             for key, spec in endpoints_cfg.items():
-                bucket = self._make_bucket(spec) if self._enabled else None
-                if bucket:
-                    self._register_endpoint_bucket(str(key), bucket)
+                baseline_bucket = self._make_bucket(spec) if self._enabled else None
+                if baseline_bucket is not None:
+                    runtime_bucket = TokenBucket(
+                        rps=baseline_bucket.configured_rps,
+                        burst=baseline_bucket.configured_burst,
+                    )
+                    self._register_endpoint_bucket(str(key), runtime_bucket)
+                    self._register_baseline_endpoint_bucket(str(key), baseline_bucket)
                 cache_meta = self._parse_endpoint_cache_spec(spec)
                 if cache_meta:
                     self._register_endpoint_cache_cfg(str(key), cache_meta)
 
         self.wait_counts: Counter[str] = Counter()
         self.cooldown_counts: Counter[str] = Counter()
+        self.cooldown_reasons: Counter[str] = Counter()
         self.error_counts: Counter[str] = Counter()
+        self.retry_counts: Counter[str] = Counter()
         self._request_counts: Counter[str] = Counter()
         self._request_tokens: defaultdict[str, float] = defaultdict(float)
         self._planned_counts: Counter[str] = Counter()
@@ -292,6 +343,8 @@ class RestBudgetSession:
         self._cache_stores: Counter[str] = Counter()
         self._checkpoint_loads = 0
         self._checkpoint_saves = 0
+        self._wait_seconds: defaultdict[str, float] = defaultdict(float)
+        self._stats_started = time.monotonic()
 
     @staticmethod
     def _parse_retry_cfg(cfg: Any) -> RetryConfig:
@@ -456,6 +509,10 @@ class RestBudgetSession:
     def _register_endpoint_bucket(self, key: str, bucket: TokenBucket) -> None:
         for v in self._endpoint_variants(key):
             self._endpoint_buckets[v] = bucket
+
+    def _register_baseline_endpoint_bucket(self, key: str, bucket: TokenBucket) -> None:
+        for v in self._endpoint_variants(key):
+            self._baseline_endpoint_buckets[v] = bucket
 
     def _register_endpoint_cache_cfg(self, key: str, cfg: Mapping[str, Any]) -> None:
         for v in self._endpoint_variants(key):
@@ -656,14 +713,12 @@ class RestBudgetSession:
                     bucket.consume(tokens=tokens, now=now)
                 return
             wait_for = max(w for _, w, _ in waits)
-            for name, _, b in waits:
+            if wait_for > 0.0:
                 with self._stats_lock:
-                    self.wait_counts[name] += 1
-                if self._cooldown_s > 0.0:
-                    b.start_cooldown(self._cooldown_s, now=now)
-                    with self._stats_lock:
-                        self.cooldown_counts[name] += 1
-            self._sleep(wait_for)
+                    for name, wait_amount, _ in waits:
+                        self.wait_counts[name] += 1
+                        self._wait_seconds[name] += float(wait_amount)
+                self._sleep(wait_for)
 
     def _record_request(self, key: str, tokens: float) -> None:
         with self._stats_lock:
@@ -704,20 +759,154 @@ class RestBudgetSession:
                 return None
         return max(seconds, 0.0)
 
-    def _start_cooldown(self, key: str, seconds: float | None = None) -> None:
+    def _start_cooldown(
+        self,
+        key: str,
+        seconds: float | None = None,
+        *,
+        reason: str | None = None,
+    ) -> None:
         sec = self._cooldown_s if seconds is None else max(float(seconds), self._cooldown_s)
         if sec <= 0.0:
             return
         now = time.monotonic()
+        cooled: list[str] = []
         if self._global_bucket:
             self._global_bucket.start_cooldown(sec, now=now)
-            with self._stats_lock:
-                self.cooldown_counts["global"] += 1
+            cooled.append("global")
         bucket = self._endpoint_buckets.get(key)
         if bucket is not None:
             bucket.start_cooldown(sec, now=now)
-            with self._stats_lock:
-                self.cooldown_counts[key] += 1
+            cooled.append(key)
+        if not cooled:
+            return
+        label = str(reason) if reason else "unspecified"
+        with self._stats_lock:
+            for name in cooled:
+                self.cooldown_counts[name] += 1
+            self.cooldown_reasons[label] += 1
+
+    @staticmethod
+    def _try_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _parse_weight_pair(cls, value: str | None) -> tuple[float | None, float | None]:
+        if not value:
+            return None, None
+        text = value.strip()
+        if not text:
+            return None, None
+        if "/" in text:
+            used_text, limit_text = text.split("/", 1)
+            used = cls._try_float(used_text)
+            limit = cls._try_float(limit_text)
+            return used, limit
+        return cls._try_float(text), None
+
+    @classmethod
+    def _extract_binance_weights(
+        cls, headers: Mapping[str, str]
+    ) -> tuple[float | None, float | None]:
+        if not headers:
+            return None, None
+        try:
+            items = headers.items()
+        except AttributeError:
+            return None, None
+        lower = {str(k).lower(): v for k, v in items}
+        used: float | None = None
+        limit: float | None = None
+        for name in ("x-mbx-used-weight-1m", "x-mbx-used-weight"):
+            candidate = lower.get(name)
+            if candidate is None:
+                continue
+            used_candidate, limit_candidate = cls._parse_weight_pair(candidate)
+            if used_candidate is not None:
+                used = used_candidate
+            if limit_candidate is not None:
+                limit = limit_candidate
+            if used is not None and limit is not None:
+                break
+        if limit is None:
+            for name in ("x-mbx-weight-limit-1m", "x-mbx-weight-limit"):
+                limit_candidate = cls._try_float(lower.get(name))
+                if limit_candidate is not None:
+                    limit = limit_candidate
+                    break
+        return used, limit
+
+    def _adjust_bucket_from_usage(
+        self,
+        bucket: TokenBucket | None,
+        baseline: TokenBucket | None,
+        used: float,
+        limit: float | None,
+    ) -> None:
+        if bucket is None or used < 0.0:
+            return
+        baseline_bucket = baseline or bucket
+        base_limit = limit
+        if base_limit is None or base_limit <= 0.0:
+            base_limit = baseline_bucket.configured_burst
+        if base_limit is None or base_limit <= 0.0:
+            return
+        baseline_rps = baseline_bucket.configured_rps
+        baseline_burst = baseline_bucket.configured_burst
+        if baseline_rps <= 0.0 or baseline_burst <= 0.0:
+            return
+        ratio = used / base_limit
+        if ratio < 0.0:
+            return
+        current_scale = bucket.rps / baseline_rps if baseline_rps > 0.0 else 1.0
+        target_scale = current_scale
+        if ratio >= 0.98:
+            target_scale = min(current_scale, 0.2)
+        elif ratio >= 0.95:
+            target_scale = min(current_scale, 0.4)
+        elif ratio >= 0.9:
+            target_scale = min(current_scale, 0.7)
+        elif ratio <= 0.5 and current_scale < 1.0:
+            target_scale = min(1.0, current_scale + 0.2)
+        elif ratio <= 0.7 and current_scale < 1.0:
+            target_scale = min(1.0, current_scale + 0.1)
+        else:
+            return
+        target_scale = max(target_scale, 0.05)
+        new_rps = baseline_rps * target_scale
+        new_burst = baseline_burst * target_scale
+        if (
+            abs(new_rps - bucket.rps) < 1e-9
+            and abs(new_burst - bucket.burst) < 1e-9
+        ):
+            return
+        bucket.adjust_rate(rps=new_rps, burst=new_burst)
+
+    def _handle_dynamic_headers(self, key: str, headers: Mapping[str, str]) -> None:
+        if not self._dynamic_from_headers:
+            return
+        used, limit = self._extract_binance_weights(headers)
+        if used is None:
+            return
+        self._adjust_bucket_from_usage(
+            self._global_bucket,
+            self._baseline_global_bucket,
+            used,
+            limit,
+        )
+        endpoint_bucket: TokenBucket | None = None
+        baseline_bucket: TokenBucket | None = None
+        for variant in self._endpoint_variants(key):
+            if endpoint_bucket is None:
+                endpoint_bucket = self._endpoint_buckets.get(variant)
+            if baseline_bucket is None:
+                baseline_bucket = self._baseline_endpoint_buckets.get(variant)
+            if endpoint_bucket is not None and baseline_bucket is not None:
+                break
+        self._adjust_bucket_from_usage(endpoint_bucket, baseline_bucket, used, limit)
 
     @staticmethod
     def _classify_for_retry(exc: Exception) -> str | None:
@@ -946,7 +1135,14 @@ class RestBudgetSession:
             cache_key is not None and self._cache_mode == "read_write"
         )
 
+        attempt = 0
+
         def _do_request() -> Any:
+            nonlocal attempt
+            attempt += 1
+            if attempt > 1:
+                with self._stats_lock:
+                    self.retry_counts[stats_key] += 1
             self._record_request(stats_key, tokens)
             self._acquire_tokens(key, tokens=tokens)
             jitter = self._next_jitter()
@@ -970,16 +1166,25 @@ class RestBudgetSession:
                 raise
 
             status = resp.status_code
+            retry_after = self._parse_retry_after(resp.headers.get("Retry-After"))
+            cooldown_reason: str | None = None
             if status == 429:
                 with self._stats_lock:
                     self.error_counts[str(status)] += 1
-                retry_after = self._parse_retry_after(resp.headers.get("Retry-After"))
-                self._start_cooldown(key, seconds=retry_after)
+                cooldown_reason = "http_429"
                 monitoring.record_http_error(status)
             elif 500 <= status < 600:
                 with self._stats_lock:
                     self.error_counts[str(status)] += 1
+                cooldown_reason = f"http_{status}"
                 monitoring.record_http_error(status)
+            elif retry_after is not None:
+                cooldown_reason = "retry_after"
+
+            if cooldown_reason:
+                self._start_cooldown(key, seconds=retry_after, reason=cooldown_reason)
+
+            self._handle_dynamic_headers(key, resp.headers)
 
             try:
                 resp.raise_for_status()
@@ -1027,6 +1232,12 @@ class RestBudgetSession:
         """Return a JSON-serialisable snapshot of collected statistics."""
 
         with self._stats_lock:
+            wait_seconds = {k: float(v) for k, v in self._wait_seconds.items()}
+            total_wait = float(sum(wait_seconds.values()))
+            total_requests = int(sum(self._request_counts.values()))
+            total_retries = int(sum(self.retry_counts.values()))
+            elapsed = max(time.monotonic() - self._stats_started, 1e-9)
+            avg_qps = float(total_requests / elapsed) if total_requests else 0.0
             return {
                 "requests": dict(self._request_counts),
                 "request_tokens": {k: float(v) for k, v in self._request_tokens.items()},
@@ -1036,8 +1247,15 @@ class RestBudgetSession:
                 "cache_misses": dict(self._cache_misses),
                 "cache_stores": dict(self._cache_stores),
                 "waits": dict(self.wait_counts),
+                "wait_seconds": wait_seconds,
                 "cooldowns": dict(self.cooldown_counts),
+                "cooldown_reasons": dict(self.cooldown_reasons),
                 "errors": dict(self.error_counts),
+                "retry_counts": dict(self.retry_counts),
+                "requests_total": total_requests,
+                "total_retries": total_retries,
+                "total_wait_seconds": total_wait,
+                "avg_qps": avg_qps,
                 "checkpoint": {
                     "loads": self._checkpoint_loads,
                     "saves": self._checkpoint_saves,
