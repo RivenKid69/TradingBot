@@ -2,13 +2,23 @@
 """
 impl_quantizer.py
 Обёртка над quantizer. Строит Quantizer из JSON-фильтров Binance и умеет подключаться к ExecutionSimulator.
+
+Ключевые возможности:
+- :attr:`QuantizerImpl.quantizer` — объект :class:`quantizer.Quantizer` с загруженными
+  фильтрами биржи.
+- :attr:`QuantizerImpl.symbol_filters` — read-only отображение «символ → фильтры» в виде
+  подготовленных :class:`quantizer.SymbolFilters`.
+- :meth:`QuantizerImpl.validate_order` — helper, повторяющий последовательность
+  ``Quantizer.quantize_order`` и пригодный для использования исполнителями вроде
+  :class:`impl_sim_executor.SimExecutor`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Mapping
+from types import MappingProxyType
 import hashlib
 import logging
 import os
@@ -19,9 +29,11 @@ import warnings
 from services import monitoring
 
 try:
-    from quantizer import Quantizer
+    from quantizer import Quantizer, OrderCheckResult, SymbolFilters
 except Exception as e:  # pragma: no cover
     Quantizer = None  # type: ignore
+    OrderCheckResult = None  # type: ignore
+    SymbolFilters = Any  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -120,6 +132,26 @@ class QuantizerConfig:
         return self.filters_path or self.path
 
 
+@dataclass
+class _SimpleOrderCheckResult:
+    price: float
+    qty: float
+    reason_code: Optional[str] = None
+    reason: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.reason_code is None
+
+
+def _make_order_check_result(**kwargs: Any):
+    cls = OrderCheckResult
+    if cls is None:
+        return _SimpleOrderCheckResult(**kwargs)
+    return cls(**kwargs)
+
+
 class QuantizerImpl:
     _REFRESH_GUARD: Dict[str, Tuple[float, Optional[float]]] = {}
     _REFRESH_COOLDOWN_SEC: float = 30.0
@@ -167,6 +199,9 @@ class QuantizerImpl:
         self.cfg = cfg
         self._quantizer = None
         self._filters_raw: Dict[str, Dict[str, Any]] = {}
+        self._symbol_filters_map: Dict[str, SymbolFilters] = {}
+        self._symbol_filters_view: Mapping[str, SymbolFilters] = MappingProxyType(self._symbol_filters_map)
+        self._validation_fallback_warned = False
         filters_path = cfg.resolved_filters_path()
         if not cfg.filters_path:
             cfg.filters_path = filters_path
@@ -242,10 +277,72 @@ class QuantizerImpl:
 
         self._filters_raw = dict(filters)
         self._quantizer = Quantizer(filters, strict=bool(cfg.strict))
+        filters_map = getattr(self._quantizer, "_filters", None)
+        if isinstance(filters_map, dict):
+            self._symbol_filters_map.clear()
+            self._symbol_filters_map.update(filters_map)
 
     @property
     def quantizer(self):
         return self._quantizer
+
+    @property
+    def symbol_filters(self) -> Mapping[str, SymbolFilters]:
+        return self._symbol_filters_view
+
+    def validate_order(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        qty: float,
+        ref_price: Optional[float] = None,
+        enforce_ppbs: Optional[bool] = None,
+    ):
+        """Validate and quantize order parameters using :class:`quantizer.Quantizer`.
+
+        When the underlying quantizer or symbol filters are unavailable the method
+        returns the original values and logs a warning once, emulating permissive
+        behaviour.
+        """
+
+        quantizer = self._quantizer
+        enforce = self.cfg.enforce_percent_price_by_side if enforce_ppbs is None else bool(enforce_ppbs)
+        ref_value = price if ref_price is None else ref_price
+
+        if quantizer is None or not self._filters_raw:
+            if not self._validation_fallback_warned:
+                logger.warning(
+                    "Quantizer or filters unavailable; validate_order falling back to permissive behaviour"
+                )
+                self._validation_fallback_warned = True
+            return _make_order_check_result(
+                price=float(price),
+                qty=float(qty),
+            )
+
+        try:
+            return quantizer.quantize_order(
+                symbol,
+                side,
+                price,
+                qty,
+                ref_value,
+                enforce_ppbs=bool(enforce),
+            )
+        except Exception as exc:
+            if not self._validation_fallback_warned:
+                logger.warning(
+                    "Quantizer validation failed (%s); falling back to permissive behaviour",
+                    exc,
+                )
+                self._validation_fallback_warned = True
+            return _make_order_check_result(
+                price=float(price),
+                qty=float(qty),
+                reason=None,
+                reason_code=None,
+            )
 
     def attach_to(
         self,
@@ -259,6 +356,16 @@ class QuantizerImpl:
             self.cfg.strict = bool(strict)
         if enforce_percent_price_by_side is not None:
             self.cfg.enforce_percent_price_by_side = bool(enforce_percent_price_by_side)
+
+        try:
+            setattr(sim, "validate_order", self.validate_order)
+        except Exception:
+            pass
+
+        try:
+            setattr(sim, "symbol_filters", self.symbol_filters)
+        except Exception:
+            pass
 
         if self._quantizer is not None:
             try:
