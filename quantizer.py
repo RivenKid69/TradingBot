@@ -83,6 +83,23 @@ def _extract_precision_fields(filters: Dict[str, Any]) -> Tuple[Optional[int], f
 
 
 @dataclass
+class OrderCheckResult:
+    """Result of :meth:`Quantizer.quantize_order` processing."""
+
+    price: float
+    qty: float
+    reason_code: Optional[str] = None
+    reason: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
+
+    @property
+    def accepted(self) -> bool:
+        """Whether the order passed all checks."""
+
+        return self.reason_code is None
+
+
+@dataclass
 class SymbolFilters:
     price_tick: float = 0.0
     price_min: float = 0.0
@@ -122,7 +139,9 @@ class SymbolFilters:
 class Quantizer:
     """
     Единый квантайзер цен/количеств и проверок для Binance-символов.
-    Используется и в симуляторе, и в live-адаптере.
+    Используется и в симуляторе, и в live-адаптере. Для унификации
+    последовательности проверок при подготовке ордеров следует
+    использовать :meth:`quantize_order`.
     """
 
     def __init__(self, filters: Dict[str, Dict[str, Any]], strict: bool = True):
@@ -237,6 +256,92 @@ class Quantizer:
         else:
             # SELL price >= ref * multiplierDown
             return p >= r * float(f.multiplier_down)
+
+    def quantize_order(
+        self,
+        symbol: str,
+        side: str,
+        price: Number,
+        qty: Number,
+        ref_price: Number,
+        *,
+        enforce_ppbs: bool = True,
+    ) -> OrderCheckResult:
+        """Quantize ``price``/``qty`` and evaluate exchange filters in order.
+
+        The helper consolidates the ``quantize_price`` → ``quantize_qty`` →
+        ``clamp_notional`` → ``check_percent_price_by_side`` pipeline so the
+        call sites do not need to repeat the sequencing.  On success the
+        returned :class:`OrderCheckResult` contains the adjusted values and
+        ``reason_code`` is ``None``.  When a filter rejects the order the
+        quantized values are still returned along with a normalized reason code
+        (``MIN_NOTIONAL``, ``PPBS`` and so on) plus optional details for
+        logging.
+        """
+
+        quantized_price = float(self.quantize_price(symbol, price))
+        quantized_qty = float(self.quantize_qty(symbol, qty))
+        filters = self._filters.get(symbol)
+
+        # Detect quantity being clipped to zero by LOT_SIZE
+        if filters and quantized_qty <= 0.0 and float(qty) > 0.0 and filters.qty_min > 0.0:
+            return OrderCheckResult(
+                price=quantized_price,
+                qty=quantized_qty,
+                reason_code="MIN_QTY",
+                reason=f"Quantity {qty} is below LOT_SIZE.minQty={filters.qty_min}",
+                details={"min_qty": filters.qty_min, "original_qty": float(qty)},
+            )
+
+        try:
+            clamped_qty = float(self.clamp_notional(symbol, quantized_price, quantized_qty))
+        except ValueError as exc:
+            return OrderCheckResult(
+                price=quantized_price,
+                qty=0.0,
+                reason_code="MIN_NOTIONAL",
+                reason=str(exc),
+                details={
+                    "min_notional": filters.min_notional if filters else None,
+                    "price": quantized_price,
+                    "qty": quantized_qty,
+                },
+            )
+
+        if filters and quantized_qty > 0.0 and clamped_qty <= 0.0 and filters.min_notional > 0.0:
+            return OrderCheckResult(
+                price=quantized_price,
+                qty=clamped_qty,
+                reason_code="MIN_NOTIONAL",
+                reason=(
+                    f"Order notional {quantized_price * quantized_qty} below MIN_NOTIONAL="
+                    f"{filters.min_notional}"
+                ),
+                details={
+                    "min_notional": filters.min_notional,
+                    "price": quantized_price,
+                    "qty": quantized_qty,
+                },
+            )
+
+        quantized_qty = clamped_qty
+
+        if enforce_ppbs and not self.check_percent_price_by_side(symbol, side, quantized_price, ref_price):
+            return OrderCheckResult(
+                price=quantized_price,
+                qty=0.0,
+                reason_code="PPBS",
+                reason="PERCENT_PRICE_BY_SIDE filter rejected the order",
+                details={
+                    "side": str(side).upper(),
+                    "price": quantized_price,
+                    "ref_price": float(ref_price),
+                    "multiplier_up": filters.multiplier_up if filters else None,
+                    "multiplier_down": filters.multiplier_down if filters else None,
+                },
+            )
+
+        return OrderCheckResult(price=quantized_price, qty=quantized_qty)
 
     # ------------ Фабрики загрузки ------------
     @classmethod
