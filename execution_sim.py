@@ -125,6 +125,18 @@ _FILTER_DEVIATION_COUNTER = Counter(
     ["symbol", "order_type", "reason"],
 )
 
+_NEXT_OPEN_DEFERRED_COUNTER = Counter(
+    "sim_next_open_deferred_total",
+    "Number of orders deferred for next-bar open execution",
+    ["symbol", "side"],
+)
+
+_NEXT_OPEN_EXPIRED_COUNTER = Counter(
+    "sim_next_open_expired_total",
+    "Number of next-bar open orders expired before execution",
+    ["symbol", "reason"],
+)
+
 try:
     import numpy as np
 except Exception:  # минимальная замена на случай отсутствия numpy на этапе интеграции
@@ -878,11 +890,8 @@ class ExecutionSimulator:
         self._next_open_snapshot: Optional[_NextBarSnapshot] = None
         self._next_open_last_flush_ts: Optional[int] = None
         self._next_open_expected_ts: Optional[int] = None
-        self._next_open_metrics: Dict[str, int] = {
-            "submitted": 0,
-            "filled": 0,
-            "cancelled": 0,
-        }
+        self._next_open_metrics: Dict[str, int] = {}
+        self._reset_next_open_metrics()
 
         def _convert_to_plain_mapping(obj: Any) -> Dict[str, Any]:
             if isinstance(obj, Mapping):
@@ -1486,6 +1495,61 @@ class ExecutionSimulator:
             strict_open_fill=strict_open_cfg,
         )
 
+        if getattr(self, "_entry_mode", "default") == "next_bar_open":
+            latency_source = getattr(self, "_intrabar_latency_source", "latency") or "latency"
+
+            def _extract_aggregation_policy(candidate: Any) -> Optional[str]:
+                mapping = _convert_to_plain_mapping(candidate)
+                if not mapping:
+                    return None
+                for key in ("aggregation_policy", "agg_policy"):
+                    value = mapping.get(key)
+                    if value not in (None, ""):
+                        try:
+                            return str(value)
+                        except Exception:
+                            return None
+                for agg_key in (
+                    "aggregation",
+                    "aggregator",
+                    "aggregation_cfg",
+                    "aggregation_config",
+                ):
+                    if agg_key in mapping and mapping[agg_key] is not None:
+                        agg_map = _convert_to_plain_mapping(mapping[agg_key])
+                        if not agg_map:
+                            continue
+                        for policy_key in ("policy", "mode", "type", "name"):
+                            value = agg_map.get(policy_key)
+                            if value not in (None, ""):
+                                try:
+                                    return str(value)
+                                except Exception:
+                                    continue
+                return None
+
+            aggregation_policy: Optional[str] = None
+            agg_candidates = (
+                self._execution_cfg,
+                self.execution_params,
+                self._execution_intrabar_cfg,
+                getattr(run_config, "execution", None) if run_config is not None else None,
+                getattr(run_config, "aggregation", None) if run_config is not None else None,
+            )
+            for candidate in agg_candidates:
+                if candidate is None:
+                    continue
+                policy = _extract_aggregation_policy(candidate)
+                if policy:
+                    aggregation_policy = policy
+                    break
+            logger.info(
+                "ExecutionSimulator next_bar_open configured: entry_mode=%s latency_source=%s aggregation_policy=%s",
+                self._entry_mode,
+                latency_source,
+                aggregation_policy or "default",
+            )
+
         if run_config is not None:
             timing_cfg = getattr(run_config, "timing", None)
             if timing_cfg is not None:
@@ -1874,6 +1938,7 @@ class ExecutionSimulator:
         if self._entry_mode == "next_bar_open" and self._strict_open_fill:
             object.__setattr__(self, "_intrabar_price_model", None)
         if prev_mode != self._entry_mode:
+            self._reset_next_open_metrics()
             if self._entry_mode != "next_bar_open":
                 self._pending_next_open.clear()
                 self._next_open_ready_trades.clear()
@@ -1889,6 +1954,33 @@ class ExecutionSimulator:
             return
         if not self._clip_next_bar:
             object.__setattr__(self, "_clip_next_bar", False)
+
+    def _reset_next_open_metrics(self) -> None:
+        self._next_open_metrics = {"submitted": 0, "filled": 0, "cancelled": 0}
+
+    def _record_next_open_deferred(self, side: str, *, count: int = 1) -> None:
+        if getattr(self, "_entry_mode", "default") != "next_bar_open":
+            return
+        if count <= 0:
+            return
+        symbol_label = str(self.symbol).upper() if self.symbol is not None else ""
+        side_label = str(side).upper() if side else ""
+        try:
+            _NEXT_OPEN_DEFERRED_COUNTER.labels(symbol_label, side_label).inc(float(count))
+        except Exception:
+            pass
+
+    def _record_next_open_expired(self, reason: str, *, count: int = 1) -> None:
+        if getattr(self, "_entry_mode", "default") != "next_bar_open":
+            return
+        if count <= 0:
+            return
+        symbol_label = str(self.symbol).upper() if self.symbol is not None else ""
+        reason_label = str(reason) if reason else ""
+        try:
+            _NEXT_OPEN_EXPIRED_COUNTER.labels(symbol_label, reason_label).inc(float(count))
+        except Exception:
+            pass
 
     @staticmethod
     def _bool_from_any(value: Any) -> Optional[bool]:
@@ -2071,12 +2163,34 @@ class ExecutionSimulator:
         low_price = self._float_or_none(snapshot.low)
         ts = int(snapshot.ts_open or now_ms())
         if open_price is None or not math.isfinite(open_price):
-            for state in self._pending_next_open.values():
+            expired_count = 0
+            pending = list(self._pending_next_open.values())
+            if pending:
+                logger.warning(
+                    "Next-bar open execution: missing bar open price at ts=%s; expiring %d pending orders",
+                    ts,
+                    len(pending),
+                )
+            for state in pending:
                 cancelled.append(state.client_order_id)
-                cancelled_reasons[state.client_order_id] = "NO_BAR_OPEN"
+                cancelled_reasons[state.client_order_id] = "EXPIRED_NO_BAR_OPEN"
                 risk_events.extend(state.risk_events)
+                expired_count += 1
+            if expired_count > 0:
+                self._next_open_metrics["cancelled"] = (
+                    self._next_open_metrics.get("cancelled", 0) + expired_count
+                )
+                self._record_next_open_expired("NO_BAR_OPEN", count=expired_count)
             self._pending_next_open.clear()
-            return trades, cancelled, cancelled_reasons, "CANCELED_NEXT_BAR", {"code": "MISSING_BAR_OPEN"}, risk_events, fee_total
+            return (
+                trades,
+                cancelled,
+                cancelled_reasons,
+                "EXPIRED_NEXT_BAR",
+                {"code": "MISSING_BAR_OPEN"},
+                risk_events,
+                fee_total,
+            )
         cap_base_per_bar = self._reset_bar_capacity_if_needed(ts)
         cap_enforced = bool(
             self._bar_cap_base_enabled and cap_base_per_bar is not None and cap_base_per_bar > 0.0
@@ -2223,11 +2337,16 @@ class ExecutionSimulator:
             trades.append(trade)
             self._trade_log.append(trade)
             self._pending_next_open.pop(key, None)
-        status = "FILLED_NEXT_BAR" if trades else ("CANCELED_NEXT_BAR" if cancelled else None)
+        status = None
         reason_payload = None
-        if status == "FILLED_NEXT_BAR":
+        if trades and cancelled:
+            status = "PARTIAL_NEXT_BAR"
+            reason_payload = {"code": "NEXT_BAR_PARTIAL"}
+        elif trades:
+            status = "FILLED_NEXT_BAR"
             reason_payload = {"code": "NEXT_BAR_OPEN"}
-        elif status == "CANCELED_NEXT_BAR" and not reason_payload:
+        elif cancelled:
+            status = "CANCELED_NEXT_BAR"
             reason_payload = {"code": "NEXT_BAR_CANCELLED"}
         return trades, cancelled, cancelled_reasons, status, reason_payload, risk_events, fee_total
 
@@ -2270,18 +2389,26 @@ class ExecutionSimulator:
             and ts >= int(expected_ts)
             and (last_flush is None or int(last_flush) < int(expected_ts))
         ):
-            for state in list(self._pending_next_open.values()):
+            pending_states = list(self._pending_next_open.values())
+            if pending_states:
+                logger.warning(
+                    "Next-bar open execution: expected bar at ts=%s not received; expiring %d pending orders",
+                    expected_ts,
+                    len(pending_states),
+                )
+            for state in pending_states:
                 cancelled_ids.append(state.client_order_id)
-                cancelled_reasons[state.client_order_id] = "NO_BAR_DATA"
+                cancelled_reasons[state.client_order_id] = "EXPIRED_NO_BAR_DATA"
                 risk_events_all.extend(state.risk_events)
             self._pending_next_open.clear()
-            status = "CANCELED_NEXT_BAR"
+            status = "EXPIRED_NEXT_BAR"
             reason = {"code": "MISSING_NEXT_BAR"}
             added_cancelled = len(cancelled_ids) - cancelled_before
             if added_cancelled > 0:
                 self._next_open_metrics["cancelled"] = (
                     self._next_open_metrics.get("cancelled", 0) + added_cancelled
                 )
+                self._record_next_open_expired("NO_BAR_DATA", count=added_cancelled)
         if self._pending_next_open and not trades:
             if status is None:
                 status = "PENDING_NEXT_BAR"
@@ -5955,6 +6082,7 @@ class ExecutionSimulator:
                 self._next_open_cancelled.append(prev_state.client_order_id)
                 self._next_open_cancelled_reasons[prev_state.client_order_id] = "SUPERSEDED"
             self._pending_next_open.clear()
+        self._reset_next_open_metrics()
         state = PendingOrderState(
             proto=proto,
             client_order_id=cid,
@@ -5966,6 +6094,7 @@ class ExecutionSimulator:
             risk_events=list(risk_events_local),
         )
         self._pending_next_open[side_key] = state
+        self._record_next_open_deferred(side_key)
         self._next_open_metrics["submitted"] = self._next_open_metrics.get("submitted", 0) + 1
         self._next_open_new_orders.append(cid)
         return cid
@@ -7007,6 +7136,7 @@ class ExecutionSimulator:
 
                 # риск: пауза/клампинг размера перед планом
                 risk_events_local: List[RiskEvent] = []
+                adj_qty = qty_total
                 if self.risk is not None:
                     portfolio_total = None
                     try:
