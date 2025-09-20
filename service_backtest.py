@@ -34,6 +34,7 @@ from core_contracts import SignalPolicy
 from services.utils_config import snapshot_config  # сохранение снапшота конфига
 from services.utils_sandbox import read_df
 from core_config import CommonRunConfig
+from impl_quantizer import QuantizerImpl
 import di_registry
 
 
@@ -673,6 +674,53 @@ class ServiceBacktest:
     Сервис работает через BacktestAdapter, который использует SimAdapter.step.
     """
 
+    @staticmethod
+    def _ensure_quantizer_attached(
+        sim: ExecutionSimulator,
+        quantizer: QuantizerImpl,
+    ) -> None:
+        metadata_view = getattr(quantizer, "filters_metadata", None)
+        metadata_payload: Dict[str, Any] = {}
+        if isinstance(metadata_view, Mapping):
+            try:
+                metadata_payload = dict(metadata_view)
+            except Exception:
+                metadata_payload = {}
+
+        attach_api = getattr(sim, "attach_quantizer", None)
+        if callable(attach_api):
+            existing_impl = getattr(sim, "quantizer_impl", None)
+            existing_meta = getattr(sim, "quantizer_metadata", None)
+            metadata_missing = not isinstance(existing_meta, Mapping) or not existing_meta
+            impl_mismatch = not isinstance(existing_impl, QuantizerImpl) or existing_impl is not quantizer
+            if not (metadata_missing or impl_mismatch):
+                return
+            try:
+                attach_api(
+                    impl=quantizer,
+                    metadata=metadata_payload or None,
+                )
+            except TypeError:
+                logger.debug(
+                    "Simulator %s.attach_quantizer signature mismatch; falling back to legacy quantizer attachment",
+                    type(sim).__name__,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to attach quantizer via simulator API; falling back to legacy attachment",
+                )
+            else:
+                return
+
+        try:
+            quantizer.attach_to(
+                sim,
+                strict=quantizer.cfg.strict_filters,
+                enforce_percent_price_by_side=quantizer.cfg.enforce_percent_price_by_side,
+            )
+        except Exception:
+            logger.exception("Failed to attach quantizer to simulator")
+
     class _EmptySource:
         """Заглушка источника данных для SimAdapter."""
 
@@ -703,6 +751,16 @@ class ServiceBacktest:
             or getattr(sim, "run_config", None)
             or getattr(sim, "_run_config", None)
         )
+
+        quantizer_impl: Optional[QuantizerImpl] = None
+        try:
+            quantizer_impl = di_registry.resolve(QuantizerImpl)
+        except KeyError:
+            existing_impl = getattr(self.sim, "quantizer_impl", None)
+            if isinstance(existing_impl, QuantizerImpl):
+                quantizer_impl = existing_impl
+        if isinstance(quantizer_impl, QuantizerImpl):
+            self._ensure_quantizer_attached(self.sim, quantizer_impl)
 
         self._fees_expected_payload: Optional[Dict[str, Any]] = None
         self._fees_metadata: Optional[Dict[str, Any]] = None
