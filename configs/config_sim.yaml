@@ -14,6 +14,10 @@ execution:
   timeframe_ms: null
   use_latency_from: null
   latency_constant_ms: null
+  entry_mode: default         # Режим входа для симулятора; default соответствует текущему легаси-поведению.
+  clip_to_bar:                # Настройки клипа цен по диапазону последнего бара.
+    enabled: true             # true удерживает цены в пределах [low, high] бара (легаси-поведение).
+    strict_open_fill: false   # true → строго применять клип к открытиям; false оставляет прежнюю логику.
   bar_capacity_base:
     enabled: false           # Переключатель ограничения объёма сделок по ADV базовой валюты.
     capacity_frac_of_ADV_base: 1.0  # Доля дневного ADV (1.0 = 100%), доступная в каждом баре после пересчёта.

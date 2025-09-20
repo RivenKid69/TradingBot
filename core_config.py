@@ -277,6 +277,26 @@ class ExecutionBridgeConfig(BaseModel):
         extra = "allow"
 
 
+class ExecutionEntryMode(str, Enum):
+    """Available strategies for deriving execution entry points."""
+
+    DEFAULT = "default"
+    STRICT = "strict"
+
+
+class ClipToBarConfig(BaseModel):
+    """Control clipping of intrabar prices to the observed bar range."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Clip simulated prices to the current bar's high/low range.",
+    )
+    strict_open_fill: bool = Field(
+        default=False,
+        description="When enabled, force opening bar fills to honour the clipped price strictly.",
+    )
+
+
 class ExecutionRuntimeConfig(BaseModel):
     """Runtime execution configuration shared across run modes."""
 
@@ -284,15 +304,34 @@ class ExecutionRuntimeConfig(BaseModel):
     timeframe_ms: Optional[int] = Field(default=None)
     use_latency_from: Optional[str] = Field(default=None)
     latency_constant_ms: Optional[int] = Field(default=None)
+    entry_mode: ExecutionEntryMode = Field(
+        default=ExecutionEntryMode.DEFAULT,
+        description="Режим выбора точки входа; ``default`` соответствует текущему поведению.",
+    )
+    clip_to_bar: ClipToBarConfig = Field(default_factory=ClipToBarConfig)
     bridge: ExecutionBridgeConfig = Field(default_factory=ExecutionBridgeConfig)
 
     class Config:
         extra = "allow"
 
-    def dict(self, *args, **kwargs):  # type: ignore[override]
+    def _export_payload(self, method: str, *args, **kwargs) -> Dict[str, Any]:
         if "exclude_unset" not in kwargs:
             kwargs["exclude_unset"] = False
-        return super().dict(*args, **kwargs)
+        exporter = getattr(super(), method)
+        payload = exporter(*args, **kwargs)
+        if isinstance(payload, dict):
+            clip_cfg = payload.get("clip_to_bar")
+            if isinstance(clip_cfg, BaseModel):
+                payload["clip_to_bar"] = clip_cfg.dict(exclude_unset=False)
+        return payload
+
+    def dict(self, *args, **kwargs):  # type: ignore[override]
+        return self._export_payload("dict", *args, **kwargs)
+
+    def model_dump(self, *args, **kwargs):  # type: ignore[override]
+        if hasattr(super(), "model_dump"):
+            return self._export_payload("model_dump", *args, **kwargs)
+        return self._export_payload("dict", *args, **kwargs)
 
 
 class AdvRuntimeConfig(BaseModel):

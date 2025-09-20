@@ -20,6 +20,10 @@ execution:
   timeframe_ms: null
   use_latency_from: null
   latency_constant_ms: null
+  entry_mode: default         # Entry mode for fills; default keeps the legacy behaviour.
+  clip_to_bar:                # Clip simulated prices to the last bar's [low, high] range.
+    enabled: true             # true preserves legacy clipping; false disables it.
+    strict_open_fill: false   # true enforces clipped open fills; false keeps legacy logic.
   bridge:
     intrabar_price_model: null
     timeframe_ms: null
