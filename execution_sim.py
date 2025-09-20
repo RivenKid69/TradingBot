@@ -478,6 +478,8 @@ class SimStepReport:
     fill_ratio: float = 1.0
     capacity_reason: str = ""
     exec_status: str = ""
+    status: str = ""
+    reason: Mapping[str, Any] | None = None
     maker_share: float = 0.0
     expected_fee_bps: float = 0.0
     expected_spread_bps: Optional[float] = None
@@ -505,6 +507,18 @@ class SimStepReport:
                     cost_components[name] = None
                     continue
                 cost_components[name] = float(num)
+        if self.reason is None:
+            reason_payload: Dict[str, Any] | None = None
+        elif isinstance(self.reason, Mapping):
+            try:
+                reason_payload = {str(k): v for k, v in self.reason.items()}
+            except Exception:
+                reason_payload = dict(self.reason)
+        else:
+            reason_payload = {
+                str(k): v for k, v in getattr(self.reason, "__dict__", {}).items()
+            }
+
         return {
             "trades": trades_payload,
             "cancelled_ids": list(self.cancelled_ids),
@@ -548,6 +562,8 @@ class SimStepReport:
             "fill_ratio": float(self.fill_ratio),
             "capacity_reason": str(self.capacity_reason),
             "exec_status": str(self.exec_status),
+            "status": str(self.status),
+            "reason": reason_payload,
             "maker_share": float(self.maker_share),
             "expected_fee_bps": float(self.expected_fee_bps),
             "expected_spread_bps": (
