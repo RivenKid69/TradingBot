@@ -541,16 +541,26 @@ class SimExecutor(TradeExecutor):
                 detail_payload["constraint"] = details
         if ref_price is not None:
             detail_payload["ref_price"] = ref_price
-        rejection_entry: Dict[str, Any] = {
-            "which": str(reason_code or "FILTER"),
-            "detail": detail_payload,
+        entry_extra: Dict[str, Any] = {
             "order_type": str(order.order_type),
             "source": "quantizer_precheck",
         }
         client_id = getattr(order, "client_order_id", None)
         if client_id:
-            rejection_entry["client_order_id"] = str(client_id)
-        report.reason = {"rejections": [rejection_entry]}
+            entry_extra["client_order_id"] = str(client_id)
+        rejection_entry = ExecutionSimulator._build_reason_payload(
+            str(reason_code or "FILTER"),
+            details=detail_payload,
+            extra=entry_extra,
+        )
+        entries = [rejection_entry]
+        counts = ExecutionSimulator._summarize_rejection_counts(entries)
+        extra_payload = {"counts": counts} if counts else None
+        report.reason = ExecutionSimulator._build_reason_payload(
+            "FILTER_REJECTION",
+            details={"rejections": entries},
+            extra=extra_payload,
+        )
 
         payload = report.to_dict()
         core_reports = sim_report_dict_to_core_exec_reports(
