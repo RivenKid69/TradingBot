@@ -284,7 +284,11 @@ class SimExecutor(TradeExecutor):
 
         # последовательное подключение компонентов к симулятору
         if quantizer is not None:
-            quantizer.attach_to(self._sim, strict=True, enforce_percent_price_by_side=True)
+            quantizer.attach_to(
+                self._sim,
+                strict=quantizer.cfg.strict,
+                enforce_percent_price_by_side=quantizer.cfg.enforce_percent_price_by_side,
+            )
         if risk is not None:
             risk.attach_to(self._sim)
         if latency is not None:
@@ -371,7 +375,11 @@ class SimExecutor(TradeExecutor):
                 pass
 
         if q_impl is not None:
-            q_impl.attach_to(sim, strict=True, enforce_percent_price_by_side=True)
+            q_impl.attach_to(
+                sim,
+                strict=q_impl.cfg.strict,
+                enforce_percent_price_by_side=q_impl.cfg.enforce_percent_price_by_side,
+            )
         if r_impl is not None:
             r_impl.attach_to(sim)
         if l_impl is not None:
