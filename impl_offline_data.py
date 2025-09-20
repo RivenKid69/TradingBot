@@ -21,7 +21,7 @@ import pandas as pd  # предполагается в зависимостях
 import clock
 from core_models import Bar, Tick
 from core_contracts import MarketDataSource
-from utils_time import parse_time_to_ms, floor_to_timeframe, is_bar_closed
+from utils_time import parse_time_to_ms, bar_close_ms, is_bar_closed
 from config import DataDegradationConfig
 
 logger = logging.getLogger(__name__)
@@ -131,7 +131,7 @@ class OfflineCSVBarSource(MarketDataSource):
                             time.sleep(delay_ms / 1000.0)
                     yield prev_bar
                     continue
-                close_ts = floor_to_timeframe(ts, interval_ms_cfg) + interval_ms_cfg
+                close_ts = bar_close_ms(ts, interval_ms_cfg)
                 is_final = True
                 if self.cfg.enforce_closed_bars and not is_bar_closed(
                     close_ts, clock.now_ms(), self.cfg.close_lag_ms
