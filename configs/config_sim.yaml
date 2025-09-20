@@ -58,7 +58,8 @@ model:
   params: {}
 
 quantizer:
-  filters_path: "binance_filters.json"
+  filters_path: "data/binance_filters.json"
+  # Flip the strict/enforce flags below to false to restore legacy permissive behaviour.
   strict: true
   enforce_percent_price_by_side: true
   auto_refresh_days: 30
