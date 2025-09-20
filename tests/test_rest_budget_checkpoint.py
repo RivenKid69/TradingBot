@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 from collections import deque
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 
 requests = pytest.importorskip("requests")
+if not hasattr(requests, "Session"):
+    pytest.skip("requests.Session not available", allow_module_level=True)
 
 from services.rest_budget import RestBudgetSession
 
@@ -25,16 +28,31 @@ def _session(tmp_path: Path, *, resume: bool = True, enabled: bool = True) -> Re
 def test_save_and_load_checkpoint(tmp_path: Path) -> None:
     session = _session(tmp_path)
     payload = {"position": 5, "symbols": ["BTCUSDT", "ETHUSDT"]}
-    session.save_checkpoint(payload)
+    session.save_checkpoint(
+        payload,
+        last_symbol="ethusdt",
+        last_range=(1_690_000_000_000, 1_690_008_600_000),
+        progress_pct=12.5,
+    )
 
     ckpt_path = tmp_path / "ckpt.json"
     assert ckpt_path.exists()
     on_disk = json.loads(ckpt_path.read_text(encoding="utf-8"))
-    assert on_disk["position"] == 5
-    assert on_disk["symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert on_disk["data"]["position"] == 5
+    assert on_disk["data"]["symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert on_disk["last_symbol"] == "ETHUSDT"
+    assert on_disk["last_range"] == [1_690_000_000_000, 1_690_008_600_000]
+    assert on_disk["progress_pct"] == pytest.approx(12.5)
+    assert isinstance(on_disk["saved_at"], str)
 
     loaded = session.load_checkpoint()
-    assert loaded == on_disk
+    assert isinstance(loaded, Mapping)
+    assert loaded["position"] == 5
+    assert loaded["data"]["symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert loaded["last_symbol"] == "ETHUSDT"
+    assert loaded["last_range"] == [1_690_000_000_000, 1_690_008_600_000]
+    assert loaded["progress_pct"] == pytest.approx(12.5)
+    assert loaded["_checkpoint"]["last_symbol"] == "ETHUSDT"
 
 
 def test_load_checkpoint_disabled(tmp_path: Path) -> None:
@@ -64,7 +82,10 @@ def test_stats_plan_and_checkpoint(tmp_path: Path) -> None:
     )
     session.plan_request("GET /api/test", count=3, tokens=2.5)
     session.save_checkpoint({"position": 1})
-    assert session.load_checkpoint() == {"position": 1}
+    checkpoint = session.load_checkpoint()
+    assert isinstance(checkpoint, Mapping)
+    assert checkpoint["position"] == 1
+    assert checkpoint["progress_pct"] is None
 
     stats = session.stats()
     assert stats["planned_requests"] == {"GET /api/test": 3}
@@ -118,6 +139,7 @@ def test_stats_requests_and_cache(tmp_path: Path) -> None:
     try:
         payload = session.get("https://example.com/api", endpoint="GET /api", tokens=1.5)
         assert payload == {"value": 42}
+        assert session.is_cached("https://example.com/api", endpoint="GET /api")
         payload_cached = session.get("https://example.com/api", endpoint="GET /api", tokens=1.5)
         assert payload_cached == {"value": 42}
     finally:
@@ -129,6 +151,9 @@ def test_stats_requests_and_cache(tmp_path: Path) -> None:
     assert stats["cache_stores"] == {"GET /api": 1}
     assert stats["cache_hits"]["GET /api"] == 1
     assert stats["cache_misses"]["GET /api"] >= 1
+    assert stats["cache_totals"]["hits"] == 1
+    assert stats["cache_totals"]["stores"] == 1
+    assert stats["cache_totals"]["misses"] >= 1
     assert stats["checkpoint"] == {"loads": 0, "saves": 0}
     assert pytest.approx(1.5) == stats["request_tokens"]["GET /api"]
     json.dumps(stats)
