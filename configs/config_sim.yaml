@@ -59,8 +59,10 @@ model:
 
 quantizer:
   filters_path: "data/binance_filters.json"
-  # Flip the strict/enforce flags below to false to restore legacy permissive behaviour.
-  strict: true
+  # strict_filters=true → строго придерживаться актуальных фильтров; false включает мягкий фолбек к кешу/легаси-логике.
+  strict_filters: true
+  # quantize_mode управляет округлением; "inward" (дефолт) поджимает цену/объём внутрь биржевых ограничений.
+  quantize_mode: "inward"
   enforce_percent_price_by_side: true
   auto_refresh_days: 30
   refresh_on_start: false
