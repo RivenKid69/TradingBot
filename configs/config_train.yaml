@@ -9,6 +9,11 @@ execution_params:
   limit_offset_bps: 0.0  # e.g. 25 for 0.25% offset when using LIMIT_MID_BPS
   ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
   tif: GTC               # e.g. IOC or FOK
+execution:
+  entry_mode: default         # Entry mode for fills; ``default`` mirrors the legacy simulator behaviour.
+  clip_to_bar:                # Controls clipping of simulated prices to the observed bar range.
+    enabled: true             # Keep prices within [low, high] of the current bar (legacy behaviour).
+    strict_open_fill: false   # Force clipped open-price fills when true; false keeps legacy logic.
 execution_config:
   notional_threshold: 10000.0
   large_order_algo: TWAP
