@@ -181,6 +181,44 @@ class SimExecutor(TradeExecutor):
 
         return payload
 
+    @staticmethod
+    def _attach_quantizer_via_api(
+        sim: ExecutionSimulator,
+        quantizer: QuantizerImpl,
+    ) -> bool:
+        attach_api = getattr(sim, "attach_quantizer", None)
+        if not callable(attach_api):
+            return False
+
+        metadata_view = getattr(quantizer, "filters_metadata", None)
+        metadata_payload: Dict[str, Any] = {}
+        if isinstance(metadata_view, Mapping):
+            try:
+                metadata_payload = dict(metadata_view)
+            except Exception:
+                metadata_payload = {}
+
+        try:
+            attach_api(
+                impl=quantizer,
+                metadata=metadata_payload or None,
+            )
+        except TypeError:
+            logger.debug(
+                "Simulator %s.attach_quantizer signature mismatch; falling back to legacy attachment",
+                type(sim).__name__,
+            )
+            return False
+        except Exception as exc:
+            logger.warning(
+                "Simulator %s.attach_quantizer failed: %s; falling back to legacy attachment",
+                type(sim).__name__,
+                exc,
+            )
+            return False
+
+        return True
+
     def __init__(
         self,
         sim: ExecutionSimulator,
@@ -290,11 +328,13 @@ class SimExecutor(TradeExecutor):
 
         # последовательное подключение компонентов к симулятору
         if quantizer is not None:
-            quantizer.attach_to(
-                self._sim,
-                strict=quantizer.cfg.strict,
-                enforce_percent_price_by_side=quantizer.cfg.enforce_percent_price_by_side,
-            )
+            attached = self._attach_quantizer_via_api(self._sim, quantizer)
+            if not attached:
+                quantizer.attach_to(
+                    self._sim,
+                    strict=quantizer.cfg.strict,
+                    enforce_percent_price_by_side=quantizer.cfg.enforce_percent_price_by_side,
+                )
         if risk is not None:
             risk.attach_to(self._sim)
         if latency is not None:
@@ -381,11 +421,13 @@ class SimExecutor(TradeExecutor):
                 pass
 
         if q_impl is not None:
-            q_impl.attach_to(
-                sim,
-                strict=q_impl.cfg.strict,
-                enforce_percent_price_by_side=q_impl.cfg.enforce_percent_price_by_side,
-            )
+            attached = SimExecutor._attach_quantizer_via_api(sim, q_impl)
+            if not attached:
+                q_impl.attach_to(
+                    sim,
+                    strict=q_impl.cfg.strict,
+                    enforce_percent_price_by_side=q_impl.cfg.enforce_percent_price_by_side,
+                )
         if r_impl is not None:
             r_impl.attach_to(sim)
         if l_impl is not None:

@@ -431,23 +431,7 @@ class QuantizerImpl:
         if enforce_percent_price_by_side is not None:
             self.cfg.enforce_percent_price_by_side = bool(enforce_percent_price_by_side)
 
-        try:
-            setattr(sim, "validate_order", self.validate_order)
-        except Exception:
-            pass
-
-        try:
-            setattr(sim, "symbol_filters", self.symbol_filters)
-        except Exception:
-            pass
-
         quantizer = self._quantizer
-        if quantizer is not None:
-            try:
-                setattr(sim, "quantizer", quantizer)
-            except Exception:
-                pass
-
         filters_payload: Optional[Dict[str, Dict[str, Any]]] = None
         if self._filters_raw:
             filters_payload = dict(self._filters_raw)
@@ -462,26 +446,12 @@ class QuantizerImpl:
         )
         metadata_for_sim = dict(metadata_view) if metadata_view else {}
 
-        try:
-            setattr(sim, "quantize_mode", str(self.cfg.quantize_mode))
-        except Exception:
-            pass
-        if metadata_for_sim:
-            try:
-                setattr(sim, "quantizer_metadata", dict(metadata_for_sim))
-            except Exception:
-                pass
-
         attach_api = getattr(sim, "attach_quantizer", None)
         if callable(attach_api):
             try:
                 attach_api(
-                    quantizer=quantizer,
-                    filters=filters_payload,
-                    strict_filters=strict_active,
-                    enforce_ppbs=enforce_active,
+                    impl=self,
                     metadata=dict(metadata_for_sim) if metadata_for_sim else None,
-                    quantize_mode=str(self.cfg.quantize_mode),
                 )
             except TypeError:
                 logger.debug(
@@ -496,6 +466,32 @@ class QuantizerImpl:
                 )
             else:
                 return
+
+        try:
+            setattr(sim, "validate_order", self.validate_order)
+        except Exception:
+            pass
+
+        try:
+            setattr(sim, "symbol_filters", self.symbol_filters)
+        except Exception:
+            pass
+
+        if quantizer is not None:
+            try:
+                setattr(sim, "quantizer", quantizer)
+            except Exception:
+                pass
+
+        try:
+            setattr(sim, "quantize_mode", str(self.cfg.quantize_mode))
+        except Exception:
+            pass
+        if metadata_for_sim:
+            try:
+                setattr(sim, "quantizer_metadata", dict(metadata_for_sim))
+            except Exception:
+                pass
 
         filters_attached = False
         warn_message: Optional[str] = None
