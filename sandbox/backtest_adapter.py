@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
 import clock
-from utils_time import floor_to_timeframe, is_bar_closed
+from utils_time import bar_close_ms, is_bar_closed
 
 from core_contracts import SignalPolicy, PolicyCtx
 from core_models import Order, Side
@@ -558,7 +558,7 @@ class BacktestAdapter:
                     bar_low = None
 
             if self._timing.enforce_closed_bars:
-                close_ts = floor_to_timeframe(ts, self._timing.timeframe_ms) + self._timing.timeframe_ms
+                close_ts = bar_close_ms(ts, self._timing.timeframe_ms)
                 if not is_bar_closed(close_ts, clock.now_ms(), self._timing.close_lag_ms):
                     skip_cnt += 1
                     try:

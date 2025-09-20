@@ -60,6 +60,7 @@ except Exception:  # pragma: no cover - optional dependency for legacy setups
 try:
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
     from utils_time import (
+        bar_start_ms,
         get_hourly_multiplier,
         get_liquidity_multiplier,
         load_hourly_seasonality,
@@ -73,6 +74,7 @@ except Exception:  # pragma: no cover - fallback when running as standalone file
     sys.path.append(str(pathlib.Path(__file__).resolve().parent))
     from utils.time import HOUR_MS, HOURS_IN_WEEK, hour_of_week
     from utils_time import (
+        bar_start_ms,
         get_hourly_multiplier,
         get_liquidity_multiplier,
         load_hourly_seasonality,
@@ -3036,7 +3038,7 @@ class ExecutionSimulator:
         if timeframe <= 0:
             timeframe = 1
         try:
-            bar_start = (ts_val // timeframe) * timeframe
+            bar_start = bar_start_ms(ts_val, timeframe)
         except Exception:
             bar_start = ts_val
         if self._capacity_bar_ts is None or bar_start != self._capacity_bar_ts:

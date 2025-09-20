@@ -18,7 +18,14 @@ import numpy as np
 import clock
 from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
 
-__all__ = ["floor_to_timeframe", "is_bar_closed", "now_ms", "next_bar_open_ms"]
+__all__ = [
+    "bar_start_ms",
+    "bar_close_ms",
+    "floor_to_timeframe",
+    "is_bar_closed",
+    "next_bar_open_ms",
+    "now_ms",
+]
 
 _logging_spec = importlib.util.spec_from_file_location(
     "py_logging", Path(sysconfig.get_path("stdlib")) / "logging/__init__.py"
@@ -76,10 +83,40 @@ def _coerce_seasonality_payload(value: Any) -> np.ndarray | None:
     return arr
 
 
+def _normalize_bar_bounds(ts_ms: int, timeframe_ms: int) -> tuple[int, int]:
+    """Return the ``(start, close)`` bounds for ``ts_ms`` within ``timeframe_ms``."""
+
+    try:
+        ts_val = int(ts_ms)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ts_ms must be an integer timestamp") from exc
+    try:
+        timeframe_val = int(timeframe_ms)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("timeframe_ms must be an integer duration") from exc
+    if timeframe_val <= 0:
+        raise ValueError("timeframe_ms must be a positive integer")
+    start = (ts_val // timeframe_val) * timeframe_val
+    close = start + timeframe_val
+    return start, close
+
+
+def bar_start_ms(ts_ms: int, timeframe_ms: int) -> int:
+    """Return the open timestamp of the bar containing ``ts_ms``."""
+
+    return _normalize_bar_bounds(ts_ms, timeframe_ms)[0]
+
+
+def bar_close_ms(ts_ms: int, timeframe_ms: int) -> int:
+    """Return the close timestamp of the bar containing ``ts_ms``."""
+
+    return _normalize_bar_bounds(ts_ms, timeframe_ms)[1]
+
+
 def floor_to_timeframe(ts_ms: int, timeframe_ms: int) -> int:
     """Floor ``ts_ms`` down to the nearest multiple of ``timeframe_ms``."""
 
-    return (ts_ms // timeframe_ms) * timeframe_ms
+    return bar_start_ms(ts_ms, timeframe_ms)
 
 
 def is_bar_closed(ts_close_ms: int, now_utc_ms: int, lag_ms: int = 0) -> bool:
@@ -97,7 +134,7 @@ def now_ms() -> int:
 def next_bar_open_ms(close_ms: int, timeframe_ms: int) -> int:
     """Return the open timestamp of the bar following ``close_ms``."""
 
-    return floor_to_timeframe(close_ms, timeframe_ms) + timeframe_ms
+    return bar_close_ms(close_ms, timeframe_ms)
 
 
 def interpolate_daily_multipliers(days: Sequence[float]) -> np.ndarray:
