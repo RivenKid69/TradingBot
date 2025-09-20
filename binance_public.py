@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from core_config import RetryConfig
 from services.rest_budget import RestBudgetSession
@@ -15,6 +15,77 @@ from services.rest_budget import RestBudgetSession
 DEFAULT_RETRY_CFG = RetryConfig(max_attempts=5, backoff_base_s=0.5, max_backoff_s=60.0)
 _BOOK_TICKER_TTL_S = 1.0
 _LAST_PRICE_TTL_S = 1.0
+
+#: Budget keys used by :class:`BinancePublicClient` along with the documented
+#: Binance REST endpoints and their indicative request weights.  The weight
+#: values are based on https://binance-docs.github.io/apidocs/spot/en/ and are
+#: meant to mirror how :class:`services.rest_budget.RestBudgetSession` should
+#: account for the relative cost of each request.  Keeping the mapping close to
+#: the client makes it easy to audit and maintain budgets when Binance updates
+#: endpoint weights.
+BINANCE_REST_BUDGETS: Dict[str, str] = {
+    "serverTime": "GET /api/v3/time (weight 1)",
+    "klines": "GET /api/v3/klines & GET /fapi/v1/klines (weight depends on limit)",
+    "aggTrades": "GET /api/v3/aggTrades & GET /fapi/v1/aggTrades (weight 1-2)",
+    "markPriceKlines": "GET /fapi/v1/markPriceKlines (weight depends on limit)",
+    "fundingRate": "GET /fapi/v1/fundingRate (weight 1)",
+    "exchangeInfo": "GET /api/v3/exchangeInfo & GET /fapi/v1/exchangeInfo (weight 10)",
+    "bookTicker": "GET /api/v3/ticker/bookTicker (weight 1 single / 2 multi)",
+    "tickerPrice": "GET /api/v3/ticker/price (weight 1 single / 2 multi)",
+    "ticker24hr": "GET /api/v3/ticker/24hr & GET /fapi/v1/ticker/24hr (weight 1-40)",
+}
+
+
+def _kline_tokens(limit: int) -> float:
+    """Return an approximate request weight for ``limit`` kline candles."""
+
+    try:
+        limit_val = int(limit)
+    except (TypeError, ValueError):
+        limit_val = 0
+    limit_val = max(limit_val, 1)
+    if limit_val <= 100:
+        return 1.0
+    if limit_val <= 500:
+        return 2.0
+    if limit_val <= 1000:
+        return 5.0
+    return 10.0
+
+
+def _agg_trades_tokens(limit: int) -> float:
+    """Return representative weight for aggregated trade queries."""
+
+    try:
+        limit_val = int(limit)
+    except (TypeError, ValueError):
+        limit_val = 0
+    return 1.0 if limit_val <= 500 else 2.0
+
+
+def _book_ticker_tokens(count: int) -> float:
+    """Weight helper for :meth:`get_book_ticker`."""
+
+    return 1.0 if count <= 1 else 2.0
+
+
+def _ticker_price_tokens(count: int) -> float:
+    """Weight helper for :meth:`get_last_price`."""
+
+    return 1.0 if count <= 1 else 2.0
+
+
+def _ticker_24hr_tokens(symbols: List[str] | None) -> float:
+    """Return approximate weight for 24hr statistics requests."""
+
+    if not symbols:
+        # Requesting the entire book of tickers carries the highest weight.
+        return 40.0
+    count = len(symbols)
+    if count <= 1:
+        return 1.0
+    # Binance charges up to 40 weight units; scale moderately by symbol count.
+    return float(min(40.0, max(2.0, float(count))))
 
 
 @dataclass
@@ -31,6 +102,9 @@ class BinancePublicClient:
       - get_funding() для funding rate (futures)
     Пагинация — по startTime/endTime + limit.
     Времена — миллисекунды Unix.
+
+    See :data:`BINANCE_REST_BUDGETS` for a reference of budget names used by
+    the client and the corresponding Binance REST endpoints/weights.
     """
 
     def __init__(
@@ -54,6 +128,8 @@ class BinancePublicClient:
             Tuple[float, Tuple[Optional[Union[Decimal, float]], Optional[Union[Decimal, float]]]],
         ] = {}
         self._last_price_cache: Dict[str, Tuple[float, Optional[Union[Decimal, float]]]] = {}
+        self._last_response_metadata: Dict[str, Any] | None = None
+        self._last_weight_headers: Dict[str, Any] | None = None
 
     def close(self) -> None:
         """Release owned REST session resources."""
@@ -72,14 +148,79 @@ class BinancePublicClient:
 
     # -------- SERVER TIME --------
 
+    def _update_last_response_metadata(self) -> None:
+        metadata: Mapping[str, Any] | None = None
+        getter = getattr(self.session, "get_last_response_metadata", None)
+        if callable(getter):
+            try:
+                candidate = getter()
+            except TypeError:
+                candidate = None
+            if isinstance(candidate, Mapping):
+                metadata = dict(candidate)
+        elif isinstance(getter, Mapping):
+            metadata = dict(getter)
+
+        self._last_response_metadata = metadata
+        if metadata is None:
+            self._last_weight_headers = None
+            return
+
+        weights = metadata.get("binance_weights") or metadata.get("weight_headers")
+        if isinstance(weights, Mapping):
+            self._last_weight_headers = {str(k): weights[k] for k in weights}
+        else:
+            self._last_weight_headers = None
+
+    def _session_get(
+        self,
+        url: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        budget: str,
+        tokens: float,
+        endpoint: str | None = None,
+    ) -> Any:
+        kwargs: Dict[str, Any] = {
+            "params": params,
+            "timeout": self.timeout,
+            "budget": budget,
+            "tokens": float(tokens),
+        }
+        if endpoint is not None:
+            kwargs["endpoint"] = endpoint
+        data = self.session.get(url, **kwargs)
+        self._update_last_response_metadata()
+        return data
+
+    @property
+    def last_response_metadata(self) -> Optional[Dict[str, Any]]:
+        """Return metadata captured from the most recent REST response."""
+
+        if self._last_response_metadata is None:
+            return None
+        return dict(self._last_response_metadata)
+
+    @property
+    def last_weight_headers(self) -> Optional[Dict[str, Any]]:
+        """Return parsed Binance weight headers from the latest response."""
+
+        if self._last_weight_headers is None:
+            return None
+        return dict(self._last_weight_headers)
+
     def get_server_time(self) -> Tuple[int, float]:
-        """Fetch Binance server time and measure round-trip time."""
+        """Fetch Binance server time and measure round-trip time.
+
+        Budget ``serverTime`` tracks ``GET /api/v3/time`` which carries a
+        constant weight of ``1`` per request.
+        """
         base = self.e.spot_base
         path = "/api/v3/time"
         url = f"{base}{path}"
         params: Dict[str, Any] = {}
         t0 = time.time()
-        data = self.session.get(url, params=params, timeout=self.timeout)
+        data = self._session_get(url, params=params, budget="serverTime", tokens=1.0)
         t1 = time.time()
         if isinstance(data, dict) and "serverTime" in data:
             return int(data["serverTime"]), (t1 - t0) * 1000.0
@@ -92,6 +233,9 @@ class BinancePublicClient:
         Возвращает «сырые» klines: список списков, как в Binance API.
         market: "spot" | "futures"
         interval: "1m" | "5m" | "15m" | "1h" | ...
+        Budget ``klines`` corresponds to ``GET /api/v3/klines`` (spot) and
+        ``GET /fapi/v1/klines`` (futures) where the request weight grows with
+        ``limit``.
         """
         if market not in ("spot", "futures"):
             raise ValueError("market должен быть 'spot' или 'futures'")
@@ -107,9 +251,8 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        data = self.session.get(
-            url, params=params, timeout=self.timeout, budget="klines"
-        )
+        tokens = _kline_tokens(limit)
+        data = self._session_get(url, params=params, budget="klines", tokens=tokens)
         if isinstance(data, list):
             return data  # type: ignore
         raise RuntimeError(f"Unexpected klines response: {data}")
@@ -125,7 +268,11 @@ class BinancePublicClient:
         end_ms: int | None = None,
         limit: int = 1000,
     ) -> List[Dict[str, Any]]:
-        """Fetch aggregated trades from Binance public API."""
+        """Fetch aggregated trades from Binance public API.
+
+        Budget ``aggTrades`` reflects ``GET /api/v3/aggTrades`` and the futures
+        equivalent where heavier ``limit`` values consume two weight units.
+        """
         if market not in ("spot", "futures"):
             raise ValueError("market must be 'spot' or 'futures'")
         base = self.e.spot_base if market == "spot" else self.e.futures_base
@@ -139,8 +286,9 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        data = self.session.get(
-            url, params=params, timeout=self.timeout, budget="aggTrades"
+        tokens = _agg_trades_tokens(limit)
+        data = self._session_get(
+            url, params=params, budget="aggTrades", tokens=tokens
         )
         if isinstance(data, list):
             return data  # type: ignore[return-value]
@@ -161,8 +309,11 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        data = self.session.get(
-            url, params=params, timeout=self.timeout, budget="markPriceKlines"
+        # Budget ``markPriceKlines`` mirrors futures mark price klines with the
+        # same weight profile as standard klines.
+        tokens = _kline_tokens(limit)
+        data = self._session_get(
+            url, params=params, budget="markPriceKlines", tokens=tokens
         )
         if isinstance(data, list):
             return data  # type: ignore
@@ -182,9 +333,9 @@ class BinancePublicClient:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        data = self.session.get(
-            url, params=params, timeout=self.timeout, budget="fundingRate"
-        )
+        # Budget ``fundingRate`` maps to ``GET /fapi/v1/fundingRate`` which has a
+        # flat weight of ``1`` per request.
+        data = self._session_get(url, params=params, budget="fundingRate", tokens=1.0)
         if isinstance(data, list):
             return data  # type: ignore
         raise RuntimeError(f"Unexpected funding response: {data}")
@@ -196,6 +347,9 @@ class BinancePublicClient:
         Возвращает фильтры торговли для указанных символов Binance.
         Поддерживаются типы фильтров: PRICE_FILTER, LOT_SIZE, MIN_NOTIONAL,
         PERCENT_PRICE_BY_SIDE / PERCENT_PRICE.
+        Budget ``exchangeInfo`` represents ``GET /api/v3/exchangeInfo`` and
+        ``GET /fapi/v1/exchangeInfo`` which both have an advertised weight of
+        ``10``.
         """
         if market not in ("spot", "futures"):
             raise ValueError("market must be 'spot' or 'futures'")
@@ -205,8 +359,8 @@ class BinancePublicClient:
         params: Dict[str, Any] = {}
         if symbols:
             params["symbols"] = json.dumps([s.upper() for s in symbols])
-        data = self.session.get(
-            url, params=params, timeout=self.timeout, budget="exchangeInfo"
+        data = self._session_get(
+            url, params=params, budget="exchangeInfo", tokens=10.0
         )
         out: Dict[str, Dict[str, Any]] = {}
         if isinstance(data, dict):
@@ -260,6 +414,10 @@ class BinancePublicClient:
         mapping ``symbol -> (bid, ask)`` for multiple symbols.  Values are
         ``Decimal`` where possible with a float fallback when conversion
         fails.
+
+        Budget ``bookTicker`` maps to ``GET /api/v3/ticker/bookTicker`` with a
+        weight of ``1`` for single-symbol requests and ``2`` when fetching
+        multiple symbols.
         """
 
         if isinstance(symbols, str):
@@ -288,11 +446,12 @@ class BinancePublicClient:
                 params = {"symbol": missing[0]}
             else:
                 params = {"symbols": json.dumps(missing)}
-            data = self.session.get(
+            request_tokens = _book_ticker_tokens(len(missing))
+            data = self._session_get(
                 url,
                 params=params,
-                timeout=self.timeout,
                 budget="bookTicker",
+                tokens=request_tokens,
             )
             parsed: Dict[
                 str,
@@ -352,11 +511,13 @@ class BinancePublicClient:
 
         url = f"{self.e.spot_base}/api/v3/ticker/price"
         params = {"symbol": sym}
-        data = self.session.get(
+        # Budget ``tickerPrice`` corresponds to ``GET /api/v3/ticker/price``
+        # with a constant single-symbol weight of ``1``.
+        data = self._session_get(
             url,
             params=params,
-            timeout=self.timeout,
             budget="tickerPrice",
+            tokens=_ticker_price_tokens(1),
         )
         if not isinstance(data, dict):
             raise RuntimeError(f"Unexpected tickerPrice response: {data}")
@@ -442,15 +603,19 @@ class BinancePublicClient:
         path = "/api/v3/ticker/24hr" if market == "spot" else "/fapi/v1/ticker/24hr"
         url = f"{base}{path}"
         params: Dict[str, Any]
-        if len(symbols) == 1:
-            params = {"symbol": symbols[0].upper()}
+        normalized = [s.upper() for s in symbols]
+        if len(normalized) == 1:
+            params = {"symbol": normalized[0]}
         else:
-            params = {"symbols": json.dumps([s.upper() for s in symbols])}
-        data = self.session.get(
+            params = {"symbols": json.dumps(normalized)}
+        # Budget ``ticker24hr`` spans spot/futures 24-hour statistics and can
+        # cost up to ``40`` weight units when requesting many symbols.
+        tokens = _ticker_24hr_tokens(normalized if normalized else None)
+        data = self._session_get(
             url,
             params=params,
-            timeout=self.timeout,
             budget="ticker24hr",
+            tokens=tokens,
         )
         results: Dict[
             str,

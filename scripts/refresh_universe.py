@@ -187,6 +187,8 @@ def _fetch_quote_volume(session: RestBudgetSession, symbol: str) -> float:
         TICKER_24HR_URL,
         params={"symbol": symbol},
         endpoint=TICKER_24HR_ENDPOINT,
+        budget="ticker24hr",
+        tokens=1.0,
     )
     if isinstance(payload, Mapping):
         try:
@@ -217,7 +219,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_path = Path(args.out)
 
     with RestBudgetSession(session_cfg) as session:
-        exchange_info = session.get(EXCHANGE_INFO_URL, endpoint=EXCHANGE_INFO_ENDPOINT)
+        exchange_info = session.get(
+            EXCHANGE_INFO_URL,
+            endpoint=EXCHANGE_INFO_ENDPOINT,
+            budget="exchangeInfo",
+            tokens=10.0,
+        )
         if not isinstance(exchange_info, Mapping):
             raise RuntimeError("Unexpected exchangeInfo response")
 

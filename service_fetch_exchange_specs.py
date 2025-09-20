@@ -40,6 +40,23 @@ def _klines_endpoint_key(market: str) -> str:
     return "GET /fapi/v1/klines"
 
 
+def _estimate_kline_tokens(limit: int) -> float:
+    """Return a conservative weight estimate for Binance kline queries."""
+
+    try:
+        limit_val = int(limit)
+    except (TypeError, ValueError):
+        limit_val = 0
+    limit_val = max(limit_val, 1)
+    if limit_val <= 100:
+        return 1.0
+    if limit_val <= 500:
+        return 2.0
+    if limit_val <= 1000:
+        return 5.0
+    return 10.0
+
+
 def _ensure_dir(path: str) -> None:
     d = os.path.dirname(path) if os.path.splitext(path)[1] else path
     if d:
@@ -74,7 +91,12 @@ def run(
     """
 
     session = session or RestBudgetSession({})
-    data = session.get(_endpoint(market), endpoint=_endpoint_key(market))
+    data = session.get(
+        _endpoint(market),
+        endpoint=_endpoint_key(market),
+        budget="exchangeInfo",
+        tokens=10.0,
+    )
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected exchangeInfo response")
 
@@ -211,6 +233,8 @@ def run(
                 _klines_endpoint(market),
                 params=params,
                 endpoint=_klines_endpoint_key(market),
+                budget="klines",
+                tokens=_estimate_kline_tokens(limit),
             )
             if not isinstance(payload, list):
                 continue

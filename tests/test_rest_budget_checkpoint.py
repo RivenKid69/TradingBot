@@ -159,6 +159,35 @@ def test_stats_requests_and_cache(tmp_path: Path) -> None:
     json.dumps(stats)
 
 
+def test_last_response_metadata_tracks_weights(tmp_path: Path) -> None:
+    response = _DummyResponse({"value": 1})
+    response.headers = {
+        "X-MBX-USED-WEIGHT-1M": "123",
+        "X-MBX-ORDER-COUNT-1M": "5",
+        "X-OTHER": "ignored",
+    }
+    dummy_session = _DummySession([response])
+    session = RestBudgetSession({}, session=dummy_session)
+    try:
+        payload = session.get(
+            "https://example.com/api",
+            endpoint="GET /api",
+            budget="test-budget",
+            tokens=2.0,
+        )
+        assert payload == {"value": 1}
+        metadata = session.get_last_response_metadata()
+    finally:
+        session.close()
+
+    assert metadata is not None
+    assert metadata["budget"] == "test-budget"
+    assert metadata["cache_hit"] is False
+    assert metadata["tokens"] == pytest.approx(2.0)
+    weights = metadata.get("binance_weights")
+    assert weights == {"x-mbx-used-weight-1m": 123.0, "x-mbx-order-count-1m": 5.0}
+
+
 def test_qps_bucket_support() -> None:
     session = RestBudgetSession({"global": {"qps": 2.5, "burst": 5}})
     try:
