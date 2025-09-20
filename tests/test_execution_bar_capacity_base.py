@@ -3,7 +3,7 @@ import json
 import pathlib
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import pytest
 
@@ -52,6 +52,8 @@ class _CompatReport:
     latency_timeout_ratio: float = 0.0
     execution_profile: str = ""
     vol_raw: Optional[Dict[str, float]] = None
+    status: str = ""
+    reason: Optional[Dict[str, Any]] = None
 
 
 exec_mod.SimStepReport = _CompatReport  # type: ignore[attr-defined]
