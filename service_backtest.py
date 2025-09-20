@@ -717,6 +717,15 @@ class ServiceBacktest:
     ) -> List[Dict[str, Any]]:
         if self.cfg.snapshot_config_path and self.cfg.artifacts_dir:
             snapshot_config(self.cfg.snapshot_config_path, self.cfg.artifacts_dir)
+        reset_summary = getattr(self.sim, "reset_filter_rejection_summary", None)
+        if callable(reset_summary):
+            try:
+                reset_summary()
+            except Exception:
+                logger.debug(
+                    "service_backtest: failed to reset filter rejection summary",
+                    exc_info=True,
+                )
         reports = self._bt.run(
             df, ts_col=ts_col, symbol_col=symbol_col, price_col=price_col
         )
@@ -898,6 +907,38 @@ class ServiceBacktest:
                 comp_avg_repr,
                 comp_sum_repr,
             )
+
+        rejection_summary: Dict[str, int] = {}
+        getter = getattr(self.sim, "get_filter_rejection_summary", None)
+        if callable(getter):
+            try:
+                payload = getter(reset=True)
+            except Exception:
+                logger.debug(
+                    "service_backtest: failed to fetch filter rejection summary",
+                    exc_info=True,
+                )
+            else:
+                if isinstance(payload, Mapping):
+                    for key, value in payload.items():
+                        try:
+                            count = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if count > 0:
+                            rejection_summary[str(key)] = count
+        if rejection_summary:
+            summary_repr = ", ".join(
+                f"{key}={rejection_summary[key]}" for key in sorted(rejection_summary)
+            )
+            logger.info(
+                "%s: filter_rejections %s",
+                "service_backtest",
+                summary_repr,
+            )
+            for rep in reports:
+                if isinstance(rep, dict):
+                    rep.setdefault("filter_rejections", dict(rejection_summary))
 
         try:
             if getattr(self.sim, "_logger", None):
