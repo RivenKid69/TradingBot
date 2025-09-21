@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, Mapping
 from types import MappingProxyType
 import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -49,10 +50,21 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
     return None
 
 
-def _filters_age_days(meta: Dict[str, Any], path: str) -> Optional[float]:
+def _filters_age_days(meta: Mapping[str, Any] | None, path: str) -> Optional[float]:
     ts: Optional[datetime] = None
-    for key in ("built_at", "generated_at"):
-        ts = _parse_timestamp(meta.get(key))
+    metadata_sources: Tuple[Mapping[str, Any], ...] = ()
+    if isinstance(meta, Mapping):
+        base_meta: Mapping[str, Any] = meta
+        nested_meta = base_meta.get("metadata") if isinstance(base_meta, Mapping) else None
+        if isinstance(nested_meta, Mapping):
+            metadata_sources = (nested_meta, base_meta)
+        else:
+            metadata_sources = (base_meta,)
+    for source in metadata_sources:
+        for key in ("built_at", "builtAt", "generated_at", "generatedAt"):
+            ts = _parse_timestamp(source.get(key))
+            if ts is not None:
+                break
         if ts is not None:
             break
     if ts is None and path:
@@ -126,9 +138,9 @@ class QuantizerConfig:
     strict_filters: bool = True
     quantize_mode: str = "inward"
     enforce_percent_price_by_side: bool = True  # передаётся в симулятор как enforce_ppbs
-    filters_path: Optional[str] = None
-    auto_refresh_days: Optional[int] = None
-    refresh_on_start: Optional[bool] = None
+    filters_path: Optional[str] = ""
+    auto_refresh_days: Optional[int] = 30
+    refresh_on_start: Optional[bool] = False
 
     def resolved_filters_path(self) -> str:
         candidate = self.filters_path
@@ -195,43 +207,70 @@ class QuantizerImpl:
     def _load_filters(
         path: str, max_age_days: Optional[int]
     ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-        if Quantizer is None or not path:
+        if not path:
             return {}, {}
-        max_age = 30
-        if max_age_days is not None:
-            try:
-                max_age = max(0, int(max_age_days))
-            except Exception:
-                max_age = 30
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            try:
-                loaded = Quantizer.load_filters(
-                    path,
-                    max_age_days=max_age,
-                    fatal=False,
-                )
-            except TypeError:
-                loaded = Quantizer.load_filters(path)  # type: ignore[misc]
-        for warn in caught:
-            try:
-                formatted = warnings.formatwarning(
-                    warn.message, warn.category, warn.filename, warn.lineno, warn.line
-                )
-            except Exception:
-                formatted = f"{getattr(warn.category, '__name__', 'Warning')}: {warn.message}"
-            logger.warning("Quantizer warning (%s): %s", path, str(formatted).strip())
 
-        if isinstance(loaded, tuple):
-            filters_raw, meta_raw = loaded
+        def _normalize_payload(
+            filters_raw: Any, metadata_raw: Any
+        ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+            filters_map: Dict[str, Dict[str, Any]] = {}
+            if isinstance(filters_raw, Mapping):
+                try:
+                    filters_map = {str(sym): dict(f or {}) for sym, f in filters_raw.items()}
+                except Exception:
+                    filters_map = {str(sym): f for sym, f in filters_raw.items()}  # type: ignore[assignment]
+            metadata_map: Dict[str, Any] = dict(metadata_raw) if isinstance(metadata_raw, Mapping) else {}
+            return filters_map, metadata_map
+
+        if Quantizer is not None:
+            max_age = 30
+            if max_age_days is not None:
+                try:
+                    max_age = max(0, int(max_age_days))
+                except Exception:
+                    max_age = 30
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                try:
+                    loaded = Quantizer.load_filters(
+                        path,
+                        max_age_days=max_age,
+                        fatal=False,
+                    )
+                except TypeError:
+                    loaded = Quantizer.load_filters(path)  # type: ignore[misc]
+            for warn in caught:
+                try:
+                    formatted = warnings.formatwarning(
+                        warn.message, warn.category, warn.filename, warn.lineno, warn.line
+                    )
+                except Exception:
+                    formatted = f"{getattr(warn.category, '__name__', 'Warning')}: {warn.message}"
+                logger.warning("Quantizer warning (%s): %s", path, str(formatted).strip())
+
+            if isinstance(loaded, tuple):
+                filters_raw, meta_raw = loaded
+            else:
+                filters_raw, meta_raw = loaded, {}
+            return _normalize_payload(filters_raw, meta_raw)
+
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh) or {}
+        except FileNotFoundError:
+            return {}, {}
+        except Exception as exc:
+            logger.warning("Failed to load quantizer filters from %s: %s", path, exc)
+            return {}, {}
+
+        if isinstance(payload, Mapping):
+            filters_block = payload.get("filters") if "filters" in payload else payload
+            metadata_block = payload.get("metadata")
         else:
-            filters_raw, meta_raw = loaded, {}
+            filters_block = {}
+            metadata_block = {}
 
-        filters: Dict[str, Dict[str, Any]] = (
-            dict(filters_raw) if isinstance(filters_raw, dict) else {}
-        )
-        meta: Dict[str, Any] = dict(meta_raw) if isinstance(meta_raw, dict) else {}
-        return filters, meta
+        return _normalize_payload(filters_block, metadata_block)
 
     def __init__(self, cfg: QuantizerConfig) -> None:
         self.cfg = cfg
@@ -269,6 +308,7 @@ class QuantizerImpl:
         status_reason: Optional[str] = None
 
         metadata_payload: Dict[str, Any] = {
+            "config_path": str(cfg.path or ""),
             "path": filters_path,
             "resolved_path": filters_path,
             "auto_refresh_days": auto_refresh_days,
@@ -278,9 +318,6 @@ class QuantizerImpl:
         if not filters_path:
             status = "missing"
             status_reason = "Filters path is not configured"
-        elif Quantizer is None:
-            status = "error"
-            status_reason = "Quantizer module is unavailable"
         else:
             filters, meta = self._load_filters(filters_path, auto_refresh_days)
             meta_dict = dict(meta or {}) if isinstance(meta, dict) else {}
@@ -288,49 +325,53 @@ class QuantizerImpl:
             stale = _is_stale(age_days, auto_refresh_days)
             missing = not filters
 
-            if refresh_on_start and (missing or stale):
-                refresh_requested = True
-                logger.info(
-                    "Refreshing Binance filters: path=%s missing=%s stale=%s auto_refresh_days=%s",
-                    filters_path,
-                    missing,
-                    stale,
-                    auto_refresh_days,
-                )
-                executed, refresh_succeeded, refresh_returncode, refresh_msg = self._refresh_filters(
-                    filters_path
-                )
-                refresh_executed = executed
-                if refresh_msg:
-                    refresh_message = refresh_msg
-                if refresh_succeeded:
-                    filters, meta = self._load_filters(filters_path, auto_refresh_days)
-                    meta_dict = dict(meta or {}) if isinstance(meta, dict) else {}
-                    age_days = _filters_age_days(meta_dict, filters_path)
-                    stale = _is_stale(age_days, auto_refresh_days)
-                    missing = not filters
+            if Quantizer is None:
+                status = "error"
+                status_reason = "Quantizer module is unavailable"
+            else:
+                if refresh_on_start and (missing or stale):
+                    refresh_requested = True
+                    logger.info(
+                        "Refreshing Binance filters: path=%s missing=%s stale=%s auto_refresh_days=%s",
+                        filters_path,
+                        missing,
+                        stale,
+                        auto_refresh_days,
+                    )
+                    executed, refresh_succeeded, refresh_returncode, refresh_msg = self._refresh_filters(
+                        filters_path
+                    )
+                    refresh_executed = executed
+                    if refresh_msg:
+                        refresh_message = refresh_msg
+                    if refresh_succeeded:
+                        filters, meta = self._load_filters(filters_path, auto_refresh_days)
+                        meta_dict = dict(meta or {}) if isinstance(meta, dict) else {}
+                        age_days = _filters_age_days(meta_dict, filters_path)
+                        stale = _is_stale(age_days, auto_refresh_days)
+                        missing = not filters
 
-            if missing:
-                status = "missing"
-                reason_parts = [
-                    f"Filters unavailable at {filters_path}" if filters_path else "Filters unavailable"
-                ]
-                if refresh_message and not refresh_succeeded:
-                    reason_parts.append(str(refresh_message))
-                status_reason = "; ".join(reason_parts)
-            elif stale:
-                status = "stale"
-                if auto_refresh_days > 0:
-                    if age_days is not None:
-                        status_reason = (
-                            f"Filters age {age_days:.2f}d exceeds {auto_refresh_days}d threshold"
-                        )
-                    else:
-                        status_reason = (
-                            f"Filters staleness exceeds {auto_refresh_days}d threshold"
-                        )
+                if missing:
+                    status = "missing"
+                    reason_parts = [
+                        f"Filters unavailable at {filters_path}" if filters_path else "Filters unavailable"
+                    ]
                     if refresh_message and not refresh_succeeded:
-                        status_reason = f"{status_reason}; {refresh_message}"
+                        reason_parts.append(str(refresh_message))
+                    status_reason = "; ".join(reason_parts)
+                elif stale:
+                    status = "stale"
+                    if auto_refresh_days > 0:
+                        if age_days is not None:
+                            status_reason = (
+                                f"Filters age {age_days:.2f}d exceeds {auto_refresh_days}d threshold"
+                            )
+                        else:
+                            status_reason = (
+                                f"Filters staleness exceeds {auto_refresh_days}d threshold"
+                            )
+                        if refresh_message and not refresh_succeeded:
+                            status_reason = f"{status_reason}; {refresh_message}"
 
         size_bytes = _file_size_bytes(filters_path) if filters_path else None
         sha256 = _file_sha256(filters_path) if size_bytes is not None else None
