@@ -243,100 +243,25 @@ def cancel_order(*args: Any, **kwargs: Any):
 
 @retry_sync(DEFAULT_RETRY_CFG, _no_retry)
 def reconcile_state(local_state, client) -> Dict[str, Any]:
-    """Fetch remote state and compare with ``local_state``."""
-
-    try:
-        remote_orders = client.get_open_orders() or []
-        account = client.get_account()
-        balances = account.get("balances", [])
-    except Exception as e:  # pragma: no cover - network/auth errors
-        raise RuntimeError("failed to fetch remote state") from e
-
-    remote_order_ids = {
-        str(o.get("orderId") or o.get("clientOrderId")) for o in remote_orders
-    }
-    local_orders_map: Dict[str, Dict[str, Any]] = {}
-    local_open_orders = getattr(local_state, "open_orders", []) or []
-    if isinstance(local_open_orders, Mapping):
-        iterable_orders = local_open_orders.values()
-    else:
-        iterable_orders = local_open_orders
-    for idx, payload in enumerate(iterable_orders):
-        order_data: Dict[str, Any] = {}
-        if hasattr(payload, "to_dict"):
-            try:
-                order_data = dict(payload.to_dict())  # type: ignore[misc]
-            except Exception:
-                order_data = {}
-        elif isinstance(payload, Mapping):
-            order_data = dict(payload)
-        else:
-            continue
-        key = (
-            order_data.get("orderId")
-            or order_data.get("clientOrderId")
-            or order_data.get("order_id")
-            or order_data.get("client_order_id")
-            or str(idx)
-        )
-        local_orders_map[str(key)] = order_data
-    missing_open = sorted(remote_order_ids - local_orders_map.keys())
-    extra_open = sorted(local_orders_map.keys() - remote_order_ids)
-
-    remote_positions = {
-        str(b.get("asset")):
-        float(b.get("free", 0.0)) + float(b.get("locked", 0.0))
-        for b in balances
-    }
-    local_positions = {
-        str(sym): float(qty)
-        for sym, qty in getattr(local_state, "positions", {}).items()
-    }
-    position_diffs: Dict[str, Dict[str, float]] = {}
-    for asset in set(remote_positions) | set(local_positions):
-        r = remote_positions.get(asset, 0.0)
-        l = local_positions.get(asset, 0.0)
-        if abs(r - l) > 1e-8:
-            position_diffs[asset] = {"local": l, "remote": r}
-
-    return {
-        "missing_open_orders": missing_open,
-        "extra_open_orders": extra_open,
-        "position_diffs": position_diffs,
-    }
-
-
-@retry_sync(DEFAULT_RETRY_CFG, _no_retry)
-def place_order(*args, **kwargs):
-    """Stub for placing an order on Binance Spot.
-
-    TODO: Implement actual connection and request signing when private
-    trading mode becomes available.
-    """
-    raise NotImplementedError("Binance spot private API is not yet connected")
-
-
-@retry_sync(DEFAULT_RETRY_CFG, _no_retry)
-def cancel_order(*args, **kwargs):
-    """Stub for cancelling an order on Binance Spot.
-
-    TODO: Implement actual connection and request signing when private
-    trading mode becomes available.
-    """
-    raise NotImplementedError("Binance spot private API is not yet connected")
-
-
-@retry_sync(DEFAULT_RETRY_CFG, _no_retry)
-def reconcile_state(local_state, client) -> Dict[str, Any]:
     """Fetch remote state and compare with ``local_state``.
 
-    This function queries Binance Spot private REST endpoints for
-    account balances and open orders, then compares them with the
-    provided ``local_state`` (typically loaded from persistence).
+    The returned dictionary contains three keys:
 
-    Returns a summary dictionary describing discrepancies between
-    local and remote data.
+    ``missing_open_orders``
+        Sorted list of order identifiers that are present on the exchange but
+        absent in the local state.
+
+    ``extra_open_orders``
+        Sorted list of local order identifiers that are not reported by the
+        exchange.
+
+    ``position_diffs``
+        Mapping of asset symbol to a ``{"local": float, "remote": float}``
+        structure describing balance discrepancies.
     """
+
+    if client is None:
+        raise RuntimeError("Binance spot private client is required for reconcile_state")
 
     try:
         remote_orders = client.get_open_orders() or []
@@ -345,46 +270,105 @@ def reconcile_state(local_state, client) -> Dict[str, Any]:
     except Exception as e:  # pragma: no cover - network/auth errors
         raise RuntimeError("failed to fetch remote state") from e
 
-    remote_order_ids = {
-        str(o.get("orderId") or o.get("clientOrderId")) for o in remote_orders
-    }
-    local_orders_map: Dict[str, Dict[str, Any]] = {}
-    local_open_orders = getattr(local_state, "open_orders", []) or []
-    if isinstance(local_open_orders, Mapping):
-        iterable_orders = local_open_orders.values()
-    else:
-        iterable_orders = local_open_orders
-    for idx, payload in enumerate(iterable_orders):
-        order_data: Dict[str, Any] = {}
+    remote_order_ids = set()
+    for idx, order_payload in enumerate(remote_orders):
+        if isinstance(order_payload, Mapping):
+            raw_id = order_payload.get("orderId") or order_payload.get("clientOrderId")
+        else:
+            logger.warning(
+                "Unexpected remote open order payload at index %s: %r", idx, order_payload
+            )
+            continue
+        if raw_id:
+            remote_order_ids.add(str(raw_id))
+
+    def _extract_local_order_id(payload: Any, *, fallback: str | None = None) -> str | None:
+        data: Mapping[str, Any] | None = None
         if hasattr(payload, "to_dict"):
             try:
-                order_data = dict(payload.to_dict())  # type: ignore[misc]
-            except Exception:
-                order_data = {}
+                maybe_data = payload.to_dict()  # type: ignore[misc]
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to serialise local order payload: %s", exc)
+                maybe_data = None
+            if isinstance(maybe_data, Mapping):
+                data = maybe_data
         elif isinstance(payload, Mapping):
-            order_data = dict(payload)
-        else:
-            continue
-        key = (
-            order_data.get("orderId")
-            or order_data.get("clientOrderId")
-            or order_data.get("order_id")
-            or order_data.get("client_order_id")
-            or str(idx)
+            data = payload
+        elif isinstance(payload, str) and payload:
+            return payload
+
+        if data is not None:
+            identifier = (
+                data.get("orderId")
+                or data.get("clientOrderId")
+                or data.get("order_id")
+                or data.get("client_order_id")
+            )
+            if identifier:
+                return str(identifier)
+
+        if fallback:
+            return fallback
+        return None
+
+    local_order_ids: set[str] = set()
+    local_open_orders = getattr(local_state, "open_orders", None)
+    if isinstance(local_open_orders, Mapping):
+        for key, payload in local_open_orders.items():
+            fallback = str(key) if key not in (None, "") else None
+            identifier = _extract_local_order_id(payload, fallback=fallback)
+            if identifier:
+                local_order_ids.add(identifier)
+            else:
+                logger.warning("Unable to determine order id for local order key %r", key)
+    elif isinstance(local_open_orders, list):
+        for idx, payload in enumerate(local_open_orders):
+            identifier = _extract_local_order_id(payload)
+            if identifier:
+                local_order_ids.add(identifier)
+            else:
+                logger.warning(
+                    "Unable to determine order id for local order at index %s: %r",
+                    idx,
+                    payload,
+                )
+    elif local_open_orders not in (None, []):
+        logger.warning(
+            "Unsupported type for local open_orders: %s", type(local_open_orders).__name__
         )
-        local_orders_map[str(key)] = order_data
-    missing_open = sorted(remote_order_ids - local_orders_map.keys())
-    extra_open = sorted(local_orders_map.keys() - remote_order_ids)
+
+    missing_open = sorted(remote_order_ids - local_order_ids)
+    extra_open = sorted(local_order_ids - remote_order_ids)
 
     remote_positions = {
         str(b.get("asset")):
         float(b.get("free", 0.0)) + float(b.get("locked", 0.0))
         for b in balances
+        if isinstance(b, Mapping)
     }
-    local_positions = {
-        str(sym): float(qty)
-        for sym, qty in getattr(local_state, "positions", {}).items()
-    }
+
+    local_positions: Dict[str, float] = {}
+    raw_local_positions = getattr(local_state, "positions", None) or {}
+    if isinstance(raw_local_positions, Mapping):
+        for symbol, payload in raw_local_positions.items():
+            qty_value: Any
+            if isinstance(payload, Mapping):
+                qty_value = payload.get("qty")
+            else:
+                qty_value = payload
+
+            qty = _safe_float(qty_value)
+            if qty is None:
+                logger.warning(
+                    "Failed to parse local position quantity for %r: %r", symbol, payload
+                )
+                continue
+            local_positions[str(symbol)] = float(qty)
+    elif raw_local_positions not in (None, {}):
+        logger.warning(
+            "Unsupported type for local positions: %s", type(raw_local_positions).__name__
+        )
+
     position_diffs: Dict[str, Dict[str, float]] = {}
     for asset in set(remote_positions) | set(local_positions):
         r = remote_positions.get(asset, 0.0)
@@ -397,3 +381,5 @@ def reconcile_state(local_state, client) -> Dict[str, Any]:
         "extra_open_orders": extra_open,
         "position_diffs": position_diffs,
     }
+
+
