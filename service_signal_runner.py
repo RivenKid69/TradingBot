@@ -430,6 +430,7 @@ class _Worker:
         zero_signal_alert: int = 0,
         state_enabled: bool = False,
         rest_candidates: Sequence[Any] | None = None,
+        monitoring: MonitoringAggregator | None = None,
         monitoring_agg: MonitoringAggregator | None = None,
     ) -> None:
         self._fp = fp
@@ -524,10 +525,193 @@ class _Worker:
         )
         self._rest_backoff_until: Dict[str, float] = {}
         self._rest_backoff_step: Dict[str, float] = {}
-        self._monitoring = monitoring_agg
+        self._monitoring: MonitoringAggregator | None = (
+            monitoring if monitoring is not None else monitoring_agg
+        )
         if self._state_enabled:
             self._seed_last_prices_from_state()
             self._load_exposure_state()
+
+    # ------------------------------------------------------------------
+    # Monitoring helpers
+    # ------------------------------------------------------------------
+    def _extract_monitoring_snapshot(self, source: Any) -> Mapping[str, Any] | None:
+        if source is None:
+            return None
+        queue: deque[Any] = deque([source])
+        visited: set[int] = set()
+        callable_attrs = (
+            "get_monitoring_snapshot",
+            "monitoring_snapshot",
+            "get_monitoring_metrics",
+            "monitoring_metrics",
+            "get_monitoring_stats",
+            "monitoring_stats",
+            "get_stats",
+            "stats",
+            "snapshot",
+            "get_snapshot",
+        )
+        value_attrs = (
+            "monitoring",
+            "metrics",
+            "state",
+            "stats",
+            "latest_stats",
+        )
+        while queue:
+            obj = queue.popleft()
+            if obj is None:
+                continue
+            if isinstance(obj, MappingABC):
+                return obj
+            ident = id(obj)
+            if ident in visited:
+                continue
+            visited.add(ident)
+            if isinstance(obj, SequenceABC) and not isinstance(
+                obj, (str, bytes, bytearray)
+            ):
+                for item in obj:
+                    if item is not None:
+                        queue.append(item)
+                continue
+            mapping_view = None
+            if hasattr(obj, "__dict__"):
+                try:
+                    mapping_view = vars(obj)
+                except Exception:
+                    mapping_view = None
+                if isinstance(mapping_view, MappingABC):
+                    queue.append(mapping_view)
+            for name in callable_attrs:
+                candidate = getattr(obj, name, None)
+                if callable(candidate):
+                    try:
+                        result = candidate()
+                    except Exception:
+                        continue
+                    if result is not None:
+                        queue.append(result)
+                elif candidate is not None:
+                    queue.append(candidate)
+            for name in value_attrs:
+                if hasattr(obj, name):
+                    queue.append(getattr(obj, name))
+        return None
+
+    @staticmethod
+    def _find_in_mapping(data: Mapping[str, Any], keys: Sequence[str]) -> Any:
+        queue: deque[Any] = deque([data])
+        visited: set[int] = set()
+        while queue:
+            item = queue.popleft()
+            if isinstance(item, SequenceABC) and not isinstance(
+                item, (str, bytes, bytearray)
+            ):
+                for elem in item:
+                    if elem is not None:
+                        queue.append(elem)
+                continue
+            if isinstance(item, MappingABC):
+                mapping_item: Mapping[str, Any] = item
+            elif hasattr(item, "__dict__"):
+                try:
+                    mapping_item = vars(item)
+                except Exception:
+                    mapping_item = None
+                if not isinstance(mapping_item, MappingABC):
+                    continue
+            else:
+                continue
+            item = mapping_item
+            ident = id(item)
+            if ident in visited:
+                continue
+            visited.add(ident)
+            for key in keys:
+                if key in item:
+                    value = item[key]
+                    if value is not None:
+                        return value
+            for value in item.values():
+                if isinstance(value, MappingABC):
+                    queue.append(value)
+                elif isinstance(value, SequenceABC) and not isinstance(
+                    value, (str, bytes, bytearray)
+                ):
+                    for elem in value:
+                        if isinstance(elem, MappingABC):
+                            queue.append(elem)
+        return None
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_fill_metrics(
+        self, snapshot: Mapping[str, Any] | None
+    ) -> tuple[float | None, float | None]:
+        if not snapshot:
+            return None, None
+        requested_keys = (
+            "requested",
+            "requested_qty",
+            "requested_quantity",
+            "requested_volume",
+            "requested_notional",
+            "requested_base",
+            "qty_requested",
+            "fill_requested",
+        )
+        filled_keys = (
+            "filled",
+            "filled_qty",
+            "filled_quantity",
+            "filled_volume",
+            "filled_notional",
+            "filled_base",
+            "qty_filled",
+            "fill_filled",
+        )
+        requested = self._coerce_float(
+            self._find_in_mapping(snapshot, requested_keys)
+        )
+        filled = self._coerce_float(self._find_in_mapping(snapshot, filled_keys))
+        if requested is None or filled is None:
+            ratio = self._coerce_float(
+                self._find_in_mapping(
+                    snapshot,
+                    (
+                        "fill_ratio",
+                        "fillRatio",
+                        "fill_rate",
+                        "fillRate",
+                    ),
+                )
+            )
+            if ratio is not None:
+                requested = 1.0
+                filled = ratio
+        return requested, filled
+
+    def _extract_daily_pnl(self, snapshot: Mapping[str, Any] | None) -> float | None:
+        if not snapshot:
+            return None
+        pnl = self._find_in_mapping(
+            snapshot,
+            (
+                "daily_pnl",
+                "dailyPnl",
+                "dailyPnL",
+                "pnl",
+                "realized_pnl",
+            ),
+        )
+        return self._coerce_float(pnl)
 
     # ------------------------------------------------------------------
     # Dynamic guard helpers
@@ -2117,22 +2301,54 @@ class _Worker:
 
         def _finalize() -> list[Any]:
             emitted_count = len(emitted)
-            try:
-                monitoring.record_signals(bar.symbol, emitted_count, duplicates)
-            except Exception:
-                pass
-            if emitted_count == 0:
-                self._zero_signal_streak += 1
-                if (
-                    self._zero_signal_alert > 0
-                    and self._zero_signal_streak >= self._zero_signal_alert
-                ):
+            runtime_monitoring = self._monitoring
+            duplicates_count = duplicates
+            if runtime_monitoring is not None:
+                try:
+                    runtime_monitoring.record_signals(
+                        bar.symbol, emitted_count, duplicates_count
+                    )
+                except Exception:
+                    pass
+                snapshot = self._extract_monitoring_snapshot(self._executor)
+                requested, filled = self._extract_fill_metrics(snapshot)
+                if requested is not None and filled is not None:
                     try:
-                        monitoring.alert_zero_signals(bar.symbol)
+                        runtime_monitoring.record_fill(requested, filled)
                     except Exception:
                         pass
-            else:
+                pnl_value = self._extract_daily_pnl(snapshot)
+                if pnl_value is not None:
+                    try:
+                        runtime_monitoring.record_pnl(pnl_value)
+                    except Exception:
+                        pass
                 self._zero_signal_streak = 0
+            else:
+                try:
+                    monitoring.record_signals(bar.symbol, emitted_count, duplicates_count)
+                except Exception:
+                    pass
+                if emitted_count == 0:
+                    self._zero_signal_streak += 1
+                    if (
+                        self._zero_signal_alert > 0
+                        and self._zero_signal_streak >= self._zero_signal_alert
+                    ):
+                        try:
+                            monitoring.alert_zero_signals(bar.symbol)
+                        except Exception:
+                            pass
+                else:
+                    self._zero_signal_streak = 0
+            total = emitted_count + duplicates_count
+            if total > 0:
+                try:
+                    monitoring.signal_error_rate.labels(bar.symbol).set(
+                        float(duplicates_count) / float(total)
+                    )
+                except Exception:
+                    pass
             return emitted
 
         if self._pipeline_cfg is not None and not self._pipeline_cfg.enabled:
@@ -3236,6 +3452,7 @@ class ServiceSignalRunner:
             ),
             state_enabled=self.cfg.state.enabled,
             rest_candidates=rest_candidates,
+            monitoring=self.monitoring_agg,
             monitoring_agg=self.monitoring_agg,
         )
         if self._portfolio_limits_cfg:
