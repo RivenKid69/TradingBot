@@ -12,7 +12,7 @@ from enum import Enum
 from dataclasses import dataclass, field
 
 import yaml
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field, root_validator, model_validator
 import logging
 
 from services.universe import get_symbols
@@ -84,9 +84,41 @@ class TTLConfig(BaseModel):
     """Настройки TTL для сигналов и дедупликации."""
 
     enabled: bool = Field(default=False)
-    ttl_seconds: int = Field(default=60)
+    ttl_seconds: int = Field(default=60, ge=0, le=24 * 60 * 60)
     out_csv: Optional[str] = Field(default=None)
     dedup_persist: Optional[str] = Field(default=None)
+    mode: Literal["off", "relative", "absolute"] = Field(
+        default="relative",
+        description="Алгоритм TTL: relative — относительно закрытия бара, absolute — жёсткая отсечка, off — выключено.",
+    )
+    guard_ms: int = Field(
+        default=5_000,
+        ge=0,
+        le=15 * 60 * 1000,
+        description="Дополнительный защитный буфер в миллисекундах перед публикацией решений.",
+    )
+    absolute_failsafe_ms: int = Field(
+        default=15 * 60 * 1000,
+        ge=0,
+        le=60 * 60 * 1000,
+        description="Абсолютный предел возраста решений в миллисекундах независимо от режима.",
+    )
+    state_path: str = Field(
+        default="state/ttl_state.json",
+        description="Путь к файлу состояния TTL-гварда.",
+    )
+
+    @model_validator(mode="after")
+    def _clamp_values(cls, values: "TTLConfig") -> "TTLConfig":
+        guard = int(getattr(values, "guard_ms", 0) or 0)
+        failsafe = int(getattr(values, "absolute_failsafe_ms", 0) or 0)
+        guard = max(0, min(guard, 15 * 60 * 1000))
+        failsafe = max(0, min(failsafe, 60 * 60 * 1000))
+        if failsafe and guard and guard > failsafe:
+            guard = failsafe
+        object.__setattr__(values, "guard_ms", guard)
+        object.__setattr__(values, "absolute_failsafe_ms", failsafe)
+        return values
 
 
 class RiskConfigSection(BaseModel):

@@ -67,6 +67,7 @@ from core_contracts import FeaturePipe, SignalPolicy
 from services.utils_config import (
     snapshot_config,
 )  # снапшот конфига (Фаза 3)  # noqa: F401
+from services.utils_app import atomic_write_with_retry
 from core_config import (
     CommonRunConfig,
     ClockSyncConfig,
@@ -409,6 +410,23 @@ class SignalRunnerConfig:
 RunnerConfig = SignalRunnerConfig
 
 
+def _parse_pipeline_config(data: Mapping[str, Any]) -> PipelineConfig:
+    """Parse raw mapping into :class:`PipelineConfig`."""
+
+    enabled = bool((data or {}).get("enabled", True))
+    stages_cfg = (data or {}).get("stages", {}) or {}
+    stages: Dict[str, PipelineStageConfig] = {}
+    for name, st in stages_cfg.items():
+        if isinstance(st, MappingABC):
+            st_enabled = bool(st.get("enabled", True))
+            params = {k: v for k, v in st.items() if k != "enabled"}
+        else:
+            st_enabled = bool(st)
+            params = {}
+        stages[name] = PipelineStageConfig(enabled=st_enabled, params=params)
+    return PipelineConfig(enabled=enabled, stages=stages)
+
+
 class _Worker:
     def __init__(
         self,
@@ -432,6 +450,8 @@ class _Worker:
         rest_candidates: Sequence[Any] | None = None,
         monitoring: MonitoringAggregator | None = None,
         monitoring_agg: MonitoringAggregator | None = None,
+        worker_id: str | None = None,
+        status_callback: Callable[[str, Dict[str, Any]], None] | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -443,13 +463,16 @@ class _Worker:
         self._ws_dedup_enabled = ws_dedup_enabled
         self._ws_dedup_log_skips = ws_dedup_log_skips
         self._ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
-        self._throttle_cfg = throttle_cfg
+        self._throttle_cfg: ThrottleConfig | None = None
+        self._throttle_lock = threading.RLock()
         self._no_trade_cfg = no_trade_cfg
         self._pipeline_cfg = pipeline_cfg
         self._signal_quality_cfg = signal_quality_cfg or SignalQualityConfig()
         self._zero_signal_alert = int(zero_signal_alert)
         self._zero_signal_streak = 0
         self._state_enabled = bool(state_enabled)
+        self._worker_id = worker_id or f"worker-{id(self):x}"
+        self._status_callback = status_callback
         self._positions: Dict[str, float] = {}
         self._pending_exposure: Dict[int, Dict[str, Any]] = {}
         self._exposure_state: Dict[str, Any] = {
@@ -477,15 +500,7 @@ class _Worker:
                 )
             except Exception:
                 pass
-        if throttle_cfg is not None and throttle_cfg.enabled:
-            self._global_bucket = TokenBucket(
-                rps=throttle_cfg.global_.rps, burst=throttle_cfg.global_.burst
-            )
-            self._symbol_bucket_factory = lambda: TokenBucket(
-                rps=throttle_cfg.symbol.rps, burst=throttle_cfg.symbol.burst
-            )
-            self._symbol_buckets = defaultdict(self._symbol_bucket_factory)
-            self._queue = deque(maxlen=throttle_cfg.queue.max_items)
+        self._configure_throttle(throttle_cfg)
         self._last_bar_ts: Dict[str, int] = {}
         self._dynamic_guard: DynamicNoTradeGuard | None = None
         dyn_cfg: DynamicGuardConfig | None = None
@@ -531,6 +546,81 @@ class _Worker:
         if self._state_enabled:
             self._seed_last_prices_from_state()
             self._load_exposure_state()
+
+    # ------------------------------------------------------------------
+    # Configuration helpers
+    # ------------------------------------------------------------------
+    def _configure_throttle(self, throttle_cfg: ThrottleConfig | None) -> None:
+        with self._throttle_lock:
+            self._throttle_cfg = throttle_cfg
+            if throttle_cfg is not None and throttle_cfg.enabled:
+                self._global_bucket = TokenBucket(
+                    rps=throttle_cfg.global_.rps, burst=throttle_cfg.global_.burst
+                )
+                self._symbol_bucket_factory = lambda: TokenBucket(
+                    rps=throttle_cfg.symbol.rps, burst=throttle_cfg.symbol.burst
+                )
+                self._symbol_buckets = defaultdict(self._symbol_bucket_factory)
+                max_items = max(0, int(throttle_cfg.queue.max_items))
+                self._queue = deque(maxlen=max_items if max_items > 0 else None)
+            else:
+                self._global_bucket = None
+                self._symbol_bucket_factory = None
+                self._symbol_buckets = None
+                self._queue = None
+
+    def update_throttle_config(self, throttle_cfg: ThrottleConfig | None) -> None:
+        self._configure_throttle(throttle_cfg)
+
+    def update_pipeline_config(self, pipeline_cfg: PipelineConfig | None) -> None:
+        self._pipeline_cfg = pipeline_cfg
+
+    def update_ws_settings(
+        self,
+        *,
+        enabled: bool | None = None,
+        log_skips: bool | None = None,
+        timeframe_ms: int | None = None,
+    ) -> None:
+        if enabled is not None:
+            self._ws_dedup_enabled = bool(enabled)
+        if log_skips is not None:
+            self._ws_dedup_log_skips = bool(log_skips)
+        if timeframe_ms is not None and timeframe_ms > 0:
+            self._ws_dedup_timeframe_ms = int(timeframe_ms)
+
+    def _queue_snapshot(self) -> tuple[int, int]:
+        with self._throttle_lock:
+            if self._queue is None:
+                return 0, 0
+            maxlen = self._queue.maxlen or 0
+            return len(self._queue), int(maxlen)
+
+    def _publish_status(
+        self,
+        *,
+        symbol: str,
+        last_bar_ts: int | None,
+        emitted: int,
+        duplicates: int,
+    ) -> None:
+        if self._status_callback is None:
+            return
+        queue_size, queue_max = self._queue_snapshot()
+        payload = {
+            "id": self._worker_id,
+            "last_bar_symbol": symbol,
+            "last_bar_ts": last_bar_ts,
+            "emitted": emitted,
+            "duplicates": duplicates,
+            "queue": {"size": queue_size, "max": queue_max},
+            "safe_mode": bool(self._safe_mode_fn()),
+            "updated_at_ms": clock.now_ms(),
+        }
+        try:
+            self._status_callback(self._worker_id, payload)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Monitoring helpers
@@ -1651,27 +1741,32 @@ class _Worker:
                 pass
 
     def _acquire_tokens(self, symbol: str) -> tuple[bool, str | None]:
-        if self._global_bucket is None:
+        with self._throttle_lock:
+            if self._global_bucket is None:
+                return True, None
+            now = time.monotonic()
+            if not self._global_bucket.consume(now=now):
+                return False, "THROTTLED_GLOBAL"
+            sb_factory = self._symbol_bucket_factory
+            if sb_factory is None:
+                return True, None
+            sb = self._symbol_buckets[symbol]
+            if not sb.consume(now=now):
+                self._global_bucket.tokens = min(
+                    self._global_bucket.tokens + 1.0, self._global_bucket.burst
+                )
+                return False, "THROTTLED_SYMBOL"
             return True, None
-        now = time.monotonic()
-        if not self._global_bucket.consume(now=now):
-            return False, "THROTTLED_GLOBAL"
-        sb = self._symbol_buckets[symbol]
-        if not sb.consume(now=now):
-            self._global_bucket.tokens = min(
-                self._global_bucket.tokens + 1.0, self._global_bucket.burst
-            )
-            return False, "THROTTLED_SYMBOL"
-        return True, None
 
     def _refund_tokens(self, symbol: str) -> None:
-        if self._global_bucket is not None:
-            self._global_bucket.tokens = min(
-                self._global_bucket.tokens + 1.0, self._global_bucket.burst
-            )
-        if self._symbol_buckets is not None:
-            sb = self._symbol_buckets[symbol]
-            sb.tokens = min(sb.tokens + 1.0, sb.burst)
+        with self._throttle_lock:
+            if self._global_bucket is not None:
+                self._global_bucket.tokens = min(
+                    self._global_bucket.tokens + 1.0, self._global_bucket.burst
+                )
+            if self._symbol_buckets is not None:
+                sb = self._symbol_buckets[symbol]
+                sb.tokens = min(sb.tokens + 1.0, sb.burst)
 
     def _current_bar_volume(self, bar: Bar) -> float | None:
         for attr in ("volume_quote", "volume_base", "trades"):
@@ -2041,6 +2136,9 @@ class _Worker:
         )
 
     def _emit(self, o: Any, symbol: str, bar_close_ms: int) -> bool:
+        ttl_stage_cfg = self._pipeline_cfg.get("ttl") if self._pipeline_cfg else None
+        ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
+
         if self._guards is not None:
             checked, reason = self._guards.apply(bar_close_ms, symbol, [o])
             if reason or not checked:
@@ -2066,29 +2164,41 @@ class _Worker:
 
         created_ts = int(getattr(o, "created_ts_ms", 0) or 0)
         now_ms = clock.now_ms()
-        ok, expires_at_ms, _ = check_ttl(
-            bar_close_ms=created_ts,
-            now_ms=now_ms,
-            timeframe_ms=self._ws_dedup_timeframe_ms,
-        )
-        if not ok:
+        expires_at_ms = 0
+        if ttl_enabled:
             try:
-                self._logger.info(
-                    "TTL_EXPIRED_PUBLISH %s",
-                    {
-                        "symbol": symbol,
-                        "created_ts_ms": created_ts,
-                        "now_ms": now_ms,
-                        "expires_at_ms": expires_at_ms,
-                    },
-                )
+                monitoring.inc_stage(Stage.TTL)
             except Exception:
                 pass
-            try:
-                monitoring.signal_absolute_count.labels(symbol).inc()
-            except Exception:
-                pass
-            return False
+            ok, expires_at_ms, _ = check_ttl(
+                bar_close_ms=created_ts,
+                now_ms=now_ms,
+                timeframe_ms=self._ws_dedup_timeframe_ms,
+            )
+            if not ok:
+                try:
+                    self._logger.info(
+                        "TTL_EXPIRED_PUBLISH %s",
+                        {
+                            "symbol": symbol,
+                            "created_ts_ms": created_ts,
+                            "now_ms": now_ms,
+                            "expires_at_ms": expires_at_ms,
+                        },
+                    )
+                except Exception:
+                    pass
+                try:
+                    monitoring.signal_absolute_count.labels(symbol).inc()
+                except Exception:
+                    pass
+                try:
+                    pipeline_stage_drop_count.labels(
+                        symbol, Stage.TTL.name, Reason.OTHER.name
+                    ).inc()
+                except Exception:
+                    pass
+                return False
         try:
             age_ms = now_ms - created_ts
             monitoring.age_at_publish_ms.labels(symbol).observe(age_ms)
@@ -2158,7 +2268,19 @@ class _Worker:
         if stage_cfg is not None and not stage_cfg.enabled:
             self._commit_exposure(o)
             return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
-        if self._throttle_cfg and self._throttle_cfg.enabled:
+        throttle_stage_cfg = (
+            self._pipeline_cfg.get("throttle") if self._pipeline_cfg else None
+        )
+        throttle_enabled = (
+            self._throttle_cfg is not None
+            and self._throttle_cfg.enabled
+            and (throttle_stage_cfg is None or throttle_stage_cfg.enabled)
+        )
+        if throttle_enabled:
+            try:
+                monitoring.inc_stage(Stage.THROTTLE)
+            except Exception:
+                pass
             ok, reason = self._acquire_tokens(symbol)
             if not ok:
                 if self._throttle_cfg.mode == "queue" and self._queue is not None:
@@ -2177,6 +2299,14 @@ class _Worker:
                     monitoring.throttle_dropped_count.labels(symbol, reason or "").inc()
                 except Exception:
                     pass
+                try:
+                    pipeline_stage_drop_count.labels(
+                        symbol,
+                        Stage.THROTTLE.name,
+                        (reason or Reason.OTHER.name),
+                    ).inc()
+                except Exception:
+                    pass
                 return PipelineResult(
                     action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER
                 )
@@ -2193,11 +2323,18 @@ class _Worker:
         emitted: list[Any] = []
         if self._queue is None:
             return emitted
-        now = time.monotonic()
-        while self._queue:
-            exp, symbol, bar_close_ms, order = self._queue[0]
-            if exp <= now:
-                self._queue.popleft()
+        while True:
+            with self._throttle_lock:
+                if self._queue is None or not self._queue:
+                    break
+                exp, symbol, bar_close_ms, order = self._queue[0]
+                now = time.monotonic()
+                if exp <= now:
+                    self._queue.popleft()
+                    expired = True
+                else:
+                    expired = False
+            if expired:
                 try:
                     self._rollback_exposure(order)
                 except Exception:
@@ -2214,7 +2351,15 @@ class _Worker:
             ok, _ = self._acquire_tokens(symbol)
             if not ok:
                 break
-            self._queue.popleft()
+            with self._throttle_lock:
+                if self._queue is None:
+                    self._refund_tokens(symbol)
+                    break
+                try:
+                    self._queue.popleft()
+                except IndexError:
+                    self._refund_tokens(symbol)
+                    break
             if not self._emit(order, symbol, bar_close_ms):
                 self._refund_tokens(symbol)
                 try:
@@ -2349,6 +2494,12 @@ class _Worker:
                     )
                 except Exception:
                     pass
+            self._publish_status(
+                symbol=bar.symbol,
+                last_bar_ts=ts_ms,
+                emitted=emitted_count,
+                duplicates=duplicates_count,
+            )
             return emitted
 
         if self._pipeline_cfg is not None and not self._pipeline_cfg.enabled:
@@ -2360,24 +2511,40 @@ class _Worker:
             emitted.extend(self._drain_queue())
 
         close_ms: int | None = None
+        dedup_stage_cfg = self._pipeline_cfg.get("dedup") if self._pipeline_cfg else None
+        dedup_enabled = self._ws_dedup_enabled and (
+            dedup_stage_cfg is None or dedup_stage_cfg.enabled
+        )
         if self._ws_dedup_enabled:
             close_ms = int(bar.ts) + self._ws_dedup_timeframe_ms
-            if signal_bus.should_skip(bar.symbol, close_ms):
-                if self._ws_dedup_log_skips:
+            if dedup_enabled:
+                try:
+                    monitoring.inc_stage(Stage.DEDUP)
+                except Exception:
+                    pass
+                if signal_bus.should_skip(bar.symbol, close_ms):
+                    if self._ws_dedup_log_skips:
+                        try:
+                            self._logger.info("SKIP_DUPLICATE_BAR")
+                        except Exception:
+                            pass
                     try:
-                        self._logger.info("SKIP_DUPLICATE_BAR")
+                        monitoring.ws_dup_skipped_count.labels(bar.symbol).inc()
                     except Exception:
                         pass
-                try:
-                    monitoring.ws_dup_skipped_count.labels(bar.symbol).inc()
-                except Exception:
-                    pass
-                try:
-                    monitoring.queue_len.set(len(self._queue) if self._queue else 0)
-                except Exception:
-                    pass
-                duplicates = 1
-                return _finalize()
+                    try:
+                        size, _ = self._queue_snapshot()
+                        monitoring.queue_len.set(size)
+                    except Exception:
+                        pass
+                    try:
+                        pipeline_stage_drop_count.labels(
+                            bar.symbol, Stage.DEDUP.name, Reason.OTHER.name
+                        ).inc()
+                    except Exception:
+                        pass
+                    duplicates = 1
+                    return _finalize()
         guard_res = closed_bar_guard(
             bar=bar,
             now_ms=clock.now_ms(),
@@ -2411,7 +2578,8 @@ class _Worker:
             except Exception:
                 pass
             try:
-                monitoring.queue_len.set(len(self._queue) if self._queue else 0)
+                size, _ = self._queue_snapshot()
+                monitoring.queue_len.set(size)
             except Exception:
                 pass
             return _finalize()
@@ -2678,32 +2846,46 @@ class _Worker:
         created_ts_ms = clock.now_ms()
         self._stage_exposure_adjustments(orders, created_ts_ms)
         checked_orders = []
+        ttl_stage_cfg = self._pipeline_cfg.get("ttl") if self._pipeline_cfg else None
+        ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
+
         for o in orders:
-            ok, expires_at_ms, _ = check_ttl(
-                bar_close_ms=int(bar.ts),
-                now_ms=created_ts_ms,
-                timeframe_ms=self._ws_dedup_timeframe_ms,
-            )
-            if not ok:
+            if ttl_enabled:
                 try:
-                    self._logger.info(
-                        "TTL_EXPIRED_BOUNDARY %s",
-                        {
-                            "symbol": bar.symbol,
-                            "bar_close_ms": int(bar.ts),
-                            "now_ms": created_ts_ms,
-                            "expires_at_ms": expires_at_ms,
-                        },
-                    )
+                    monitoring.inc_stage(Stage.TTL)
                 except Exception:
                     pass
-                try:
-                    monitoring.ttl_expired_boundary_count.labels(bar.symbol).inc()
-                    monitoring.signal_boundary_count.labels(bar.symbol).inc()
-                except Exception:
-                    pass
-                self._rollback_exposure(o)
-                continue
+                ok, expires_at_ms, _ = check_ttl(
+                    bar_close_ms=int(bar.ts),
+                    now_ms=created_ts_ms,
+                    timeframe_ms=self._ws_dedup_timeframe_ms,
+                )
+                if not ok:
+                    try:
+                        self._logger.info(
+                            "TTL_EXPIRED_BOUNDARY %s",
+                            {
+                                "symbol": bar.symbol,
+                                "bar_close_ms": int(bar.ts),
+                                "now_ms": created_ts_ms,
+                                "expires_at_ms": expires_at_ms,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        monitoring.ttl_expired_boundary_count.labels(bar.symbol).inc()
+                        monitoring.signal_boundary_count.labels(bar.symbol).inc()
+                    except Exception:
+                        pass
+                    try:
+                        pipeline_stage_drop_count.labels(
+                            bar.symbol, Stage.TTL.name, Reason.OTHER.name
+                        ).inc()
+                    except Exception:
+                        pass
+                    self._rollback_exposure(o)
+                    continue
 
             setattr(o, "created_ts_ms", created_ts_ms)
             checked_orders.append(o)
@@ -2740,7 +2922,8 @@ class _Worker:
                     pass
 
         try:
-            monitoring.queue_len.set(len(self._queue) if self._queue else 0)
+            size, _ = self._queue_snapshot()
+            monitoring.queue_len.set(size)
         except Exception:
             pass
 
@@ -2877,6 +3060,14 @@ class ServiceSignalRunner:
         self.ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
         self._metadata_persisted = False
         self._git_hash: str | None = None
+        logs_dir = Path(self.cfg.logs_dir or "logs")
+        self._runner_status_path = logs_dir / "runner_status.json"
+        self._reload_flag_path = logs_dir / "reload_request.json"
+        self._safe_stop_flag_path = logs_dir / "safe_stop.request"
+        self._runner_status_lock = threading.Lock()
+        self._runner_status_workers: Dict[str, Dict[str, Any]] = {}
+        self._worker_ref: _Worker | None = None
+        self._last_safe_mode_state: Dict[str, bool] = {}
 
         monitoring.clear_runtime_aggregator()
         if self.monitoring_cfg.enabled:
@@ -3027,6 +3218,193 @@ class ServiceSignalRunner:
                 )
             except Exception:
                 pass
+
+    def _current_safe_mode_state(self) -> Dict[str, bool]:
+        clock_safe = bool(self._clock_safe_mode)
+        try:
+            kill_switch_active = bool(monitoring.kill_switch_triggered())
+        except Exception:
+            kill_switch_active = False
+        try:
+            ops_tripped = bool(ops_kill_switch.tripped())
+        except Exception:
+            ops_tripped = False
+        return {
+            "active": clock_safe or kill_switch_active or ops_tripped,
+            "clock": clock_safe,
+            "kill_switch": kill_switch_active,
+            "ops": ops_tripped,
+        }
+
+    def _compose_runner_status(self) -> Dict[str, Any]:
+        workers = sorted(
+            (dict(payload) for payload in self._runner_status_workers.values()),
+            key=lambda item: str(item.get("id", "")),
+        )
+        queue_size = 0
+        queue_max = 0
+        for payload in workers:
+            queue_info = payload.get("queue") or {}
+            try:
+                queue_size += int(queue_info.get("size", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                q_max = int(queue_info.get("max", 0) or 0)
+            except (TypeError, ValueError):
+                q_max = 0
+            queue_max = max(queue_max, q_max)
+        status = {
+            "updated_at_ms": clock.now_ms(),
+            "safe_mode": self._current_safe_mode_state(),
+            "queue": {"size": queue_size, "max": queue_max},
+            "workers": workers,
+        }
+        return status
+
+    def _write_runner_status_unlocked(self) -> None:
+        status = self._compose_runner_status()
+        safe_state = status.get("safe_mode")
+        if isinstance(safe_state, MappingABC):
+            self._last_safe_mode_state = {
+                str(key): bool(value) for key, value in safe_state.items()
+            }
+        try:
+            atomic_write_with_retry(
+                self._runner_status_path,
+                json.dumps(status, ensure_ascii=False),
+                retries=3,
+                backoff=0.1,
+            )
+        except Exception:
+            self.logger.exception("failed to persist runner status")
+
+    def _write_runner_status(self) -> None:
+        with self._runner_status_lock:
+            self._write_runner_status_unlocked()
+
+    def _update_runner_status(self, worker_id: str, payload: Dict[str, Any]) -> None:
+        with self._runner_status_lock:
+            self._runner_status_workers[worker_id] = payload
+            self._write_runner_status_unlocked()
+
+    def _reload_runtime_config(self, path: Path) -> None:
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        except Exception:
+            self.logger.exception("failed to read runtime config from %s", path)
+            return
+        if not isinstance(data, MappingABC):
+            self.logger.warning("runtime config %s is not a mapping", path)
+            return
+        throttle_data = data.get("throttle")
+        if throttle_data is not None:
+            try:
+                new_throttle = ThrottleConfig.parse_obj(throttle_data)
+            except Exception as exc:
+                self.logger.warning("invalid throttle override: %s", exc)
+            else:
+                self.throttle_cfg = new_throttle
+                if self._worker_ref is not None:
+                    self._worker_ref.update_throttle_config(new_throttle)
+        ws_data = data.get("ws") or {}
+        if isinstance(ws_data, MappingABC):
+            enabled = ws_data.get("enabled")
+            log_skips = ws_data.get("log_skips")
+            timeframe = ws_data.get("timeframe_ms")
+            if timeframe is None:
+                timeframe = ws_data.get("timeframe")
+            if enabled is not None:
+                self.ws_dedup_enabled = bool(enabled)
+            if log_skips is not None:
+                self.ws_dedup_log_skips = bool(log_skips)
+            if timeframe is not None:
+                try:
+                    self.ws_dedup_timeframe_ms = int(timeframe)
+                except (TypeError, ValueError):
+                    pass
+            if self._worker_ref is not None:
+                self._worker_ref.update_ws_settings(
+                    enabled=self.ws_dedup_enabled,
+                    log_skips=self.ws_dedup_log_skips,
+                    timeframe_ms=self.ws_dedup_timeframe_ms,
+                )
+        pipeline_data = data.get("pipeline")
+        if pipeline_data is not None:
+            new_pipeline = _parse_pipeline_config(pipeline_data)
+            if self.pipeline_cfg is None:
+                self.pipeline_cfg = new_pipeline
+            else:
+                self.pipeline_cfg = self.pipeline_cfg.merge(new_pipeline)
+            if self._worker_ref is not None:
+                self._worker_ref.update_pipeline_config(self.pipeline_cfg)
+        self.logger.info("runtime overrides reloaded from %s", path)
+        self._write_runner_status()
+
+    def _handle_reload_request(self) -> None:
+        flag = self._reload_flag_path
+        if not flag.exists():
+            return
+        try:
+            with flag.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh) or {}
+        except Exception:
+            self.logger.exception("failed to parse reload request")
+            payload = {}
+        finally:
+            try:
+                flag.unlink()
+            except Exception:
+                pass
+        paths = payload.get("paths")
+        if isinstance(paths, str):
+            paths = [paths]
+        elif not isinstance(paths, SequenceABC):
+            paths = []
+        resolved_paths = []
+        for item in paths:
+            if not item:
+                continue
+            resolved_paths.append(Path(item))
+        if not resolved_paths:
+            resolved_paths = [Path("configs/runtime.yaml")]
+        for candidate in resolved_paths:
+            try:
+                target = candidate if candidate.is_absolute() else Path(candidate)
+                if not target.exists():
+                    self.logger.warning("reload target missing: %s", target)
+                    continue
+                self._reload_runtime_config(target)
+            except Exception:
+                self.logger.exception("failed to reload %s", candidate)
+
+    def _handle_safe_stop_flag(
+        self, shutdown: ShutdownManager, stop_event: threading.Event
+    ) -> None:
+        flag = self._safe_stop_flag_path
+        if not flag.exists() or stop_event.is_set():
+            return
+        try:
+            self.logger.info("safe stop requested via %s", flag)
+        except Exception:
+            pass
+        stop_event.set()
+        shutdown.request_shutdown()
+        try:
+            flag.unlink()
+        except Exception:
+            pass
+        self._write_runner_status()
+
+    def _process_control_flags(
+        self, shutdown: ShutdownManager, stop_event: threading.Event
+    ) -> None:
+        self._handle_reload_request()
+        self._handle_safe_stop_flag(shutdown, stop_event)
+        current_state = self._current_safe_mode_state()
+        if current_state != self._last_safe_mode_state:
+            self._write_runner_status()
 
     def run(self) -> Iterator[Dict[str, Any]]:
         # снапшот конфига, если задан
@@ -3454,7 +3832,11 @@ class ServiceSignalRunner:
             rest_candidates=rest_candidates,
             monitoring=self.monitoring_agg,
             monitoring_agg=self.monitoring_agg,
+            worker_id="worker-0",
+            status_callback=self._update_runner_status,
         )
+        self._worker_ref = worker
+        self._write_runner_status()
         if self._portfolio_limits_cfg:
             try:
                 guard_cfg = PortfolioLimitConfig.from_mapping(
@@ -4202,8 +4584,12 @@ class ServiceSignalRunner:
                 _persist_state("event")
 
         while not stop_event.is_set():
+            self._process_control_flags(shutdown, stop_event)
+            if stop_event.is_set():
+                break
             try:
                 for rep in self.adapter.run_events(worker):
+                    self._process_control_flags(shutdown, stop_event)
                     if stop_event.is_set():
                         break
                     if ws_failures:
@@ -4403,28 +4789,13 @@ def from_config(
             "alert_command", cfg.kill_switch_ops.alert_command
         )
 
-    # Pipeline configuration
-    def _parse_pipeline(data: Dict[str, Any]) -> PipelineConfig:
-        enabled = bool(data.get("enabled", True))
-        stages_cfg = data.get("stages", {}) or {}
-        stages: Dict[str, PipelineStageConfig] = {}
-        for name, st in stages_cfg.items():
-            if isinstance(st, dict):
-                st_enabled = bool(st.get("enabled", True))
-                params = {k: v for k, v in st.items() if k != "enabled"}
-            else:
-                st_enabled = bool(st)
-                params = {}
-            stages[name] = PipelineStageConfig(enabled=st_enabled, params=params)
-        return PipelineConfig(enabled=enabled, stages=stages)
-
     base_pipeline = PipelineConfig()
     base_shutdown: Dict[str, Any] = {}
     if snapshot_config_path:
         try:
             with open(snapshot_config_path, "r", encoding="utf-8") as f:
                 base_data = yaml.safe_load(f) or {}
-            base_pipeline = _parse_pipeline(base_data.get("pipeline", {}))
+            base_pipeline = _parse_pipeline_config(base_data.get("pipeline", {}))
             base_shutdown = base_data.get("shutdown", {}) or {}
         except Exception:
             base_pipeline = PipelineConfig()
@@ -4447,11 +4818,11 @@ def from_config(
                 ops_data = {}
             break
     if ops_data:
-        ops_pipeline = _parse_pipeline(ops_data.get("pipeline", {}))
+        ops_pipeline = _parse_pipeline_config(ops_data.get("pipeline", {}))
         ops_shutdown = ops_data.get("shutdown", {}) or {}
         ops_retry = ops_data.get("retry", {}) or {}
     elif rt_cfg.get("pipeline"):
-        ops_pipeline = _parse_pipeline(rt_cfg.get("pipeline", {}))
+        ops_pipeline = _parse_pipeline_config(rt_cfg.get("pipeline", {}))
 
     pipeline_cfg = base_pipeline.merge(ops_pipeline)
 
