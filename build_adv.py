@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 import yaml
 
@@ -121,6 +121,103 @@ def _merge_mappings(base: Mapping[str, Any], override: Mapping[str, Any]) -> dic
         else:
             merged[key] = value
     return merged
+
+
+def _normalize_endpoint_map(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key, value in raw.items():
+        if isinstance(value, Mapping):
+            normalized[str(key)] = dict(value)
+        else:
+            normalized[str(key)] = value
+    return normalized
+
+
+def _normalize_rest_budget_config(rest_cfg_raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(rest_cfg_raw, Mapping):
+        return {}
+
+    sources: list[Mapping[str, Any]] = [rest_cfg_raw]
+    for key in ("session", "config"):
+        nested = rest_cfg_raw.get(key)
+        if isinstance(nested, Mapping):
+            sources.append(nested)
+
+    combined: dict[str, Any] = {}
+    for source in sources:
+        combined = _merge_mappings(combined, dict(source))
+
+    session_cfg: dict[str, Any] = {}
+    limits_cfg = combined.get("limits")
+    if isinstance(limits_cfg, Mapping):
+        global_cfg: MutableMapping[str, Any] | None = None
+        for alias in ("global", "global_", "default", "defaults"):
+            candidate = limits_cfg.get(alias)
+            if isinstance(candidate, Mapping):
+                global_cfg = dict(candidate)
+                break
+        if global_cfg is None:
+            scalars = {
+                key: value for key, value in limits_cfg.items() if not isinstance(value, Mapping)
+            }
+            if scalars:
+                global_cfg = dict(scalars)
+        if global_cfg:
+            session_cfg["global"] = global_cfg
+        endpoints_cfg = limits_cfg.get("endpoints")
+        if isinstance(endpoints_cfg, Mapping):
+            session_cfg["endpoints"] = _normalize_endpoint_map(endpoints_cfg)
+
+    if "global" not in session_cfg:
+        for alias in ("global", "global_", "default_global"):
+            candidate = combined.get(alias)
+            if isinstance(candidate, Mapping):
+                session_cfg["global"] = dict(candidate)
+                break
+
+    if "endpoints" not in session_cfg:
+        endpoints_candidate = combined.get("endpoints")
+        if isinstance(endpoints_candidate, Mapping):
+            session_cfg["endpoints"] = _normalize_endpoint_map(endpoints_candidate)
+
+    concurrency_cfg = combined.get("concurrency")
+    if isinstance(concurrency_cfg, Mapping):
+        session_cfg["concurrency"] = dict(concurrency_cfg)
+        for alias in ("batch_size", "queue", "max_in_flight"):
+            candidate = concurrency_cfg.get(alias)
+            if candidate is not None:
+                session_cfg.setdefault("batch_size", candidate)
+                break
+
+    batch_candidate = combined.get("batch_size")
+    if batch_candidate is not None:
+        session_cfg.setdefault("batch_size", batch_candidate)
+
+    for key in (
+        "enabled",
+        "cache",
+        "checkpoint",
+        "retry",
+        "dynamic_from_headers",
+        "timeout",
+        "timeout_s",
+        "cooldown_s",
+        "cooldown_sec",
+        "jitter",
+        "jitter_ms",
+        "cache_mode",
+        "cache_dir",
+        "cache_ttl_days",
+        "cache_controls",
+    ):
+        value = combined.get(key)
+        if value is None:
+            continue
+        session_cfg[key] = dict(value) if isinstance(value, Mapping) else value
+
+    return session_cfg
 
 
 def _first_non_empty_str(*candidates: Any) -> str | None:
@@ -254,13 +351,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     chunk_days = max(1, int(args.chunk_days))
 
     offline_config = _load_offline_config(_default_offline_config_path())
-    offline_rest_cfg = offline_config.get("rest_budget")
-    if isinstance(offline_rest_cfg, Mapping):
-        offline_rest_cfg = dict(offline_rest_cfg)
-    else:
-        offline_rest_cfg = {}
+    offline_rest_cfg = _normalize_rest_budget_config(
+        offline_config.get("rest_budget") if isinstance(offline_config, Mapping) else None
+    )
 
-    rest_cfg_loaded = _load_rest_config(str(args.rest_budget_config))
+    rest_cfg_loaded = _normalize_rest_budget_config(_load_rest_config(str(args.rest_budget_config)))
     rest_cfg: dict[str, Any]
     if offline_rest_cfg:
         rest_cfg = _merge_mappings(offline_rest_cfg, rest_cfg_loaded)

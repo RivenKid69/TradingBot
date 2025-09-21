@@ -1,11 +1,30 @@
 rest_budget:
-  enabled: true
-  global: { qps: 8, burst: 16, jitter_ms: 50, cooldown_sec: 5 }
-  endpoints:
-    klines: { qps: 5, burst: 10 }
-    exchangeInfo: { qps: 0.1, burst: 1, min_refresh_days: 1 }
-  cache: { dir: "cache/http", ttl_days: 7, mode: "read_write" }
-  checkpoint: { enabled: true, path: "state/offline_checkpoint.json" }
-  concurrency: { workers: 4, batch_size: 500 }
-  dynamic_from_headers: false
-  shuffle_symbols: true
+  # Global rate limiter applied to every request unless overridden below.
+  limits:
+    global:
+      qps: 8            # Target requests per second across all endpoints.
+      burst: 16         # Maximum burst size before throttling kicks in.
+      jitter_ms: 50     # Randomised jitter added before sleeps to avoid sync.
+      cooldown_sec: 5   # Optional cooldown when the global bucket is exhausted.
+    endpoints:
+      # Endpoint specific overrides inherit from the global limiter.
+      klines:
+        qps: 5
+        burst: 10
+      exchangeInfo:
+        qps: 0.1
+        burst: 1
+        min_refresh_days: 1  # Minimum age before forcing a refresh when cached.
+  cache:
+    path: "cache/http"         # Directory where REST responses are cached.
+    ttl_days: 7                 # Expiration window for cached responses.
+    mode: "read_write"          # Set to read or off to disable storing new entries.
+  checkpoint:
+    enabled: true               # Toggle on-disk progress checkpoints between runs.
+    path: "state/offline_checkpoint.json"
+  concurrency:
+    workers: 4                  # Number of worker threads dispatching HTTP requests.
+    batch_size: 500             # Max in-flight futures per producer before blocking.
+  shuffle:
+    enabled: true               # Shuffle symbol order to spread load across runs.
+  dynamic_from_headers: false   # Respect Binance weight headers when available.
