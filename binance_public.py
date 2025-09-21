@@ -364,20 +364,21 @@ class BinancePublicClient:
         )
         out: Dict[str, Dict[str, Any]] = {}
         if isinstance(data, dict):
+            recognized_filters = {
+                "PRICE_FILTER",
+                "LOT_SIZE",
+                "MIN_NOTIONAL",
+                "PERCENT_PRICE_BY_SIDE",
+                "PERCENT_PRICE",
+                "COMMISSION_STEP",
+            }
             for s in data.get("symbols", []):
                 sym = s.get("symbol")
                 filts = s.get("filters", [])
                 d: Dict[str, Any] = {}
                 for f in filts:
                     ftype = f.get("filterType")
-                    if ftype in {
-                        "PRICE_FILTER",
-                        "LOT_SIZE",
-                        "MIN_NOTIONAL",
-                        "PERCENT_PRICE_BY_SIDE",
-                        "PERCENT_PRICE",
-                        "COMMISSION_STEP",
-                    }:
+                    if ftype in recognized_filters:
                         d[ftype] = {k: v for k, v in f.items() if k != "filterType"}
                 for key, value in s.items():
                     if isinstance(key, str) and key.lower().endswith("precision"):
