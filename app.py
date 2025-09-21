@@ -8,6 +8,7 @@ import time
 import subprocess
 import copy
 import difflib
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Header
@@ -17,7 +18,7 @@ import yaml
 
 from utils_time import load_seasonality
 
-from core_config import load_config, load_config_from_str
+from core_config import ClockSyncConfig, load_config, load_config_from_str
 from ingest_config import (
     load_config as load_ingest_config,
     load_config_from_str as parse_ingest_config,
@@ -28,6 +29,9 @@ from legacy_sandbox_config import (
     SandboxConfig,
 )
 
+import clock
+from services import monitoring
+from services.rest_budget import RestBudgetSession
 from services.utils_app import (
     ensure_dir as _ensure_dir,
     run_cmd,
@@ -318,6 +322,35 @@ def _show_diff(old: str, new: str, label: str) -> str:
     return diff
 
 
+def _load_latest_metrics(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            file_size = fh.tell()
+            if file_size <= 0:
+                return {}
+            chunk = 4096
+            buffer = bytearray()
+            position = file_size
+            while position > 0 and buffer.count(b"\n") < 2:
+                read = min(chunk, position)
+                fh.seek(position - read)
+                data = fh.read(read)
+                if not data:
+                    break
+                buffer = data + buffer
+                position -= read
+            lines = [line for line in buffer.splitlines() if line.strip()]
+            if not lines:
+                return {}
+            last_line = lines[-1].decode("utf-8")
+        return json.loads(last_line)
+    except Exception:
+        return {}
+
+
 # --------------------------- Streamlit UI ---------------------------
 
 st.set_page_config(page_title="Trading Signals Control", layout="wide")
@@ -333,6 +366,9 @@ with st.sidebar:
     cfg_sandbox = st.text_input("configs/sandbox.yaml", value="configs/sandbox.yaml")
     cfg_sim = st.text_input("configs/sim.yaml", value="configs/sim.yaml")
     cfg_realtime = st.text_input("configs/realtime.yaml", value="configs/realtime.yaml")
+    rest_budget_cfg = st.text_input(
+        "Rest budget (clock sync)", value="configs/rest_budget.yaml"
+    )
 
     logs_dir = st.text_input("Каталог логов", value="logs")
     _ensure_dir(logs_dir)
@@ -388,6 +424,7 @@ tabs = st.tabs(
         "Threshold Tuner",
         "Probability Calibration",
         "Drift Monitor",
+        "Monitoring",
     ]
 )
 # --------------------------- Tab: Status ---------------------------
@@ -2720,3 +2757,178 @@ with tabs[19]:
                 st.dataframe(res.head(50))
             except Exception as e:
                 st.error(f"Ошибка расчёта PSI: {e}")
+
+with tabs[20]:
+    st.subheader("Monitoring overview")
+
+    monitoring_logs = st.session_state.setdefault("monitoring_logs", [])
+    latest_metrics = _load_latest_metrics(os.path.join(logs_dir, "metrics.jsonl"))
+    queue_info = latest_metrics.get("throttle_queue") or {}
+    cooldowns = latest_metrics.get("cooldowns_active") or {}
+    ws_data = latest_metrics.get("ws") or {}
+
+    def _fmt_ts(ts_ms: Any) -> str:
+        try:
+            ts_val = float(ts_ms)
+        except (TypeError, ValueError):
+            return "—"
+        if ts_val <= 0:
+            return "—"
+        try:
+            return datetime.utcfromtimestamp(ts_val / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "—"
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Clock drift (ms)", f"{clock.clock_skew():.2f}")
+        age_sec = clock.last_sync_age_sec()
+        age_text = f"{age_sec:.1f}" if age_sec != float("inf") else "∞"
+        st.metric("Last sync age (s)", age_text)
+    with col2:
+        st.metric(
+            "Queue size",
+            f"{queue_info.get('size', 0)}/{queue_info.get('max', 0)}",
+        )
+        st.metric("Cooldowns active", str(cooldowns.get("count", 0)))
+    with col3:
+        st.metric("Last WS failure", _fmt_ts(ws_data.get("last_failure_ms")))
+        st.metric("Last WS reconnect", _fmt_ts(ws_data.get("last_reconnect_ms")))
+
+    st.divider()
+    st.subheader("Snapshot summary")
+    snapshot_summary = read_json(snapshot_json)
+    if snapshot_summary:
+        st.json(snapshot_summary)
+    else:
+        st.info("Snapshot metrics JSON не найден.")
+
+    snap_df = read_csv(snapshot_csv)
+    if not snap_df.empty:
+        st.subheader("Snapshot metrics chart")
+        numeric_df = snap_df.copy()
+        numeric_df["value"] = pd.to_numeric(numeric_df["value"], errors="coerce")
+        plot_df = numeric_df.dropna(subset=["value"]).set_index("metric")["value"]
+        if not plot_df.empty:
+            st.bar_chart(plot_df)
+        st.dataframe(snap_df)
+    else:
+        st.info("Snapshot metrics CSV не найден или пуст.")
+
+    st.divider()
+    st.subheader("Clock sync")
+
+    if st.button("Sync now", type="primary"):
+        timestamp = datetime.utcnow().strftime("%H:%M:%S")
+        run_cfg = None
+        try:
+            run_cfg = load_config(cfg_realtime)
+        except Exception as exc:
+            monitoring_logs.append(f"[{timestamp}] config error: {exc}")
+            monitoring_logs[:] = monitoring_logs[-200:]
+            st.warning(f"Не удалось загрузить конфиг: {exc}")
+        if run_cfg is not None:
+            clock_cfg = getattr(run_cfg, "clock_sync", ClockSyncConfig())
+            rest_cfg_data: Dict[str, Any] = {}
+            if rest_budget_cfg and os.path.exists(rest_budget_cfg):
+                try:
+                    with open(rest_budget_cfg, "r", encoding="utf-8") as fh:
+                        raw_cfg = yaml.safe_load(fh) or {}
+                    if isinstance(raw_cfg, dict):
+                        rest_cfg_data = raw_cfg
+                except Exception as exc:
+                    monitoring_logs.append(
+                        f"[{timestamp}] rest config error: {exc}"
+                    )
+                    monitoring_logs[:] = monitoring_logs[-200:]
+                    st.warning(f"Ошибка rest-конфига: {exc}")
+            elif rest_budget_cfg:
+                monitoring_logs.append(
+                    f"[{timestamp}] rest config not found: {rest_budget_cfg}"
+                )
+                monitoring_logs[:] = monitoring_logs[-200:]
+                st.warning(f"Rest budget config не найден: {rest_budget_cfg}")
+
+            try:
+                with RestBudgetSession(rest_cfg_data) as sess:
+                    drift, rtt = clock.manual_sync(clock_cfg, session=sess)
+            except Exception as exc:
+                monitoring_logs.append(f"[{timestamp}] sync failed: {exc}")
+                monitoring_logs[:] = monitoring_logs[-200:]
+                st.warning(f"Синхронизация не удалась: {exc}")
+            else:
+                monitoring.report_clock_sync(
+                    drift, rtt, True, clock.system_utc_ms()
+                )
+                monitoring_logs.append(
+                    f"[{timestamp}] sync drift={drift:.2f}ms rtt={rtt:.2f}ms"
+                )
+                monitoring_logs[:] = monitoring_logs[-200:]
+                st.success(
+                    f"Drift {drift:.2f} ms, median RTT {rtt:.2f} ms"
+                )
+
+    st.divider()
+    st.subheader("HTTP metrics")
+    http_data = latest_metrics.get("http") or {}
+    http_rows: List[Dict[str, Any]] = []
+    for window, stats in http_data.items():
+        if not isinstance(stats, dict):
+            continue
+        row: Dict[str, Any] = {
+            "window": window,
+            "attempts": stats.get("attempts"),
+            "success": stats.get("success"),
+            "errors": stats.get("errors"),
+            "total": stats.get("total"),
+            "error_rate": stats.get("error_rate"),
+        }
+        codes = stats.get("by_code") or {}
+        if isinstance(codes, dict):
+            for code, value in codes.items():
+                row[f"code_{code}"] = value
+        http_rows.append(row)
+    if http_rows:
+        st.table(pd.DataFrame(http_rows).set_index("window"))
+    else:
+        st.info("HTTP статистика пока недоступна.")
+
+    st.subheader("Websocket metrics")
+    if ws_data:
+        st.table(pd.DataFrame([ws_data]))
+    else:
+        st.info("Websocket статистика пока недоступна.")
+
+    st.subheader("Signal metrics")
+    signals_data = latest_metrics.get("signals") or {}
+    signal_rows: List[Dict[str, Any]] = []
+    for key in ("window_1m", "window_5m"):
+        stats = signals_data.get(key)
+        if isinstance(stats, dict):
+            row = {"window": key}
+            row.update(stats)
+            signal_rows.append(row)
+    if signal_rows:
+        st.table(pd.DataFrame(signal_rows).set_index("window"))
+    else:
+        st.info("Signal статистика пока недоступна.")
+    streaks = signals_data.get("zero_signal_streaks") or {}
+    if isinstance(streaks, dict) and streaks:
+        streak_df = (
+            pd.DataFrame(
+                [{"symbol": sym, "streak": streak} for sym, streak in streaks.items()]
+            )
+            .sort_values("streak", ascending=False)
+            .set_index("symbol")
+        )
+        st.table(streak_df)
+
+    st.subheader("Sync log")
+    if monitoring_logs:
+        st.text_area(
+            "Log",
+            "\n".join(monitoring_logs[-50:]),
+            height=160,
+        )
+    else:
+        st.info("Лог синхронизации пока пуст.")
