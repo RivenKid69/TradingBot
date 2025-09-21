@@ -36,6 +36,10 @@ shutdown:
 ttl:
   enabled: false
   ttl_seconds: 60
+  mode: relative
+  guard_ms: 5000
+  absolute_failsafe_ms: 900000
+  state_path: state/ttl_state.json
   out_csv: null
   dedup_persist: null
 api:
@@ -113,6 +117,12 @@ pipeline:
     policy:
       enabled: true
     risk:
+      enabled: true
+    ttl:
+      enabled: true
+    dedup:
+      enabled: true
+    throttle:
       enabled: true
     publish:
       enabled: true

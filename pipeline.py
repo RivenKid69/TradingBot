@@ -30,6 +30,9 @@ class Stage(Enum):
     EXTREME = auto()
     POLICY = auto()
     RISK = auto()
+    TTL = auto()
+    DEDUP = auto()
+    THROTTLE = auto()
     PUBLISH = auto()
 
 

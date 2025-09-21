@@ -6,6 +6,8 @@ import sys
 import json
 import time
 import subprocess
+import copy
+import difflib
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Header
@@ -37,6 +39,7 @@ from services.utils_app import (
     read_csv,
     append_row_csv,
     load_signals_full,
+    atomic_write_with_retry,
 )
 from service_backtest import BacktestConfig, from_config as backtest_from_config
 from service_signal_runner import ServiceSignalRunner, RunnerConfig
@@ -272,6 +275,47 @@ def run_backtest_from_yaml(cfg_path: str, default_out: str, logs_dir: str) -> st
     else:
         pd.DataFrame(reports).to_csv(out_path, index=False)
     return out_path
+
+
+# --------------------------- YAML helpers ---------------------------
+
+
+def _load_yaml_file(path: str) -> tuple[Dict[str, Any], str]:
+    if not path or not os.path.exists(path):
+        return {}, ""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            content = fh.read()
+    except Exception:
+        return {}, ""
+    try:
+        data = yaml.safe_load(content) or {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return data, content
+
+
+def _dump_yaml(data: Dict[str, Any]) -> str:
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+
+
+def _show_diff(old: str, new: str, label: str) -> str:
+    diff = "\n".join(
+        difflib.unified_diff(
+            (old or "").splitlines(),
+            (new or "").splitlines(),
+            fromfile=f"{label} (old)",
+            tofile=f"{label} (new)",
+            lineterm="",
+        )
+    )
+    if diff.strip():
+        st.code(diff, language="diff")
+    else:
+        st.info("Изменений нет")
+    return diff
 
 
 # --------------------------- Streamlit UI ---------------------------
@@ -577,12 +621,65 @@ with tabs[5]:
 with tabs[6]:
     st.subheader("Realtime сигналер (WebSocket Binance, без ключей)")
 
+    runtime_yaml = st.text_input("Runtime YAML", value="configs/runtime.yaml")
+    live_yaml = st.text_input("Основной конфиг (config_live.yaml)", value="configs/config_live.yaml")
+
+    runner_status = read_json(os.path.join(logs_dir, "runner_status.json"))
+    running = background_running(realtime_pid)
+
+    safe_state = runner_status.get("safe_mode", {}) or {}
+    queue_info = runner_status.get("queue", {}) or {}
+    status_cols = st.columns(4)
+    with status_cols[0]:
+        st.metric("Safe mode", "ON" if safe_state.get("active") else "OFF")
+    with status_cols[1]:
+        st.metric(
+            "Queue",
+            f"{queue_info.get('size', 0)}/{queue_info.get('max', 0)}",
+        )
+    with status_cols[2]:
+        st.metric("Workers", len(runner_status.get("workers", [])))
+    with status_cols[3]:
+        st.metric("Процесс", "запущен" if running else "остановлен")
+
+    workers_payload = runner_status.get("workers") or []
+    if workers_payload:
+        st.dataframe(pd.DataFrame(workers_payload), use_container_width=True)
+    else:
+        st.info("Статус воркеров пока не доступен.")
+
+    st.divider()
+    cols = st.columns(3)
+    with cols[0]:
+        if st.button("Старт", disabled=running, type="primary"):
+            try:
+                pid = start_background(
+                    [sys.executable, "script_live.py", "--config", cfg_realtime],
+                    pid_file=realtime_pid,
+                    log_file=realtime_log,
+                )
+                st.success(f"Сигналер запущен, PID={pid}")
+            except Exception as e:
+                st.error(str(e))
+    with cols[1]:
+        if st.button("Стоп", disabled=not running, type="secondary"):
+            ok = stop_background(realtime_pid)
+            if ok:
+                st.success("Остановлено")
+            else:
+                st.error("Не удалось остановить процесс (возможно, уже не работает)")
+    with cols[2]:
+        if st.button("Показать configs/realtime.yaml"):
+            try:
+                with open(cfg_realtime, "r", encoding="utf-8") as f:
+                    st.code(f.read(), language="yaml")
+            except Exception as e:
+                st.error(str(e))
+
     with st.expander(
         "Параметры стратегии (сохранить в configs/realtime.yaml)", expanded=False
     ):
         try:
-            import copy
-
             rt_cfg = load_config(cfg_realtime).model_dump()
             st.write("Текущая стратегия:")
             strat = rt_cfg.get("strategy", {}) or {}
@@ -610,34 +707,257 @@ with tabs[6]:
         except Exception as e:
             st.error(f"Не удалось прочитать/изменить {cfg_realtime}: {e}")
 
-    running = background_running(realtime_pid)
-    st.write(f"Статус: **{'запущен' if running else 'остановлен'}**")
-    cols = st.columns(3)
-    with cols[0]:
-        if st.button("Старт", disabled=running, type="primary"):
-            try:
-                pid = start_background(
-                    [sys.executable, "script_live.py", "--config", cfg_realtime],
-                    pid_file=realtime_pid,
-                    log_file=realtime_log,
-                )
-                st.success(f"Сигналер запущен, PID={pid}")
-            except Exception as e:
-                st.error(str(e))
-    with cols[1]:
-        if st.button("Стоп", disabled=not running, type="secondary"):
-            ok = stop_background(realtime_pid)
-            if ok:
-                st.success("Остановлено")
+    runtime_data, runtime_text = _load_yaml_file(runtime_yaml)
+    live_data, live_text = _load_yaml_file(live_yaml)
+
+    st.divider()
+    st.markdown("#### Этапы пайплайна")
+    stage_order = [
+        "closed_bar",
+        "windows",
+        "anomaly",
+        "extreme",
+        "policy",
+        "risk",
+        "ttl",
+        "dedup",
+        "throttle",
+        "publish",
+    ]
+    stage_labels = {
+        "closed_bar": "Closed bar",
+        "windows": "Windows",
+        "anomaly": "Anomaly",
+        "extreme": "Extreme",
+        "policy": "Policy",
+        "risk": "Risk",
+        "ttl": "TTL",
+        "dedup": "Dedup",
+        "throttle": "Throttle",
+        "publish": "Publish",
+    }
+    base_pipeline = live_data.get("pipeline") or {}
+    pipeline_enabled = bool(base_pipeline.get("enabled", True))
+    runtime_pipeline = runtime_data.get("pipeline") or {}
+    if "enabled" in runtime_pipeline:
+        pipeline_enabled = bool(runtime_pipeline.get("enabled", True))
+    stage_states: Dict[str, bool] = {}
+    base_stages = base_pipeline.get("stages") or {}
+    for stage in stage_order:
+        entry = base_stages.get(stage)
+        if isinstance(entry, dict):
+            stage_states[stage] = bool(entry.get("enabled", True))
+        elif entry is not None:
+            stage_states[stage] = bool(entry)
+        else:
+            stage_states[stage] = True
+    runtime_stage_cfg = runtime_pipeline.get("stages") or {}
+    for stage, cfg in runtime_stage_cfg.items():
+        if isinstance(cfg, dict):
+            stage_states[stage] = bool(cfg.get("enabled", True))
+        else:
+            stage_states[stage] = bool(cfg)
+    with st.form("pipeline_stages_form"):
+        pipeline_enabled_input = st.checkbox(
+            "Pipeline включен", value=pipeline_enabled
+        )
+        stage_columns = st.columns(3)
+        stage_inputs: Dict[str, bool] = {}
+        for idx, stage in enumerate(stage_order):
+            label = stage_labels.get(stage, stage)
+            stage_inputs[stage] = stage_columns[idx % 3].checkbox(
+                label, value=stage_states.get(stage, True)
+            )
+        if st.form_submit_button("Сохранить pipeline"):
+            new_runtime = copy.deepcopy(runtime_data)
+            pipeline_section = copy.deepcopy(runtime_pipeline)
+            pipeline_section["enabled"] = bool(pipeline_enabled_input)
+            existing_stages = pipeline_section.get("stages") or {}
+            new_stages: Dict[str, Any] = {}
+            for stage in stage_order:
+                prev = existing_stages.get(stage)
+                if isinstance(prev, dict):
+                    params = {k: v for k, v in prev.items() if k != "enabled"}
+                else:
+                    params = {}
+                entry = dict(params)
+                entry["enabled"] = bool(stage_inputs[stage])
+                new_stages[stage] = entry
+            for stage, cfg in existing_stages.items():
+                if stage not in new_stages:
+                    new_stages[stage] = cfg
+            pipeline_section["stages"] = new_stages
+            new_runtime["pipeline"] = pipeline_section
+            new_runtime_text = _dump_yaml(new_runtime)
+            diff = _show_diff(runtime_text, new_runtime_text, runtime_yaml)
+            if diff.strip():
+                atomic_write_with_retry(runtime_yaml, new_runtime_text)
+                st.success("Pipeline настройки сохранены")
+                st.info("Запросите reload для применения изменений.")
             else:
-                st.error("Не удалось остановить процесс (возможно, уже не работает)")
-    with cols[2]:
-        if st.button("Показать configs/realtime.yaml"):
-            try:
-                with open(cfg_realtime, "r", encoding="utf-8") as f:
-                    st.code(f.read(), language="yaml")
-            except Exception as e:
-                st.error(str(e))
+                st.info("Нет изменений")
+
+    st.divider()
+    st.markdown("#### TTL")
+    ttl_cfg = copy.deepcopy(live_data.get("ttl") or {})
+    ttl_mode_options = ["relative", "absolute", "off"]
+    current_mode = str(ttl_cfg.get("mode", "relative"))
+    if current_mode not in ttl_mode_options:
+        current_mode = "relative"
+    with st.form("ttl_form"):
+        ttl_enabled = st.checkbox("TTL включён", value=bool(ttl_cfg.get("enabled", False)))
+        ttl_seconds = st.number_input(
+            "TTL секунд", min_value=0, max_value=86_400, value=int(ttl_cfg.get("ttl_seconds", 60))
+        )
+        ttl_mode = st.selectbox("Режим", ttl_mode_options, index=ttl_mode_options.index(current_mode))
+        guard_ms = st.number_input(
+            "Guard, мс", min_value=0, max_value=900_000, value=int(ttl_cfg.get("guard_ms", 5_000))
+        )
+        failsafe_ms = st.number_input(
+            "Абсолютный предел, мс", min_value=0, max_value=3_600_000, value=int(ttl_cfg.get("absolute_failsafe_ms", 900_000))
+        )
+        state_path_val = st.text_input(
+            "Файл состояния", value=str(ttl_cfg.get("state_path", "state/ttl_state.json"))
+        )
+        out_csv_val = st.text_input(
+            "CSV для сигналов", value=str(ttl_cfg.get("out_csv") or "")
+        )
+        dedup_persist_val = st.text_input(
+            "Файл кеша дедупликации", value=str(ttl_cfg.get("dedup_persist") or "")
+        )
+        if st.form_submit_button("Сохранить TTL"):
+            new_live = copy.deepcopy(live_data)
+            new_ttl = dict(ttl_cfg)
+            new_ttl.update(
+                {
+                    "enabled": bool(ttl_enabled),
+                    "ttl_seconds": int(ttl_seconds),
+                    "mode": ttl_mode,
+                    "guard_ms": int(guard_ms),
+                    "absolute_failsafe_ms": int(failsafe_ms),
+                    "state_path": state_path_val.strip(),
+                    "out_csv": out_csv_val.strip() or None,
+                    "dedup_persist": dedup_persist_val.strip() or None,
+                }
+            )
+            new_live["ttl"] = new_ttl
+            new_live_text = _dump_yaml(new_live)
+            diff = _show_diff(live_text, new_live_text, live_yaml)
+            if diff.strip():
+                atomic_write_with_retry(live_yaml, new_live_text)
+                st.success("TTL настройки сохранены")
+            else:
+                st.info("Нет изменений")
+
+    st.divider()
+    st.markdown("#### Throttle")
+    throttle_cfg = copy.deepcopy(runtime_data.get("throttle") or {})
+    mode_options = ["drop", "queue"]
+    current_mode = str(throttle_cfg.get("mode", "drop"))
+    if current_mode not in mode_options:
+        current_mode = "drop"
+    global_cfg = throttle_cfg.get("global") or {}
+    symbol_cfg = throttle_cfg.get("symbol") or {}
+    queue_cfg = throttle_cfg.get("queue") or {}
+    with st.form("throttle_form"):
+        thr_enabled = st.checkbox("Throttle включён", value=bool(throttle_cfg.get("enabled", False)))
+        thr_mode = st.selectbox("Режим", mode_options, index=mode_options.index(current_mode))
+        global_rps = st.number_input(
+            "Global RPS", min_value=0.0, value=float(global_cfg.get("rps", 0.0))
+        )
+        global_burst = st.number_input(
+            "Global burst", min_value=0, value=int(global_cfg.get("burst", 0))
+        )
+        symbol_rps = st.number_input(
+            "Symbol RPS", min_value=0.0, value=float(symbol_cfg.get("rps", 0.0))
+        )
+        symbol_burst = st.number_input(
+            "Symbol burst", min_value=0, value=int(symbol_cfg.get("burst", 0))
+        )
+        queue_max = st.number_input(
+            "Queue max items", min_value=0, value=int(queue_cfg.get("max_items", 0))
+        )
+        queue_ttl = st.number_input(
+            "Queue TTL, мс", min_value=0, value=int(queue_cfg.get("ttl_ms", 0))
+        )
+        time_source_val = st.text_input(
+            "Источник времени", value=str(throttle_cfg.get("time_source", "monotonic"))
+        )
+        if st.form_submit_button("Сохранить throttle"):
+            new_runtime = copy.deepcopy(runtime_data)
+            new_throttle = dict(throttle_cfg)
+            new_throttle.update(
+                {
+                    "enabled": bool(thr_enabled),
+                    "mode": thr_mode,
+                    "time_source": time_source_val.strip() or "monotonic",
+                    "global": {"rps": float(global_rps), "burst": int(global_burst)},
+                    "symbol": {"rps": float(symbol_rps), "burst": int(symbol_burst)},
+                    "queue": {"max_items": int(queue_max), "ttl_ms": int(queue_ttl)},
+                }
+            )
+            new_runtime["throttle"] = new_throttle
+            new_runtime_text = _dump_yaml(new_runtime)
+            diff = _show_diff(runtime_text, new_runtime_text, runtime_yaml)
+            if diff.strip():
+                atomic_write_with_retry(runtime_yaml, new_runtime_text)
+                st.success("Throttle настройки сохранены")
+                st.info("Запросите reload для применения изменений.")
+            else:
+                st.info("Нет изменений")
+
+    st.divider()
+    st.markdown("#### WebSocket дедупликация")
+    ws_cfg = copy.deepcopy(runtime_data.get("ws") or {})
+    with st.form("ws_form"):
+        ws_enabled = st.checkbox("WS дедуп включён", value=bool(ws_cfg.get("enabled", False)))
+        persist_path_val = st.text_input(
+            "Файл persist", value=str(ws_cfg.get("persist_path") or "")
+        )
+        log_skips_val = st.checkbox(
+            "Логировать пропуски", value=bool(ws_cfg.get("log_skips", False))
+        )
+        if st.form_submit_button("Сохранить дедупликацию"):
+            new_runtime = copy.deepcopy(runtime_data)
+            new_ws = dict(ws_cfg)
+            new_ws.update(
+                {
+                    "enabled": bool(ws_enabled),
+                    "persist_path": persist_path_val.strip() or None,
+                    "log_skips": bool(log_skips_val),
+                }
+            )
+            new_runtime["ws"] = new_ws
+            new_runtime_text = _dump_yaml(new_runtime)
+            diff = _show_diff(runtime_text, new_runtime_text, runtime_yaml)
+            if diff.strip():
+                atomic_write_with_retry(runtime_yaml, new_runtime_text)
+                st.success("Настройки дедупликации сохранены")
+                st.info("Запросите reload для применения изменений.")
+            else:
+                st.info("Нет изменений")
+
+    st.divider()
+    action_cols = st.columns(2)
+    reload_flag = os.path.join(logs_dir, "reload_request.json")
+    safe_stop_flag = os.path.join(logs_dir, "safe_stop.request")
+    with action_cols[0]:
+        if st.button("Запросить reload", type="primary"):
+            payload = {
+                "requested_at_ms": int(time.time() * 1000),
+                "paths": [runtime_yaml],
+            }
+            atomic_write_with_retry(
+                reload_flag, json.dumps(payload, ensure_ascii=False)
+            )
+            st.success("reload_request.json обновлён")
+    with action_cols[1]:
+        if st.button("Safe stop", type="secondary"):
+            payload = {"requested_at_ms": int(time.time() * 1000)}
+            atomic_write_with_retry(
+                safe_stop_flag, json.dumps(payload, ensure_ascii=False)
+            )
+            st.success("Safe stop запрос записан")
 
     st.divider()
     st.subheader("Последние сигналы")
@@ -942,8 +1262,6 @@ with tabs[10]:
             key="mt_set_model_a",
         ):
             try:
-                import copy
-
                 rt_cfg = load_config(cfg_realtime).model_dump()
                 new_cfg = copy.deepcopy(rt_cfg)
                 new_cfg.setdefault("strategy", {}).setdefault("params", {})
