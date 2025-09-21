@@ -18,7 +18,11 @@ from build_adv_base import (
     compute_adv_quote,
     fetch_klines_for_symbols,
 )
+from build_adv import _normalize_rest_budget_config, _load_offline_config as _load_offline_defaults
 from services.rest_budget import RestBudgetSession
+
+
+STATS_PATH = Path("logs/offline/build_adv_hourly_stats.json")
 
 
 def _normalize_symbols(items: Iterable[Any]) -> list[str]:
@@ -30,6 +34,20 @@ def _normalize_symbols(items: Iterable[Any]) -> list[str]:
         if text not in result:
             result.append(text)
     return result
+
+
+def _merge_dicts(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {key: value for key, value in base.items()}
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], Mapping)
+            and isinstance(value, Mapping)
+        ):
+            merged[key] = _merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _load_symbols_file(path: str | None) -> list[str]:
@@ -214,6 +232,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Path to RestBudgetSession YAML configuration",
     )
     parser.add_argument(
+        "--config",
+        default="configs/offline.yaml",
+        help="Path to offline YAML config providing default rest budget settings",
+    )
+    parser.add_argument(
         "--clip-lower",
         type=float,
         default=5.0,
@@ -295,9 +318,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     start_ms = int(start_dt.timestamp() * 1000)
     end_ms = int(end_dt.timestamp() * 1000)
 
-    rest_cfg = _load_rest_budget_config(args.rest_budget_config)
+    offline_payload: Mapping[str, Any] | dict[str, Any] = {}
+    if args.config:
+        try:
+            offline_payload = _load_offline_defaults(Path(args.config))
+        except Exception:
+            offline_payload = {}
+    offline_rest_cfg = _normalize_rest_budget_config(
+        offline_payload.get("rest_budget") if isinstance(offline_payload, Mapping) else None
+    )
+    rest_cfg_file = _load_rest_budget_config(args.rest_budget_config)
+    rest_cfg_loaded = _normalize_rest_budget_config(rest_cfg_file)
+    rest_cfg: dict[str, Any] = offline_rest_cfg
+    if rest_cfg_loaded:
+        rest_cfg = _merge_dicts(rest_cfg, rest_cfg_loaded) if rest_cfg else rest_cfg_loaded
 
+    stats_path = STATS_PATH
     with RestBudgetSession(rest_cfg) as session:
+        try:
+            session.write_stats(stats_path)
+        except Exception:
+            logging.debug("Failed to write initial stats snapshot", exc_info=True)
         datasets = fetch_klines_for_symbols(
             session,
             unique_symbols,
@@ -305,6 +346,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             interval=interval,
             start_ms=start_ms,
             end_ms=end_ms,
+            stats_path=stats_path,
         )
 
     generated_at = datetime.now(timezone.utc)

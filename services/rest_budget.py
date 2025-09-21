@@ -347,6 +347,8 @@ class RestBudgetSession:
         self._checkpoint_saves = 0
         self._wait_seconds: defaultdict[str, float] = defaultdict(float)
         self._stats_started = time.monotonic()
+        self._stats_started_wall = time.time()
+        self._last_checkpoint_snapshot: dict[str, Any] | None = None
 
     @staticmethod
     def _parse_retry_cfg(cfg: Any) -> RetryConfig:
@@ -1273,6 +1275,36 @@ class RestBudgetSession:
         else:
             with self._stats_lock:
                 self._checkpoint_saves += 1
+                snapshot: dict[str, Any] = {
+                    "saved_at": payload.get("saved_at"),
+                    "progress_pct": payload.get("progress_pct"),
+                    "last_symbol": payload.get("last_symbol"),
+                    "last_range": payload.get("last_range"),
+                }
+                data_summary: dict[str, Any] = {}
+                if isinstance(data, Mapping):
+                    for key, caster in (
+                        ("tasks_total", int),
+                        ("tasks_completed", int),
+                        ("pending_tasks", int),
+                        ("pending_tasks_remaining", int),
+                        ("pending_bars", int),
+                        ("pending_bars_remaining", int),
+                        ("processed", int),
+                        ("total", int),
+                    ):
+                        if key not in data:
+                            continue
+                        value = data.get(key)
+                        try:
+                            data_summary[key] = caster(value)
+                        except (TypeError, ValueError):
+                            data_summary[key] = value
+                    if "completed" in data:
+                        data_summary["completed"] = bool(data.get("completed"))
+                if data_summary:
+                    snapshot["data_summary"] = data_summary
+                self._last_checkpoint_snapshot = snapshot
 
     def submit(self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> Future[T]:
         if self._executor is None:
@@ -1572,6 +1604,160 @@ class RestBudgetSession:
                     "saves": self._checkpoint_saves,
                 },
             }
+
+    @staticmethod
+    def _format_ts(ts: float) -> str | None:
+        if not math.isfinite(ts) or ts <= 0.0:
+            return None
+        try:
+            dt = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return dt.isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _bucket_snapshot(
+        bucket: TokenBucket,
+        *,
+        remaining: float,
+        now_wall: float,
+    ) -> dict[str, Any]:
+        with bucket._lock:
+            tokens = float(bucket.tokens)
+            burst = float(bucket.burst)
+            rps = float(bucket.rps)
+            configured_rps = float(bucket.configured_rps)
+            configured_burst = float(bucket.configured_burst)
+        until_wall = now_wall + remaining if math.isfinite(remaining) else float("inf")
+        snapshot: dict[str, Any] = {
+            "active": remaining > 0.0 and math.isfinite(remaining),
+            "remaining_s": float(remaining) if math.isfinite(remaining) else float("inf"),
+            "until_ts": until_wall,
+            "until_iso": RestBudgetSession._format_ts(until_wall),
+            "tokens": tokens,
+            "burst": burst,
+            "rps": rps,
+            "configured_burst": configured_burst,
+            "configured_rps": configured_rps,
+        }
+        return snapshot
+
+    def _cooldown_snapshot(self, now_monotonic: float, now_wall: float) -> dict[str, Any]:
+        endpoints: dict[str, Any] = {}
+        seen_ids: set[int] = set()
+        for key, bucket in list(self._endpoint_buckets.items()):
+            ident = id(bucket)
+            if ident in seen_ids:
+                continue
+            seen_ids.add(ident)
+            remaining = bucket.wait_time(tokens=0.0, now=now_monotonic)
+            if remaining <= 0.0:
+                continue
+            canonical = self._normalize_endpoint_key(key) or key
+            endpoints[canonical] = self._bucket_snapshot(
+                bucket,
+                remaining=remaining,
+                now_wall=now_wall,
+            )
+
+        global_snapshot: dict[str, Any] | None = None
+        if self._global_bucket is not None:
+            remaining = self._global_bucket.wait_time(tokens=0.0, now=now_monotonic)
+            if remaining > 0.0:
+                global_snapshot = self._bucket_snapshot(
+                    self._global_bucket,
+                    remaining=remaining,
+                    now_wall=now_wall,
+                )
+
+        count = len(endpoints) + (1 if global_snapshot else 0)
+        payload: dict[str, Any] = {
+            "count": int(count),
+            "ts": now_wall,
+            "ts_iso": self._format_ts(now_wall),
+            "endpoints": endpoints,
+        }
+        if global_snapshot:
+            payload["global"] = global_snapshot
+        else:
+            payload["global"] = {"active": False}
+        return payload
+
+    def write_stats(self, path: str | os.PathLike[str]) -> None:
+        """Persist the current :meth:`stats` snapshot to ``path`` atomically."""
+
+        stats_payload = self.stats()
+        now_wall = time.time()
+        now_monotonic = time.monotonic()
+        cooldowns = self._cooldown_snapshot(now_monotonic, now_wall)
+
+        with self._stats_lock:
+            checkpoint_meta = (
+                dict(self._last_checkpoint_snapshot)
+                if isinstance(self._last_checkpoint_snapshot, Mapping)
+                else None
+            )
+
+        session_meta: dict[str, Any] = {
+            "enabled": bool(self._enabled),
+            "max_workers": int(self._max_workers),
+            "batch_size": int(self.batch_size),
+            "queue_capacity": int(self._queue_capacity),
+            "cooldown_s": float(self._cooldown_s),
+            "jitter_ms": [float(self._jitter_min_ms), float(self._jitter_max_ms)],
+            "cache_mode": self._cache_mode,
+        }
+        if self._cache_dir is not None:
+            session_meta["cache_dir"] = str(self._cache_dir)
+        if self._checkpoint_path is not None:
+            session_meta["checkpoint_path"] = str(self._checkpoint_path)
+
+        payload = dict(stats_payload)
+        payload["ts"] = now_wall
+        payload["ts_iso"] = self._format_ts(now_wall)
+        payload["runtime_seconds"] = float(max(now_wall - self._stats_started_wall, 0.0))
+        payload["session"] = session_meta
+        payload["cooldowns_active"] = cooldowns
+        if checkpoint_meta:
+            payload["checkpoint_meta"] = checkpoint_meta
+
+        try:
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            logger.warning("Stats payload is not JSON serialisable")
+            return
+
+        target = Path(path)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        prefix = f".{target.stem}.stats."
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(target.parent), prefix=prefix, suffix=".tmp"
+            )
+        except OSError as exc:
+            logger.warning("Failed to create stats temp file in %s: %s", target.parent, exc)
+            return
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                tmp_file.write(encoded)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            os.replace(tmp_name, target)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write stats file %s: %s", target, exc)
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+
 
 
 DAY_MS = 86_400_000

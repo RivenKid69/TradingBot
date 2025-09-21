@@ -468,6 +468,8 @@ def build_adv(
     session: RestBudgetSession,
     symbols: Sequence[str],
     config: BuildAdvConfig,
+    *,
+    stats_path: str | Path | None = None,
 ) -> BuildAdvResult:
     if not symbols:
         raise ValueError("symbol list is empty")
@@ -475,6 +477,16 @@ def build_adv(
     interval = config.interval.lower()
     if interval not in INTERVAL_TO_MS:
         raise ValueError(f"unsupported interval: {config.interval}")
+
+    stats_target = stats_path
+
+    def _write_stats_safe() -> None:
+        if not stats_target:
+            return
+        try:
+            session.write_stats(stats_target)
+        except Exception:
+            pass
 
     step_ms = INTERVAL_TO_MS[interval]
     start_aligned, end_aligned = _align_range(config.start_ms, config.end_ms, step_ms)
@@ -703,6 +715,7 @@ def build_adv(
                 "fetched_bars": 0,
                 "total_bars": existing,
             }
+        _write_stats_safe()
         return BuildAdvResult(
             out_path=config.out_path,
             rows_written=0,
@@ -738,6 +751,7 @@ def build_adv(
         last_range=last_range_saved,
     )
     checkpoint_state.update(state)
+    _write_stats_safe()
 
     handled_signals: dict[int, Any] = {}
 
@@ -804,6 +818,7 @@ def build_adv(
                     last_range=last_range_seen,
                 )
                 checkpoint_state.update(state)
+                _write_stats_safe()
                 future = session.submit(_fetch_single, task)
                 futures.append((absolute, task, future))
 
@@ -835,6 +850,7 @@ def build_adv(
                 )
                 checkpoint_state.update(state)
                 tasks_completed = max(tasks_completed, absolute + 1)
+                _write_stats_safe()
             idx += max(len(batch), 1)
 
         final_state = _save_checkpoint(
@@ -847,6 +863,7 @@ def build_adv(
             last_range=last_range_seen,
         )
         checkpoint_state.update(final_state)
+        _write_stats_safe()
     finally:
         for sig, previous in handled_signals.items():
             try:
@@ -865,6 +882,7 @@ def build_adv(
     combined = combined.sort_values(["symbol", "ts_ms"]).reset_index(drop=True)
 
     _write_dataset(config.out_path, combined)
+    _write_stats_safe()
 
     per_symbol: dict[str, dict[str, int]] = {}
     for sym in normalized_symbols:
@@ -912,6 +930,7 @@ def fetch_klines_for_symbols(
     start_ms: int,
     end_ms: int,
     limit: int = 1500,
+    stats_path: str | Path | None = None,
 ) -> Mapping[str, pd.DataFrame]:
     """Fetch kline history for ``symbols`` within the supplied time range.
 
@@ -937,6 +956,16 @@ def fetch_klines_for_symbols(
     datasets: dict[str, pd.DataFrame] = {}
 
     client = BinancePublicClient(session=session)
+    stats_target = stats_path
+
+    def _write_stats_safe() -> None:
+        if not stats_target:
+            return
+        try:
+            session.write_stats(stats_target)
+        except Exception:
+            pass
+
     try:
         for raw_symbol in symbols:
             symbol = str(raw_symbol).strip().upper()
@@ -968,6 +997,7 @@ def fetch_klines_for_symbols(
                     ]
                 if not frame.empty:
                     dataset = _merge_frames(dataset, frame)
+                _write_stats_safe()
             if not dataset.empty:
                 ts_numeric = pd.to_numeric(dataset["ts_ms"], errors="coerce")
                 dataset = dataset.loc[

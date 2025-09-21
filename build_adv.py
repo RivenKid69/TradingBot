@@ -84,6 +84,9 @@ def _default_offline_config_path() -> Path:
     return Path(__file__).resolve().parent / "configs" / "offline.yaml"
 
 
+STATS_PATH = Path("logs/offline/build_adv_stats.json")
+
+
 def _load_offline_config(path: Path) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as fh:
@@ -284,6 +287,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="data/adv/cache",
         help="Directory for per-symbol parquet cache",
     )
+    parser.add_argument(
+        "--config",
+        default=str(_default_offline_config_path()),
+        help="Path to offline YAML config containing rest_budget settings.",
+    )
     parser.add_argument("--limit", type=int, default=1500, help="Maximum bars per request")
     parser.add_argument(
         "--chunk-days",
@@ -350,7 +358,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     limit = max(1, int(args.limit))
     chunk_days = max(1, int(args.chunk_days))
 
-    offline_config = _load_offline_config(_default_offline_config_path())
+    offline_config = _load_offline_config(Path(args.config or _default_offline_config_path()))
     offline_rest_cfg = _normalize_rest_budget_config(
         offline_config.get("rest_budget") if isinstance(offline_config, Mapping) else None
     )
@@ -430,6 +438,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         dry_run=bool(args.dry_run),
     )
 
+    stats_path = STATS_PATH
     with RestBudgetSession(
         rest_cfg,
         cache_dir=http_cache_dir,
@@ -439,7 +448,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         checkpoint_enabled=checkpoint_enabled,
         resume_from_checkpoint=bool(resume_flag),
     ) as session:
-        result = build_adv(session, symbols, config)
+        if stats_path:
+            try:
+                session.write_stats(stats_path)
+            except Exception:
+                pass
+        result = build_adv(session, symbols, config, stats_path=stats_path)
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
 
 

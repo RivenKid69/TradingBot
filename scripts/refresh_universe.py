@@ -47,7 +47,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Plan requests without saving output or fetching tickers.",
     )
+    parser.add_argument(
+        "--config",
+        default=str(_default_offline_config_path()),
+        help="Path to offline YAML config containing rest_budget settings.",
+    )
     return parser.parse_args(argv)
+
+
+STATS_PATH = Path("logs/offline/refresh_universe_stats.json")
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -365,7 +373,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    config_path = _default_offline_config_path()
+    config_path = Path(args.config or _default_offline_config_path())
     rest_cfg, shuffle_cfg, cache_controls = _load_rest_budget_config(config_path)
     shuffle_enabled, shuffle_min_size, shuffle_seed = _parse_shuffle_options(shuffle_cfg)
 
@@ -387,7 +395,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     liquidity_threshold = float(args.liquidity_threshold or 0.0)
     out_path = Path(args.out)
 
+    stats_path = STATS_PATH
     with RestBudgetSession(rest_cfg) as session:
+        try:
+            session.write_stats(stats_path)
+        except Exception:
+            logging.debug("Failed to write initial stats snapshot", exc_info=True)
         exchange_info = session.get(
             EXCHANGE_INFO_URL,
             endpoint=EXCHANGE_INFO_ENDPOINT,
@@ -496,6 +509,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             stats = session.stats()
             logging.info("REST session stats: %s", json.dumps(stats, ensure_ascii=False))
             _log_request_stats(stats)
+            try:
+                session.write_stats(stats_path)
+            except Exception:
+                logging.debug("Failed to persist stats snapshot", exc_info=True)
             return 0
 
         checkpoint_state: dict[str, Any] = {
@@ -598,6 +615,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if not futures:
                         processed_count = max(processed_count, idx + len(batch))
                         _save_checkpoint(processed_count, symbol=last_symbol_seen)
+                        try:
+                            session.write_stats(stats_path)
+                        except Exception:
+                            logging.debug("Failed to persist stats snapshot", exc_info=True)
                         idx += max(len(batch), 1)
                         continue
                     last_symbol_batch: str | None = None
@@ -615,6 +636,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if last_symbol_batch is not None:
                         last_symbol_seen = last_symbol_batch
                     _save_checkpoint(processed_count, symbol=last_symbol_seen)
+                    try:
+                        session.write_stats(stats_path)
+                    except Exception:
+                        logging.debug("Failed to persist stats snapshot", exc_info=True)
                     idx += max(len(batch), 1)
             finally:
                 for sig, previous in handled_signals.items():
@@ -624,6 +649,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         pass
 
             _save_checkpoint(len(order), symbol=last_symbol_seen, completed=True)
+            try:
+                session.write_stats(stats_path)
+            except Exception:
+                logging.debug("Failed to persist stats snapshot", exc_info=True)
 
         eligible_symbols = [
             symbol
@@ -643,6 +672,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         stats = session.stats()
         logging.info("REST session stats: %s", json.dumps(stats, ensure_ascii=False))
         _log_request_stats(stats)
+        try:
+            session.write_stats(stats_path)
+        except Exception:
+            logging.debug("Failed to persist stats snapshot", exc_info=True)
 
     return 0
 
