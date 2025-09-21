@@ -430,6 +430,7 @@ class _Worker:
         zero_signal_alert: int = 0,
         state_enabled: bool = False,
         rest_candidates: Sequence[Any] | None = None,
+        monitoring_agg: MonitoringAggregator | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -523,6 +524,7 @@ class _Worker:
         )
         self._rest_backoff_until: Dict[str, float] = {}
         self._rest_backoff_step: Dict[str, float] = {}
+        self._monitoring = monitoring_agg
         if self._state_enabled:
             self._seed_last_prices_from_state()
             self._load_exposure_state()
@@ -2575,6 +2577,39 @@ async def worker_loop(bus: "EventBus", worker: _Worker) -> None:
         raise
 
 
+def _attach_monitoring_target(
+    target: Any, agg: MonitoringAggregator | None
+) -> None:
+    """Best-effort attachment of ``agg`` to ``target`` if supported."""
+
+    if agg is None or target is None:
+        return
+    setter = getattr(target, "set_monitoring_aggregator", None)
+    if callable(setter):
+        try:
+            setter(agg)
+            return
+        except Exception:
+            pass
+    setter = getattr(target, "set_monitoring", None)
+    if callable(setter):
+        try:
+            setter(agg)
+            return
+        except Exception:
+            pass
+    try:
+        setattr(target, "monitoring_agg", agg)
+        return
+    except Exception:
+        pass
+    if hasattr(target, "_monitoring"):
+        try:
+            setattr(target, "_monitoring", agg)
+        except Exception:
+            pass
+
+
 class ServiceSignalRunner:
     def __init__(
         self,
@@ -2591,6 +2626,7 @@ class ServiceSignalRunner:
         pipeline_cfg: PipelineConfig | None = None,
         shutdown_cfg: Dict[str, Any] | None = None,
         monitoring_cfg: MonitoringConfig | None = None,
+        monitoring_agg: MonitoringAggregator | None = None,
         *,
         enforce_closed_bars: bool = True,
         ws_dedup_enabled: bool = False,
@@ -2626,16 +2662,37 @@ class ServiceSignalRunner:
         self._metadata_persisted = False
         self._git_hash: str | None = None
 
+        monitoring.clear_runtime_aggregator()
         if self.monitoring_cfg.enabled:
-            alert_cfg = getattr(self.monitoring_cfg, "alerts", None)
-            try:
-                self.alerts = AlertManager(alert_cfg)
-                self.monitoring_agg = MonitoringAggregator(
-                    self.monitoring_cfg, self.alerts
-                )
-            except Exception:
-                self.alerts = None
+            agg: MonitoringAggregator | None = monitoring_agg
+            if agg is not None:
+                self.alerts = getattr(agg, "alerts", None)
+            else:
+                alert_cfg = getattr(self.monitoring_cfg, "alerts", None)
+                try:
+                    self.alerts = AlertManager(alert_cfg)
+                except Exception:
+                    self.alerts = None
+                else:
+                    try:
+                        agg = MonitoringAggregator(self.monitoring_cfg, self.alerts)
+                    except Exception:
+                        agg = None
+                        self.alerts = None
+            if agg is not None and agg.enabled:
+                self.monitoring_agg = agg
+                monitoring.set_runtime_aggregator(self.monitoring_agg)
+            else:
                 self.monitoring_agg = None
+        else:
+            self.monitoring_agg = None
+
+        if self.monitoring_agg is not None:
+            _attach_monitoring_target(self.adapter, self.monitoring_agg)
+            for name in ("source", "market_data"):
+                _attach_monitoring_target(
+                    getattr(self.adapter, name, None), self.monitoring_agg
+                )
 
         if self.signal_quality_cfg.enabled:
             self.logger.info(
@@ -3125,10 +3182,15 @@ class ServiceSignalRunner:
 
         monitoring_stop = threading.Event()
         monitoring_thread: threading.Thread | None = None
-        if self.monitoring_agg is not None:
+        if self.monitoring_agg is not None and self.monitoring_agg.enabled:
 
             def _monitoring_loop() -> None:
-                interval = float(getattr(self.monitoring_cfg, "tick_sec", 1.0))
+                try:
+                    interval = float(self.monitoring_cfg.tick_sec)
+                except Exception:
+                    interval = 1.0
+                if interval <= 0:
+                    interval = 1.0
                 while not monitoring_stop.is_set():
                     try:
                         self.monitoring_agg.tick(int(time.time() * 1000))
@@ -3140,7 +3202,9 @@ class ServiceSignalRunner:
             monitoring_thread = threading.Thread(target=_monitoring_loop, daemon=True)
             monitoring_thread.start()
             shutdown.on_stop(monitoring_stop.set)
+            shutdown.on_stop(monitoring.clear_runtime_aggregator)
             shutdown.on_flush(self.monitoring_agg.flush)
+            shutdown.on_finalize(monitoring.clear_runtime_aggregator)
             shutdown.on_finalize(lambda: monitoring_thread.join(timeout=1.0))
 
         rest_candidates = [
@@ -3172,6 +3236,7 @@ class ServiceSignalRunner:
             ),
             state_enabled=self.cfg.state.enabled,
             rest_candidates=rest_candidates,
+            monitoring_agg=self.monitoring_agg,
         )
         if self._portfolio_limits_cfg:
             try:
@@ -3387,6 +3452,7 @@ class ServiceSignalRunner:
         ws_client = getattr(self.adapter, "ws", None) or getattr(
             self.adapter, "source", None
         )
+        _attach_monitoring_target(ws_client, self.monitoring_agg)
         if ws_client is not None and hasattr(ws_client, "stop"):
 
             async def _stop_ws_client() -> None:

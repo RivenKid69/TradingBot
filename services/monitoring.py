@@ -574,10 +574,10 @@ class MonitoringAggregator:
         self.fill_ratio: Optional[float] = None
         self.daily_pnl: Optional[float] = None
 
-        if self.enabled:
-            set_runtime_aggregator(self)
-        else:
-            clear_runtime_aggregator()
+        # ``ServiceSignalRunner`` is responsible for registering the runtime
+        # aggregator once the full runtime wiring is complete.  This avoids
+        # transient registration in case initialisation fails midway through
+        # ServiceSignalRunner construction.
 
     # ------------------------------------------------------------------
     # Properties and helpers
