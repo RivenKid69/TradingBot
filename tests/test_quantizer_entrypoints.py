@@ -132,22 +132,24 @@ def test_quantizer_refresh_is_debounced(monkeypatch, tmp_path):
     def _fake_load_filters(path, max_age_days=0, fatal=False):
         return {}, {}
 
-    refresh_calls: list[str] = []
+    run_calls: list[list[str]] = []
 
-    def _fake_refresh(path):
-        refresh_calls.append(path)
-        return False
+    class _DummyCompletedProcess:
+        def __init__(self):
+            self.returncode = 0
+            self.stdout = ""
+            self.stderr = ""
+
+    def _fake_run(cmd, capture_output=True, text=True):  # pragma: no cover - simple stub
+        run_calls.append(list(cmd))
+        return _DummyCompletedProcess()
 
     monkeypatch.setattr(
         impl_quantizer.Quantizer,
         "load_filters",
         staticmethod(_fake_load_filters),
     )
-    monkeypatch.setattr(
-        QuantizerImpl,
-        "_refresh_filters",
-        staticmethod(_fake_refresh),
-    )
+    monkeypatch.setattr(impl_quantizer.subprocess, "run", _fake_run)
 
     cfg = QuantizerConfig(
         path=str(filters_path),
@@ -159,4 +161,4 @@ def test_quantizer_refresh_is_debounced(monkeypatch, tmp_path):
     QuantizerImpl(cfg)
     QuantizerImpl(cfg)
 
-    assert len(refresh_calls) == 1
+    assert len(run_calls) == 1
