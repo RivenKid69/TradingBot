@@ -240,6 +240,7 @@ class MonitoringAlertConfig:
     command: Optional[str] = None
     channel: str = "noop"
     cooldown_sec: float = 0.0
+    telegram: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

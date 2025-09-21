@@ -14,3 +14,6 @@ alerts:
   command: null               # command to execute when alerts trigger
   channel: noop               # alert delivery channel (noop or telegram)
   cooldown_sec: 0             # minimum seconds between repeated alerts of same type
+  telegram:
+    bot_token_env: TELEGRAM_BOT_TOKEN  # env var name with bot token
+    chat_id_env: TELEGRAM_CHAT_ID      # env var name with chat id
