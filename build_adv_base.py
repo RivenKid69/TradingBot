@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import signal
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
+from typing import (
+    Any,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    Sequence,
+    Tuple,
+)
 
 import pandas as pd
 
-from binance_public import BinancePublicClient
+from binance_public import BinancePublicClient, PublicEndpoints
 from services.rest_budget import RestBudgetSession, split_time_range
 
 
@@ -50,13 +60,30 @@ class FetchTask:
     symbol: str
     start_ms: int
     bars: int
+    interval: str
 
     def to_checkpoint(self) -> dict[str, Any]:
         return {
             "symbol": self.symbol,
+            "interval": self.interval,
             "start_ms": int(self.start_ms),
             "bars": int(self.bars),
+            "end_ms": int(self.end_exclusive()),
         }
+
+    def end_exclusive(self, step_ms: int | None = None) -> int:
+        if step_ms is None:
+            key = self.interval.lower()
+            step = INTERVAL_TO_MS.get(key)
+            if step is None:
+                raise KeyError(f"Unknown interval for task: {self.interval}")
+        else:
+            step = int(step_ms)
+        bars = max(int(self.bars), 0)
+        return int(self.start_ms + bars * step)
+
+    def range_tuple(self, step_ms: int | None = None) -> Tuple[int, int]:
+        return int(self.start_ms), self.end_exclusive(step_ms)
 
 
 @dataclass
@@ -72,6 +99,7 @@ class BuildAdvConfig:
     limit: int = 1500
     chunk_days: int = 30
     resume_from_checkpoint: bool = False
+    dry_run: bool = False
 
 
 @dataclass
@@ -87,6 +115,9 @@ class BuildAdvResult:
     end_ms: int
     interval: str
     per_symbol: dict[str, Mapping[str, int]]
+    dry_run: bool = False
+    plan: Mapping[str, Any] | None = None
+    rest_stats: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -100,7 +131,58 @@ class BuildAdvResult:
             "interval": self.interval,
             "per_symbol": {k: dict(v) for k, v in self.per_symbol.items()},
         }
+        payload["dry_run"] = bool(self.dry_run)
+        if self.plan is not None:
+            payload["plan"] = dict(self.plan)
+        if self.rest_stats is not None:
+            payload["rest_stats"] = dict(self.rest_stats)
         return payload
+
+
+def _estimate_kline_tokens(limit: int) -> float:
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        value = 0
+    value = max(value, 1)
+    if value <= 100:
+        return 1.0
+    if value <= 500:
+        return 2.0
+    if value <= 1000:
+        return 5.0
+    return 10.0
+
+
+def _resolve_kline_endpoint(market: str) -> tuple[str, str]:
+    endpoints = PublicEndpoints()
+    if market.lower() == "spot":
+        return endpoints.spot_base, "/api/v3/klines"
+    return endpoints.futures_base, "/fapi/v1/klines"
+
+
+def _task_request_details(
+    market: str,
+    task: FetchTask,
+    *,
+    interval: str,
+    limit: int,
+    end_limit: int,
+) -> tuple[str, dict[str, Any]]:
+    base, path = _resolve_kline_endpoint(market)
+    url = f"{base}{path}"
+    end_exclusive = min(task.end_exclusive(), int(end_limit))
+    params: dict[str, Any] = {
+        "symbol": task.symbol.upper(),
+        "interval": interval,
+        "limit": int(max(1, int(limit))),
+        "startTime": int(task.start_ms),
+    }
+    end_inclusive = int(end_exclusive - 1)
+    if end_inclusive < task.start_ms:
+        end_inclusive = int(task.start_ms)
+    params["endTime"] = end_inclusive
+    return url, params
 
 
 def _align_range(start_ms: int, end_ms: int, step_ms: int) -> tuple[int, int]:
@@ -158,6 +240,7 @@ def _split_ranges_to_tasks(
     step_ms: int,
     limit: int,
     symbol: str,
+    interval: str,
 ) -> list[FetchTask]:
     tasks: list[FetchTask] = []
     max_bars = max(1, int(limit))
@@ -169,7 +252,14 @@ def _split_ranges_to_tasks(
         cursor = start
         while remaining > 0:
             chunk = min(remaining, max_bars)
-            tasks.append(FetchTask(symbol=symbol, start_ms=cursor, bars=chunk))
+            tasks.append(
+                FetchTask(
+                    symbol=symbol,
+                    start_ms=cursor,
+                    bars=chunk,
+                    interval=interval,
+                )
+            )
             cursor += chunk * step_ms
             remaining -= chunk
     return tasks
@@ -321,17 +411,57 @@ def _save_checkpoint(
     signature: Mapping[str, Any],
     current: FetchTask | None = None,
     completed: bool = False,
-) -> None:
+    last_symbol: str | None = None,
+    last_range: Tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    safe_total = max(int(total), 0)
+    safe_position = int(position)
+    if safe_total > 0:
+        safe_position = max(0, min(safe_position, safe_total))
+    else:
+        safe_position = max(0, safe_position)
+
     payload: dict[str, Any] = {
-        "task_index": int(position),
-        "tasks_total": int(total),
+        "task_index": safe_position,
+        "tasks_total": safe_total,
         "signature": dict(signature),
     }
+
+    normalized_symbol = last_symbol.strip().upper() if isinstance(last_symbol, str) else None
+    normalized_range = tuple(int(x) for x in last_range) if last_range is not None else None
+
     if current is not None:
         payload["current"] = current.to_checkpoint()
+        normalized_symbol = current.symbol.upper()
+        normalized_range = current.range_tuple()
+
     if completed:
         payload["completed"] = True
-    session.save_checkpoint(payload)
+
+    if safe_total <= 0:
+        progress_pct = 100.0 if completed else None
+    else:
+        progress_pct = (safe_position / safe_total) * 100.0
+        if completed:
+            progress_pct = 100.0
+    if progress_pct is not None:
+        payload["progress_pct"] = progress_pct
+
+    session.save_checkpoint(
+        payload,
+        last_symbol=normalized_symbol,
+        last_range=list(normalized_range) if normalized_range is not None else None,
+        progress_pct=progress_pct,
+    )
+
+    return {
+        "payload": payload,
+        "last_symbol": normalized_symbol,
+        "last_range": list(normalized_range) if normalized_range is not None else None,
+        "progress_pct": progress_pct,
+        "completed": completed,
+    }
+
 
 
 def build_adv(
@@ -372,7 +502,12 @@ def build_adv(
     if not window_ranges:
         window_ranges.append((start_aligned, end_aligned - step_ms))
 
-    for symbol in symbols:
+    normalized_symbols: list[str] = []
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol:
+            continue
+        normalized_symbols.append(symbol)
         cache_path = _cache_path(cache_dir, symbol, interval)
         dataset = _load_cache(cache_path)
         datasets[symbol] = dataset
@@ -400,6 +535,7 @@ def build_adv(
             step_ms=step_ms,
             limit=config.limit,
             symbol=symbol,
+            interval=interval,
         )
         tasks.extend(symbol_tasks)
         existing = 0
@@ -411,13 +547,16 @@ def build_adv(
             existing = int(mask.sum())
         existing_counts[symbol] = existing
 
+    if not normalized_symbols:
+        raise ValueError("symbol list is empty")
+
     tasks.sort(key=lambda t: (t.symbol, t.start_ms))
     plan_signature: dict[str, Any] = {
         "market": config.market,
         "interval": interval,
         "start": int(start_aligned),
         "end": int(end_aligned),
-        "symbols": [s.upper() for s in symbols],
+        "symbols": list(normalized_symbols),
         "limit": int(config.limit),
         "chunk_days": int(config.chunk_days),
     }
@@ -433,91 +572,291 @@ def build_adv(
                 total_tasks=len(tasks),
             )
 
+    last_symbol_saved: str | None = None
+    last_range_saved: Tuple[int, int] | None = None
+    if isinstance(checkpoint_payload, Mapping):
+        symbol_candidate = checkpoint_payload.get("last_symbol")
+        if isinstance(symbol_candidate, str):
+            symbol_text = symbol_candidate.strip().upper()
+            last_symbol_saved = symbol_text or None
+        range_candidate = checkpoint_payload.get("last_range")
+        if isinstance(range_candidate, Sequence) and len(range_candidate) == 2:
+            try:
+                start_val = int(range_candidate[0])
+                end_val = int(range_candidate[1])
+            except (TypeError, ValueError):
+                last_range_saved = None
+            else:
+                last_range_saved = (start_val, end_val)
+
     batch_pref = int(getattr(session, "batch_size", 0) or 0)
     worker_pref = int(getattr(session, "max_workers", 0) or 0)
     batch_size = max(1, batch_pref or worker_pref or 1)
 
-    _save_checkpoint(
+    plan_symbol_summary: dict[str, dict[str, int]] = {}
+    for sym in normalized_symbols:
+        plan_symbol_summary[sym] = {
+            "existing_bars": int(existing_counts.get(sym, 0)),
+            "pending_tasks": 0,
+            "pending_bars": 0,
+            "cached_tasks": 0,
+            "cached_bars": 0,
+        }
+
+    include_details = bool(config.dry_run)
+    planned_details: list[dict[str, Any]] = [] if include_details else []
+    pending_bars_total = 0
+    cached_tasks_total = 0
+    cached_bars_total = 0
+
+    plan_callable = getattr(session, "plan_request", None)
+    if not callable(plan_callable):
+        plan_callable = None
+    cache_callable = getattr(session, "is_cached", None)
+    if not callable(cache_callable):
+        cache_callable = None
+
+    for absolute, task in enumerate(tasks):
+        if absolute < start_index:
+            continue
+        limit_value = min(int(config.limit), int(task.bars))
+        if plan_callable is not None:
+            try:
+                plan_callable("klines", tokens=_estimate_kline_tokens(limit_value))
+            except Exception:
+                pass
+        cached = False
+        if cache_callable is not None:
+            try:
+                url, params = _task_request_details(
+                    config.market,
+                    task,
+                    interval=interval,
+                    limit=limit_value,
+                    end_limit=end_aligned,
+                )
+                cached = bool(
+                    cache_callable(
+                        url,
+                        method="GET",
+                        params=params,
+                        budget="klines",
+                    )
+                )
+            except Exception:
+                cached = False
+        summary = plan_symbol_summary[task.symbol]
+        summary["pending_tasks"] += 1
+        summary["pending_bars"] += int(task.bars)
+        pending_bars_total += int(task.bars)
+        if cached:
+            summary["cached_tasks"] += 1
+            summary["cached_bars"] += int(task.bars)
+            cached_tasks_total += 1
+            cached_bars_total += int(task.bars)
+        if include_details:
+            end_exclusive = min(task.end_exclusive(step_ms), end_aligned)
+            planned_details.append(
+                {
+                    "symbol": task.symbol,
+                    "start_ms": int(task.start_ms),
+                    "end_ms": int(end_exclusive),
+                    "bars": int(task.bars),
+                    "limit": int(limit_value),
+                    "cached": bool(cached),
+                }
+            )
+
+    pending_task_count = max(len(tasks) - start_index, 0)
+    per_symbol_plan = {
+        sym: {
+            "existing_bars": int(summary["existing_bars"]),
+            "pending_tasks": int(summary["pending_tasks"]),
+            "pending_bars": int(summary["pending_bars"]),
+            "cached_tasks": int(summary["cached_tasks"]),
+            "cached_bars": int(summary["cached_bars"]),
+        }
+        for sym, summary in plan_symbol_summary.items()
+    }
+    plan_payload: dict[str, Any] = {
+        "resume_from_task": int(start_index),
+        "tasks_total": int(len(tasks)),
+        "pending_tasks": int(pending_task_count),
+        "pending_tasks_remaining": int(pending_task_count),
+        "pending_bars": int(pending_bars_total),
+        "pending_bars_remaining": int(pending_bars_total),
+        "cached_tasks": int(cached_tasks_total),
+        "cached_bars": int(cached_bars_total),
+        "existing_bars": int(sum(existing_counts.values())),
+        "per_symbol": per_symbol_plan,
+    }
+    if include_details:
+        plan_payload["tasks"] = planned_details
+
+    if config.dry_run:
+        rest_stats = session.stats()
+        per_symbol_result: dict[str, dict[str, int]] = {}
+        for sym in normalized_symbols:
+            existing = int(existing_counts.get(sym, 0))
+            per_symbol_result[sym] = {
+                "existing_bars": existing,
+                "fetched_bars": 0,
+                "total_bars": existing,
+            }
+        return BuildAdvResult(
+            out_path=config.out_path,
+            rows_written=0,
+            tasks_total=len(tasks),
+            tasks_completed=start_index,
+            bars_fetched=0,
+            start_ms=start_aligned,
+            end_ms=end_aligned,
+            interval=interval,
+            per_symbol=per_symbol_result,
+            dry_run=True,
+            plan=plan_payload,
+            rest_stats=rest_stats,
+        )
+
+    fetched_counts: dict[str, int] = {sym: 0 for sym in normalized_symbols}
+    tasks_completed = start_index
+    bars_fetched = 0
+
+    checkpoint_state: dict[str, Any] = {
+        "payload": None,
+        "last_symbol": last_symbol_saved,
+        "last_range": list(last_range_saved) if last_range_saved is not None else None,
+        "progress_pct": None,
+        "completed": False,
+    }
+    state = _save_checkpoint(
         session,
         position=start_index,
         total=len(tasks),
         signature=plan_signature,
+        last_symbol=last_symbol_saved,
+        last_range=last_range_saved,
     )
+    checkpoint_state.update(state)
 
-    fetched_counts: dict[str, int] = {symbol: 0 for symbol in symbols}
-    tasks_completed = start_index
-    bars_fetched = 0
+    handled_signals: dict[int, Any] = {}
+
+    def _handle_signal(signum: int, frame: Any | None) -> None:  # pragma: no cover - signal handler
+        payload = checkpoint_state.get("payload")
+        if isinstance(payload, Mapping):
+            session.save_checkpoint(
+                payload,
+                last_symbol=checkpoint_state.get("last_symbol"),
+                last_range=checkpoint_state.get("last_range"),
+                progress_pct=checkpoint_state.get("progress_pct"),
+            )
+        if signum == getattr(signal, "SIGINT", None):
+            raise KeyboardInterrupt
+        raise SystemExit(128 + int(signum))
+
+    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            previous = signal.getsignal(sig)
+            signal.signal(sig, _handle_signal)
+        except (ValueError, OSError):  # pragma: no cover - platform dependent
+            continue
+        else:
+            handled_signals[sig] = previous
 
     client = BinancePublicClient(session=session)
+
+    def _fetch_single(fetch_task: FetchTask) -> pd.DataFrame:
+        window_end = min(fetch_task.end_exclusive(step_ms), end_aligned)
+        raw = client.get_klines(
+            market=config.market,
+            symbol=fetch_task.symbol,
+            interval=interval,
+            start_ms=fetch_task.start_ms,
+            end_ms=window_end - 1,
+            limit=min(int(config.limit), int(fetch_task.bars)),
+        )
+        frame = _raw_to_df(raw, fetch_task.symbol)
+        if frame.empty:
+            return frame
+        ts_numeric = pd.to_numeric(frame["ts_ms"], errors="coerce")
+        mask = (ts_numeric >= fetch_task.start_ms) & (ts_numeric < window_end)
+        return frame.loc[mask]
+
+    last_symbol_seen = last_symbol_saved
+    last_range_seen = last_range_saved
+
     try:
         idx = start_index
         while idx < len(tasks):
             batch = tasks[idx : idx + batch_size]
-            futures: list[tuple[int, FetchTask]] = []
+            futures: list[tuple[int, FetchTask, Future[pd.DataFrame]]] = []
             for offset, task in enumerate(batch):
                 absolute = idx + offset
-                _save_checkpoint(
+                state = _save_checkpoint(
                     session,
                     position=absolute,
                     total=len(tasks),
                     signature=plan_signature,
                     current=task,
+                    last_symbol=last_symbol_seen,
+                    last_range=last_range_seen,
                 )
-                futures.append((absolute, task))
+                checkpoint_state.update(state)
+                future = session.submit(_fetch_single, task)
+                futures.append((absolute, task, future))
 
-            results: list[tuple[int, FetchTask, pd.DataFrame]] = []
-            for absolute, task in futures:
-                step = step_ms
-                window_end = task.start_ms + task.bars * step
-                raw = client.get_klines(
-                    market=config.market,
-                    symbol=task.symbol,
-                    interval=interval,
-                    start_ms=task.start_ms,
-                    end_ms=window_end - 1,
-                    limit=min(config.limit, task.bars),
-                )
-                frame = _raw_to_df(raw, task.symbol)
+            for absolute, task, future in futures:
+                try:
+                    frame = future.result()
+                except Exception as exc:  # pragma: no cover - network dependent
+                    raise RuntimeError(
+                        f"Failed to fetch {task.symbol} {interval} starting at {task.start_ms}: {exc}"
+                    ) from exc
+                dataset = datasets[task.symbol]
                 if not frame.empty:
-                    frame = frame[
-                        (pd.to_numeric(frame["ts_ms"], errors="coerce") >= task.start_ms)
-                        & (
-                            pd.to_numeric(frame["ts_ms"], errors="coerce")
-                            < task.start_ms + task.bars * step
-                        )
-                    ]
-                results.append((absolute, task, frame))
-
-            for absolute, task, frame in results:
-                key = task.symbol
-                dataset = datasets[key]
-                if not frame.empty:
-                    datasets[key] = dataset = _merge_frames(dataset, frame)
+                    dataset = _merge_frames(dataset, frame)
+                    datasets[task.symbol] = dataset
                     bars = int(len(frame))
-                    fetched_counts[key] += bars
+                    fetched_counts[task.symbol] += bars
                     bars_fetched += bars
-                    cache_path = _cache_path(cache_dir, key, interval)
+                    cache_path = _cache_path(cache_dir, task.symbol, interval)
                     _write_dataset(cache_path, dataset)
-                _save_checkpoint(
+                last_symbol_seen = task.symbol.upper()
+                last_range_seen = task.range_tuple()
+                state = _save_checkpoint(
                     session,
                     position=absolute + 1,
                     total=len(tasks),
                     signature=plan_signature,
-                    current=task,
+                    last_symbol=last_symbol_seen,
+                    last_range=last_range_seen,
                 )
+                checkpoint_state.update(state)
                 tasks_completed = max(tasks_completed, absolute + 1)
-
             idx += max(len(batch), 1)
 
-        _save_checkpoint(
+        final_state = _save_checkpoint(
             session,
             position=len(tasks),
             total=len(tasks),
             signature=plan_signature,
             completed=True,
+            last_symbol=last_symbol_seen,
+            last_range=last_range_seen,
         )
+        checkpoint_state.update(final_state)
     finally:
-        client.close()
+        for sig, previous in handled_signals.items():
+            try:
+                signal.signal(sig, previous)
+            except (ValueError, OSError):
+                continue
+        try:
+            client.close()
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
 
     combined = _combine_datasets(datasets, start_ms=start_aligned, end_ms=end_aligned)
     combined = combined[
@@ -528,21 +867,27 @@ def build_adv(
     _write_dataset(config.out_path, combined)
 
     per_symbol: dict[str, dict[str, int]] = {}
-    for symbol in symbols:
-        dataset = datasets[symbol]
+    for sym in normalized_symbols:
+        dataset = datasets[sym]
         if dataset.empty:
             total = 0
         else:
-            ts_series = (
-                pd.to_numeric(dataset["ts_ms"], errors="coerce").dropna().astype("int64")
-            )
+            ts_series = pd.to_numeric(dataset["ts_ms"], errors="coerce").dropna().astype("int64")
             mask = (ts_series >= start_aligned) & (ts_series < end_aligned)
             total = int(mask.sum())
-        per_symbol[symbol] = {
-            "existing_bars": int(existing_counts.get(symbol, 0)),
-            "fetched_bars": int(fetched_counts.get(symbol, 0)),
+        per_symbol[sym] = {
+            "existing_bars": int(existing_counts.get(sym, 0)),
+            "fetched_bars": int(fetched_counts.get(sym, 0)),
             "total_bars": total,
         }
+
+    remaining_tasks = max(len(tasks) - tasks_completed, 0)
+    remaining_bars = max(pending_bars_total - bars_fetched, 0)
+    plan_payload = dict(plan_payload)
+    plan_payload["pending_tasks_remaining"] = int(remaining_tasks)
+    plan_payload["pending_bars_remaining"] = int(remaining_bars)
+
+    rest_stats = session.stats()
 
     return BuildAdvResult(
         out_path=config.out_path,
@@ -554,9 +899,10 @@ def build_adv(
         end_ms=end_aligned,
         interval=interval,
         per_symbol=per_symbol,
+        dry_run=False,
+        plan=plan_payload,
+        rest_stats=rest_stats,
     )
-
-
 def fetch_klines_for_symbols(
     session: RestBudgetSession,
     symbols: Sequence[str],
@@ -601,18 +947,18 @@ def fetch_klines_for_symbols(
                 step_ms=step_ms,
                 limit=safe_limit,
                 symbol=symbol,
+                interval=interval_key,
             )
             dataset = pd.DataFrame(columns=KLINE_COLUMNS)
             for task in tasks:
-                window_end = task.start_ms + task.bars * step_ms
-                window_end = min(window_end, end_aligned)
+                window_end = min(task.end_exclusive(step_ms), end_aligned)
                 raw = client.get_klines(
                     market=market,
                     symbol=task.symbol,
                     interval=interval_key,
                     start_ms=task.start_ms,
                     end_ms=window_end - 1,
-                    limit=min(safe_limit, task.bars),
+                    limit=min(safe_limit, int(task.bars)),
                 )
                 frame = _raw_to_df(raw, task.symbol)
                 if not frame.empty:
