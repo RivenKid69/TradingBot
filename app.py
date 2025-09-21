@@ -351,6 +351,63 @@ def _load_latest_metrics(path: str) -> Dict[str, Any]:
         return {}
 
 
+def _extract_cache_ttl_days(config_path: str) -> float | None:
+    data, _ = _load_yaml_file(config_path)
+    if not data:
+        return None
+
+    def _dig(payload: Dict[str, Any], path: List[str]) -> Any:
+        current: Any = payload
+        for key in path:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return None
+        return current
+
+    candidate_paths = [
+        ["offline", "cache", "ttl_days"],
+        ["offline", "cache_ttl_days"],
+        ["rest_budget", "cache", "ttl_days"],
+        ["rest_budget", "cache_ttl_days"],
+        ["cache", "ttl_days"],
+    ]
+    for path in candidate_paths:
+        value = _dig(data, path)
+        if value is None:
+            continue
+        try:
+            ttl = float(value)
+        except (TypeError, ValueError):
+            continue
+        if ttl < 0:
+            continue
+        return ttl
+    return None
+
+
+def _json_preview(payload: Any, limit: int = 10) -> tuple[Any, bool]:
+    truncated = False
+    if isinstance(payload, list):
+        if len(payload) > limit:
+            truncated = True
+        return payload[:limit], truncated
+
+    if isinstance(payload, dict):
+        preview: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if key == "filters" and isinstance(value, dict):
+                items = list(value.items())
+                if len(items) > limit:
+                    truncated = True
+                preview[key] = {k: v for k, v in items[:limit]}
+            else:
+                preview[key] = value
+        return preview, truncated
+
+    return payload, truncated
+
+
 # --------------------------- Streamlit UI ---------------------------
 
 st.set_page_config(page_title="Trading Signals Control", layout="wide")
@@ -488,6 +545,215 @@ with tabs[0]:
     snap_df = read_csv(snapshot_csv)
     if not snap_df.empty:
         st.dataframe(snap_df)
+
+    st.divider()
+    st.subheader("Universe & Filters")
+
+    offline_config_path = st.text_input(
+        "Offline config (TTL)", value="configs/offline.yaml", key="offline_config_universe"
+    )
+    ttl_days = _extract_cache_ttl_days(offline_config_path)
+    if offline_config_path and not os.path.exists(offline_config_path):
+        st.warning(f"Offline config не найден: {offline_config_path}")
+    elif ttl_days is not None:
+        st.caption(f"TTL из offline config: {ttl_days:g} дней")
+    else:
+        st.caption("TTL (offline.cache.ttl_days) не найден в offline config.")
+
+    universe_path = st.text_input(
+        "Universe JSON", value="data/universe/symbols.json", key="universe_json_path"
+    )
+    filters_path = st.text_input(
+        "Filters JSON", value="data/binance_filters.json", key="filters_json_path"
+    )
+
+    preview_limit = 10
+
+    def _count_universe_entries(payload: Any) -> Optional[int]:
+        if isinstance(payload, list):
+            return len(payload)
+        if isinstance(payload, dict):
+            symbols = payload.get("symbols")
+            if isinstance(symbols, list):
+                return len(symbols)
+        return None
+
+    def _count_filter_entries(payload: Any) -> Optional[int]:
+        if isinstance(payload, dict):
+            filters_block = payload.get("filters")
+            if isinstance(filters_block, dict):
+                return len(filters_block)
+        return None
+
+    def _render_json_file(
+        *,
+        label: str,
+        path: str,
+        count_fn,
+        log_name: str,
+        refresh_cmd: List[str],
+    ) -> None:
+        st.markdown(f"### {label}")
+        st.caption(f"`{path}`")
+
+        button_key = f"refresh_{log_name}"
+        if st.button("Refresh", key=button_key):
+            rc = run_cmd(
+                refresh_cmd,
+                log_path=os.path.join(logs_dir, f"{log_name}.log"),
+            )
+            if rc == 0:
+                st.success("Успешно обновлено")
+            else:
+                st.error(f"Refresh завершился с кодом {rc}")
+
+        exists = os.path.exists(path)
+        payload: Any = None
+        if exists:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except Exception as exc:
+                st.error(f"Ошибка чтения {path}: {exc}")
+                payload = None
+        else:
+            st.warning("Файл не найден. Нажмите Refresh, чтобы скачать данные.")
+
+        mtime_ts = os.path.getmtime(path) if exists else None
+        age_days = None
+        if mtime_ts is not None:
+            age_days = (time.time() - mtime_ts) / 86400.0
+
+        count_value = count_fn(payload) if payload is not None else None
+        info_cols = st.columns(3)
+        with info_cols[0]:
+            st.metric(
+                "Количество",
+                str(count_value) if count_value is not None else "—",
+            )
+        with info_cols[1]:
+            mtime_text = (
+                datetime.utcfromtimestamp(mtime_ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+                if mtime_ts is not None
+                else "—"
+            )
+            st.metric("mtime", mtime_text)
+        with info_cols[2]:
+            st.metric(
+                "Возраст (дней)",
+                f"{age_days:.2f}" if age_days is not None else "—",
+            )
+
+        if ttl_days is not None and ttl_days > 0 and age_days is not None and age_days > ttl_days:
+            st.warning(
+                "Файл старше TTL. Нажмите Refresh, чтобы обновить данные.",
+            )
+
+        if payload is not None:
+            preview, truncated = _json_preview(payload, limit=preview_limit)
+            st.code(
+                json.dumps(preview, ensure_ascii=False, indent=2),
+                language="json",
+            )
+            if truncated:
+                st.caption(f"Показаны первые {preview_limit} элементов.")
+            st.download_button(
+                "Скачать JSON",
+                data=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=os.path.basename(path) or "data.json",
+                mime="application/json",
+                key=f"download_{log_name}",
+            )
+
+    _render_json_file(
+        label="Universe (symbols)",
+        path=universe_path,
+        count_fn=_count_universe_entries,
+        log_name="refresh_universe",
+        refresh_cmd=[
+            sys.executable,
+            "scripts/refresh_universe.py",
+            "--config",
+            offline_config_path,
+            "--out",
+            universe_path,
+        ],
+    )
+
+    _render_json_file(
+        label="Binance filters",
+        path=filters_path,
+        count_fn=_count_filter_entries,
+        log_name="refresh_filters",
+        refresh_cmd=[
+            sys.executable,
+            "scripts/fetch_binance_filters.py",
+            "--config",
+            offline_config_path,
+            "--out",
+            filters_path,
+        ],
+    )
+
+    st.divider()
+    st.subheader("Quantizer — настройки фильтров")
+
+    quantizer_targets = [
+        ("configs/quantizer.yaml", "Quantizer (offline)"),
+        ("configs/config_live.yaml", "Live config"),
+    ]
+
+    for idx, (cfg_path, label) in enumerate(quantizer_targets):
+        with st.expander(f"{label} — `{cfg_path}`", expanded=(idx == 0)):
+            data, _ = _load_yaml_file(cfg_path)
+            quantizer_cfg: Dict[str, Any] = {}
+            if isinstance(data, dict):
+                section = data.get("quantizer")
+                if isinstance(section, dict):
+                    quantizer_cfg = section
+            strict_default = bool(
+                quantizer_cfg.get(
+                    "strict_filters",
+                    quantizer_cfg.get("strict", True),
+                )
+            )
+            enforce_default = bool(
+                quantizer_cfg.get("enforce_percent_price_by_side", True)
+            )
+
+            with st.form(f"quantizer_form_{idx}"):
+                strict_value = st.checkbox(
+                    "quantizer.strict_filters",
+                    value=strict_default,
+                )
+                enforce_value = st.checkbox(
+                    "quantizer.enforce_percent_price_by_side",
+                    value=enforce_default,
+                )
+                submitted = st.form_submit_button("Сохранить")
+
+            if submitted:
+                new_payload: Dict[str, Any] = copy.deepcopy(data) if isinstance(data, dict) else {}
+                if not isinstance(new_payload, dict):
+                    new_payload = {}
+                new_payload.setdefault("quantizer", {})
+                if not isinstance(new_payload["quantizer"], dict):
+                    new_payload["quantizer"] = {}
+                new_payload["quantizer"]["strict_filters"] = bool(strict_value)
+                new_payload["quantizer"]["enforce_percent_price_by_side"] = bool(
+                    enforce_value
+                )
+                if "strict" in new_payload["quantizer"]:
+                    new_payload["quantizer"]["strict"] = bool(strict_value)
+                try:
+                    atomic_write_with_retry(
+                        cfg_path,
+                        _dump_yaml(new_payload),
+                    )
+                except Exception as exc:
+                    st.error(f"Не удалось сохранить {cfg_path}: {exc}")
+                else:
+                    st.success(f"Сохранено: {cfg_path}")
 
 # --------------------------- Tab: Ingest ---------------------------
 
