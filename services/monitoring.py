@@ -170,13 +170,13 @@ def clear_runtime_aggregator() -> None:
     set_runtime_aggregator(None)
 
 
-def _get_runtime_aggregator() -> "MonitoringAggregator | None":
+def get_runtime_aggregator() -> "MonitoringAggregator | None":
     return _runtime_aggregator
 
 
 def record_http_request() -> None:
     """Record an HTTP request attempt."""
-    agg = _get_runtime_aggregator()
+    agg = get_runtime_aggregator()
     if agg is not None:
         try:
             agg.record_http_attempt()
@@ -188,12 +188,12 @@ def record_http_request() -> None:
         pass
 
 
-def record_http_success(status: Union[int, str]) -> None:
+def record_http_success(status: Union[int, str], *, timed_out: bool = False) -> None:
     """Record successful HTTP response with ``status`` code."""
-    agg = _get_runtime_aggregator()
+    agg = get_runtime_aggregator()
     if agg is not None:
         try:
-            agg.record_http(True, status)
+            agg.record_http(True, status, timed_out=bool(timed_out))
         except Exception:
             pass
     try:
@@ -202,12 +202,14 @@ def record_http_success(status: Union[int, str]) -> None:
         pass
 
 
-def record_http_error(code: Union[int, str]) -> None:
+def record_http_error(
+    code: Union[int, str], *, timed_out: bool = False
+) -> None:
     """Record HTTP error with classification ``code``."""
-    agg = _get_runtime_aggregator()
+    agg = get_runtime_aggregator()
     if agg is not None:
         try:
-            agg.record_http(False, code)
+            agg.record_http(False, code, timed_out=bool(timed_out))
         except Exception:
             pass
     try:
@@ -218,7 +220,7 @@ def record_http_error(code: Union[int, str]) -> None:
 
 def record_signals(symbol: str, emitted: int, duplicates: int) -> None:
     """Record per-bar signal statistics for ``symbol``."""
-    agg = _get_runtime_aggregator()
+    agg = get_runtime_aggregator()
     if agg is not None:
         try:
             agg.record_signals(symbol, emitted, duplicates)
@@ -890,11 +892,19 @@ class MonitoringAggregator:
             self._http_attempts[window].append(ts_ms)
             self._prune_http_attempts(window, ts_ms)
 
-    def record_http(self, success: bool, status: Optional[Union[int, str]]) -> None:
+    def record_http(
+        self,
+        success: bool,
+        status: Optional[Union[int, str]],
+        *,
+        timed_out: bool = False,
+    ) -> None:
         if not self.enabled:
             return
         ts_ms = int(time.time() * 1000)
         classification = self._classify_http(success, status)
+        if timed_out:
+            classification = "timeout"
         for window in self._window_ms:
             self._http_events[window].append((ts_ms, bool(success), status, classification))
             counts = self._http_counts[window]
@@ -1206,6 +1216,7 @@ __all__ = [
     "record_http_success",
     "record_http_error",
     "record_signals",
+    "get_runtime_aggregator",
     "set_runtime_aggregator",
     "clear_runtime_aggregator",
     "alert_zero_signals",

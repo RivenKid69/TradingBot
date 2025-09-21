@@ -1449,7 +1449,9 @@ class RestBudgetSession:
                 label = self._error_label(exc)
                 with self._stats_lock:
                     self.error_counts[label] += 1
-                monitoring.record_http_error(label)
+                monitoring.record_http_error(
+                    label, timed_out=isinstance(exc, requests.exceptions.Timeout)
+                )
                 raise
 
             status = resp.status_code
