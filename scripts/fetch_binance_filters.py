@@ -38,11 +38,12 @@ def _parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         nargs="?",
         type=Path,
         const=DEFAULT_UNIVERSE_PATH,
-        default=None,
+        default=DEFAULT_UNIVERSE_PATH,
         metavar="PATH",
         help=(
-            "Path to a JSON file containing universe symbols. "
-            "Use --universe without PATH to default to data/universe/symbols.json."
+            "Path to a JSON file containing universe symbols (default: "
+            f"{DEFAULT_UNIVERSE_PATH}). Use --universe without PATH to use the "
+            "default path, or pass '-' to disable loading a universe file."
         ),
     )
     parser.add_argument(
@@ -307,7 +308,7 @@ def _load_universe_symbols(path: Path) -> List[str]:
 
 def _load_symbols(args: argparse.Namespace) -> List[str]:
     symbols: List[str] = []
-    if args.universe:
+    if args.universe and str(args.universe) != "-":
         symbols.extend(_load_universe_symbols(args.universe))
     if args.symbols:
         symbols.extend(args.symbols)
