@@ -25,6 +25,7 @@ ExecutionSimulator v2
 import collections
 from collections import deque
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping, Callable, Deque
 import hashlib
 import math
@@ -195,6 +196,11 @@ try:
     from sim.quantizer import Quantizer, load_filters
 except Exception:
     Quantizer = None  # type: ignore
+
+try:
+    from impl_quantizer import QuantizerImpl  # type: ignore
+except Exception:  # pragma: no cover - optional dependency in stripped environments
+    QuantizerImpl = None  # type: ignore
 
 try:
     from sim.fees import FeesModel, FundingCalculator, FundingEvent
@@ -820,14 +826,208 @@ class ExecutionSimulator:
                 return {}
         return {}
 
+    @staticmethod
+    def _make_legacy_quantizer_impl(
+        quantizer: Any,
+        *,
+        strict: bool,
+        enforce: bool,
+        filters: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
+        """Wrap a bare quantizer into an object resembling :class:`QuantizerImpl`."""
+
+        class _LegacyQuantizerAttachment:
+            def __init__(self) -> None:
+                self.quantizer = quantizer
+                quantize_mode = getattr(quantizer, "quantize_mode", None)
+                self.cfg = SimpleNamespace(
+                    strict_filters=bool(strict),
+                    enforce_percent_price_by_side=bool(enforce),
+                    quantize_mode=str(quantize_mode)
+                    if quantize_mode is not None
+                    else "inward",
+                )
+
+                filters_payload: Dict[str, Dict[str, Any]] = {}
+                if isinstance(filters, Mapping):
+                    try:
+                        filters_payload = {
+                            str(sym): dict(value or {})
+                            for sym, value in filters.items()
+                        }
+                    except Exception:
+                        try:
+                            filters_payload = dict(filters)  # type: ignore[assignment]
+                        except Exception:
+                            filters_payload = {}
+                self._filters_raw = filters_payload
+
+                symbol_filters_attr = getattr(quantizer, "_filters", None)
+                if isinstance(symbol_filters_attr, Mapping):
+                    try:
+                        self.symbol_filters = dict(symbol_filters_attr)
+                    except Exception:
+                        self.symbol_filters = symbol_filters_attr
+                else:
+                    self.symbol_filters = {}
+
+                meta_map: Dict[str, Any] = {}
+                if isinstance(metadata, Mapping):
+                    try:
+                        meta_map = dict(metadata)
+                    except Exception:
+                        meta_map = {}
+                meta_map.setdefault("strict_filters_active", bool(strict))
+                meta_map.setdefault(
+                    "enforce_percent_price_by_side_active", bool(enforce)
+                )
+                self.filters_metadata = meta_map
+
+            def validate_order(
+                self,
+                symbol: str,
+                side: str,
+                price: float,
+                qty: float,
+                ref_price: Optional[float] = None,
+                enforce_ppbs: Optional[bool] = None,
+            ) -> Any:
+                ref_value = price if ref_price is None else ref_price
+                enforce_flag = (
+                    bool(self.cfg.enforce_percent_price_by_side)
+                    if enforce_ppbs is None
+                    else bool(enforce_ppbs)
+                )
+                q_obj = self.quantizer
+                if q_obj is None:
+                    return SimpleNamespace(
+                        price=float(price),
+                        qty=float(qty),
+                        reason_code=None,
+                        reason=None,
+                        details=None,
+                    )
+
+                quantize_order = getattr(q_obj, "quantize_order", None)
+                if callable(quantize_order):
+                    try:
+                        return quantize_order(
+                            symbol,
+                            side,
+                            price,
+                            qty,
+                            ref_value,
+                            enforce_ppbs=enforce_flag,
+                        )
+                    except TypeError:
+                        return quantize_order(
+                            symbol,
+                            side,
+                            price,
+                            qty,
+                            ref_value,
+                        )
+
+                price_val = float(price)
+                qty_val = float(qty)
+                quantize_price = getattr(q_obj, "quantize_price", None)
+                if callable(quantize_price):
+                    try:
+                        price_val = float(quantize_price(symbol, price_val))
+                    except Exception:
+                        price_val = float(price)
+                quantize_qty = getattr(q_obj, "quantize_qty", None)
+                if callable(quantize_qty):
+                    try:
+                        qty_val = float(quantize_qty(symbol, qty_val))
+                    except Exception:
+                        qty_val = float(qty)
+                return SimpleNamespace(
+                    price=price_val,
+                    qty=qty_val,
+                    reason_code=None,
+                    reason=None,
+                    details=None,
+                )
+
+        return _LegacyQuantizerAttachment()
+
+    def _update_quantizer_metadata(
+        self, metadata: Optional[Mapping[str, Any]]
+    ) -> Dict[str, Any]:
+        meta_map: Dict[str, Any] = {}
+        if isinstance(metadata, Mapping):
+            try:
+                meta_map = dict(metadata)
+            except Exception:
+                meta_map = {}
+        self.quantizer_metadata = meta_map
+
+        age_raw = meta_map.get("age_days")
+        age_value: Optional[float] = None
+        if age_raw is not None:
+            try:
+                age_value = float(age_raw)
+            except (TypeError, ValueError):
+                age_value = None
+            else:
+                if not math.isfinite(age_value):
+                    age_value = None
+        self.quantizer_filters_age_days = age_value
+
+        size_raw = meta_map.get("size_bytes")
+        size_value: Optional[int] = None
+        if size_raw is not None:
+            try:
+                size_value = int(size_raw)
+            except (TypeError, ValueError):
+                size_value = None
+            else:
+                if size_value < 0:
+                    size_value = None
+        self.quantizer_filters_size_bytes = size_value
+
+        sha_raw = meta_map.get("sha256") or meta_map.get("filters_sha256")
+        if isinstance(sha_raw, str) and sha_raw:
+            self.quantizer_filters_sha256 = sha_raw
+        else:
+            self.quantizer_filters_sha256 = None
+
+        self._log_quantizer_metadata_line()
+        return meta_map
+
+    def _log_quantizer_metadata_line(self) -> None:
+        age_val = self.quantizer_filters_age_days
+        if isinstance(age_val, (int, float)) and math.isfinite(age_val):
+            age_repr = f"{float(age_val):.2f}"
+        else:
+            age_repr = "n/a"
+
+        size_val = self.quantizer_filters_size_bytes
+        if isinstance(size_val, int) and size_val >= 0:
+            size_repr = str(size_val)
+        else:
+            size_repr = "n/a"
+
+        sha_val = self.quantizer_filters_sha256
+        logger.info(
+            "Quantizer filters metadata: age_days=%s size_bytes=%s sha256=%s",
+            age_repr,
+            size_repr,
+            sha_val if sha_val else "n/a",
+        )
+
     def __init__(
         self,
         *,
         symbol: str = "BTCUSDT",
         latency_steps: int = 0,
         seed: int = 0,
+        slip_k: float = 0.0,
         lob: Optional[Any] = None,
         filters_path: Optional[str] = "data/binance_filters.json",
+        quantizer_impl: Optional["QuantizerImpl"] = None,
         enforce_ppbs: bool = True,
         strict_filters: bool = True,
         fees_config: Optional[dict] = None,
@@ -859,6 +1059,7 @@ class ExecutionSimulator:
         self._latency_symbol: Optional[str] = self.symbol
         self.latency_steps = int(max(0, latency_steps))
         self.seed = int(seed)
+        self._slip_k = float(slip_k)
         # Seed global RNGs for reproducibility of any downstream randomness.
         random.seed(self.seed)
         try:
@@ -1031,23 +1232,114 @@ class ExecutionSimulator:
         # квантайзер и «сырые» фильтры — опционально
         self.filters: Dict[str, Dict[str, Any]] = {}
         self.quantizer: Optional[Quantizer] = None
+        self.quantizer_impl: Optional[Any] = None
+        self.quantizer_metadata: Dict[str, Any] = {}
+        self.quantizer_filters_age_days: Optional[float] = None
+        self.quantizer_filters_size_bytes: Optional[int] = None
+        self.quantizer_filters_sha256: Optional[str] = None
         self.enforce_ppbs = bool(enforce_ppbs)
         self.strict_filters = bool(strict_filters)
-        try:
-            if Quantizer is not None and filters_path:
+
+        def _legacy_setup() -> None:
+            if Quantizer is None or not filters_path:
+                self.quantizer = None
+                self.filters = {}
+                self.quantizer_impl = None
+                self._update_quantizer_metadata({})
+                return
+
+            try:
                 max_age = int(os.getenv("TB_FILTER_MAX_AGE_DAYS", "30"))
-                fatal = os.getenv("TB_FAIL_ON_STALE_FILTERS") not in (None, "0", "")
-                filters, meta = load_filters(
+            except Exception:
+                max_age = 30
+            fatal = os.getenv("TB_FAIL_ON_STALE_FILTERS") not in (None, "0", "")
+
+            try:
+                filters_payload, metadata_payload = load_filters(
                     filters_path, max_age_days=max_age, fatal=fatal
                 )
-                if filters:
-                    self.filters = dict(filters)
-                    self.quantizer = Quantizer(filters, strict=strict_filters)
-                if meta:
-                    logger.info("Loaded filter metadata: %s", meta)
-        except Exception:
-            # не ломаемся, если файл отсутствует; квантизация просто не активна
-            self.quantizer = None
+            except Exception:
+                logger.exception(
+                    "Failed to load quantizer filters from %s; quantizer disabled",
+                    filters_path,
+                )
+                self._update_quantizer_metadata({})
+                return
+
+            filters_dict = dict(filters_payload or {})
+            metadata_dict = (
+                dict(metadata_payload)
+                if isinstance(metadata_payload, Mapping)
+                else {}
+            )
+            if filters_dict and Quantizer is not None:
+                try:
+                    quantizer_obj = Quantizer(filters_dict, strict=strict_filters)
+                except Exception:
+                    logger.exception(
+                        "Failed to construct Quantizer from filters at %s",
+                        filters_path,
+                    )
+                    self._update_quantizer_metadata(metadata_dict)
+                    return
+                wrapper = self._make_legacy_quantizer_impl(
+                    quantizer_obj,
+                    strict=strict_filters,
+                    enforce=self.enforce_ppbs,
+                    filters=filters_dict,
+                    metadata=metadata_dict,
+                )
+                wrapper_meta = getattr(wrapper, "filters_metadata", None)
+                metadata_for_attach = (
+                    dict(wrapper_meta)
+                    if isinstance(wrapper_meta, Mapping)
+                    else dict(metadata_dict)
+                )
+                self.attach_quantizer(
+                    impl=wrapper,
+                    metadata=metadata_for_attach,
+                )
+            else:
+                self._update_quantizer_metadata(metadata_dict)
+
+        attached_quantizer = False
+        if quantizer_impl is not None:
+            try:
+                self.attach_quantizer(impl=quantizer_impl)
+            except Exception:
+                logger.exception(
+                    "Failed to attach provided quantizer implementation; falling back to legacy filters"
+                )
+            else:
+                attached_quantizer = True
+
+        if not attached_quantizer and QuantizerImpl is not None and filters_path:
+            cfg_payload: Dict[str, Any] = {
+                "path": str(filters_path),
+                "filters_path": str(filters_path),
+                "strict_filters": bool(strict_filters),
+                "strict": bool(strict_filters),
+                "enforce_percent_price_by_side": bool(self.enforce_ppbs),
+            }
+            try:
+                auto_impl = QuantizerImpl.from_dict(cfg_payload)
+            except Exception:
+                logger.warning(
+                    "QuantizerImpl initialisation failed for %s; falling back to legacy filters",
+                    filters_path,
+                )
+            else:
+                try:
+                    self.attach_quantizer(impl=auto_impl)
+                except Exception:
+                    logger.exception(
+                        "QuantizerImpl attachment failed; falling back to legacy filters"
+                    )
+                else:
+                    attached_quantizer = True
+
+        if not attached_quantizer:
+            _legacy_setup()
 
         # комиссии и funding
         self.fees = (
@@ -2527,8 +2819,119 @@ class ExecutionSimulator:
             report.reason = reason
         return report
 
+    def attach_quantizer(
+        self,
+        *,
+        impl: Any,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Attach a quantizer implementation to the simulator."""
+
+        self.quantizer_impl = impl
+        quantizer_obj = getattr(impl, "quantizer", None)
+        self.quantizer = quantizer_obj if quantizer_obj is not None else None
+
+        filters_payload: Dict[str, Dict[str, Any]] = {}
+        raw_filters = getattr(impl, "_filters_raw", None)
+        if isinstance(raw_filters, Mapping):
+            try:
+                filters_payload = {
+                    str(sym): dict(value or {})
+                    for sym, value in raw_filters.items()
+                }
+            except Exception:
+                try:
+                    filters_payload = dict(raw_filters)
+                except Exception:
+                    filters_payload = {}
+        elif hasattr(impl, "filters"):
+            candidate = getattr(impl, "filters")
+            if isinstance(candidate, Mapping):
+                try:
+                    filters_payload = dict(candidate)
+                except Exception:
+                    filters_payload = {}
+        self.filters = filters_payload
+
+        try:
+            symbol_filters = getattr(impl, "symbol_filters")
+        except Exception:
+            symbol_filters = None
+        if symbol_filters is not None:
+            try:
+                setattr(self, "symbol_filters", symbol_filters)
+            except Exception:
+                pass
+
+        validator = getattr(impl, "validate_order", None)
+        if callable(validator):
+            try:
+                setattr(self, "validate_order", validator)
+            except Exception:
+                pass
+
+        cfg = getattr(impl, "cfg", None)
+        strict_cfg = getattr(cfg, "strict_filters", None)
+        enforce_cfg = getattr(cfg, "enforce_percent_price_by_side", None)
+
+        meta_source: Optional[Mapping[str, Any]] = metadata
+        if meta_source is None:
+            meta_source = getattr(impl, "filters_metadata", None)
+        meta_map = self._update_quantizer_metadata(meta_source)
+
+        strict_active = meta_map.get("strict_filters_active")
+        enforce_active = meta_map.get("enforce_percent_price_by_side_active")
+        if strict_active is None and isinstance(strict_cfg, bool):
+            strict_active = bool(strict_cfg) and bool(self.filters)
+        if enforce_active is None and isinstance(enforce_cfg, bool):
+            enforce_active = bool(enforce_cfg) and bool(self.filters)
+
+        if strict_active is not None:
+            self.strict_filters = bool(strict_active)
+        elif isinstance(strict_cfg, bool):
+            self.strict_filters = bool(strict_cfg)
+
+        if enforce_active is not None:
+            self.enforce_ppbs = bool(enforce_active)
+        elif isinstance(enforce_cfg, bool):
+            self.enforce_ppbs = bool(enforce_cfg)
+
+        quantize_mode = getattr(cfg, "quantize_mode", None)
+        if quantize_mode is not None:
+            try:
+                setattr(self, "quantize_mode", str(quantize_mode))
+            except Exception:
+                pass
+
     def set_quantizer(self, q: Quantizer) -> None:
-        self.quantizer = q
+        if q is None:
+            self.quantizer = None
+            self.quantizer_impl = None
+            self.filters = {}
+            self._update_quantizer_metadata({})
+            return
+
+        strict_flag = bool(self.strict_filters)
+        enforce_flag = bool(self.enforce_ppbs)
+        filters_payload = (
+            dict(self.filters)
+            if isinstance(self.filters, Mapping) and self.filters
+            else None
+        )
+        wrapper = self._make_legacy_quantizer_impl(
+            q,
+            strict=strict_flag,
+            enforce=enforce_flag,
+            filters=filters_payload,
+        )
+        meta = getattr(wrapper, "filters_metadata", None)
+        metadata_payload = (
+            dict(meta) if isinstance(meta, Mapping) else {}
+        )
+        self.attach_quantizer(
+            impl=wrapper,
+            metadata=metadata_payload,
+        )
 
     def set_symbol(self, symbol: str) -> None:
         self.symbol = str(symbol).upper()
