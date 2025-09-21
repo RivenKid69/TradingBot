@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, List, Mapping, MutableMapping, Sequence
@@ -19,6 +20,7 @@ from services.rest_budget import RestBudgetSession
 
 DEFAULT_CHUNK_SIZE = 100
 EXCHANGE_INFO_ENDPOINT = "GET /api/v3/exchangeInfo"
+DEFAULT_UNIVERSE_PATH = Path(__file__).resolve().parents[1] / "data" / "universe" / "symbols.json"
 
 
 def _parse_args(argv: List[str] | None = None) -> argparse.Namespace:
@@ -28,12 +30,20 @@ def _parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--out",
         required=True,
+        type=Path,
         help="Destination JSON file path",
     )
     parser.add_argument(
         "--universe",
-        action="store_true",
-        help="Load symbols from services.universe.get_symbols()",
+        nargs="?",
+        type=Path,
+        const=DEFAULT_UNIVERSE_PATH,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a JSON file containing universe symbols. "
+            "Use --universe without PATH to default to data/universe/symbols.json."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -277,36 +287,51 @@ def _normalize_symbols(raw: Iterable[str]) -> List[str]:
     return list(dict.fromkeys(cleaned))
 
 
+def _load_universe_symbols(path: Path) -> List[str]:
+    with path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    candidates: Sequence[Any]
+    if isinstance(payload, Mapping):
+        symbols = payload.get("symbols")
+        if not isinstance(symbols, Sequence) or isinstance(symbols, (str, bytes)):
+            raise ValueError(
+                f"Universe file {path} must contain a sequence under 'symbols'"
+            )
+        candidates = symbols
+    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        candidates = payload
+    else:
+        raise ValueError(f"Universe file {path} must contain a JSON array of symbols")
+    return _normalize_symbols(str(item) for item in candidates)
+
+
 def _load_symbols(args: argparse.Namespace) -> List[str]:
     symbols: List[str] = []
     if args.universe:
-        from services.universe import get_symbols as get_universe_symbols
-
-        symbols.extend(get_universe_symbols())
+        symbols.extend(_load_universe_symbols(args.universe))
     if args.symbols:
         symbols.extend(args.symbols)
     return _normalize_symbols(symbols)
 
 
-def _ensure_directory(path: str) -> None:
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
+def _ensure_directory(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _write_json_atomic(path: str, payload: dict) -> None:
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     _ensure_directory(path)
-    directory = os.path.dirname(path) or "."
-    fd, tmp_path = tempfile.mkstemp(prefix=".binance_filters_", dir=directory)
+    directory = path.parent
+    fd, tmp_path = tempfile.mkstemp(prefix=".binance_filters_", dir=str(directory))
+    tmp_path_obj = Path(tmp_path)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
             json.dump(payload, tmp_file, ensure_ascii=False, indent=2, sort_keys=True)
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
-        os.replace(tmp_path, path)
+        os.replace(tmp_path_obj, path)
     finally:
         try:
-            os.unlink(tmp_path)
+            os.unlink(tmp_path_obj)
         except FileNotFoundError:
             pass
 
@@ -314,7 +339,7 @@ def _write_json_atomic(path: str, payload: dict) -> None:
 def _build_metadata(filters: Mapping[str, Any]) -> dict:
     return {
         "built_at": datetime.now(timezone.utc).isoformat(),
-        "source": "/api/v3/exchangeInfo",
+        "source": EXCHANGE_INFO_ENDPOINT,
         "symbols_count": len(filters),
     }
 
@@ -398,104 +423,35 @@ def _save_checkpoint(
             if isinstance(data, Mapping):
                 stored[sym] = dict(data)
         payload["filters"] = stored
-    session.save_checkpoint(payload)
+    last_symbol = symbols[limit - 1] if limit > 0 else None
+    progress_pct: float | None = None
+    if symbols:
+        progress_pct = float(limit) / float(len(symbols)) * 100.0
+    session.save_checkpoint(payload, last_symbol=last_symbol, progress_pct=progress_pct)
 
 
 def main(argv: List[str] | None = None) -> int:
     args = _parse_args(argv)
-    try:
-        symbols = _load_symbols(args)
-        config_path = _default_offline_config_path()
-        rest_cfg, script_cfg = _load_offline_config(config_path)
-        chunk_size = _resolve_chunk_size(script_cfg)
-        checkpoint_threshold = _resolve_checkpoint_threshold(script_cfg, chunk_size)
+    symbols = _load_symbols(args)
+    config_path = _default_offline_config_path()
+    rest_cfg, script_cfg = _load_offline_config(config_path)
+    chunk_size = _resolve_chunk_size(script_cfg)
+    checkpoint_threshold = _resolve_checkpoint_threshold(script_cfg, chunk_size)
 
-        with RestBudgetSession(rest_cfg) as session:
-            client = BinancePublicClient(session=session)
-            try:
-                symbol_count = len(symbols)
-                if symbol_count == 0:
-                    chunk_count = 1
-                else:
-                    chunk_count = (symbol_count + chunk_size - 1) // chunk_size
-                session.plan_request(EXCHANGE_INFO_ENDPOINT, count=chunk_count, tokens=1.0)
+    with RestBudgetSession(rest_cfg) as session:
+        with closing(BinancePublicClient(session=session)) as client:
+            symbol_count = len(symbols)
+            chunk_count = 1 if symbol_count == 0 else (symbol_count + chunk_size - 1) // chunk_size
+            session.plan_request(
+                EXCHANGE_INFO_ENDPOINT, count=chunk_count, tokens=10.0
+            )
 
-                if args.dry_run:
-                    target = "all available" if symbol_count == 0 else f"{symbol_count}"
-                    print(
-                        "Dry run: would perform "
-                        f"{chunk_count} request(s) to {EXCHANGE_INFO_ENDPOINT} "
-                        f"for {target} symbol(s) with chunk_size={chunk_size}",
-                    )
-                    print(
-                        json.dumps(
-                            session.stats(), ensure_ascii=False, indent=2, sort_keys=True
-                        )
-                    )
-                    return 0
-
-                should_checkpoint = (
-                    symbol_count > 0
-                    and chunk_count > 1
-                    and symbol_count >= checkpoint_threshold
-                )
-
-                filters: dict[str, dict[str, Any]] = {}
-                start_index = 0
-                if should_checkpoint:
-                    start_index, restored = _restore_checkpoint(
-                        session, symbols, enable=should_checkpoint
-                    )
-                    if start_index > 0:
-                        print(
-                            f"Resuming from symbol index {start_index}",
-                            file=sys.stderr,
-                        )
-                    filters.update(restored)
-                    _save_checkpoint(
-                        session,
-                        symbols,
-                        start_index,
-                        filters,
-                        chunk_size,
-                    )
-
-                if symbol_count == 0:
-                    filters = client.get_exchange_filters(market="spot", symbols=None)
-                else:
-                    index = start_index
-                    for chunk in _iter_symbol_chunks(symbols[index:], chunk_size):
-                        if not chunk:
-                            continue
-                        chunk_filters = client.get_exchange_filters(
-                            market="spot", symbols=chunk
-                        )
-                        filters.update(chunk_filters)
-                        index += len(chunk)
-                        if should_checkpoint:
-                            _save_checkpoint(
-                                session,
-                                symbols,
-                                index,
-                                filters,
-                                chunk_size,
-                            )
-                    if should_checkpoint:
-                        _save_checkpoint(
-                            session,
-                            symbols,
-                            len(symbols),
-                            filters,
-                            chunk_size,
-                            completed=True,
-                        )
-
-                metadata = _build_metadata(filters)
-                payload = {"metadata": metadata, "filters": filters}
-                _write_json_atomic(args.out, payload)
+            if args.dry_run:
+                target = "all available" if symbol_count == 0 else f"{symbol_count}"
                 print(
-                    f"Fetched {metadata['symbols_count']} symbol filters "
-                    f"from {metadata['source']} into {args.out}"
+                    "Dry run: would perform "
+                    f"{chunk_count} request(s) to {EXCHANGE_INFO_ENDPOINT} "
+                    f"for {target} symbol(s) with chunk_size={chunk_size}",
                 )
                 print(
                     json.dumps(
@@ -503,11 +459,90 @@ def main(argv: List[str] | None = None) -> int:
                     )
                 )
                 return 0
-            finally:
-                client.close()
-    except Exception as exc:  # pragma: no cover - CLI error handling
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+
+            should_checkpoint = (
+                symbol_count > 0
+                and chunk_count > 1
+                and symbol_count >= checkpoint_threshold
+            )
+
+            filters: dict[str, dict[str, Any]] = {}
+            start_index = 0
+            if should_checkpoint:
+                start_index, restored = _restore_checkpoint(
+                    session, symbols, enable=should_checkpoint
+                )
+                if start_index > 0:
+                    print(
+                        f"Resuming from symbol index {start_index}",
+                        file=sys.stderr,
+                    )
+                filters.update(restored)
+                _save_checkpoint(
+                    session,
+                    symbols,
+                    start_index,
+                    filters,
+                    chunk_size,
+                )
+
+            if symbol_count == 0:
+                filters = client.get_exchange_filters(market="spot", symbols=None)
+                if not filters:
+                    raise RuntimeError("No filters returned from Binance exchangeInfo")
+            else:
+                index = start_index
+                for chunk in _iter_symbol_chunks(symbols[index:], chunk_size):
+                    if not chunk:
+                        continue
+                    chunk_filters = client.get_exchange_filters(
+                        market="spot", symbols=chunk
+                    )
+                    missing = [sym for sym in chunk if sym not in chunk_filters]
+                    if missing:
+                        raise RuntimeError(
+                            "Missing filters for symbol(s): " + ", ".join(missing)
+                        )
+                    filters.update(chunk_filters)
+                    index += len(chunk)
+                    if should_checkpoint:
+                        _save_checkpoint(
+                            session,
+                            symbols,
+                            index,
+                            filters,
+                            chunk_size,
+                        )
+                if len(filters) < symbol_count:
+                    missing_total = [sym for sym in symbols if sym not in filters]
+                    if missing_total:
+                        raise RuntimeError(
+                            "Missing filters after completion for symbol(s): "
+                            + ", ".join(missing_total)
+                        )
+                if should_checkpoint:
+                    _save_checkpoint(
+                        session,
+                        symbols,
+                        len(symbols),
+                        filters,
+                        chunk_size,
+                        completed=True,
+                    )
+
+            metadata = _build_metadata(filters)
+            payload = {"metadata": metadata, "filters": filters}
+            _write_json_atomic(args.out, payload)
+            print(
+                f"Fetched {metadata['symbols_count']} symbol filters "
+                f"from {metadata['source']} into {args.out}"
+            )
+            print(
+                json.dumps(
+                    session.stats(), ensure_ascii=False, indent=2, sort_keys=True
+                )
+            )
+            return 0
 
 
 if __name__ == "__main__":
