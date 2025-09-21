@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
@@ -78,6 +78,67 @@ def _resolve_symbols(symbols_arg: str, symbols_file: str) -> list[str]:
     if file_symbols:
         return file_symbols
     return _default_symbols()
+
+
+def _default_offline_config_path() -> Path:
+    return Path(__file__).resolve().parent / "configs" / "offline.yaml"
+
+
+def _load_offline_config(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        print(
+            f"[WARN] offline config not found: {path}",
+            file=sys.stderr,
+        )
+        return {}
+    except Exception as exc:  # pragma: no cover - defensive logging
+        print(f"[WARN] failed to load offline config {path}: {exc}", file=sys.stderr)
+        return {}
+    if not isinstance(payload, Mapping):
+        print(
+            f"[WARN] offline config {path} must be a mapping, got {type(payload).__name__}",
+            file=sys.stderr,
+        )
+        return {}
+    return dict(payload)
+
+
+def _merge_mappings(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {key: value for key, value in base.items()}
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], Mapping)
+            and isinstance(value, Mapping)
+        ):
+            merged[key] = _merge_mappings(
+                merged[key],
+                value,
+            )
+        else:
+            merged[key] = value
+    return merged
+
+
+def _first_non_empty_str(*candidates: Any) -> str | None:
+    for value in candidates:
+        if isinstance(value, (str, Path)):
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _load_rest_config(path: str) -> dict[str, Any]:
@@ -165,7 +226,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Ignore checkpoint even if present",
     )
-    parser.set_defaults(resume_from_checkpoint=False)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan fetch ranges without performing HTTP requests",
+    )
+    parser.set_defaults(resume_from_checkpoint=None)
     return parser.parse_args(argv)
 
 
@@ -187,6 +253,75 @@ def main(argv: Sequence[str] | None = None) -> None:
     limit = max(1, int(args.limit))
     chunk_days = max(1, int(args.chunk_days))
 
+    offline_config = _load_offline_config(_default_offline_config_path())
+    offline_rest_cfg = offline_config.get("rest_budget")
+    if isinstance(offline_rest_cfg, Mapping):
+        offline_rest_cfg = dict(offline_rest_cfg)
+    else:
+        offline_rest_cfg = {}
+
+    rest_cfg_loaded = _load_rest_config(str(args.rest_budget_config))
+    rest_cfg: dict[str, Any]
+    if offline_rest_cfg:
+        rest_cfg = _merge_mappings(offline_rest_cfg, rest_cfg_loaded)
+    else:
+        rest_cfg = dict(rest_cfg_loaded)
+
+    cache_cfg_raw = rest_cfg.get("cache") if isinstance(rest_cfg, Mapping) else None
+    cache_cfg = dict(cache_cfg_raw) if isinstance(cache_cfg_raw, Mapping) else {}
+
+    http_cache_dir = _first_non_empty_str(
+        cache_cfg.get("dir"),
+        cache_cfg.get("path"),
+        cache_cfg.get("cache_dir"),
+        rest_cfg.get("cache_dir") if isinstance(rest_cfg, Mapping) else None,
+    )
+    if not http_cache_dir:
+        http_cache_dir = str(cache_dir)
+
+    if args.cache_mode:
+        cache_mode = str(args.cache_mode)
+    else:
+        cache_mode = _first_non_empty_str(
+            cache_cfg.get("mode"),
+            cache_cfg.get("cache_mode"),
+            rest_cfg.get("cache_mode") if isinstance(rest_cfg, Mapping) else None,
+        )
+
+    if args.cache_ttl is not None:
+        cache_ttl = float(args.cache_ttl)
+    else:
+        cache_ttl = _coerce_float(cache_cfg.get("ttl_days"))
+        if cache_ttl is None:
+            cache_ttl = _coerce_float(cache_cfg.get("ttl"))
+
+    checkpoint_cfg_raw = rest_cfg.get("checkpoint") if isinstance(rest_cfg, Mapping) else None
+    checkpoint_cfg = dict(checkpoint_cfg_raw) if isinstance(checkpoint_cfg_raw, Mapping) else {}
+
+    checkpoint_path_override = args.checkpoint_path.strip()
+    checkpoint_path = _first_non_empty_str(
+        checkpoint_path_override,
+        checkpoint_cfg.get("path"),
+        checkpoint_cfg.get("file"),
+        checkpoint_cfg.get("checkpoint_path"),
+    )
+    if not checkpoint_path:
+        checkpoint_path = str(cache_dir / "checkpoint.json")
+
+    checkpoint_enabled_flag = checkpoint_cfg.get("enabled")
+    if checkpoint_enabled_flag is None:
+        checkpoint_enabled = bool(checkpoint_path)
+    else:
+        checkpoint_enabled = bool(checkpoint_enabled_flag) and bool(checkpoint_path)
+
+    resume_flag: bool | None = args.resume_from_checkpoint
+    if resume_flag is None:
+        resume_flag = bool(checkpoint_enabled)
+    else:
+        resume_flag = bool(resume_flag)
+    if resume_flag and not checkpoint_enabled:
+        resume_flag = False
+
     config = BuildAdvConfig(
         market=args.market,
         interval=args.interval,
@@ -196,33 +331,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         cache_dir=cache_dir,
         limit=limit,
         chunk_days=chunk_days,
-        resume_from_checkpoint=bool(args.resume_from_checkpoint),
+        resume_from_checkpoint=bool(resume_flag),
+        dry_run=bool(args.dry_run),
     )
-
-    rest_cfg = _load_rest_config(str(args.rest_budget_config))
-
-    checkpoint_path = args.checkpoint_path.strip()
-    if not checkpoint_path:
-        checkpoint_path = str(cache_dir / "checkpoint.json")
-
-    cache_override = str(cache_dir)
-    cache_mode = args.cache_mode if args.cache_mode else None
 
     with RestBudgetSession(
         rest_cfg,
-        cache_dir=cache_override,
-        ttl_days=args.cache_ttl,
+        cache_dir=http_cache_dir,
+        ttl_days=cache_ttl,
         mode=cache_mode,
         checkpoint_path=checkpoint_path,
-        checkpoint_enabled=bool(checkpoint_path),
-        resume_from_checkpoint=bool(args.resume_from_checkpoint),
+        checkpoint_enabled=checkpoint_enabled,
+        resume_from_checkpoint=bool(resume_flag),
     ) as session:
         result = build_adv(session, symbols, config)
-        payload = {
-            "result": result.to_dict(),
-            "rest": session.stats(),
-        }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
