@@ -3308,22 +3308,49 @@ class ServiceSignalRunner:
 
         state_stop = threading.Event()
         state_thread: threading.Thread | None = None
+
+        def _persist_state(reason: str) -> None:
+            if not self.cfg.state.enabled:
+                return
+            path = self.cfg.state.path
+            backend = self.cfg.state.backend
+            try:
+                state_storage.save_state(
+                    path,
+                    backend=backend,
+                    lock_path=self.cfg.state.lock_path,
+                    backup_keep=self.cfg.state.backup_keep,
+                )
+            except Exception:
+                self.logger.warning(
+                    "failed to save persistent state (reason=%s) path=%s backend=%s",
+                    reason,
+                    path,
+                    backend,
+                    exc_info=True,
+                )
+            else:
+                self.logger.info(
+                    "persistent state saved (reason=%s) path=%s backend=%s",
+                    reason,
+                    path,
+                    backend,
+                )
+
         if self.cfg.state.enabled and self.cfg.state.snapshot_interval_s > 0:
 
             def _state_loop() -> None:
                 while not state_stop.wait(self.cfg.state.snapshot_interval_s):
                     try:
-                        state_storage.save_state(
-                            self.cfg.state.path,
-                            backend=self.cfg.state.backend,
-                            lock_path=self.cfg.state.lock_path,
-                            backup_keep=self.cfg.state.backup_keep,
-                        )
+                        _persist_state("interval")
                     except Exception:
-                        pass
+                        self.logger.exception(
+                            "unexpected error during periodic state persistence"
+                        )
 
             state_thread = threading.Thread(target=_state_loop, daemon=True)
             state_thread.start()
+        if self.cfg.state.enabled:
             shutdown.on_stop(state_stop.set)
 
         # Optional asynchronous event bus processing
@@ -3390,14 +3417,11 @@ class ServiceSignalRunner:
 
         shutdown.on_flush(_flush_snapshot)
         if self.cfg.state.enabled and self.cfg.state.flush_on_event:
-            shutdown.on_flush(
-                lambda: state_storage.save_state(
-                    self.cfg.state.path,
-                    backend=self.cfg.state.backend,
-                    lock_path=self.cfg.state.lock_path,
-                    backup_keep=self.cfg.state.backup_keep,
-                )
-            )
+
+            def _flush_persistent_state() -> None:
+                _persist_state("flush")
+
+            shutdown.on_flush(_flush_persistent_state)
 
         def _write_marker() -> None:
             try:
@@ -3415,6 +3439,12 @@ class ServiceSignalRunner:
         shutdown.on_finalize(_write_marker)
         if snapshot_thread is not None:
             shutdown.on_finalize(lambda: snapshot_thread.join(timeout=1.0))
+        if self.cfg.state.enabled:
+
+            def _finalize_persistent_state() -> None:
+                _persist_state("finalize")
+
+            shutdown.on_finalize(_finalize_persistent_state)
         if state_thread is not None:
             shutdown.on_finalize(lambda: state_thread.join(timeout=1.0))
         shutdown.on_finalize(lambda: self._clock_stop.set())
@@ -3888,15 +3918,7 @@ class ServiceSignalRunner:
                 self.logger.exception("failed to handle report for state persistence")
                 updates.clear()
             if updates and self.cfg.state.flush_on_event:
-                try:
-                    state_storage.save_state(
-                        self.cfg.state.path,
-                        backend=self.cfg.state.backend,
-                        lock_path=self.cfg.state.lock_path,
-                        backup_keep=self.cfg.state.backup_keep,
-                    )
-                except Exception:
-                    self.logger.exception("failed to flush persistent state on event")
+                _persist_state("event")
 
         while not stop_event.is_set():
             try:
