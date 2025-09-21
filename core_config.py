@@ -212,9 +212,12 @@ class StateConfig(BaseModel):
     backend: str = Field(default="json")
     path: str = Field(default="state/state_store.json")
     snapshot_interval_s: int = Field(default=0)
+    snapshot_interval_ms: Optional[int] = Field(default=None)
     flush_on_event: bool = Field(default=True)
     backup_keep: int = Field(default=0)
     lock_path: str = Field(default="state/state.lock")
+    dir: Optional[str] = Field(default=None)
+    last_processed_per_symbol: bool = Field(default=False)
 
 
 @dataclass
