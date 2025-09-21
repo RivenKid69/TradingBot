@@ -10,7 +10,7 @@ import signal
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
 import yaml
 
@@ -50,50 +50,157 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        key: (dict(value) if isinstance(value, Mapping) else value)
+        for key, value in base.items()
+    }
+    for key, value in override.items():
+        if (
+            key in merged
+            and isinstance(merged[key], Mapping)
+            and isinstance(value, Mapping)
+        ):
+            merged[key] = _deep_merge(merged[key], value)  # type: ignore[arg-type]
+        else:
+            merged[key] = dict(value) if isinstance(value, Mapping) else value
+    return merged
+
+
+def _normalize_endpoint_map(raw: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key, value in raw.items():
+        if isinstance(value, Mapping):
+            normalized[str(key)] = dict(value)
+        else:
+            normalized[str(key)] = value
+    return normalized
+
+
+def _normalize_rest_budget_sections(
+    rest_cfg: Mapping[str, Any]
+) -> tuple[dict[str, Any], Any, Mapping[str, Any] | None]:
+    sources: list[Mapping[str, Any]] = []
+    if isinstance(rest_cfg, Mapping):
+        sources.append(rest_cfg)
+        for key in ("session", "config"):
+            nested = rest_cfg.get(key)
+            if isinstance(nested, Mapping):
+                sources.append(nested)
+
+    combined: dict[str, Any] = {}
+    for source in sources:
+        combined = _deep_merge(combined, source)
+
+    session_cfg: dict[str, Any] = {}
+    limits_cfg = combined.get("limits")
+    if isinstance(limits_cfg, Mapping):
+        global_cfg: MutableMapping[str, Any] | None = None
+        for alias in ("global", "global_", "default", "defaults"):
+            candidate = limits_cfg.get(alias)
+            if isinstance(candidate, Mapping):
+                global_cfg = dict(candidate)
+                break
+        if global_cfg is None:
+            scalars = {
+                key: value for key, value in limits_cfg.items() if not isinstance(value, Mapping)
+            }
+            if scalars:
+                global_cfg = dict(scalars)
+        if global_cfg:
+            session_cfg["global"] = global_cfg
+        endpoints_cfg = limits_cfg.get("endpoints")
+        if isinstance(endpoints_cfg, Mapping):
+            session_cfg["endpoints"] = _normalize_endpoint_map(endpoints_cfg)
+
+    if "global" not in session_cfg:
+        for alias in ("global", "global_", "default_global"):
+            candidate = combined.get(alias)
+            if isinstance(candidate, Mapping):
+                session_cfg["global"] = dict(candidate)
+                break
+
+    if "endpoints" not in session_cfg:
+        endpoints_candidate = combined.get("endpoints")
+        if isinstance(endpoints_candidate, Mapping):
+            session_cfg["endpoints"] = _normalize_endpoint_map(endpoints_candidate)
+
+    concurrency_cfg = combined.get("concurrency")
+    if isinstance(concurrency_cfg, Mapping):
+        session_cfg["concurrency"] = dict(concurrency_cfg)
+        for alias in ("batch_size", "queue", "max_in_flight"):
+            candidate = concurrency_cfg.get(alias)
+            if candidate is not None:
+                session_cfg.setdefault("batch_size", candidate)
+                break
+
+    batch_candidate = combined.get("batch_size")
+    if batch_candidate is not None:
+        session_cfg.setdefault("batch_size", batch_candidate)
+
+    for key in (
+        "enabled",
+        "cache",
+        "cache_controls",
+        "checkpoint",
+        "retry",
+        "dynamic_from_headers",
+        "timeout",
+        "timeout_s",
+        "cooldown_s",
+        "cooldown_sec",
+        "jitter",
+        "jitter_ms",
+        "cache_mode",
+        "cache_dir",
+        "cache_ttl_days",
+    ):
+        value = combined.get(key)
+        if value is None:
+            continue
+        session_cfg[key] = dict(value) if isinstance(value, Mapping) else value
+
+    shuffle_cfg: Any = None
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("shuffle", "shuffle_symbols", "shuffleOptions"):
+            if key in source:
+                shuffle_cfg = source[key]
+                break
+        if shuffle_cfg is not None:
+            break
+
+    cache_controls = combined.get("cache_controls")
+    if not isinstance(cache_controls, Mapping):
+        cache_controls = None
+
+    return session_cfg, shuffle_cfg, cache_controls
+
+
 def _load_rest_budget_config(path: Path) -> tuple[dict[str, Any], Any, Mapping[str, Any] | None]:
     try:
         with path.open("r", encoding="utf-8") as f:
             payload = yaml.safe_load(f) or {}
     except FileNotFoundError:
         logging.warning("offline config not found at %s, using defaults", path)
-        return {}, None
+        return {}, None, None
     except Exception as exc:  # pragma: no cover - defensive logging
         logging.warning("failed to load offline config %s: %s", path, exc)
-        return {}, None
+        return {}, None, None
 
     if not isinstance(payload, Mapping):
         logging.warning("offline config %s must be a mapping, got %s", path, type(payload))
-        return {}, None
+        return {}, None, None
 
     rest_cfg = payload.get("rest_budget", {})
     if not isinstance(rest_cfg, Mapping):
         logging.warning("offline config %s missing rest_budget mapping", path)
         return {}, None, None
 
-    shuffle_cfg = (
-        rest_cfg.get("shuffle")
-        or rest_cfg.get("shuffle_symbols")
-        or rest_cfg.get("shuffleOptions")
-    )
-
-    session_cfg: Mapping[str, Any] | None = None
-    if isinstance(rest_cfg.get("session"), Mapping):
-        session_cfg = rest_cfg["session"]  # type: ignore[index]
-    elif isinstance(rest_cfg.get("config"), Mapping):
-        session_cfg = rest_cfg["config"]  # type: ignore[index]
-
-    rest_session_cfg: Mapping[str, Any]
-    if session_cfg is not None:
-        rest_session_cfg = session_cfg
-    else:
-        rest_session_cfg = rest_cfg
-
-    cache_controls: Mapping[str, Any] | None = None
-    raw_cache_controls = rest_cfg.get("cache_controls")
-    if isinstance(raw_cache_controls, Mapping):
-        cache_controls = raw_cache_controls
-
-    return dict(rest_session_cfg), shuffle_cfg, cache_controls
+    return _normalize_rest_budget_sections(rest_cfg)
 
 
 def _ensure_directory(path: Path) -> None:

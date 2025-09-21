@@ -171,14 +171,23 @@ endpoint `tradeFee`. Если Binance публикует CSV-файл, его м
 ### Offline REST budget configuration
 
 Файл `configs/offline.yaml` содержит общие параметры для офлайн‑скриптов,
-использующих `services.rest_budget.RestBudgetSession`. Ключ `rest_budget` включает
-лимитер (`enabled`), задаёт глобальный токен‑бакет (`global.qps` и `burst`) и
-опции кэширования (`cache.dir`, `ttl_days`, `mode`). В секции `endpoints`
-переопределяются квоты и дополнительные параметры для отдельных маршрутов API
-(`min_refresh_days`). Блок `checkpoint` управляет путём и режимом восстановления
-прогресса, а `concurrency.workers`/`batch_size` ограничивают параллелизм.
-Флаг `shuffle_symbols` включает случайную перестановку символов при обновлении
-вселенной.
+использующих `services.rest_budget.RestBudgetSession`. Ключ `rest_budget`
+сгруппирован по блокам:
+
+- `limits.global` задаёт базовый токен‑бакет (`qps`, `burst`) и паузы
+  (`jitter_ms`, `cooldown_sec`).
+- `limits.endpoints` позволяет переопределять квоты и вспомогательные параметры
+  для конкретных REST‑маршрутов Binance (например, `exchangeInfo.min_refresh_days`).
+- `cache` управляет путём к каталогу, режимом (`read`, `read_write`, `off`) и TTL
+  кэшированных ответов.
+- `checkpoint.enabled`/`checkpoint.path` переключают сохранение прогресса и путь
+  до файла контрольной точки.
+- `concurrency.workers` и `concurrency.batch_size` ограничивают число рабочих
+  потоков и размер очереди задач внутри `RestBudgetSession`.
+- `shuffle.enabled` включает перемешивание очереди символов, чтобы равномернее
+  распределять нагрузку между запусками.
+- Флаг `dynamic_from_headers` разрешает автоматически подстраивать вес запросов
+  согласно заголовкам Binance, если они присутствуют.
 
 Параметры симуляции можно временно переопределить через CLI:
 
