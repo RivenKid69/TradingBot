@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, Tuple, Union, Optional, Any
-from collections import deque
+from typing import Dict, Tuple, Union, Optional, Any, DefaultDict
+from collections import deque, defaultdict
 
 from enum import Enum
 from utils.prometheus import Counter, Histogram
@@ -154,9 +154,34 @@ http_error_count = Counter(
     ["code"],
 )
 
+_runtime_aggregator: "MonitoringAggregator | None" = None
+
+
+def set_runtime_aggregator(agg: "MonitoringAggregator | None") -> None:
+    """Register the currently active :class:`MonitoringAggregator`."""
+
+    global _runtime_aggregator
+    _runtime_aggregator = agg
+
+
+def clear_runtime_aggregator() -> None:
+    """Reset the registered runtime :class:`MonitoringAggregator`."""
+
+    set_runtime_aggregator(None)
+
+
+def _get_runtime_aggregator() -> "MonitoringAggregator | None":
+    return _runtime_aggregator
+
 
 def record_http_request() -> None:
     """Record an HTTP request attempt."""
+    agg = _get_runtime_aggregator()
+    if agg is not None:
+        try:
+            agg.record_http_attempt()
+        except Exception:
+            pass
     try:
         http_request_count.inc()
     except Exception:
@@ -165,6 +190,12 @@ def record_http_request() -> None:
 
 def record_http_success(status: Union[int, str]) -> None:
     """Record successful HTTP response with ``status`` code."""
+    agg = _get_runtime_aggregator()
+    if agg is not None:
+        try:
+            agg.record_http(True, status)
+        except Exception:
+            pass
     try:
         http_success_count.labels(str(status)).inc()
     except Exception:
@@ -173,6 +204,12 @@ def record_http_success(status: Union[int, str]) -> None:
 
 def record_http_error(code: Union[int, str]) -> None:
     """Record HTTP error with classification ``code``."""
+    agg = _get_runtime_aggregator()
+    if agg is not None:
+        try:
+            agg.record_http(False, code)
+        except Exception:
+            pass
     try:
         http_error_count.labels(str(code)).inc()
     except Exception:
@@ -181,6 +218,12 @@ def record_http_error(code: Union[int, str]) -> None:
 
 def record_signals(symbol: str, emitted: int, duplicates: int) -> None:
     """Record per-bar signal statistics for ``symbol``."""
+    agg = _get_runtime_aggregator()
+    if agg is not None:
+        try:
+            agg.record_signals(symbol, emitted, duplicates)
+        except Exception:
+            pass
     total = int(emitted) + int(duplicates)
     if total <= 0:
         return
@@ -469,65 +512,334 @@ def _collect(counter: Union[Counter, Gauge]) -> Dict[str, float]:
 
 
 class MonitoringAggregator:
-    """Aggregate runtime metrics and emit alerts.
-
-    The aggregator collects various runtime statistics and periodically
-    evaluates them against :class:`MonitoringConfig.thresholds`.  If any of the
-    thresholds are exceeded an alert is sent via the provided
-    :class:`AlertManager` instance.  Metrics are also periodically flushed to a
-    JSON lines file for external processing.
-    """
+    """Aggregate runtime metrics, evaluate thresholds and emit alerts."""
 
     def __init__(self, cfg: MonitoringConfig, alerts: AlertManager) -> None:
         self.cfg = cfg
         self.alerts = alerts
-        self.enabled = bool(cfg.enabled)
-        # Frequency of metrics flushes
-        self.flush_interval_sec = int(getattr(cfg, "snapshot_metrics_sec", 60))
-        self._last_flush = time.time()
+        self.enabled = bool(getattr(cfg, "enabled", False))
+        thresholds = getattr(cfg, "thresholds", None)
+        if thresholds is None:
+            thresholds = MonitoringConfig().thresholds
+        self.thresholds = thresholds
 
-        # Sliding window stores
-        self._ws_events: deque[tuple[int, str]] = deque()
-        self._http_events: deque[tuple[int, bool, Optional[int]]] = deque()
-        self._signal_events: deque[tuple[int, str, int, int]] = deque()
+        self._window_ms: Dict[str, int] = {"1m": 60_000, "5m": 5 * 60_000}
+        self._ws_events: Dict[str, deque[tuple[int, str]]] = {
+            key: deque() for key in self._window_ms
+        }
+        self._ws_counts: Dict[str, DefaultDict[str, int]] = {
+            key: defaultdict(int) for key in self._window_ms
+        }
+        self._http_events: Dict[str, deque[tuple[int, bool, Optional[Union[int, str]], str]]] = {
+            key: deque() for key in self._window_ms
+        }
+        self._http_counts: Dict[str, Dict[str, int]] = {
+            key: {
+                "total": 0,
+                "success": 0,
+                "error": 0,
+                "429": 0,
+                "5xx": 0,
+                "timeout": 0,
+                "other": 0,
+            }
+            for key in self._window_ms
+        }
+        self._http_attempts: Dict[str, deque[int]] = {
+            key: deque() for key in self._window_ms
+        }
+        self._signal_events: Dict[str, deque[tuple[int, str, int, int]]] = {
+            key: deque() for key in self._window_ms
+        }
+        self._signal_counts: Dict[str, Dict[str, DefaultDict[str, int]]] = {
+            key: {
+                "emitted": defaultdict(int),
+                "duplicates": defaultdict(int),
+            }
+            for key in self._window_ms
+        }
         self._last_bar_close_ms: Dict[str, int] = {}
-        # Latest computed metrics
+        self._zero_signal_streaks: Dict[str, int] = {}
+        self._zero_signal_alerted: set[str] = set()
+        self._feed_alerted: set[str] = set()
+        self._signal_alerted: set[str] = set()
+        self._stale_alerted: set[str] = set()
+        self._ws_alert_active = False
+        self._fill_alert_active = False
+        self._pnl_alert_active = False
+        self._consecutive_ws_failures = 0
+        self._metrics_path = os.path.join("logs", "metrics.jsonl")
+        self._last_flush_ts = time.time()
+
         self.fill_ratio: Optional[float] = None
         self.daily_pnl: Optional[float] = None
+
+        if self.enabled:
+            set_runtime_aggregator(self)
+        else:
+            clear_runtime_aggregator()
+
+    # ------------------------------------------------------------------
+    # Properties and helpers
+    @property
+    def flush_interval_sec(self) -> int:
+        """Flush interval in seconds derived from configuration."""
+
+        raw = getattr(self.cfg, "snapshot_metrics_sec", 60)
+        try:
+            interval = int(raw)
+        except Exception:
+            interval = 60
+        if interval <= 0:
+            interval = 60
+        return interval
+
+    def _notify(self, key: str, message: str) -> None:
+        if not self.alerts:
+            return
+        try:
+            self.alerts.notify(key, message)
+        except Exception:
+            pass
+
+    def _classify_http(self, success: bool, status: Optional[Union[int, str]]) -> str:
+        if success:
+            return "success"
+        if status is None:
+            return "timeout"
+        if isinstance(status, str):
+            code = status.strip().lower()
+            if code == "timeout":
+                return "timeout"
+            if code.isdigit():
+                try:
+                    status = int(code)
+                except Exception:
+                    return "other"
+            else:
+                return "other"
+        if isinstance(status, (int, float)):
+            status_int = int(status)
+            if status_int == 429:
+                return "429"
+            if 500 <= status_int <= 599:
+                return "5xx"
+            return "other"
+        return "other"
+
+    def _prune_ws_window(self, window: str, now_ms: int) -> None:
+        cutoff = now_ms - self._window_ms[window]
+        dq = self._ws_events[window]
+        counts = self._ws_counts[window]
+        while dq and dq[0][0] < cutoff:
+            _, event = dq.popleft()
+            counts[event] -= 1
+            if counts[event] <= 0:
+                counts.pop(event, None)
+
+    def _prune_http_window(self, window: str, now_ms: int) -> None:
+        cutoff = now_ms - self._window_ms[window]
+        dq = self._http_events[window]
+        counts = self._http_counts[window]
+        while dq and dq[0][0] < cutoff:
+            _, ok, _, classification = dq.popleft()
+            counts["total"] = max(0, counts["total"] - 1)
+            if ok:
+                counts["success"] = max(0, counts["success"] - 1)
+            else:
+                counts["error"] = max(0, counts["error"] - 1)
+                key = classification if classification in counts else "other"
+                counts[key] = max(0, counts.get(key, 0) - 1)
+
+    def _prune_http_attempts(self, window: str, now_ms: int) -> None:
+        cutoff = now_ms - self._window_ms[window]
+        dq = self._http_attempts[window]
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+
+    def _prune_signal_window(self, window: str, now_ms: int) -> None:
+        cutoff = now_ms - self._window_ms[window]
+        dq = self._signal_events[window]
+        counts = self._signal_counts[window]
+        emitted = counts["emitted"]
+        duplicates = counts["duplicates"]
+        while dq and dq[0][0] < cutoff:
+            _, sym, em, du = dq.popleft()
+            if em:
+                new_val = emitted.get(sym, 0) - em
+                if new_val > 0:
+                    emitted[sym] = new_val
+                else:
+                    emitted.pop(sym, None)
+            if du:
+                new_val = duplicates.get(sym, 0) - du
+                if new_val > 0:
+                    duplicates[sym] = new_val
+                else:
+                    duplicates.pop(sym, None)
+
+    def _http_snapshot(self, window: str) -> Dict[str, Any]:
+        counts = self._http_counts[window]
+        total = counts["total"]
+        errors = counts["error"]
+        snapshot = {
+            "attempts": len(self._http_attempts[window]),
+            "success": counts["success"],
+            "errors": errors,
+            "total": total,
+            "error_rate": float(errors) / float(total) if total > 0 else 0.0,
+            "by_code": {
+                "429": counts.get("429", 0),
+                "5xx": counts.get("5xx", 0),
+                "timeout": counts.get("timeout", 0),
+                "other": counts.get("other", 0),
+            },
+        }
+        return snapshot
+
+    def _signal_snapshot(self, window: str) -> Dict[str, Any]:
+        emitted = self._signal_counts[window]["emitted"]
+        duplicates = self._signal_counts[window]["duplicates"]
+        totals = {
+            "emitted": sum(emitted.values()),
+            "duplicates": sum(duplicates.values()),
+        }
+        rates: Dict[str, float] = {}
+        worst_symbol: Optional[str] = None
+        worst_rate = 0.0
+        for sym in set(emitted) | set(duplicates):
+            em = emitted.get(sym, 0)
+            du = duplicates.get(sym, 0)
+            if em > 0:
+                rate = float(du) / float(em)
+            else:
+                rate = 1.0 if du > 0 else 0.0
+            rates[sym] = rate
+            if rate > worst_rate:
+                worst_rate = rate
+                worst_symbol = sym
+        return {
+            "emitted": totals["emitted"],
+            "duplicates": totals["duplicates"],
+            "rates": rates,
+            "worst_symbol": worst_symbol,
+            "worst_rate": worst_rate,
+        }
+
+    def _build_metrics(self, now_ms: int, feed_lags: Dict[str, int], stale: list[str]) -> Dict[str, Any]:
+        worst_feed = max(feed_lags.items(), key=lambda item: item[1], default=(None, 0))
+        ws_snapshot = {
+            "failures_1m": int(self._ws_counts["1m"].get("failure", 0)),
+            "failures_5m": int(self._ws_counts["5m"].get("failure", 0)),
+            "reconnects_1m": int(self._ws_counts["1m"].get("reconnect", 0)),
+            "reconnects_5m": int(self._ws_counts["5m"].get("reconnect", 0)),
+            "consecutive_failures": int(self._consecutive_ws_failures),
+        }
+        http_snapshot = {
+            "window_1m": self._http_snapshot("1m"),
+            "window_5m": self._http_snapshot("5m"),
+        }
+        signal_snapshot = {
+            "window_1m": self._signal_snapshot("1m"),
+            "window_5m": self._signal_snapshot("5m"),
+            "zero_signal_symbols": sorted(
+                [sym for sym, streak in self._zero_signal_streaks.items() if streak > 0]
+            ),
+        }
+        metrics = {
+            "ts_ms": now_ms,
+            "feed_lag_ms": dict(feed_lags),
+            "worst_feed_lag": {
+                "symbol": worst_feed[0],
+                "lag_ms": worst_feed[1],
+            },
+            "stale_symbols": stale,
+            "fill_ratio": self.fill_ratio,
+            "pnl": self.daily_pnl,
+            "ws": ws_snapshot,
+            "http": http_snapshot,
+            "signals": signal_snapshot,
+        }
+        return metrics
 
     # ------------------------------------------------------------------
     # Recording helpers
     def record_feed(self, symbol: str, close_ms: int) -> None:
-        """Record receipt of latest bar for *symbol* with ``close_ms``."""
         if not self.enabled:
             return
-        now_ms = int(time.time() * 1000)
-        self._last_bar_close_ms[symbol] = int(close_ms)
         try:
-            report_feed_lag(symbol, now_ms - int(close_ms))
+            close = int(close_ms)
+        except Exception:
+            return
+        self._last_bar_close_ms[str(symbol)] = close
+        try:
+            now_ms = int(time.time() * 1000)
+            report_feed_lag(str(symbol), max(0, now_ms - close))
         except Exception:
             pass
 
     def record_ws(self, event: str) -> None:
-        """Record websocket ``event`` (e.g. ``reconnect`` or ``failure``)."""
         if not self.enabled:
             return
-        self._ws_events.append((int(time.time() * 1000), str(event)))
+        ts_ms = int(time.time() * 1000)
+        ev = str(event)
+        for window in self._window_ms:
+            self._ws_events[window].append((ts_ms, ev))
+            self._ws_counts[window][ev] += 1
+            self._prune_ws_window(window, ts_ms)
+        if ev == "failure":
+            self._consecutive_ws_failures += 1
+        elif ev == "reconnect":
+            self._consecutive_ws_failures = 0
 
-    def record_http(self, success: bool, status: Optional[int]) -> None:
-        """Record outcome of an HTTP request."""
+    def record_http_attempt(self) -> None:
         if not self.enabled:
             return
-        self._http_events.append((int(time.time() * 1000), bool(success), status))
+        ts_ms = int(time.time() * 1000)
+        for window in self._window_ms:
+            self._http_attempts[window].append(ts_ms)
+            self._prune_http_attempts(window, ts_ms)
+
+    def record_http(self, success: bool, status: Optional[Union[int, str]]) -> None:
+        if not self.enabled:
+            return
+        ts_ms = int(time.time() * 1000)
+        classification = self._classify_http(success, status)
+        for window in self._window_ms:
+            self._http_events[window].append((ts_ms, bool(success), status, classification))
+            counts = self._http_counts[window]
+            counts["total"] += 1
+            if success:
+                counts["success"] += 1
+            else:
+                counts["error"] += 1
+                key = classification if classification in counts else "other"
+                counts[key] += 1
+            self._prune_http_window(window, ts_ms)
 
     def record_signals(self, symbol: str, emitted: int, duplicates: int) -> None:
-        """Record signal counts for ``symbol``."""
         if not self.enabled:
             return
-        self._signal_events.append((int(time.time() * 1000), symbol, int(emitted), int(duplicates)))
+        sym = str(symbol)
+        em = int(emitted)
+        du = int(duplicates)
+        ts_ms = int(time.time() * 1000)
+        if em > 0 or du > 0:
+            for window in self._window_ms:
+                self._signal_events[window].append((ts_ms, sym, em, du))
+                if em:
+                    self._signal_counts[window]["emitted"][sym] += em
+                if du:
+                    self._signal_counts[window]["duplicates"][sym] += du
+                self._prune_signal_window(window, ts_ms)
+        if em <= 0:
+            self._zero_signal_streaks[sym] = self._zero_signal_streaks.get(sym, 0) + 1
+        else:
+            if sym in self._zero_signal_streaks:
+                self._zero_signal_streaks.pop(sym, None)
+            self._zero_signal_alerted.discard(sym)
 
     def record_fill(self, requested: Optional[float], filled: Optional[float]) -> None:
-        """Record executed vs requested volume and compute fill ratio."""
         if not self.enabled:
             return
         if requested is None or filled is None:
@@ -541,18 +853,15 @@ class MonitoringAggregator:
             return
         ratio = fil / req
         self.fill_ratio = ratio
-        th = self.cfg.thresholds
-        fill_ratio_min = getattr(th, "fill_ratio_min", 0.0)
-        if fill_ratio_min and ratio < fill_ratio_min:
-            try:
-                self.alerts.notify(
-                    "fill_ratio", f"fill ratio {ratio:.3f} below {fill_ratio_min}"
-                )
-            except Exception:
-                pass
+        threshold = float(getattr(self.thresholds, "fill_ratio_min", 0.0) or 0.0)
+        if threshold > 0 and ratio < threshold:
+            if not self._fill_alert_active:
+                self._notify("fill_ratio", f"fill ratio {ratio:.3f} below {threshold}")
+                self._fill_alert_active = True
+        else:
+            self._fill_alert_active = False
 
     def record_pnl(self, daily_pnl: Optional[float]) -> None:
-        """Record daily PnL and emit alerts if below threshold."""
         if not self.enabled:
             return
         if daily_pnl is None:
@@ -562,143 +871,151 @@ class MonitoringAggregator:
         except (TypeError, ValueError):
             return
         self.daily_pnl = pnl
-        th = self.cfg.thresholds
-        pnl_min = getattr(th, "pnl_min", 0.0)
-        if pnl_min and pnl < pnl_min:
-            try:
-                self.alerts.notify("pnl", f"daily pnl {pnl:.2f} below {pnl_min}")
-            except Exception:
-                pass
+        threshold = float(getattr(self.thresholds, "pnl_min", 0.0) or 0.0)
+        if threshold > 0 and pnl < threshold:
+            if not self._pnl_alert_active:
+                self._notify("pnl", f"daily pnl {pnl:.2f} below {threshold}")
+                self._pnl_alert_active = True
+        else:
+            self._pnl_alert_active = False
 
     # ------------------------------------------------------------------
-    def _prune(self, dq: deque[tuple], cutoff_ms: int) -> None:
-        """Drop events older than ``cutoff_ms`` from ``dq``."""
-        while dq and dq[0][0] < cutoff_ms:
-            dq.popleft()
-
     def tick(self, now_ms: int) -> None:
-        """Aggregate recent data and emit alerts if thresholds exceeded."""
         if not self.enabled:
             return
+        for window in self._window_ms:
+            self._prune_ws_window(window, now_ms)
+            self._prune_http_window(window, now_ms)
+            self._prune_http_attempts(window, now_ms)
+            self._prune_signal_window(window, now_ms)
 
-        cutoff_1m = now_ms - 60_000
-        cutoff_5m = now_ms - 5 * 60_000
+        th = self.thresholds
 
-        # Prune outdated events
-        self._prune(self._ws_events, cutoff_5m)
-        self._prune(self._http_events, cutoff_5m)
-        self._prune(self._signal_events, cutoff_5m)
+        feed_lags: Dict[str, int] = {
+            sym: max(0, now_ms - close)
+            for sym, close in self._last_bar_close_ms.items()
+        }
+        feed_threshold = float(getattr(th, "feed_lag_ms", 0.0) or 0.0)
+        stale_threshold = max(int(feed_threshold) if feed_threshold > 0 else 0, 120_000)
+        stale_symbols = sorted([sym for sym, lag in feed_lags.items() if lag > stale_threshold])
 
-        th = self.cfg.thresholds
-
-        # Feed lag checks
-        feed_lags: Dict[str, int] = {}
-        if th.feed_lag_ms > 0:
-            for sym, close in self._last_bar_close_ms.items():
-                lag = int(now_ms - close)
-                feed_lags[sym] = lag
-                if lag > th.feed_lag_ms:
-                    try:
-                        self.alerts.notify(
+        if feed_threshold > 0:
+            current_alerts: set[str] = set()
+            for sym, lag in feed_lags.items():
+                if lag > feed_threshold:
+                    current_alerts.add(sym)
+                    if sym not in self._feed_alerted:
+                        self._notify(
                             f"feed_lag_{sym}",
-                            f"{sym} feed lag {lag}ms exceeds {th.feed_lag_ms}",
+                            f"{sym} feed lag {lag}ms exceeds {feed_threshold}",
                         )
-                    except Exception:
-                        pass
+                        self._feed_alerted.add(sym)
+                elif sym in self._feed_alerted:
+                    self._feed_alerted.discard(sym)
+            for sym in list(self._feed_alerted):
+                if sym not in current_alerts:
+                    self._feed_alerted.discard(sym)
+        else:
+            self._feed_alerted.clear()
 
-        # Websocket events
-        ws_fail_1m = sum(1 for ts, ev in self._ws_events if ts >= cutoff_1m and ev == "failure")
-        ws_fail_5m = sum(1 for _, ev in self._ws_events if ev == "failure")
-        ws_rec_1m = sum(1 for ts, ev in self._ws_events if ts >= cutoff_1m and ev == "reconnect")
-        ws_rec_5m = sum(1 for _, ev in self._ws_events if ev == "reconnect")
-        if th.ws_failures > 0 and ws_fail_1m > th.ws_failures:
-            try:
-                self.alerts.notify(
-                    "ws_failures", f"websocket failures last minute: {ws_fail_1m}"
+        for sym in stale_symbols:
+            if sym not in self._stale_alerted:
+                self._notify(
+                    f"feed_stale_{sym}",
+                    f"{sym} stale for {feed_lags.get(sym, 0)}ms exceeds {stale_threshold}",
                 )
-            except Exception:
-                pass
+                self._stale_alerted.add(sym)
+        for sym in list(self._stale_alerted):
+            if sym not in stale_symbols:
+                self._stale_alerted.discard(sym)
 
-        # HTTP statistics
-        http_total_1m = sum(1 for ts, *_ in self._http_events if ts >= cutoff_1m)
-        http_error_1m = sum(1 for ts, ok, _ in self._http_events if ts >= cutoff_1m and not ok)
-        http_total_5m = len(self._http_events)
-        http_error_5m = sum(1 for _, ok, _ in self._http_events if not ok)
-
-        # Signal statistics
-        emitted_1m: Dict[str, int] = {}
-        dup_1m: Dict[str, int] = {}
-        for ts, sym, em, du in self._signal_events:
-            if ts >= cutoff_1m:
-                emitted_1m[sym] = emitted_1m.get(sym, 0) + em
-                dup_1m[sym] = dup_1m.get(sym, 0) + du
-        emitted_5m: Dict[str, int] = {}
-        dup_5m: Dict[str, int] = {}
-        for _, sym, em, du in self._signal_events:
-            emitted_5m[sym] = emitted_5m.get(sym, 0) + em
-            dup_5m[sym] = dup_5m.get(sym, 0) + du
-
-        worst_sym: Optional[str] = None
-        worst_rate = 0.0
-        for sym in set(emitted_1m) | set(dup_1m):
-            em = emitted_1m.get(sym, 0)
-            du = dup_1m.get(sym, 0)
-            rate = du / em if em > 0 else 0.0
-            if rate > worst_rate:
-                worst_rate = rate
-                worst_sym = sym
-        if th.error_rate > 0 and worst_rate > th.error_rate and worst_sym is not None:
-            try:
-                self.alerts.notify(
-                    "signal_error_rate",
-                    f"{worst_sym} duplicate rate {worst_rate:.3f} exceeds {th.error_rate}",
+        ws_fail_1m = int(self._ws_counts["1m"].get("failure", 0))
+        ws_fail_5m = int(self._ws_counts["5m"].get("failure", 0))
+        ws_rec_1m = int(self._ws_counts["1m"].get("reconnect", 0))
+        ws_rec_5m = int(self._ws_counts["5m"].get("reconnect", 0))
+        ws_threshold = float(getattr(th, "ws_failures", 0.0) or 0.0)
+        triggered_ws = ws_threshold > 0 and (
+            ws_fail_1m > ws_threshold or self._consecutive_ws_failures >= ws_threshold
+        )
+        if triggered_ws:
+            if not self._ws_alert_active:
+                self._notify(
+                    "ws_failures",
+                    (
+                        f"websocket failures last minute: {ws_fail_1m} "
+                        f"consecutive={self._consecutive_ws_failures}"
+                    ),
                 )
-            except Exception:
-                pass
+                self._ws_alert_active = True
+        else:
+            self._ws_alert_active = False
 
-        # Periodic flush to metrics file
-        now_sec = now_ms / 1000.0
-        if now_sec - self._last_flush >= self.flush_interval_sec:
-            metrics = {
-                "ts_ms": now_ms,
-                "feed_lag_ms": feed_lags,
-                "fill_ratio": self.fill_ratio,
-                "pnl": self.daily_pnl,
-                "ws": {
-                    "reconnects_1m": ws_rec_1m,
-                    "reconnects_5m": ws_rec_5m,
-                    "failures_1m": ws_fail_1m,
-                    "failures_5m": ws_fail_5m,
-                },
-                "http": {
-                    "total_1m": http_total_1m,
-                    "errors_1m": http_error_1m,
-                    "total_5m": http_total_5m,
-                    "errors_5m": http_error_5m,
-                },
-                "signals": {
-                    "emitted_1m": sum(emitted_1m.values()),
-                    "duplicates_1m": sum(dup_1m.values()),
-                    "emitted_5m": sum(emitted_5m.values()),
-                    "duplicates_5m": sum(dup_5m.values()),
-                },
+        error_threshold = float(getattr(th, "error_rate", 0.0) or 0.0)
+        if error_threshold > 0:
+            emitted = self._signal_counts["1m"]["emitted"]
+            duplicates = self._signal_counts["1m"]["duplicates"]
+            active: set[str] = set()
+            for sym in set(emitted) | set(duplicates):
+                em = emitted.get(sym, 0)
+                du = duplicates.get(sym, 0)
+                rate = float(du) / float(em) if em > 0 else (1.0 if du > 0 else 0.0)
+                if rate > error_threshold:
+                    active.add(sym)
+                    if sym not in self._signal_alerted:
+                        self._notify(
+                            "signal_error_rate",
+                            f"{sym} duplicate rate {rate:.3f} exceeds {error_threshold}",
+                        )
+                        self._signal_alerted.add(sym)
+                elif sym in self._signal_alerted:
+                    self._signal_alerted.discard(sym)
+            for sym in list(self._signal_alerted):
+                if sym not in active:
+                    self._signal_alerted.discard(sym)
+        else:
+            self._signal_alerted.clear()
+
+        zero_threshold = int(getattr(th, "zero_signals", 0) or 0)
+        if zero_threshold > 0:
+            for sym, streak in list(self._zero_signal_streaks.items()):
+                if streak >= zero_threshold:
+                    if sym not in self._zero_signal_alerted:
+                        self._notify(
+                            "zero_signals",
+                            f"{sym} {streak} consecutive zero-signal bars",
+                        )
+                        self._zero_signal_alerted.add(sym)
+                else:
+                    self._zero_signal_alerted.discard(sym)
+                if streak <= 0:
+                    self._zero_signal_streaks.pop(sym, None)
+        else:
+            self._zero_signal_alerted.clear()
+            self._zero_signal_streaks = {
+                sym: streak for sym, streak in self._zero_signal_streaks.items() if streak > 0
             }
+
+        now_sec = now_ms / 1000.0
+        if now_sec - self._last_flush_ts >= self.flush_interval_sec:
+            metrics = self._build_metrics(now_ms, feed_lags, stale_symbols)
             line = json.dumps(metrics, sort_keys=True)
             try:
                 atomic_write_with_retry(
-                    os.path.join("logs", "metrics.jsonl"), line + "\n", retries=3, backoff=0.1
+                    self._metrics_path,
+                    line + "\n",
+                    retries=3,
+                    backoff=0.1,
+                    mode="a",
                 )
             except Exception:
                 pass
-            self._last_flush = now_sec
+            self._last_flush_ts = now_sec
 
     def flush(self) -> None:
-        """Force flush of accumulated metrics to disk."""
         if not self.enabled:
             return
         try:
-            # Reset flush timestamp so that ``tick`` writes out immediately.
-            self._last_flush = 0.0
+            self._last_flush_ts = 0.0
             self.tick(int(time.time() * 1000))
         except Exception:
             pass
@@ -797,6 +1114,8 @@ __all__ = [
     "record_http_success",
     "record_http_error",
     "record_signals",
+    "set_runtime_aggregator",
+    "clear_runtime_aggregator",
     "alert_zero_signals",
     "report_clock_sync",
     "clock_sync_age_seconds",
