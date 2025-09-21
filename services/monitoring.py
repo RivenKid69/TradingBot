@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, Tuple, Union, Optional, Any, DefaultDict, Iterable
+from typing import Dict, Tuple, Union, Optional, Any, DefaultDict, Iterable, Mapping
 from collections import deque, defaultdict
 
 from enum import Enum
@@ -337,6 +337,15 @@ _feed_lag_max: Dict[str, float] = {}
 _kill_cfg: Optional[KillSwitchConfig] = None
 _kill_triggered: bool = False
 _kill_reason: Dict[str, Any] = {}
+_last_ws_failure_ts_ms: int = 0
+_last_ws_reconnect_ts_ms: int = 0
+_throttle_queue_depth_snapshot: Dict[str, int] = {"size": 0, "max": 0}
+_cooldowns_active_snapshot: Dict[str, Any] = {
+    "count": 0,
+    "global": False,
+    "symbols": [],
+}
+_zero_signal_streaks_snapshot: Dict[str, int] = {}
 
 
 def report_clock_sync(
@@ -577,6 +586,19 @@ class MonitoringAggregator:
         self.daily_pnl: Optional[float] = None
 
         self._bar_interval_ms: Dict[str, int] = {}
+        self.last_ws_reconnect_ms: Optional[int] = None
+        self.last_ws_failure_ms: Optional[int] = None
+        self.throttle_queue_depth: Dict[str, int] = {"size": 0, "max": 0}
+        self.cooldowns_active: Dict[str, Any] = {
+            "count": 0,
+            "global": False,
+            "symbols": [],
+        }
+        self.zero_signal_streaks: Dict[str, int] = {}
+        global _throttle_queue_depth_snapshot, _cooldowns_active_snapshot, _zero_signal_streaks_snapshot
+        _throttle_queue_depth_snapshot = dict(self.throttle_queue_depth)
+        _cooldowns_active_snapshot = dict(self.cooldowns_active)
+        _zero_signal_streaks_snapshot = {}
 
         # ``ServiceSignalRunner`` is responsible for registering the runtime
         # aggregator once the full runtime wiring is complete.  This avoids
@@ -766,6 +788,80 @@ class MonitoringAggregator:
             "worst_rate": worst_rate,
         }
 
+    def update_queue_depth(self, size: int, max_size: int | None = None) -> None:
+        if not self.enabled:
+            return
+        try:
+            queue_size = int(size)
+        except Exception:
+            queue_size = 0
+        if max_size is None:
+            queue_cap = 0
+        else:
+            try:
+                queue_cap = int(max_size)
+            except Exception:
+                queue_cap = 0
+        payload = {"size": max(0, queue_size), "max": max(0, queue_cap)}
+        self.throttle_queue_depth = payload
+        global _throttle_queue_depth_snapshot
+        _throttle_queue_depth_snapshot = dict(payload)
+
+    def update_cooldowns(self, payload: Mapping[str, Any] | None) -> None:
+        if not self.enabled:
+            return
+        global_flag = False
+        symbols: list[str] = []
+        count_val: Optional[int] = None
+        if isinstance(payload, Mapping):
+            global_flag = bool(payload.get("global"))
+            raw_symbols = payload.get("symbols")
+            if isinstance(raw_symbols, Mapping):
+                for sym, active in raw_symbols.items():
+                    if not active:
+                        continue
+                    try:
+                        sym_str = str(sym)
+                    except Exception:
+                        continue
+                    if sym_str:
+                        symbols.append(sym_str)
+            elif isinstance(raw_symbols, (list, tuple, set)):
+                for sym in raw_symbols:
+                    try:
+                        sym_str = str(sym)
+                    except Exception:
+                        continue
+                    if sym_str:
+                        symbols.append(sym_str)
+            try:
+                count_val = int(payload.get("count"))
+            except Exception:
+                count_val = None
+        symbols = sorted({sym for sym in symbols if sym})
+        count = count_val
+        if count is None:
+            count = len(symbols) + (1 if global_flag else 0)
+        self.cooldowns_active = {
+            "count": max(0, int(count)),
+            "global": bool(global_flag),
+            "symbols": symbols,
+        }
+        global _cooldowns_active_snapshot
+        _cooldowns_active_snapshot = dict(self.cooldowns_active)
+
+    def _update_zero_signal_snapshot(self) -> None:
+        if not self.enabled:
+            return
+        active = {
+            sym: int(streak)
+            for sym, streak in self._zero_signal_streaks.items()
+            if int(streak) > 0
+        }
+        self.zero_signal_streaks = active
+        global _zero_signal_streaks_snapshot
+        _zero_signal_streaks_snapshot = dict(active)
+
     def _build_metrics(self, now_ms: int, feed_lags: Dict[str, int], stale: list[str]) -> Dict[str, Any]:
         worst_feed = max(feed_lags.items(), key=lambda item: item[1], default=(None, 0))
         ws_snapshot = {
@@ -774,6 +870,8 @@ class MonitoringAggregator:
             "reconnects_1m": int(self._ws_counts["1m"].get("reconnect", 0)),
             "reconnects_5m": int(self._ws_counts["5m"].get("reconnect", 0)),
             "consecutive_failures": int(self._consecutive_ws_failures),
+            "last_failure_ms": self.last_ws_failure_ms,
+            "last_reconnect_ms": self.last_ws_reconnect_ms,
         }
         http_snapshot = {
             "window_1m": self._http_snapshot("1m"),
@@ -785,6 +883,7 @@ class MonitoringAggregator:
             "zero_signal_symbols": sorted(
                 [sym for sym, streak in self._zero_signal_streaks.items() if streak > 0]
             ),
+            "zero_signal_streaks": dict(self.zero_signal_streaks),
         }
         metrics = {
             "ts_ms": now_ms,
@@ -799,6 +898,8 @@ class MonitoringAggregator:
             "ws": ws_snapshot,
             "http": http_snapshot,
             "signals": signal_snapshot,
+            "throttle_queue": dict(self.throttle_queue_depth),
+            "cooldowns_active": dict(self.cooldowns_active),
         }
         return metrics
 
@@ -864,6 +965,13 @@ class MonitoringAggregator:
             return
         ts_ms = int(time.time() * 1000)
         ev = str(event)
+        global _last_ws_failure_ts_ms, _last_ws_reconnect_ts_ms
+        if ev == "failure":
+            self.last_ws_failure_ms = ts_ms
+            _last_ws_failure_ts_ms = ts_ms
+        elif ev == "reconnect":
+            self.last_ws_reconnect_ms = ts_ms
+            _last_ws_reconnect_ts_ms = ts_ms
         for window in self._window_ms:
             self._ws_events[window].append((ts_ms, ev))
             self._ws_counts[window][ev] += 1
@@ -938,6 +1046,7 @@ class MonitoringAggregator:
             if sym in self._zero_signal_streaks:
                 self._zero_signal_streaks.pop(sym, None)
             self._zero_signal_alerted.discard(sym)
+        self._update_zero_signal_snapshot()
 
     def record_fill(self, requested: Optional[float], filled: Optional[float]) -> None:
         if not self.enabled:
@@ -1096,6 +1205,7 @@ class MonitoringAggregator:
             self._zero_signal_streaks = {
                 sym: streak for sym, streak in self._zero_signal_streaks.items() if streak > 0
             }
+        self._update_zero_signal_snapshot()
 
         now_sec = now_ms / 1000.0
         if now_sec - self._last_flush_ts >= self.flush_interval_sec:
@@ -1158,11 +1268,24 @@ def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[Dict[str, Any], str
     worst_feed = max(feed_lag.items(), key=lambda x: x[1], default=(None, 0.0))
     worst_ws = max(ws_fail.items(), key=lambda x: x[1], default=(None, 0.0))
     worst_err = max(error_rates.items(), key=lambda x: x[1], default=(None, 0.0))
+    zero_streaks = dict(_zero_signal_streaks_snapshot)
+    worst_zero = max(zero_streaks.items(), key=lambda x: x[1], default=(None, 0))
+    queue_depth = dict(_throttle_queue_depth_snapshot)
+    cooldowns = dict(_cooldowns_active_snapshot)
 
     summary = {
         "worst_feed_lag": {"symbol": worst_feed[0], "feed_lag_ms": worst_feed[1]},
         "worst_ws_failures": {"symbol": worst_ws[0], "failures": worst_ws[1]},
         "worst_error_rate": {"symbol": worst_err[0], "error_rate": worst_err[1]},
+        "queue_depth": queue_depth,
+        "cooldowns_active": cooldowns,
+        "last_ws_failure_ms": _last_ws_failure_ts_ms or None,
+        "last_ws_reconnect_ms": _last_ws_reconnect_ts_ms or None,
+        "worst_zero_signal": {
+            "symbol": worst_zero[0],
+            "streak": worst_zero[1],
+        },
+        "zero_signal_streaks": zero_streaks,
     }
 
     json_str = json.dumps(summary, sort_keys=True)
@@ -1170,6 +1293,15 @@ def snapshot_metrics(json_path: str, csv_path: str) -> Tuple[Dict[str, Any], str
     csv_lines.append(f"worst_feed_lag,{worst_feed[0] or ''},{worst_feed[1]}")
     csv_lines.append(f"worst_ws_failures,{worst_ws[0] or ''},{worst_ws[1]}")
     csv_lines.append(f"worst_error_rate,{worst_err[0] or ''},{worst_err[1]}")
+    csv_lines.append(f"worst_zero_signal,{worst_zero[0] or ''},{worst_zero[1]}")
+    csv_lines.append(f"queue_size,,{queue_depth.get('size', 0)}")
+    csv_lines.append(f"queue_max,,{queue_depth.get('max', 0)}")
+    csv_lines.append(f"cooldowns_total,,{cooldowns.get('count', 0)}")
+    csv_lines.append(
+        f"cooldowns_global,,{1 if cooldowns.get('global') else 0}"
+    )
+    csv_lines.append(f"last_ws_failure_ms,,{_last_ws_failure_ts_ms}")
+    csv_lines.append(f"last_ws_reconnect_ms,,{_last_ws_reconnect_ts_ms}")
     csv_str = "\n".join(csv_lines)
 
     try:

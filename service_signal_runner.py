@@ -473,6 +473,7 @@ class _Worker:
         self._state_enabled = bool(state_enabled)
         self._worker_id = worker_id or f"worker-{id(self):x}"
         self._status_callback = status_callback
+        self._last_status_payload: Dict[str, Any] = {"id": self._worker_id}
         self._positions: Dict[str, float] = {}
         self._pending_exposure: Dict[int, Dict[str, Any]] = {}
         self._exposure_state: Dict[str, Any] = {
@@ -546,6 +547,7 @@ class _Worker:
         if self._state_enabled:
             self._seed_last_prices_from_state()
             self._load_exposure_state()
+        self._update_queue_metrics(update_status=False)
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -568,6 +570,7 @@ class _Worker:
                 self._symbol_bucket_factory = None
                 self._symbol_buckets = None
                 self._queue = None
+        self._update_queue_metrics(update_status=False)
 
     def update_throttle_config(self, throttle_cfg: ThrottleConfig | None) -> None:
         self._configure_throttle(throttle_cfg)
@@ -596,6 +599,87 @@ class _Worker:
             maxlen = self._queue.maxlen or 0
             return len(self._queue), int(maxlen)
 
+    def _cooldown_snapshot(self) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {"global": False, "symbols": [], "count": 0}
+        with self._throttle_lock:
+            now = time.monotonic()
+            global_active = False
+            if self._global_bucket is not None:
+                try:
+                    self._global_bucket.consume(0.0, now=now)
+                except Exception:
+                    pass
+                global_active = self._global_bucket.tokens < 1.0
+            symbols_active: list[str] = []
+            if self._symbol_buckets is not None:
+                for sym, bucket in self._symbol_buckets.items():
+                    try:
+                        bucket.consume(0.0, now=now)
+                    except Exception:
+                        continue
+                    if bucket.tokens < 1.0:
+                        try:
+                            sym_key = str(sym)
+                        except Exception:
+                            continue
+                        if sym_key:
+                            symbols_active.append(sym_key)
+        symbols_unique = sorted({sym for sym in symbols_active if sym})
+        snapshot["global"] = bool(global_active)
+        snapshot["symbols"] = symbols_unique
+        snapshot["count"] = int(len(symbols_unique) + (1 if global_active else 0))
+        return snapshot
+
+    def _update_queue_metrics(
+        self,
+        size: int | None = None,
+        max_size: int | None = None,
+        *,
+        payload_override: Dict[str, Any] | None = None,
+        update_status: bool = True,
+    ) -> None:
+        if size is None or max_size is None:
+            queue_size, queue_max = self._queue_snapshot()
+        else:
+            try:
+                queue_size = int(size)
+            except Exception:
+                queue_size = 0
+            try:
+                queue_max = int(max_size)
+            except Exception:
+                queue_max = 0
+        queue_size = max(0, queue_size)
+        queue_max = max(0, queue_max)
+        try:
+            monitoring.queue_len.set(queue_size)
+        except Exception:
+            pass
+        runtime_monitoring = self._monitoring
+        if runtime_monitoring is not None:
+            try:
+                runtime_monitoring.update_queue_depth(queue_size, queue_max)
+            except Exception:
+                pass
+            try:
+                runtime_monitoring.update_cooldowns(self._cooldown_snapshot())
+            except Exception:
+                pass
+        if payload_override is not None:
+            payload = dict(payload_override)
+        elif self._last_status_payload:
+            payload = dict(self._last_status_payload)
+        else:
+            payload = {"id": self._worker_id}
+        payload["queue"] = {"size": queue_size, "max": queue_max}
+        payload["updated_at_ms"] = clock.now_ms()
+        self._last_status_payload = payload
+        if update_status and self._status_callback is not None:
+            try:
+                self._status_callback(self._worker_id, payload)
+            except Exception:
+                pass
+
     def _publish_status(
         self,
         *,
@@ -613,12 +697,16 @@ class _Worker:
             "last_bar_ts": last_bar_ts,
             "emitted": emitted,
             "duplicates": duplicates,
-            "queue": {"size": queue_size, "max": queue_max},
             "safe_mode": bool(self._safe_mode_fn()),
-            "updated_at_ms": clock.now_ms(),
         }
+        self._update_queue_metrics(
+            queue_size,
+            queue_max,
+            payload_override=payload,
+            update_status=False,
+        )
         try:
-            self._status_callback(self._worker_id, payload)
+            self._status_callback(self._worker_id, self._last_status_payload)
         except Exception:
             pass
 
@@ -2286,6 +2374,7 @@ class _Worker:
                 if self._throttle_cfg.mode == "queue" and self._queue is not None:
                     exp = time.monotonic() + self._throttle_cfg.queue.ttl_ms / 1000.0
                     self._queue.append((exp, symbol, bar_close_ms, o))
+                    self._update_queue_metrics()
                     try:
                         monitoring.throttle_enqueued_count.labels(
                             symbol, reason or ""
@@ -2369,6 +2458,7 @@ class _Worker:
             else:
                 emitted.append(order)
                 self._commit_exposure(order)
+        self._update_queue_metrics()
         return emitted
 
     def process(self, bar: Bar):
@@ -2532,11 +2622,7 @@ class _Worker:
                         monitoring.ws_dup_skipped_count.labels(bar.symbol).inc()
                     except Exception:
                         pass
-                    try:
-                        size, _ = self._queue_snapshot()
-                        monitoring.queue_len.set(size)
-                    except Exception:
-                        pass
+                    self._update_queue_metrics()
                     try:
                         pipeline_stage_drop_count.labels(
                             bar.symbol, Stage.DEDUP.name, Reason.OTHER.name
@@ -2577,11 +2663,7 @@ class _Worker:
                 ).inc()
             except Exception:
                 pass
-            try:
-                size, _ = self._queue_snapshot()
-                monitoring.queue_len.set(size)
-            except Exception:
-                pass
+            self._update_queue_metrics()
             return _finalize()
 
         dyn_stage_cfg = self._pipeline_cfg.get("dynamic_guard") if self._pipeline_cfg else None
@@ -2921,11 +3003,7 @@ class _Worker:
                 except Exception:
                     pass
 
-        try:
-            size, _ = self._queue_snapshot()
-            monitoring.queue_len.set(size)
-        except Exception:
-            pass
+        self._update_queue_metrics()
 
         if self._ws_dedup_enabled and close_ms is not None:
             try:
