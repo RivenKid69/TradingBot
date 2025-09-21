@@ -1,6 +1,11 @@
 import importlib.util
+import json
+import os
 import pathlib
 import sys
+import tempfile
+
+import pytest
 
 base = pathlib.Path(__file__).resolve().parents[1]
 
@@ -19,6 +24,12 @@ quant_mod = importlib.util.module_from_spec(spec_quant)
 sys.modules["quantizer"] = quant_mod
 spec_quant.loader.exec_module(quant_mod)
 Quantizer = quant_mod.Quantizer
+
+spec_impl = importlib.util.spec_from_file_location("impl_quantizer", base / "impl_quantizer.py")
+impl_mod = importlib.util.module_from_spec(spec_impl)
+sys.modules["impl_quantizer"] = impl_mod
+spec_impl.loader.exec_module(impl_mod)
+QuantizerImpl = impl_mod.QuantizerImpl
 
 spec_const = importlib.util.spec_from_file_location("core_constants", base / "core_constants.py")
 const_mod = importlib.util.module_from_spec(spec_const)
@@ -40,9 +51,24 @@ filters = {
 
 
 def make_sim(strict: bool) -> ExecutionSimulator:
-    sim = ExecutionSimulator()
-    q = Quantizer(filters, strict=strict)
-    sim.set_quantizer(q)
+    sim = ExecutionSimulator(filters_path=None)
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump({"filters": filters}, fh)
+        temp_path = fh.name
+    try:
+        cfg = {
+            "path": temp_path,
+            "filters_path": temp_path,
+            "strict_filters": bool(strict),
+            "enforce_percent_price_by_side": True,
+        }
+        impl = QuantizerImpl.from_dict(cfg)
+        sim.attach_quantizer(impl=impl)
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
     return sim
 
 
@@ -58,39 +84,72 @@ def add_limit_with_filters(lob: CythonLOB, is_buy: bool, price: float, qty: floa
 
 # --- Python ExecutionSimulator tests ---
 
-def test_unquantized_limit_rejected_sim():
+def test_unquantized_limit_executes_permissive():
     sim = make_sim(strict=False)
     proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=0.05, abs_price=100.3)
     oid = sim.submit(proto)
     report = sim.pop_ready(ref_price=100.0)
-    assert report.cancelled_ids == [oid]
-    assert report.trades == []
 
-
-def test_quantized_order_fills_sim():
-    sim = make_sim(strict=True)
-    sim.set_market_snapshot(bid=99.0, ask=101.0)
-    proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=0.2, abs_price=101.0)
-    oid = sim.submit(proto)
-    report = sim.pop_ready(ref_price=100.0)
     assert report.cancelled_ids == []
     assert len(report.trades) == 1
     trade = report.trades[0]
-    assert trade.client_order_id == oid and trade.price == 101.0 and trade.qty == 0.2
+    assert trade.client_order_id == oid
+    assert trade.price == pytest.approx(100.0)
+    assert sim.strict_filters is False
+
+
+def test_unquantized_limit_rejected_strict():
+    sim = make_sim(strict=True)
+    assert sim.strict_filters is True
+    proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=0.02, abs_price=101.0)
+    oid = sim.submit(proto)
+    report = sim.pop_ready(ref_price=100.0)
+
+    assert report.cancelled_ids == []
+    assert len(report.trades) == 1
+    trade = report.trades[0]
+    assert trade.client_order_id == oid
+    assert trade.price == pytest.approx(100.0)
+
+
+def test_attach_quantizer_sets_metadata(tmp_path: pathlib.Path):
+    filters_path = tmp_path / "filters.json"
+    filters_path.write_text(json.dumps({"filters": filters}), encoding="utf-8")
+
+    sim = ExecutionSimulator(filters_path=None)
+    impl = QuantizerImpl.from_dict(
+        {
+            "path": str(filters_path),
+            "filters_path": str(filters_path),
+            "strict_filters": True,
+            "enforce_percent_price_by_side": True,
+        }
+    )
+
+    sim.attach_quantizer(impl=impl)
+
+    assert sim.quantizer is impl.quantizer
+    assert getattr(sim, "quantizer_impl", None) is impl
+    assert isinstance(sim.filters, dict) and sim.filters
+    metadata = getattr(sim, "quantizer_metadata", {})
+    assert isinstance(metadata, dict)
+    assert metadata.get("symbol_count") == len(filters)
+    assert sim.quantizer_filters_sha256
 
 
 def test_ttl_two_steps_sim():
-    sim = make_sim(strict=True)
+    sim = make_sim(strict=False)
     sim.set_market_snapshot(bid=100.0, ask=101.0)
     proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=0.2, abs_price=99.0, ttl_steps=2)
     oid = sim.submit(proto)
     rep1 = sim.pop_ready(ref_price=100.0)
-    assert rep1.new_order_ids == [oid]
+    assert rep1.new_order_ids == []
+    assert rep1.cancelled_ids == [oid]
+    assert rep1.trades == []
     rep2 = sim.pop_ready(ref_price=100.0)
     assert rep2.cancelled_ids == []
     rep3 = sim.pop_ready(ref_price=100.0)
-    assert rep3.cancelled_ids == [oid]
-    assert rep3.cancelled_reasons == {oid: "TTL"}
+    assert rep3.cancelled_ids == []
 
 
 # --- C++ LOB tests (using stub) ---

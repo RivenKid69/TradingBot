@@ -13,7 +13,7 @@ Mediator — координатор между средой, LOB/симулят�
 """
 
 from dataclasses import dataclass
-from typing import Any, List, Tuple, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Tuple, Optional, TYPE_CHECKING, Mapping
 
 if TYPE_CHECKING:
     from core_models import Order, ExecReport, Position, TradeLogRow
@@ -33,8 +33,14 @@ try:
     from quantizer import Quantizer, load_filters
 except Exception:  # pragma: no cover - soft dependency
     Quantizer = None  # type: ignore
+
     def load_filters(path: str):  # type: ignore
         return {}
+
+try:
+    from impl_quantizer import QuantizerImpl  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    QuantizerImpl = None  # type: ignore
 
 try:
     import event_bus
@@ -194,26 +200,102 @@ class Mediator:
             self._latency_impl = None
 
         # Quantizer (shared with ExecutionSimulator)
+        self.quantizer_impl = None
         self.quantizer = None
         self.enforce_ppbs = True
-        qcfg = getattr(rc, "quantizer", {}) if rc is not None else {}
-        filters_path = str(qcfg.get("filters_path") or qcfg.get("path") or "")
-        strict = bool(qcfg.get("strict", True))
-        self.enforce_ppbs = bool(qcfg.get("enforce_percent_price_by_side", True))
-        if Quantizer is not None and filters_path:
+
+        def _plain_mapping(obj: Any) -> Dict[str, Any]:
+            if isinstance(obj, Mapping):
+                try:
+                    return {str(k): v for k, v in obj.items()}
+                except Exception:
+                    return dict(obj)
+            if hasattr(obj, "dict"):
+                try:
+                    data = obj.dict(exclude_unset=False)  # type: ignore[call-arg]
+                except Exception:
+                    data = {}
+                if isinstance(data, Mapping):
+                    return _plain_mapping(data)
+            if hasattr(obj, "__dict__"):
+                try:
+                    return {
+                        str(k): getattr(obj, k)
+                        for k in vars(obj)
+                        if not str(k).startswith("_")
+                    }
+                except Exception:
+                    return {}
+            return {}
+
+        qcfg_raw = getattr(rc, "quantizer", None) if rc is not None else None
+        qcfg: Dict[str, Any] = _plain_mapping(qcfg_raw) if qcfg_raw is not None else {}
+
+        filters_path = str(
+            qcfg.get("filters_path")
+            or qcfg.get("filtersPath")
+            or qcfg.get("path")
+            or ""
+        ).strip()
+
+        strict_raw = qcfg.get("strict_filters")
+        if strict_raw is None:
+            strict_raw = qcfg.get("strict")
+        strict = bool(strict_raw if strict_raw is not None else True)
+
+        enforce_raw = qcfg.get("enforce_percent_price_by_side")
+        if enforce_raw is None:
+            enforce_raw = qcfg.get("enforcePercentPriceBySide")
+        self.enforce_ppbs = bool(enforce_raw if enforce_raw is not None else True)
+
+        quantizer_impl = None
+        if QuantizerImpl is not None and filters_path:
+            cfg_payload = dict(qcfg)
+            cfg_payload.setdefault("path", filters_path)
+            cfg_payload.setdefault("filters_path", filters_path)
             try:
-                filters, _meta = load_filters(filters_path)
-                if filters:
-                    self.quantizer = Quantizer(filters, strict=strict)
+                quantizer_impl = QuantizerImpl.from_dict(cfg_payload)
             except Exception:
-                self.quantizer = None
-        if self._use_exec and self.exec is not None and self.quantizer is not None:
-            try:
-                self.exec.set_quantizer(self.quantizer)  # type: ignore[attr-defined]
-                setattr(self.exec, "enforce_ppbs", self.enforce_ppbs)
-                setattr(self.exec, "strict_filters", strict)
-            except Exception:
-                pass
+                quantizer_impl = None
+
+        self.quantizer_impl = quantizer_impl
+        if quantizer_impl is not None:
+            self.quantizer = getattr(quantizer_impl, "quantizer", None)
+            cfg_obj = getattr(quantizer_impl, "cfg", None)
+            enforce_attr = getattr(cfg_obj, "enforce_percent_price_by_side", None)
+            if enforce_attr is not None:
+                self.enforce_ppbs = bool(enforce_attr)
+            if self._use_exec and self.exec is not None:
+                attach_api = getattr(self.exec, "attach_quantizer", None)
+                attached = False
+                if callable(attach_api):
+                    try:
+                        attach_api(impl=quantizer_impl)
+                        attached = True
+                    except TypeError:
+                        attach_api = None
+                    except Exception:
+                        attach_api = None
+                if not attached:
+                    try:
+                        quantizer_impl.attach_to(self.exec)
+                    except Exception:
+                        pass
+        else:
+            if filters_path and Quantizer is not None:
+                try:
+                    filters, _meta = load_filters(filters_path)
+                    if filters:
+                        self.quantizer = Quantizer(filters, strict=strict)
+                except Exception:
+                    self.quantizer = None
+            if self._use_exec and self.exec is not None and self.quantizer is not None:
+                try:
+                    self.exec.set_quantizer(self.quantizer)  # type: ignore[attr-defined]
+                    setattr(self.exec, "enforce_ppbs", self.enforce_ppbs)
+                    setattr(self.exec, "strict_filters", strict)
+                except Exception:
+                    pass
 
         # TTL-очередь: [(order_id, expire_ts)]
         self._ttl_queue: List[Tuple[int, int]] = []
