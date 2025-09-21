@@ -370,18 +370,18 @@ class BinancePublicClient:
                 d: Dict[str, Any] = {}
                 for f in filts:
                     ftype = f.get("filterType")
-                    if ftype in {"PRICE_FILTER", "LOT_SIZE", "MIN_NOTIONAL", "PERCENT_PRICE_BY_SIDE", "PERCENT_PRICE"}:
+                    if ftype in {
+                        "PRICE_FILTER",
+                        "LOT_SIZE",
+                        "MIN_NOTIONAL",
+                        "PERCENT_PRICE_BY_SIDE",
+                        "PERCENT_PRICE",
+                        "COMMISSION_STEP",
+                    }:
                         d[ftype] = {k: v for k, v in f.items() if k != "filterType"}
-                precision_keys = (
-                    "baseAssetPrecision",
-                    "quotePrecision",
-                    "quoteAssetPrecision",
-                    "baseCommissionPrecision",
-                    "quoteCommissionPrecision",
-                )
-                for key in precision_keys:
-                    if key in s:
-                        d[key] = s[key]
+                for key, value in s.items():
+                    if isinstance(key, str) and key.lower().endswith("precision"):
+                        d[key] = value
                 if sym and d:
                     out[sym] = d
         return out
