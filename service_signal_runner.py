@@ -2628,10 +2628,8 @@ class ServiceSignalRunner:
 
         if self.monitoring_cfg.enabled:
             alert_cfg = getattr(self.monitoring_cfg, "alerts", None)
-            channel = getattr(alert_cfg, "channel", "noop")
-            cooldown = float(getattr(alert_cfg, "cooldown_sec", 0.0))
             try:
-                self.alerts = AlertManager(channel, cooldown)
+                self.alerts = AlertManager(alert_cfg)
                 self.monitoring_agg = MonitoringAggregator(
                     self.monitoring_cfg, self.alerts
                 )
