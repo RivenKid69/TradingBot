@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, Tuple, Union, Optional, Any, DefaultDict
+from typing import Dict, Tuple, Union, Optional, Any, DefaultDict, Iterable
 from collections import deque, defaultdict
 
 from enum import Enum
@@ -574,6 +574,8 @@ class MonitoringAggregator:
         self.fill_ratio: Optional[float] = None
         self.daily_pnl: Optional[float] = None
 
+        self._bar_interval_ms: Dict[str, int] = {}
+
         # ``ServiceSignalRunner`` is responsible for registering the runtime
         # aggregator once the full runtime wiring is complete.  This avoids
         # transient registration in case initialisation fails midway through
@@ -593,6 +595,42 @@ class MonitoringAggregator:
         if interval <= 0:
             interval = 60
         return interval
+
+    def register_feed_intervals(
+        self, symbols: Iterable[str], interval_ms: int
+    ) -> None:
+        """Register the base bar interval for ``symbols`` in milliseconds."""
+
+        if not self.enabled:
+            return
+        try:
+            interval = int(interval_ms)
+        except Exception:
+            return
+        if interval <= 0:
+            return
+        for sym in symbols:
+            if sym is None:
+                continue
+            try:
+                key = str(sym)
+            except Exception:
+                continue
+            if not key:
+                continue
+            self._bar_interval_ms[key] = interval
+
+    def _stale_threshold_for(self, symbol: str) -> int:
+        """Return stale threshold for ``symbol`` in milliseconds."""
+
+        feed_threshold = float(getattr(self.thresholds, "feed_lag_ms", 0.0) or 0.0)
+        base_threshold = int(feed_threshold) if feed_threshold > 0 else 0
+        base_threshold = max(base_threshold, 120_000)
+        interval = self._bar_interval_ms.get(symbol)
+        if interval is not None and interval > 0:
+            if interval * 2 > base_threshold:
+                base_threshold = interval * 2
+        return base_threshold
 
     def _notify(self, key: str, message: str) -> None:
         if not self.alerts:
@@ -768,17 +806,58 @@ class MonitoringAggregator:
         if not self.enabled:
             return
         try:
+            sym = str(symbol)
+        except Exception:
+            return
+        if not sym:
+            return
+        try:
             close = int(close_ms)
         except Exception:
             return
-        self._last_bar_close_ms[str(symbol)] = close
+        self._last_bar_close_ms[sym] = close
+        self._stale_alerted.discard(sym)
         try:
             now_ms = int(time.time() * 1000)
-            report_feed_lag(str(symbol), max(0, now_ms - close))
+            report_feed_lag(sym, max(0, now_ms - close))
         except Exception:
             pass
 
-    def record_ws(self, event: str) -> None:
+    def record_stale(self, symbol: str, lag_ms: Optional[int] = None) -> None:
+        """Record that ``symbol`` feed is stale for ``lag_ms`` milliseconds."""
+
+        if not self.enabled:
+            return
+        try:
+            sym = str(symbol)
+        except Exception:
+            return
+        if not sym:
+            return
+        if lag_ms is None:
+            close = self._last_bar_close_ms.get(sym)
+            if close:
+                lag = max(0, int(time.time() * 1000) - close)
+            else:
+                lag = 0
+        else:
+            try:
+                lag = int(lag_ms)
+            except Exception:
+                lag = 0
+        if lag <= 0:
+            return
+        threshold = self._stale_threshold_for(sym)
+        if lag < threshold:
+            return
+        if sym not in self._stale_alerted:
+            self._notify(
+                f"feed_stale_{sym}",
+                f"{sym} stale for {lag}ms exceeds {threshold}",
+            )
+        self._stale_alerted.add(sym)
+
+    def record_ws(self, event: str, consecutive: Optional[int] = None) -> None:
         if not self.enabled:
             return
         ts_ms = int(time.time() * 1000)
@@ -787,7 +866,18 @@ class MonitoringAggregator:
             self._ws_events[window].append((ts_ms, ev))
             self._ws_counts[window][ev] += 1
             self._prune_ws_window(window, ts_ms)
-        if ev == "failure":
+        override: Optional[int] = None
+        if consecutive is not None:
+            try:
+                override = int(consecutive)
+            except Exception:
+                override = None
+            else:
+                if override < 0:
+                    override = 0
+        if override is not None:
+            self._consecutive_ws_failures = override
+        elif ev == "failure":
             self._consecutive_ws_failures += 1
         elif ev == "reconnect":
             self._consecutive_ws_failures = 0
@@ -896,8 +986,9 @@ class MonitoringAggregator:
             for sym, close in self._last_bar_close_ms.items()
         }
         feed_threshold = float(getattr(th, "feed_lag_ms", 0.0) or 0.0)
-        stale_threshold = max(int(feed_threshold) if feed_threshold > 0 else 0, 120_000)
-        stale_symbols = sorted([sym for sym, lag in feed_lags.items() if lag > stale_threshold])
+        stale_symbols = sorted(
+            [sym for sym, lag in feed_lags.items() if lag > self._stale_threshold_for(sym)]
+        )
 
         if feed_threshold > 0:
             current_alerts: set[str] = set()
@@ -920,9 +1011,10 @@ class MonitoringAggregator:
 
         for sym in stale_symbols:
             if sym not in self._stale_alerted:
+                threshold = self._stale_threshold_for(sym)
                 self._notify(
                     f"feed_stale_{sym}",
-                    f"{sym} stale for {feed_lags.get(sym, 0)}ms exceeds {stale_threshold}",
+                    f"{sym} stale for {feed_lags.get(sym, 0)}ms exceeds {threshold}",
                 )
                 self._stale_alerted.add(sym)
         for sym in list(self._stale_alerted):

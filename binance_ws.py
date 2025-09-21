@@ -152,6 +152,12 @@ class BinanceWS:
         self._interval_ms = _interval_to_ms(self.interval)
         self._last_open_ts: Dict[str, int] = {}
 
+        if self._monitoring is not None:
+            try:
+                self._monitoring.register_feed_intervals(self.symbols, self._interval_ms)
+            except Exception:
+                pass
+
     async def _check_rate_limit(self) -> bool:
         if self._rate_limiter is None:
             self._rl_total += 1
@@ -211,6 +217,12 @@ class BinanceWS:
         except Exception:
             pass
 
+        if self._monitoring is not None:
+            try:
+                self._monitoring.record_feed(bar.symbol, close_ms)
+            except Exception:
+                pass
+
     async def _emit_tick(self, tick: Tick) -> None:
         """Send book ticker event to the bus."""
 
@@ -267,7 +279,10 @@ class BinanceWS:
         self._dd_total = self._dd_drop = self._dd_stale = self._dd_delay = 0
         self._rl_total = self._rl_delayed = self._rl_dropped = 0
         if self._monitoring is not None:
-            self._monitoring.record_ws("reconnect")
+            try:
+                self._monitoring.record_ws("reconnect", 0)
+            except Exception:
+                pass
         self.consecutive_ws_failures = 0
         return ws
 
@@ -281,11 +296,20 @@ class BinanceWS:
             while not self._stop and not ops_kill_switch.tripped():
                 await asyncio.sleep(self._interval_ms / 1000.0)
                 last = self._last_close_ms
-                if last and now_ms() - last > self._interval_ms * 2:
-                    try:
-                        ops_kill_switch.record_stale()
-                    except Exception:
-                        pass
+                if last:
+                    current = now_ms()
+                    if current - last > self._interval_ms * 2:
+                        try:
+                            ops_kill_switch.record_stale()
+                        except Exception:
+                            pass
+                        if self._monitoring is not None:
+                            try:
+                                lag = max(0, current - last)
+                                for sym in self.symbols:
+                                    self._monitoring.record_stale(sym, lag)
+                            except Exception:
+                                pass
 
         stale_task = asyncio.create_task(_stale_monitor())
         connect = retry_async(self._retry_cfg, lambda e: "ws")(self._connect_once)
@@ -479,7 +503,12 @@ class BinanceWS:
                     had_ws_error = True
                     self.consecutive_ws_failures += 1
                     if self._monitoring is not None:
-                        self._monitoring.record_ws("failure")
+                        try:
+                            self._monitoring.record_ws(
+                                "failure", self.consecutive_ws_failures
+                            )
+                        except Exception:
+                            pass
                     continue
         finally:
             self._ws = None
