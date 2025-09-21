@@ -64,6 +64,7 @@ model:
 quantizer:
   filters_path: "data/binance_filters.json"
   # strict_filters=true → строго придерживаться актуальных фильтров; false включает мягкий фолбек к кешу/легаси-логике.
+  # Поле strict остаётся легаси-алиасом для strict_filters и может опускаться в новых конфигурациях.
   strict_filters: true
   # quantize_mode управляет округлением; "inward" (дефолт) поджимает цену/объём внутрь биржевых ограничений.
   quantize_mode: "inward"
