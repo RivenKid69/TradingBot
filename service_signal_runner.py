@@ -3109,6 +3109,7 @@ class ServiceSignalRunner:
         ws_dedup_enabled: bool = False,
         ws_dedup_log_skips: bool = False,
         ws_dedup_timeframe_ms: int = 0,
+        signal_writer_options: Mapping[str, Any] | None = None,
     ) -> None:
         self.adapter = adapter
         self.feature_pipe = feature_pipe
@@ -3146,6 +3147,10 @@ class ServiceSignalRunner:
         self._runner_status_workers: Dict[str, Dict[str, Any]] = {}
         self._worker_ref: _Worker | None = None
         self._last_safe_mode_state: Dict[str, bool] = {}
+        self._signal_writer_options = dict(signal_writer_options or {})
+        self._signal_writer_stats: Dict[str, Any] = {}
+        self._signal_writer_ref: SignalCSVWriter | None = None
+        self._signal_writer_reopen_flag_path = logs_dir / "signal_writer_reopen.flag"
 
         monitoring.clear_runtime_aggregator()
         if self.monitoring_cfg.enabled:
@@ -3338,6 +3343,8 @@ class ServiceSignalRunner:
             "queue": {"size": queue_size, "max": queue_max},
             "workers": workers,
         }
+        if self._signal_writer_stats:
+            status["signal_writer"] = dict(self._signal_writer_stats)
         return status
 
     def _write_runner_status_unlocked(self) -> None:
@@ -3365,6 +3372,44 @@ class ServiceSignalRunner:
         with self._runner_status_lock:
             self._runner_status_workers[worker_id] = payload
             self._write_runner_status_unlocked()
+
+    def _refresh_signal_writer_stats(self) -> bool:
+        writer = getattr(signal_bus, "OUT_WRITER", None)
+        if writer is None:
+            if self._signal_writer_stats:
+                self._signal_writer_stats = {}
+                return True
+            return False
+        try:
+            stats = writer.stats()
+        except Exception:
+            return False
+        if stats != self._signal_writer_stats:
+            self._signal_writer_stats = stats
+            return True
+        return False
+
+    def _handle_signal_writer_reopen_flag(self) -> bool:
+        flag_path = self._signal_writer_reopen_flag_path
+        if not flag_path.exists():
+            return False
+        try:
+            flag_path.unlink()
+        except Exception:
+            pass
+        writer = getattr(signal_bus, "OUT_WRITER", None)
+        if writer is None:
+            return False
+        try:
+            writer.reopen()
+        except Exception:
+            self.logger.exception("failed to reopen signal writer")
+            return False
+        try:
+            self._signal_writer_stats = writer.stats()
+        except Exception:
+            self._signal_writer_stats = {}
+        return True
 
     def _reload_runtime_config(self, path: Path) -> None:
         try:
@@ -3478,10 +3523,17 @@ class ServiceSignalRunner:
     def _process_control_flags(
         self, shutdown: ShutdownManager, stop_event: threading.Event
     ) -> None:
+        changed = False
+        if self._handle_signal_writer_reopen_flag():
+            changed = True
+        if self._refresh_signal_writer_stats():
+            changed = True
         self._handle_reload_request()
         self._handle_safe_stop_flag(shutdown, stop_event)
         current_state = self._current_safe_mode_state()
         if current_state != self._last_safe_mode_state:
+            changed = True
+        if changed:
             self._write_runner_status()
 
     def run(self) -> Iterator[Dict[str, Any]]:
@@ -4015,11 +4067,30 @@ class ServiceSignalRunner:
         out_csv = getattr(signal_bus, "OUT_CSV", None)
         if out_csv:
             try:
-                signal_bus.OUT_WRITER = SignalCSVWriter(out_csv)
-                shutdown.on_flush(signal_bus.OUT_WRITER.flush_fsync)
-                shutdown.on_finalize(signal_bus.OUT_WRITER.close)
+                opts = self._signal_writer_options
+                signal_bus.OUT_WRITER = SignalCSVWriter(
+                    out_csv,
+                    fsync_mode=str(opts.get("fsync_mode", "batch")),
+                    rotate_daily=bool(opts.get("rotate_daily", True)),
+                    flush_interval_s=opts.get("flush_interval_s"),
+                )
+                self._signal_writer_ref = signal_bus.OUT_WRITER
+                try:
+                    self._signal_writer_stats = self._signal_writer_ref.stats()
+                except Exception:
+                    self._signal_writer_stats = {}
+                writer = self._signal_writer_ref
+                shutdown.on_flush(lambda w=writer: w.flush_fsync(force=True))
+                shutdown.on_finalize(writer.close)
             except Exception:
                 signal_bus.OUT_WRITER = None
+                self._signal_writer_ref = None
+                self._signal_writer_stats = {}
+        else:
+            self._signal_writer_ref = None
+            self._signal_writer_stats = {}
+
+        self._write_runner_status()
 
         json_path = self.cfg.snapshot_metrics_json or os.path.join(
             logs_dir, "snapshot_metrics.json"
@@ -4716,12 +4787,25 @@ def from_config(
     ttl = int(signals_cfg.get("ttl_seconds", 0))
     out_csv = signals_cfg.get("out_csv")
     dedup_persist = signals_cfg.get("dedup_persist") or cfg.ws_dedup.persist_path
+    fsync_mode = str(signals_cfg.get("fsync_mode", "batch") or "batch")
+    rotate_daily = bool(signals_cfg.get("rotate_daily", True))
+    flush_interval_raw = signals_cfg.get("flush_interval_s", 5.0)
+    try:
+        flush_interval_s = float(flush_interval_raw)
+    except (TypeError, ValueError):
+        flush_interval_s = 5.0
+    signal_writer_options = {
+        "fsync_mode": fsync_mode,
+        "rotate_daily": rotate_daily,
+        "flush_interval_s": flush_interval_s,
+    }
 
     signal_bus.init(
         enabled=bus_enabled,
         ttl_seconds=ttl,
         persist_path=dedup_persist,
         out_csv=out_csv,
+        flush_interval_s=flush_interval_s,
     )
 
     cfg.ws_dedup.enabled = bus_enabled
@@ -5052,6 +5136,7 @@ def from_config(
         ws_dedup_enabled=cfg.ws_dedup.enabled,
         ws_dedup_log_skips=cfg.ws_dedup.log_skips,
         ws_dedup_timeframe_ms=cfg.timing.timeframe_ms,
+        signal_writer_options=signal_writer_options,
     )
     return service.run()
 

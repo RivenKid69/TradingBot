@@ -56,3 +56,70 @@ def test_rotation_on_write(tmp_path):
     assert path.exists()
     assert len(rotated.read_text().strip().splitlines()) == 2
     assert len(path.read_text().strip().splitlines()) == 2
+
+
+def test_stats_and_reopen(tmp_path):
+    path = tmp_path / "signals.csv"
+    w = SignalCSVWriter(str(path), fsync_mode="off")
+    now = datetime.utcnow()
+    w.write(
+        {
+            "ts_ms": _ts_ms(now),
+            "symbol": "BTC",
+            "side": "BUY",
+            "volume_frac": 1,
+            "score": 0.1,
+            "features_hash": "x",
+        }
+    )
+    stats = w.stats()
+    assert stats["written"] == 1
+    assert stats["errors"] == 0
+    w.reopen()
+    w.write(
+        {
+            "ts_ms": _ts_ms(now),
+            "symbol": "ETH",
+            "side": "SELL",
+            "volume_frac": 2,
+            "score": 0.2,
+            "features_hash": "y",
+        }
+    )
+    stats = w.stats()
+    assert stats["written"] == 2
+    assert stats["retries"] >= 0
+    w.close()
+    lines = path.read_text().strip().splitlines()
+    assert len(lines) == 3
+
+
+def test_rotate_disabled(tmp_path):
+    path = tmp_path / "signals.csv"
+    w = SignalCSVWriter(str(path), rotate_daily=False)
+    day1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    day2 = day1 + timedelta(days=1)
+    w.write(
+        {
+            "ts_ms": _ts_ms(day1),
+            "symbol": "BTC",
+            "side": "BUY",
+            "volume_frac": 1,
+            "score": 0.1,
+            "features_hash": "x",
+        }
+    )
+    w.write(
+        {
+            "ts_ms": _ts_ms(day2),
+            "symbol": "BTC",
+            "side": "SELL",
+            "volume_frac": 2,
+            "score": 0.2,
+            "features_hash": "y",
+        }
+    )
+    w.close()
+    assert not (tmp_path / "signals-2024-01-01.csv").exists()
+    assert path.exists()
+    assert len(path.read_text().strip().splitlines()) == 3

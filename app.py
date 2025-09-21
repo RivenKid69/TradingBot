@@ -1,6 +1,7 @@
 # app.py
 from __future__ import annotations
 
+import io
 import os
 import sys
 import json
@@ -992,6 +993,133 @@ with tabs[6]:
                     st.code(f.read(), language="yaml")
             except Exception as e:
                 st.error(str(e))
+
+    st.divider()
+    st.markdown("#### Signal CSV Writer")
+    signals_yaml_path = st.text_input("Signals YAML", value="configs/signals.yaml")
+    signals_cfg, _signals_text = _load_yaml_file(signals_yaml_path)
+    default_enabled = bool(signals_cfg.get("enabled", False))
+    default_out_csv = str(signals_cfg.get("out_csv", "") or "")
+    default_dedup = str(signals_cfg.get("dedup_persist", "") or "")
+    try:
+        default_ttl = int(signals_cfg.get("ttl_seconds", 0) or 0)
+    except Exception:
+        default_ttl = 0
+    default_mode = str(signals_cfg.get("fsync_mode", "batch") or "batch").lower()
+    if default_mode not in {"always", "batch", "off"}:
+        default_mode = "batch"
+    try:
+        default_flush = float(signals_cfg.get("flush_interval_s", 5.0) or 0.0)
+    except Exception:
+        default_flush = 0.0
+    default_rotate = bool(signals_cfg.get("rotate_daily", True))
+
+    fsync_options = ["always", "batch", "off"]
+    default_index = fsync_options.index(default_mode) if default_mode in fsync_options else 1
+
+    with st.form("signals_writer_form"):
+        enabled_input = st.checkbox("Включить сигнал-бас", value=default_enabled)
+        out_csv_input = st.text_input("Файл сигналов CSV", value=default_out_csv)
+        dedup_input = st.text_input(
+            "Файл дедупликации", value=default_dedup, help="Путь к persist-файлу WS dedup"
+        )
+        ttl_input = st.number_input("TTL секунд", min_value=0, value=default_ttl, step=1)
+        fsync_mode_input = st.selectbox(
+            "fsync_mode",
+            fsync_options,
+            index=default_index,
+            help="Режим fsync: always — каждый write, batch — по таймеру, off — только flush",
+        )
+        rotate_input = st.checkbox("rotate_daily", value=default_rotate)
+        flush_interval_input = st.number_input(
+            "flush_interval_s",
+            min_value=0.0,
+            value=float(default_flush),
+            step=1.0,
+        )
+        submit_signals = st.form_submit_button("Сохранить signals.yaml")
+
+    if submit_signals:
+        new_cfg = dict(signals_cfg)
+        new_cfg["enabled"] = bool(enabled_input)
+        new_cfg["out_csv"] = out_csv_input or None
+        new_cfg["dedup_persist"] = dedup_input or None
+        new_cfg["ttl_seconds"] = int(ttl_input)
+        new_cfg["fsync_mode"] = str(fsync_mode_input)
+        new_cfg["rotate_daily"] = bool(rotate_input)
+        new_cfg["flush_interval_s"] = float(flush_interval_input)
+        try:
+            _ensure_dir(signals_yaml_path)
+            with open(signals_yaml_path, "w", encoding="utf-8") as wf:
+                yaml.safe_dump(new_cfg, wf, sort_keys=False, allow_unicode=True)
+        except Exception as exc:
+            st.error(f"Не удалось сохранить {signals_yaml_path}: {exc}")
+        else:
+            st.success(f"Обновлено {signals_yaml_path}")
+            signals_cfg = new_cfg
+            default_out_csv = str(new_cfg.get("out_csv", "") or "")
+
+    flag_path = os.path.join(logs_dir, "signal_writer_reopen.flag")
+    reopen_cols = st.columns(3)
+    with reopen_cols[0]:
+        if st.button("Reopen", type="secondary"):
+            try:
+                _ensure_dir(flag_path)
+                with open(flag_path, "w", encoding="utf-8") as fh:
+                    fh.write(str(time.time()))
+            except Exception as exc:
+                st.error(f"Не удалось создать флаг reopen: {exc}")
+            else:
+                st.success(f"Флаг создан: {flag_path}")
+    with reopen_cols[1]:
+        st.write(" ")
+    with reopen_cols[2]:
+        st.caption("Создание файла signal_writer_reopen.flag перезапустит writer")
+
+    writer_stats = runner_status.get("signal_writer") or {}
+    if writer_stats:
+        metrics_cols = st.columns(4)
+        metrics_cols[0].metric("Written", int(writer_stats.get("written", 0)))
+        metrics_cols[1].metric("Retries", int(writer_stats.get("retries", 0)))
+        metrics_cols[2].metric("Errors", int(writer_stats.get("errors", 0)))
+        metrics_cols[3].metric("Dropped", int(writer_stats.get("dropped", 0)))
+        st.caption(
+            f"Файл: {writer_stats.get('path', default_out_csv) or default_out_csv} | "
+            f"fsync_mode={writer_stats.get('fsync_mode', '')}"
+        )
+        with st.expander("Полная статистика writer'а", expanded=False):
+            st.json(writer_stats)
+    else:
+        st.info("Статистика writer'а пока не доступна.")
+
+    preview_path = str(writer_stats.get("path") or default_out_csv or "").strip()
+    if preview_path:
+        preview_path = os.path.expanduser(preview_path)
+        st.markdown(f"**Последние 100 строк CSV** `{preview_path}`")
+        if os.path.exists(preview_path):
+            tail_text = tail_file(preview_path, n=100)
+            if tail_text:
+                try:
+                    with open(preview_path, "r", encoding="utf-8") as fh:
+                        header_line = fh.readline().strip()
+                except Exception:
+                    header_line = ""
+                lines = tail_text.splitlines()
+                preview_text = tail_text
+                if header_line and (not lines or lines[0] != header_line):
+                    preview_text = "\n".join([header_line, *lines])
+                try:
+                    df_tail = pd.read_csv(io.StringIO(preview_text))
+                except Exception:
+                    st.text_area("Фрагмент CSV", preview_text, height=240)
+                else:
+                    st.dataframe(df_tail, use_container_width=True)
+            else:
+                st.info("Файл сигналов пока пуст.")
+        else:
+            st.info("Файл сигналов не найден.")
+    else:
+        st.info("Укажите путь к CSV в configs/signals.yaml для предпросмотра.")
 
     with st.expander(
         "Параметры стратегии (сохранить в configs/realtime.yaml)", expanded=False
