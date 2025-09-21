@@ -255,11 +255,33 @@ def reconcile_state(local_state, client) -> Dict[str, Any]:
     remote_order_ids = {
         str(o.get("orderId") or o.get("clientOrderId")) for o in remote_orders
     }
-    local_orders = {
-        str(oid): data for oid, data in getattr(local_state, "open_orders", {}).items()
-    }
-    missing_open = sorted(remote_order_ids - local_orders.keys())
-    extra_open = sorted(local_orders.keys() - remote_order_ids)
+    local_orders_map: Dict[str, Dict[str, Any]] = {}
+    local_open_orders = getattr(local_state, "open_orders", []) or []
+    if isinstance(local_open_orders, Mapping):
+        iterable_orders = local_open_orders.values()
+    else:
+        iterable_orders = local_open_orders
+    for idx, payload in enumerate(iterable_orders):
+        order_data: Dict[str, Any] = {}
+        if hasattr(payload, "to_dict"):
+            try:
+                order_data = dict(payload.to_dict())  # type: ignore[misc]
+            except Exception:
+                order_data = {}
+        elif isinstance(payload, Mapping):
+            order_data = dict(payload)
+        else:
+            continue
+        key = (
+            order_data.get("orderId")
+            or order_data.get("clientOrderId")
+            or order_data.get("order_id")
+            or order_data.get("client_order_id")
+            or str(idx)
+        )
+        local_orders_map[str(key)] = order_data
+    missing_open = sorted(remote_order_ids - local_orders_map.keys())
+    extra_open = sorted(local_orders_map.keys() - remote_order_ids)
 
     remote_positions = {
         str(b.get("asset")):
@@ -326,11 +348,33 @@ def reconcile_state(local_state, client) -> Dict[str, Any]:
     remote_order_ids = {
         str(o.get("orderId") or o.get("clientOrderId")) for o in remote_orders
     }
-    local_orders = {
-        str(oid): data for oid, data in getattr(local_state, "open_orders", {}).items()
-    }
-    missing_open = sorted(remote_order_ids - local_orders.keys())
-    extra_open = sorted(local_orders.keys() - remote_order_ids)
+    local_orders_map: Dict[str, Dict[str, Any]] = {}
+    local_open_orders = getattr(local_state, "open_orders", []) or []
+    if isinstance(local_open_orders, Mapping):
+        iterable_orders = local_open_orders.values()
+    else:
+        iterable_orders = local_open_orders
+    for idx, payload in enumerate(iterable_orders):
+        order_data: Dict[str, Any] = {}
+        if hasattr(payload, "to_dict"):
+            try:
+                order_data = dict(payload.to_dict())  # type: ignore[misc]
+            except Exception:
+                order_data = {}
+        elif isinstance(payload, Mapping):
+            order_data = dict(payload)
+        else:
+            continue
+        key = (
+            order_data.get("orderId")
+            or order_data.get("clientOrderId")
+            or order_data.get("order_id")
+            or order_data.get("client_order_id")
+            or str(idx)
+        )
+        local_orders_map[str(key)] = order_data
+    missing_open = sorted(remote_order_ids - local_orders_map.keys())
+    extra_open = sorted(local_orders_map.keys() - remote_order_ids)
 
     remote_positions = {
         str(b.get("asset")):

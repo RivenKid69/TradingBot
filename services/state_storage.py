@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 CURRENT_STATE_VERSION = 2
+LAST_PROCESSED_GLOBAL_KEY = "__all__"
 
 
 def _coerce_float(value: Any) -> float:
@@ -193,10 +194,10 @@ class TradingState:
     """In-memory representation of runner state."""
 
     positions: Dict[str, PositionState] = field(default_factory=dict)
-    open_orders: Dict[str, OrderState] = field(default_factory=dict)
+    open_orders: list[OrderState] = field(default_factory=list)
     cash: float = 0.0
     equity: float | None = None
-    last_processed_bar_ms: int | None = None
+    last_processed_bar_ms: Dict[str, int] = field(default_factory=dict)
     seen_signals: Iterable[Any] = field(default_factory=list)
     config_snapshot: Dict[str, Any] = field(default_factory=dict)
     signal_states: Dict[str, Any] = field(default_factory=dict)
@@ -248,19 +249,19 @@ class TradingState:
                         continue
                     positions[symbol] = PositionState.from_any(item)
 
-        orders: Dict[str, OrderState] = {}
-        raw_orders = data.get("open_orders") or {}
+        orders: list[OrderState] = []
+        raw_orders = data.get("open_orders") or []
         if isinstance(raw_orders, Mapping):
-            for key, value in raw_orders.items():
-                order = OrderState.from_any(value)
-                if not order.order_id:
-                    order.order_id = str(key)
-                orders[str(key)] = order
-        elif isinstance(raw_orders, Iterable):
-            for idx, value in enumerate(raw_orders):
-                order = OrderState.from_any(value)
-                key = order.order_id or order.client_order_id or str(idx)
-                orders[str(key)] = order
+            values = list(raw_orders.values())
+        elif isinstance(raw_orders, Iterable) and not isinstance(raw_orders, (str, bytes)):
+            values = list(raw_orders)
+        else:
+            values = []
+        for idx, value in enumerate(values):
+            order = OrderState.from_any(value)
+            if not order.order_id and not order.client_order_id:
+                order.order_id = str(idx)
+            orders.append(order)
 
         def _ensure_dict(value: Any) -> Dict[str, Any]:
             if isinstance(value, Mapping):
@@ -283,6 +284,19 @@ class TradingState:
                 except (TypeError, ValueError):
                     continue
 
+        last_processed_raw = data.get("last_processed_bar_ms")
+        last_processed: Dict[str, int] = {}
+        if isinstance(last_processed_raw, Mapping):
+            for key, value in last_processed_raw.items():
+                ts = _coerce_int(value)
+                if ts is None:
+                    continue
+                last_processed[str(key)] = ts
+        else:
+            ts = _coerce_int(last_processed_raw)
+            if ts is not None:
+                last_processed[LAST_PROCESSED_GLOBAL_KEY] = ts
+
         state = cls(
             positions=positions,
             open_orders=orders,
@@ -292,7 +306,7 @@ class TradingState:
                 if isinstance(data.get("equity"), (int, float))
                 else None
             ),
-            last_processed_bar_ms=_coerce_int(data.get("last_processed_bar_ms")),
+            last_processed_bar_ms=last_processed,
             seen_signals=_ensure_list(data.get("seen_signals")),
             config_snapshot=_ensure_dict(data.get("config_snapshot")),
             signal_states=_ensure_dict(data.get("signal_states")),
@@ -319,10 +333,14 @@ class TradingState:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "positions": {k: v.to_dict() for k, v in self.positions.items()},
-            "open_orders": {k: v.to_dict() for k, v in self.open_orders.items()},
+            "open_orders": [order.to_dict() for order in self.open_orders],
             "cash": float(self.cash),
             "equity": float(self.equity) if self.equity is not None else None,
-            "last_processed_bar_ms": self.last_processed_bar_ms,
+            "last_processed_bar_ms": {
+                str(sym): int(ts)
+                for sym, ts in self.last_processed_bar_ms.items()
+                if ts is not None
+            },
             "seen_signals": list(self.seen_signals),
             "config_snapshot": copy.deepcopy(self.config_snapshot),
             "signal_states": copy.deepcopy(self.signal_states),
@@ -369,8 +387,21 @@ class TradingState:
                 setattr(self, key, copy.deepcopy(value) if isinstance(value, Mapping) else {})
             elif key in {"cash", "total_notional", "equity"}:
                 setattr(self, key, _coerce_float(value))
-            elif key in {"last_processed_bar_ms", "last_update_ms"}:
-                setattr(self, key, _coerce_int(value))
+            elif key == "last_processed_bar_ms":
+                mapping: Dict[str, int] = {}
+                if isinstance(value, Mapping):
+                    for sym, ts in value.items():
+                        ts_val = _coerce_int(ts)
+                        if ts_val is None:
+                            continue
+                        mapping[str(sym)] = ts_val
+                else:
+                    ts_val = _coerce_int(value)
+                    if ts_val is not None:
+                        mapping[LAST_PROCESSED_GLOBAL_KEY] = ts_val
+                self.last_processed_bar_ms = mapping
+            elif key == "last_update_ms":
+                self.last_update_ms = _coerce_int(value)
             elif hasattr(self, key):
                 setattr(self, key, copy.deepcopy(value))
             else:
@@ -442,7 +473,7 @@ class SQLiteBackend:
         "open_orders": "TEXT",
         "cash": "REAL",
         "equity": "REAL",
-        "last_processed_bar_ms": "INTEGER",
+        "last_processed_bar_ms": "TEXT",
         "seen_signals": "TEXT",
         "config_snapshot": "TEXT",
         "signal_states": "TEXT",
@@ -484,12 +515,51 @@ class SQLiteBackend:
         if not row:
             return TradingState()
         keys = set(row.keys())
+        def _load_json(value: Any, default: Any) -> Any:
+            if value is None:
+                return default
+            if isinstance(value, (bytes, bytearray)):
+                try:
+                    value = value.decode()
+                except Exception:
+                    return default
+            text = str(value)
+            if not text:
+                return default
+            try:
+                return json.loads(text)
+            except Exception:
+                return default
+
+        raw_last_processed = (
+            row["last_processed_bar_ms"]
+            if "last_processed_bar_ms" in keys
+            else None
+        )
+        if isinstance(raw_last_processed, (bytes, bytearray)):
+            try:
+                raw_last_processed = raw_last_processed.decode()
+            except Exception:
+                raw_last_processed = None
+        if isinstance(raw_last_processed, str):
+            raw_last_processed = raw_last_processed.strip()
+        if isinstance(raw_last_processed, str) and raw_last_processed:
+            try:
+                last_processed_payload: Any = json.loads(raw_last_processed)
+            except Exception:
+                try:
+                    last_processed_payload = int(raw_last_processed)
+                except Exception:
+                    last_processed_payload = None
+        else:
+            last_processed_payload = raw_last_processed
+
         data: Dict[str, Any] = {
-            "positions": json.loads(row["positions"] or "{}"),
-            "open_orders": json.loads(row["open_orders"] or "{}"),
+            "positions": _load_json(row["positions"], {}),
+            "open_orders": _load_json(row["open_orders"], []),
             "cash": row["cash"] if "cash" in keys else 0.0,
             "equity": row["equity"] if "equity" in keys else None,
-            "last_processed_bar_ms": row["last_processed_bar_ms"] if "last_processed_bar_ms" in keys else None,
+            "last_processed_bar_ms": last_processed_payload,
             "seen_signals": json.loads(row["seen_signals"] or "[]"),
             "config_snapshot": json.loads(row["config_snapshot"] or "{}"),
             "signal_states": json.loads(row["signal_states"] or "{}"),
@@ -525,7 +595,10 @@ class SQLiteBackend:
                     json.dumps(payload["open_orders"], separators=(",", ":")),
                     payload.get("cash", 0.0),
                     payload.get("equity"),
-                    payload.get("last_processed_bar_ms"),
+                    json.dumps(
+                        payload.get("last_processed_bar_ms", {}),
+                        separators=(",", ":"),
+                    ),
                     json.dumps(payload.get("seen_signals", []), separators=(",", ":")),
                     json.dumps(payload.get("config_snapshot", {}), separators=(",", ":")),
                     json.dumps(payload.get("signal_states", {}), separators=(",", ":")),
@@ -592,6 +665,14 @@ def update_open_order(
     if not key:
         raise ValueError("order_key must be non-empty")
     with _state_lock:
+        def _matches(order: OrderState, needle: str) -> bool:
+            if not needle:
+                return False
+            return needle in {
+                str(order.order_id or ""),
+                str(order.client_order_id or ""),
+            }
+
         if isinstance(data, OrderState):
             order = data.copy()
             if kwargs:
@@ -602,14 +683,30 @@ def update_open_order(
                 payload.update(dict(data))
             payload.update(kwargs)
             if not payload:
-                _state.open_orders.pop(key, None)
+                _state.open_orders = [
+                    existing
+                    for existing in _state.open_orders
+                    if not _matches(existing, key)
+                ]
                 _state.version = CURRENT_STATE_VERSION
                 return
-            order = _state.open_orders.get(key, OrderState()).copy()
+            order = OrderState()
             order.update(payload)
-        if not order.order_id:
+        if not order.order_id and key:
             order.order_id = key
-        _state.open_orders[key] = order
+        identifiers = {
+            str(order.order_id or ""),
+            str(order.client_order_id or ""),
+            key,
+        }
+        _state.open_orders = [
+            existing
+            for existing in _state.open_orders
+            if not any(
+                _matches(existing, ident) for ident in identifiers if ident
+            )
+        ]
+        _state.open_orders.append(order)
         _state.version = CURRENT_STATE_VERSION
 
 

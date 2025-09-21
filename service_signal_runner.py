@@ -18,7 +18,7 @@ for report in from_config(cfg):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict, is_dataclass
 from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable, Mapping, Tuple
 from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
 import os
@@ -31,6 +31,7 @@ from collections import deque, defaultdict
 import time
 from datetime import datetime, timezone
 import shlex
+import subprocess
 
 import json
 import yaml
@@ -694,6 +695,68 @@ class _Worker:
         if not math.isfinite(price) or price <= 0.0:
             return None
         return price
+
+    def _sanitize_snapshot_value(self, value: Any) -> Any:
+        if is_dataclass(value):
+            return self._sanitize_snapshot_value(asdict(value))
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, MappingABC):
+            sanitized: Dict[str, Any] = {}
+            for key, val in value.items():
+                if callable(val):
+                    continue
+                sanitized[str(key)] = self._sanitize_snapshot_value(val)
+            return sanitized
+        if isinstance(value, SequenceABC) and not isinstance(value, (str, bytes)):
+            return [self._sanitize_snapshot_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        try:
+            return self._sanitize_snapshot_value(vars(value))
+        except Exception:
+            return str(value)
+
+    def _build_config_snapshot(self) -> Dict[str, Any]:
+        try:
+            raw = asdict(self.cfg)
+        except Exception:
+            try:
+                raw = dict(vars(self.cfg))
+            except Exception:
+                return {}
+        snapshot = self._sanitize_snapshot_value(raw)
+        return snapshot if isinstance(snapshot, dict) else {}
+
+    def _read_git_hash(self) -> str | None:
+        if self._git_hash is not None:
+            return self._git_hash
+        try:
+            output = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            self._git_hash = output.decode("utf-8").strip() or None
+        except Exception:
+            self._git_hash = None
+        return self._git_hash
+
+    def _persist_run_metadata(self) -> None:
+        if self._metadata_persisted or not self.cfg.state.enabled:
+            return
+        updates: Dict[str, Any] = {}
+        snapshot = self._build_config_snapshot()
+        if snapshot:
+            updates["config_snapshot"] = snapshot
+        git_hash = self._read_git_hash()
+        if git_hash:
+            updates["git_hash"] = git_hash
+        if updates:
+            try:
+                state_storage.update_state(**updates)
+            except Exception:
+                self.logger.exception("failed to persist run metadata")
+                return
+        self._metadata_persisted = True
 
     def _set_last_price(self, symbol: str, price: Any) -> None:
         sym = str(symbol).upper()
@@ -2560,6 +2623,8 @@ class ServiceSignalRunner:
         self.ws_dedup_enabled = ws_dedup_enabled
         self.ws_dedup_log_skips = ws_dedup_log_skips
         self.ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
+        self._metadata_persisted = False
+        self._git_hash: str | None = None
 
         if self.monitoring_cfg.enabled:
             alert_cfg = getattr(self.monitoring_cfg, "alerts", None)
@@ -2780,29 +2845,39 @@ class ServiceSignalRunner:
 
                 orders_summary: Dict[str, Dict[str, Any]] = {}
                 try:
-                    raw_orders = getattr(loaded_state, "open_orders", {}) or {}
+                    raw_orders = getattr(loaded_state, "open_orders", []) or []
                     if isinstance(raw_orders, MappingABC):
-                        for oid, payload in raw_orders.items():
-                            order_data: Dict[str, Any] = {}
-                            if hasattr(payload, "to_dict"):
-                                try:
-                                    order_data = dict(payload.to_dict())  # type: ignore[misc]
-                                except Exception:
-                                    order_data = {}
-                            elif isinstance(payload, MappingABC):
-                                order_data = dict(payload)
-                            symbol = str(order_data.get("symbol", ""))
-                            qty = (
-                                order_data.get("qty")
-                                or order_data.get("quantity")
-                                or order_data.get("origQty")
-                            )
-                            orders_summary[str(oid)] = {
-                                "symbol": symbol,
-                                "side": order_data.get("side"),
-                                "qty": qty,
-                                "status": order_data.get("status"),
-                            }
+                        iterable_orders = raw_orders.values()
+                    else:
+                        iterable_orders = raw_orders
+                    for idx, payload in enumerate(iterable_orders):
+                        order_data: Dict[str, Any] = {}
+                        if hasattr(payload, "to_dict"):
+                            try:
+                                order_data = dict(payload.to_dict())  # type: ignore[misc]
+                            except Exception:
+                                order_data = {}
+                        elif isinstance(payload, MappingABC):
+                            order_data = dict(payload)
+                        key = (
+                            order_data.get("orderId")
+                            or order_data.get("clientOrderId")
+                            or order_data.get("order_id")
+                            or order_data.get("client_order_id")
+                            or str(idx)
+                        )
+                        symbol = str(order_data.get("symbol", ""))
+                        qty = (
+                            order_data.get("qty")
+                            or order_data.get("quantity")
+                            or order_data.get("origQty")
+                        )
+                        orders_summary[str(key)] = {
+                            "symbol": symbol,
+                            "side": order_data.get("side"),
+                            "qty": qty,
+                            "status": order_data.get("status"),
+                        }
                 except Exception:
                     orders_summary = {}
 
@@ -3426,73 +3501,393 @@ class ServiceSignalRunner:
             self._clock_thread = threading.Thread(target=_sync_loop, daemon=True)
             self._clock_thread.start()
 
+        positions_cache: Dict[str, Dict[str, Any]] = {}
+        open_orders_cache: Dict[str, Dict[str, Any]] = {}
+        last_processed_cache: Dict[str, int] = {}
+        seen_signals_cache: Dict[str, int] = {}
+
+        def _safe_float(value: Any) -> float | None:
+            try:
+                if value is None:
+                    return None
+                num = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(num):
+                return None
+            return num
+
+        def _safe_int(value: Any) -> int | None:
+            try:
+                if value is None:
+                    return None
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        def _order_key(data: Mapping[str, Any]) -> str | None:
+            for key in (
+                "orderId",
+                "order_id",
+                "id",
+                "clientOrderId",
+                "client_order_id",
+                "client_id",
+            ):
+                if key not in data:
+                    continue
+                value = data.get(key)
+                if value is None:
+                    continue
+                text = str(value)
+                if text:
+                    return text
+            return None
+
+        def _normalize_position_entry(value: Any) -> Dict[str, Any] | None:
+            if isinstance(value, state_storage.PositionState):
+                data = value.to_dict()
+            elif isinstance(value, MappingABC):
+                data = dict(value)
+            else:
+                data = {"qty": value}
+            qty_val = _safe_float(
+                data.get("qty")
+                or data.get("quantity")
+                or data.get("position_qty")
+                or data.get("size")
+            )
+            if qty_val is None:
+                return None
+            avg_val = _safe_float(
+                data.get("avg_price")
+                or data.get("avgPrice")
+                or data.get("price")
+            )
+            ts_val = _safe_int(
+                data.get("last_update_ms")
+                or data.get("timestamp")
+                or data.get("ts_ms")
+                or data.get("time")
+            )
+            return {
+                "qty": qty_val,
+                "avg_price": avg_val if avg_val is not None else 0.0,
+                "last_update_ms": ts_val,
+            }
+
+        def _normalize_order_payload(
+            order: Any,
+            *,
+            default_symbol: str = "",
+            default_ts: int | None = None,
+        ) -> tuple[str, Dict[str, Any]]:
+            if isinstance(order, state_storage.OrderState):
+                raw: Mapping[str, Any] = order.to_dict()
+            elif isinstance(order, MappingABC):
+                raw = order
+            else:
+                raw = getattr(order, "__dict__", {}) or {}
+            data = dict(raw)
+            key = _order_key(data) or ""
+            symbol = str(data.get("symbol") or default_symbol or "")
+            client_id = data.get("clientOrderId") or data.get("client_order_id") or data.get("client_id")
+            order_id = data.get("orderId") or data.get("order_id") or data.get("id")
+            side = data.get("side")
+            if side in (None, "") and data.get("is_buy") is not None:
+                side = "BUY" if bool(data.get("is_buy")) else "SELL"
+            qty = (
+                data.get("qty")
+                or data.get("quantity")
+                or data.get("origQty")
+                or data.get("size")
+            )
+            price = data.get("price") or data.get("avg_price") or data.get("limit_price")
+            status = data.get("status") or data.get("state")
+            ts_candidate = (
+                data.get("ts_ms")
+                or data.get("timestamp")
+                or data.get("time")
+                or data.get("updateTime")
+                or default_ts
+            )
+            qty_val = _safe_float(qty)
+            price_val = _safe_float(price)
+            ts_val = _safe_int(ts_candidate)
+            normalized = {
+                "symbol": symbol,
+                "clientOrderId": str(client_id) if client_id not in (None, "") else None,
+                "orderId": str(order_id) if order_id not in (None, "") else None,
+                "side": str(side).upper() if side not in (None, "") else None,
+                "qty": qty_val if qty_val is not None else 0.0,
+                "price": price_val,
+                "status": str(status).upper() if status not in (None, "") else None,
+                "ts_ms": ts_val,
+            }
+            normalized_key = (
+                normalized["orderId"]
+                or normalized["clientOrderId"]
+                or (key if key else None)
+            )
+            if not normalized_key:
+                normalized_key = (
+                    f"auto:{symbol}:"
+                    f"{normalized['side'] or ''}:{normalized['qty']}:{normalized['price']}:{normalized['ts_ms']}"
+                )
+            return normalized_key, normalized
+
+        def _serialize_positions() -> Dict[str, Dict[str, Any]]:
+            return {
+                sym: {
+                    "qty": payload["qty"],
+                    "avg_price": payload.get("avg_price", 0.0),
+                    "last_update_ms": payload.get("last_update_ms"),
+                }
+                for sym, payload in sorted(positions_cache.items())
+            }
+
+        def _serialize_open_orders() -> list[Dict[str, Any]]:
+            items = sorted(
+                open_orders_cache.items(),
+                key=lambda kv: ((_safe_int(kv[1].get("ts_ms")) or 0), kv[0]),
+            )
+            return [dict(payload) for _, payload in items]
+
+        def _extract_avg_price_from_report(
+            rep: Mapping[str, Any], existing: float | None
+        ) -> float | None:
+            for key in (
+                "avg_price",
+                "avgPrice",
+                "avg_entry_price",
+                "avgEntryPrice",
+                "entry_price",
+                "entryPrice",
+            ):
+                if key in rep:
+                    candidate = _safe_float(rep.get(key))
+                    if candidate is not None:
+                        return candidate
+            for key in (
+                "mark_price",
+                "markPrice",
+                "price",
+                "mtm_price",
+                "close",
+                "bar_close",
+                "bar_close_price",
+                "ref_price",
+            ):
+                if key in rep:
+                    candidate = _safe_float(rep.get(key))
+                    if candidate is not None:
+                        return candidate
+            return existing
+
+        def _capture_seen_signals() -> Dict[str, int]:
+            state = getattr(signal_bus, "STATE", {})
+            captured: Dict[str, int] = {}
+            if isinstance(state, MappingABC):
+                iterator = state.items()
+            else:
+                getter = getattr(state, "items", None)
+                iterator = getter() if callable(getter) else []
+            for key, value in iterator:
+                sid = str(key)
+                expires = _safe_int(value)
+                if expires is None:
+                    continue
+                captured[sid] = expires
+            return captured
+
+        if self.cfg.state.enabled:
+            try:
+                current_state = state_storage.get_state()
+            except Exception:
+                current_state = None
+            if current_state is not None:
+                raw_positions = getattr(current_state, "positions", {}) or {}
+                if isinstance(raw_positions, MappingABC):
+                    for sym, payload in raw_positions.items():
+                        normalized = _normalize_position_entry(payload)
+                        if not normalized:
+                            continue
+                        positions_cache[str(sym)] = normalized
+                raw_orders = getattr(current_state, "open_orders", []) or []
+                if isinstance(raw_orders, MappingABC):
+                    iterable_orders = raw_orders.values()
+                else:
+                    iterable_orders = raw_orders
+                for item in iterable_orders:
+                    if item is None:
+                        continue
+                    key, normalized = _normalize_order_payload(item)
+                    open_orders_cache[str(key)] = normalized
+                raw_last_processed = (
+                    getattr(current_state, "last_processed_bar_ms", {}) or {}
+                )
+                if isinstance(raw_last_processed, MappingABC):
+                    for sym, ts in raw_last_processed.items():
+                        ts_val = _safe_int(ts)
+                        if ts_val is None:
+                            continue
+                        last_processed_cache[str(sym)] = ts_val
+            seen_signals_cache = _capture_seen_signals()
+
+        self._persist_run_metadata()
+
         ws_failures = 0
         limit = int(self.cfg.kill_switch_ops.error_limit)
 
         def _handle_report(rep: Dict[str, Any]) -> None:
             if not self.cfg.state.enabled:
                 return
-            updated = False
+            updates: Dict[str, Any] = {}
+            positions_changed = False
+            orders_changed = False
+            last_processed_changed = False
+            seen_changed = False
             try:
-                symbol = rep.get("symbol")
+                symbol = str(rep.get("symbol") or "").upper()
                 pos_qty = rep.get("position_qty")
-                if symbol is not None and pos_qty is not None:
-                    st = state_storage.get_state()
-                    positions = dict(getattr(st, "positions", {}))
-                    if positions.get(symbol) != pos_qty:
-                        positions[symbol] = pos_qty
-                        state_storage.update_state(positions=positions)
-                        updated = True
+                ts_ms = _safe_int(rep.get("ts_ms"))
+
+                if symbol and pos_qty is not None:
+                    qty_val = _safe_float(pos_qty)
+                    if qty_val is not None:
+                        existing = positions_cache.get(symbol)
+                        existing_avg = existing.get("avg_price") if existing else None
+                        avg_price = _extract_avg_price_from_report(rep, existing_avg)
+                        if avg_price is None:
+                            avg_price = existing_avg
+                        if avg_price is None:
+                            avg_price = 0.0
+                        last_update = (
+                            _safe_int(rep.get("position_ts_ms"))
+                            or _safe_int(rep.get("position_timestamp"))
+                            or ts_ms
+                            or (existing.get("last_update_ms") if existing else None)
+                        )
+                        if math.isclose(qty_val, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                            if symbol in positions_cache:
+                                positions_cache.pop(symbol, None)
+                                positions_changed = True
+                        else:
+                            payload = {
+                                "qty": qty_val,
+                                "avg_price": float(avg_price),
+                                "last_update_ms": last_update,
+                            }
+                            if existing != payload:
+                                positions_cache[symbol] = payload
+                                positions_changed = True
 
                 orders = rep.get("core_orders") or []
                 if orders:
-                    st = state_storage.get_state()
-                    open_orders = dict(getattr(st, "open_orders", {}))
-                    for o in orders:
-                        oid = str(
-                            o.get("order_id")
-                            or o.get("client_order_id")
-                            or len(open_orders)
+                    for order in orders:
+                        key, normalized = _normalize_order_payload(
+                            order, default_symbol=symbol, default_ts=ts_ms
                         )
-                        open_orders[oid] = o
-                    state_storage.update_state(open_orders=open_orders)
-                    updated = True
+                        prev = open_orders_cache.get(key)
+                        if prev != normalized:
+                            open_orders_cache[key] = normalized
+                            orders_changed = True
 
                 reports = rep.get("core_exec_reports") or []
                 if reports:
-                    st = state_storage.get_state()
-                    open_orders = dict(getattr(st, "open_orders", {}))
-                    for er in reports:
-                        oid = str(er.get("order_id") or er.get("client_order_id"))
-                        status = str(
-                            er.get("status") or er.get("exec_status") or ""
-                        ).upper()
-                        if status in {"FILLED", "CANCELLED"}:
-                            open_orders.pop(oid, None)
+                    for report in reports:
+                        if isinstance(report, MappingABC):
+                            data = report
                         else:
-                            if oid in open_orders:
-                                try:
-                                    open_orders[oid].update(er)
-                                except Exception:
-                                    open_orders[oid] = er
-                    state_storage.update_state(open_orders=open_orders)
-                    updated = True
+                            data = getattr(report, "__dict__", {}) or {}
+                        key = _order_key(data)
+                        if not key:
+                            continue
+                        status_val = data.get("status") or data.get("exec_status")
+                        status = str(status_val).upper() if status_val else None
+                        if status in {"FILLED", "CANCELLED"}:
+                            if key in open_orders_cache:
+                                open_orders_cache.pop(key, None)
+                                orders_changed = True
+                            continue
+                        payload = open_orders_cache.get(key)
+                        if not payload:
+                            continue
+                        changed = False
+                        if status and payload.get("status") != status:
+                            payload["status"] = status
+                            changed = True
+                        qty_update = (
+                            data.get("qty")
+                            or data.get("quantity")
+                            or data.get("origQty")
+                            or data.get("remaining_qty")
+                        )
+                        qty_val = _safe_float(qty_update)
+                        if qty_val is not None and qty_val != payload.get("qty"):
+                            payload["qty"] = qty_val
+                            changed = True
+                        price_update = (
+                            data.get("price")
+                            or data.get("avg_price")
+                            or data.get("fill_price")
+                        )
+                        price_val = _safe_float(price_update)
+                        if price_val is not None and price_val != payload.get("price"):
+                            payload["price"] = price_val
+                            changed = True
+                        report_ts = (
+                            _safe_int(data.get("ts_ms"))
+                            or _safe_int(data.get("timestamp"))
+                            or _safe_int(data.get("time"))
+                            or ts_ms
+                        )
+                        if report_ts is not None and payload.get("ts_ms") != report_ts:
+                            payload["ts_ms"] = report_ts
+                            changed = True
+                        symbol_update = data.get("symbol")
+                        if symbol_update and not payload.get("symbol"):
+                            payload["symbol"] = str(symbol_update)
+                            changed = True
+                        if changed:
+                            orders_changed = True
 
-                ts_ms = rep.get("ts_ms")
                 if ts_ms is not None:
-                    seen = getattr(signal_bus, "STATE", {})
-                    try:
-                        seen_items = list(getattr(seen, "items", lambda: [])())
-                    except Exception:
-                        seen_items = []
-                    state_storage.update_state(
-                        last_processed_bar_ms=int(ts_ms),
-                        seen_signals=seen_items,
+                    if symbol:
+                        prev_symbol_ts = last_processed_cache.get(symbol)
+                        if prev_symbol_ts is None or ts_ms >= prev_symbol_ts:
+                            last_processed_cache[symbol] = ts_ms
+                            last_processed_changed = True
+                    prev_global = last_processed_cache.get(
+                        state_storage.LAST_PROCESSED_GLOBAL_KEY
                     )
-                    updated = True
+                    if prev_global is None or ts_ms > prev_global:
+                        last_processed_cache[
+                            state_storage.LAST_PROCESSED_GLOBAL_KEY
+                        ] = ts_ms
+                        last_processed_changed = True
+
+                seen_snapshot = _capture_seen_signals()
+                if seen_snapshot != seen_signals_cache:
+                    seen_signals_cache.clear()
+                    seen_signals_cache.update(seen_snapshot)
+                    seen_changed = True
+
+                if positions_changed:
+                    updates["positions"] = _serialize_positions()
+                if orders_changed:
+                    updates["open_orders"] = _serialize_open_orders()
+                if last_processed_changed:
+                    updates["last_processed_bar_ms"] = dict(last_processed_cache)
+                if seen_changed:
+                    updates["seen_signals"] = dict(seen_signals_cache)
+                if updates:
+                    updates["last_update_ms"] = ts_ms or clock.now_ms()
+                    state_storage.update_state(**updates)
             except Exception:
-                pass
-            if updated and self.cfg.state.flush_on_event:
+                self.logger.exception("failed to handle report for state persistence")
+                updates.clear()
+            if updates and self.cfg.state.flush_on_event:
                 try:
                     state_storage.save_state(
                         self.cfg.state.path,
@@ -3501,7 +3896,7 @@ class ServiceSignalRunner:
                         backup_keep=self.cfg.state.backup_keep,
                     )
                 except Exception:
-                    pass
+                    self.logger.exception("failed to flush persistent state on event")
 
         while not stop_event.is_set():
             try:
