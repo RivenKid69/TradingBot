@@ -229,6 +229,7 @@ class MonitoringThresholdsConfig:
     error_rate: float = 0.0
     fill_ratio_min: float = 0.0
     pnl_min: float = 0.0
+    zero_signals: int = 0
 
 
 @dataclass
@@ -237,6 +238,8 @@ class MonitoringAlertConfig:
 
     enabled: bool = False
     command: Optional[str] = None
+    channel: str = "noop"
+    cooldown_sec: float = 0.0
 
 
 @dataclass
@@ -245,6 +248,7 @@ class MonitoringConfig:
 
     enabled: bool = False
     snapshot_metrics_sec: int = 60
+    tick_sec: float = 1.0
     thresholds: MonitoringThresholdsConfig = field(
         default_factory=MonitoringThresholdsConfig
     )

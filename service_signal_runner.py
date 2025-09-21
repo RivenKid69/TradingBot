@@ -4215,16 +4215,34 @@ def from_config(
         monitoring_cfg.snapshot_metrics_sec = int(
             mon_section.get("snapshot_metrics_sec", monitoring_cfg.snapshot_metrics_sec)
         )
+        tick_sec = mon_section.get("tick_sec")
+        if tick_sec is not None:
+            try:
+                monitoring_cfg.tick_sec = float(tick_sec)
+            except (TypeError, ValueError):
+                pass
         thr = mon_data.get("thresholds", {}) or {}
-        monitoring_cfg.thresholds.feed_lag_ms = float(
-            thr.get("feed_lag_ms", monitoring_cfg.thresholds.feed_lag_ms)
-        )
-        monitoring_cfg.thresholds.ws_failures = float(
-            thr.get("ws_failures", monitoring_cfg.thresholds.ws_failures)
-        )
-        monitoring_cfg.thresholds.error_rate = float(
-            thr.get("error_rate", monitoring_cfg.thresholds.error_rate)
-        )
+        for key in (
+            "feed_lag_ms",
+            "ws_failures",
+            "error_rate",
+            "fill_ratio_min",
+            "pnl_min",
+        ):
+            if key in thr:
+                try:
+                    setattr(
+                        monitoring_cfg.thresholds,
+                        key,
+                        float(thr.get(key)),
+                    )
+                except (TypeError, ValueError):
+                    pass
+        if "zero_signals" in thr:
+            try:
+                monitoring_cfg.thresholds.zero_signals = int(thr.get("zero_signals"))
+            except (TypeError, ValueError):
+                pass
         al = mon_data.get("alerts", {}) or {}
         monitoring_cfg.alerts.enabled = bool(
             al.get("enabled", monitoring_cfg.alerts.enabled)
@@ -4232,6 +4250,15 @@ def from_config(
         monitoring_cfg.alerts.command = al.get(
             "command", monitoring_cfg.alerts.command
         )
+        if "channel" in al:
+            channel = al.get("channel")
+            if channel is not None:
+                monitoring_cfg.alerts.channel = str(channel)
+        if "cooldown_sec" in al:
+            try:
+                monitoring_cfg.alerts.cooldown_sec = float(al.get("cooldown_sec"))
+            except (TypeError, ValueError):
+                pass
 
     risk_limits: Dict[str, Any] = dict(cfg.risk.exposure_limits)
     risk_override_path = Path("configs/risk.yaml")

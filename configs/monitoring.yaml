@@ -1,10 +1,16 @@
 monitoring:
   enabled: false              # disable monitoring, snapshots and kill switch
   snapshot_metrics_sec: 60    # interval for metrics snapshots in seconds
+  tick_sec: 1.0               # frequency of monitoring aggregator loop in seconds
 thresholds:
   feed_lag_ms: 0              # enter safe mode if worst feed lag exceeds this; 0 disables
   ws_failures: 0              # enter safe mode if websocket failures exceed this; 0 disables
   error_rate: 0.0             # enter safe mode if signal error rate exceeds this; 0 disables
+  fill_ratio_min: 0.0         # alert if order fill ratio drops below this; 0 disables
+  pnl_min: 0.0                # alert if daily PnL drops below this; 0 disables
+  zero_signals: 0             # alert after N consecutive zero-signal bars; 0 disables
 alerts:
   enabled: false              # disable external alerting
   command: null               # command to execute when alerts trigger
+  channel: noop               # alert delivery channel (noop or telegram)
+  cooldown_sec: 0             # minimum seconds between repeated alerts of same type
