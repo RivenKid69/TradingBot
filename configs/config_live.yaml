@@ -91,8 +91,10 @@ risk:
   max_total_exposure_pct: null    # Hard cap on exposure as a fraction of equity
   exposure_buffer_frac: 0.0       # Fractional buffer applied before tripping the caps
 quantizer:
-  filters_path: "binance_filters.json"
-  strict: true
+  filters_path: "data/binance_filters.json"
+  # strict_filters=true → строго придерживаться актуальных фильтров; false включает мягкий фолбек к кешу/легаси-логике.
+  # Поле strict остаётся легаси-алиасом для strict_filters и может опускаться в новых конфигурациях.
+  strict_filters: true
   enforce_percent_price_by_side: true
   auto_refresh_days: 30
   refresh_on_start: false

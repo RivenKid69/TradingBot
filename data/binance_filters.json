@@ -50,8 +50,8 @@
     }
   },
   "metadata": {
-    "generated_at": "2025-09-19T20:48:45Z",
-    "source_dataset": "binance_exchange_filters",
-    "version": 1
+    "built_at": "2025-09-21T05:39:15.889068+00:00",
+    "source": "GET /api/v3/exchangeInfo",
+    "symbols_count": 2
   }
 }
