@@ -56,11 +56,19 @@ def _parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         nargs="*",
         help="Symbols to include (defaults to all when omitted)",
     )
+    parser.add_argument(
+        "--config",
+        default=str(_default_offline_config_path()),
+        help="Path to offline YAML config containing rest_budget settings.",
+    )
     return parser.parse_args(argv)
 
 
 def _default_offline_config_path() -> Path:
     return Path(__file__).resolve().parents[1] / "configs" / "offline.yaml"
+
+
+STATS_PATH = Path("logs/offline/fetch_binance_filters_stats.json")
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -434,12 +442,17 @@ def _save_checkpoint(
 def main(argv: List[str] | None = None) -> int:
     args = _parse_args(argv)
     symbols = _load_symbols(args)
-    config_path = _default_offline_config_path()
+    config_path = Path(args.config or _default_offline_config_path())
     rest_cfg, script_cfg = _load_offline_config(config_path)
     chunk_size = _resolve_chunk_size(script_cfg)
     checkpoint_threshold = _resolve_checkpoint_threshold(script_cfg, chunk_size)
 
+    stats_path = STATS_PATH
     with RestBudgetSession(rest_cfg) as session:
+        try:
+            session.write_stats(stats_path)
+        except Exception:
+            logging.debug("Failed to write initial stats snapshot", exc_info=True)
         with closing(BinancePublicClient(session=session)) as client:
             symbol_count = len(symbols)
             chunk_count = 1 if symbol_count == 0 else (symbol_count + chunk_size - 1) // chunk_size
@@ -459,6 +472,10 @@ def main(argv: List[str] | None = None) -> int:
                         session.stats(), ensure_ascii=False, indent=2, sort_keys=True
                     )
                 )
+                try:
+                    session.write_stats(stats_path)
+                except Exception:
+                    logging.debug("Failed to persist stats snapshot", exc_info=True)
                 return 0
 
             should_checkpoint = (
@@ -486,11 +503,19 @@ def main(argv: List[str] | None = None) -> int:
                     filters,
                     chunk_size,
                 )
+                try:
+                    session.write_stats(stats_path)
+                except Exception:
+                    logging.debug("Failed to persist stats snapshot", exc_info=True)
 
             if symbol_count == 0:
                 filters = client.get_exchange_filters(market="spot", symbols=None)
                 if not filters:
                     raise RuntimeError("No filters returned from Binance exchangeInfo")
+                try:
+                    session.write_stats(stats_path)
+                except Exception:
+                    logging.debug("Failed to persist stats snapshot", exc_info=True)
             else:
                 index = start_index
                 for chunk in _iter_symbol_chunks(symbols[index:], chunk_size):
@@ -514,6 +539,12 @@ def main(argv: List[str] | None = None) -> int:
                             filters,
                             chunk_size,
                         )
+                        try:
+                            session.write_stats(stats_path)
+                        except Exception:
+                            logging.debug(
+                                "Failed to persist stats snapshot", exc_info=True
+                            )
                 if len(filters) < symbol_count:
                     missing_total = [sym for sym in symbols if sym not in filters]
                     if missing_total:
@@ -530,6 +561,10 @@ def main(argv: List[str] | None = None) -> int:
                         chunk_size,
                         completed=True,
                     )
+                    try:
+                        session.write_stats(stats_path)
+                    except Exception:
+                        logging.debug("Failed to persist stats snapshot", exc_info=True)
 
             metadata = _build_metadata(filters)
             payload = {"metadata": metadata, "filters": filters}
@@ -543,6 +578,10 @@ def main(argv: List[str] | None = None) -> int:
                     session.stats(), ensure_ascii=False, indent=2, sort_keys=True
                 )
             )
+            try:
+                session.write_stats(stats_path)
+            except Exception:
+                logging.debug("Failed to persist stats snapshot", exc_info=True)
             return 0
 
 

@@ -8,6 +8,7 @@ import time
 import subprocess
 import copy
 import difflib
+import shlex
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -482,6 +483,7 @@ tabs = st.tabs(
         "Probability Calibration",
         "Drift Monitor",
         "Monitoring",
+        "Offline Jobs",
     ]
 )
 # --------------------------- Tab: Status ---------------------------
@@ -3198,3 +3200,196 @@ with tabs[20]:
         )
     else:
         st.info("Лог синхронизации пока пуст.")
+
+with tabs[21]:
+    st.subheader("Offline REST jobs")
+
+    offline_config_path = st.text_input(
+        "Offline config path", value="configs/offline.yaml", key="offline_jobs_config"
+    )
+
+    universe_default = st.session_state.get("universe_json_path", "data/universe/symbols.json")
+    filters_default = st.session_state.get("filters_json_path", "data/binance_filters.json")
+
+    jobs: list[dict[str, Any]] = [
+        {
+            "key": "refresh_universe",
+            "title": "Refresh universe",
+            "script": "scripts/refresh_universe.py",
+            "stats": "logs/offline/refresh_universe_stats.json",
+            "log": "logs/offline/refresh_universe.log",
+            "default_args": f"--out {universe_default}",
+            "supports_dry_run": True,
+            "resume_flag": None,
+            "description": "Fetch Binance exchange info and update USDT universe.",
+        },
+        {
+            "key": "fetch_binance_filters",
+            "title": "Fetch Binance filters",
+            "script": "scripts/fetch_binance_filters.py",
+            "stats": "logs/offline/fetch_binance_filters_stats.json",
+            "log": "logs/offline/fetch_binance_filters.log",
+            "default_args": f"--out {filters_default} --universe {universe_default}",
+            "supports_dry_run": True,
+            "resume_flag": None,
+            "description": "Download and cache exchange filters for configured symbols.",
+        },
+        {
+            "key": "build_adv",
+            "title": "Build ADV dataset",
+            "script": "build_adv.py",
+            "stats": "logs/offline/build_adv_stats.json",
+            "log": "logs/offline/build_adv.log",
+            "default_args": "--market futures --interval 1h --start 2023-01-01T00:00:00Z --end 2023-01-08T00:00:00Z --symbols BTCUSDT,ETHUSDT --out data/adv/klines.parquet",
+            "supports_dry_run": True,
+            "resume_flag": "--resume-from-checkpoint",
+            "description": "Fetch OHLCV history and build aggregated ADV parquet.",
+        },
+        {
+            "key": "build_adv_hourly",
+            "title": "Build ADV quotes (scripts/build_adv.py)",
+            "script": "scripts/build_adv.py",
+            "stats": "logs/offline/build_adv_hourly_stats.json",
+            "log": "logs/offline/build_adv_hourly.log",
+            "default_args": "--market futures --interval 1d --window-days 30 --out data/adv/adv_quotes.json",
+            "supports_dry_run": False,
+            "resume_flag": None,
+            "description": "Generate ADV quotes from cached klines for reporting.",
+        },
+        {
+            "key": "build_adv_base",
+            "title": "Build ADV base volumes",
+            "script": "scripts/build_adv_base.py",
+            "stats": "logs/offline/build_adv_base_stats.json",
+            "log": "logs/offline/build_adv_base.log",
+            "default_args": "--market futures --interval 1h --window-days 30 --out data/adv/adv_base.json",
+            "supports_dry_run": False,
+            "resume_flag": None,
+            "description": "Aggregate base volumes into ADV checkpoints.",
+        },
+    ]
+
+    for job in jobs:
+        with st.expander(job["title"], expanded=False):
+            st.caption(job.get("description") or "")
+            args_default = job.get("default_args", "")
+            args_text = st.text_input(
+                "Additional arguments",
+                value=args_default,
+                key=f"{job['key']}_args",
+            )
+
+            def _build_command(extra_flag: str | None = None) -> list[str]:
+                base_args = shlex.split(args_text) if args_text.strip() else []
+                cmd = [py, job["script"]]
+                if offline_config_path:
+                    if "--config" not in base_args:
+                        cmd.extend(["--config", offline_config_path])
+                cmd.extend(base_args)
+                if extra_flag and extra_flag not in cmd:
+                    cmd.append(extra_flag)
+                return cmd
+
+            log_path = job["log"]
+            stats_path = job["stats"]
+
+            col_run, col_dry, col_resume = st.columns(3)
+            if col_run.button("Run", key=f"{job['key']}_run"):
+                rc = run_cmd(_build_command(), log_path=log_path)
+                if rc == 0:
+                    st.success("Job completed successfully")
+                else:
+                    st.error(f"Job exited with code {rc}")
+            if job.get("supports_dry_run"):
+                if col_dry.button("Dry run", key=f"{job['key']}_dry"):
+                    rc = run_cmd(_build_command("--dry-run"), log_path=log_path)
+                    if rc == 0:
+                        st.success("Dry run finished successfully")
+                    else:
+                        st.error(f"Dry run exited with code {rc}")
+            else:
+                col_dry.write("—")
+            resume_flag = job.get("resume_flag")
+            if resume_flag:
+                if col_resume.button("Resume checkpoint", key=f"{job['key']}_resume"):
+                    rc = run_cmd(_build_command(resume_flag), log_path=log_path)
+                    if rc == 0:
+                        st.success("Resume completed successfully")
+                    else:
+                        st.error(f"Resume exited with code {rc}")
+            else:
+                col_resume.write("—")
+
+            stats = read_json(stats_path)
+            if stats:
+                requests_total = int(stats.get("requests_total", 0))
+                total_retries = int(stats.get("total_retries", 0))
+                total_wait = float(stats.get("total_wait_seconds", 0.0))
+                cols = st.columns(3)
+                cols[0].metric("Requests", f"{requests_total}")
+                cols[1].metric("Retries", f"{total_retries}")
+                cols[2].metric("Wait (s)", f"{total_wait:.2f}")
+
+                checkpoint_meta = stats.get("checkpoint_meta")
+                progress_pct: float | None = None
+                if isinstance(checkpoint_meta, Mapping):
+                    try:
+                        progress_pct = float(checkpoint_meta.get("progress_pct"))
+                    except (TypeError, ValueError):
+                        progress_pct = None
+                if progress_pct is not None:
+                    st.progress(min(max(progress_pct / 100.0, 0.0), 1.0))
+                    st.caption(f"Progress: {progress_pct:.2f}%")
+                    last_symbol = checkpoint_meta.get("last_symbol") if isinstance(checkpoint_meta, Mapping) else None
+                    if last_symbol:
+                        st.caption(f"Last symbol: {last_symbol}")
+
+                cooldowns_active = stats.get("cooldowns_active")
+                if isinstance(cooldowns_active, Mapping):
+                    active_count = int(cooldowns_active.get("count", 0))
+                    if active_count > 0:
+                        st.warning(
+                            f"Cooldowns active: {active_count}. Requests will be delayed until limits recover."
+                        )
+                    endpoints_active = cooldowns_active.get("endpoints")
+                    if isinstance(endpoints_active, Mapping) and endpoints_active:
+                        cooldown_df = pd.DataFrame.from_dict(endpoints_active, orient="index")
+                        st.dataframe(cooldown_df)
+
+                requests = stats.get("requests") or {}
+                wait_seconds = stats.get("wait_seconds") or {}
+                retry_counts = stats.get("retry_counts") or {}
+                if isinstance(requests, Mapping) or isinstance(wait_seconds, Mapping):
+                    summary_df = pd.DataFrame(
+                        {
+                            "requests": pd.Series(requests, dtype="float64"),
+                            "retries": pd.Series(retry_counts, dtype="float64"),
+                            "wait_seconds": pd.Series(wait_seconds, dtype="float64"),
+                        }
+                    ).fillna(0.0)
+                    if not summary_df.empty:
+                        st.dataframe(summary_df.sort_values("requests", ascending=False))
+
+                cooldown_counts = stats.get("cooldowns") or {}
+                if isinstance(cooldown_counts, Mapping) and cooldown_counts:
+                    st.dataframe(
+                        pd.DataFrame.from_dict(cooldown_counts, orient="index", columns=["count"])
+                    )
+
+                session_meta = stats.get("session")
+                if isinstance(session_meta, Mapping):
+                    st.caption("Session configuration snapshot:")
+                    st.json(session_meta)
+            else:
+                st.info("Stats file not found yet. Run the job to generate metrics.")
+
+            log_tail = tail_file(log_path, n=200)
+            if log_tail:
+                st.text_area(
+                    "Log tail",
+                    log_tail,
+                    height=220,
+                    key=f"{job['key']}_log_tail",
+                )
+            else:
+                st.info("Log file отсутствует или пуст.")
