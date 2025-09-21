@@ -9,6 +9,7 @@ import subprocess
 import copy
 import difflib
 import shlex
+import tempfile
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +48,10 @@ from services.utils_app import (
     atomic_write_with_retry,
 )
 from service_backtest import BacktestConfig, from_config as backtest_from_config
+from service_calibrate_slippage import (
+    from_config as calibrate_slippage_from_config,
+)
+from service_calibrate_tcost import TCostCalibrateConfig, run as calibrate_tcost_run
 from service_signal_runner import ServiceSignalRunner, RunnerConfig
 from service_eval import ServiceEval, EvalConfig
 
@@ -239,7 +244,13 @@ def build_all_pipeline(
 # --------------------------- Service wrappers ---------------------------
 
 
-def run_backtest_from_yaml(cfg_path: str, default_out: str, logs_dir: str) -> str:
+def run_backtest_from_yaml(
+    cfg_path: str,
+    default_out: str,
+    logs_dir: str,
+    *,
+    bar_report_path: str | None = None,
+) -> str:
     cfg: SandboxConfig = load_sandbox_config(cfg_path)
     sim_cfg = load_config(cfg.sim_config_path)
 
@@ -256,6 +267,7 @@ def run_backtest_from_yaml(cfg_path: str, default_out: str, logs_dir: str) -> st
         signal_cooldown_s=int(cfg.min_signal_gap_s),
         no_trade_config=cfg.no_trade,
         logs_dir=logs_dir,
+        bar_report_path=bar_report_path or cfg.bar_report_path,
     )
 
     data_cfg = cfg.data
@@ -1812,210 +1824,788 @@ backfill_on_gap: true
 
 
 with tabs[12]:
-    st.subheader("Sim Settings — тонкая настройка симулятора (configs/sim.yaml)")
-
+    st.subheader("Sim Settings — симуляция, спред и комиссии")
     st.caption(
-        "Редактируйте параметры симулятора через форму. Неизвестные ключи в sim.yaml будут сохранены без изменений. "
-        "Это влияет на бэктест (script_backtest.py)."
+        "Редактируйте intrabar-логику, клиппинг, ограничения по ADV и параметры слиппеджа/комиссий. "
+        "Изменения применяются сразу после сохранения формы."
     )
 
-    # читаем текущий sim.yaml
-    current = {}
-    try:
-        if os.path.exists(cfg_sim):
-            current = load_config(cfg_sim).model_dump()
-    except Exception as e:
-        st.error(f"Не удалось прочитать {cfg_sim}: {e}")
-        current = {}
-
-    fees = current.get("fees", {}) or {}
-    slippage = current.get("slippage", {}) or {}
-    pnl = current.get("pnl", {}) or {}
-    leakguard = current.get("leakguard", {}) or {}
-    risk = current.get("risk", {}) or {}
-
-    st.markdown("### Комиссии (fees)")
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        maker_bps = st.number_input(
-            "maker_bps (bps)",
-            min_value=0.0,
-            value=float(fees.get("maker_bps", 1.0)),
-            step=0.1,
+    cfg_cols = st.columns(3)
+    with cfg_cols[0]:
+        sim_yaml_path = st.text_input(
+            "config_sim.yaml",
+            value=cfg_sim,
+            key="sim_settings_cfg_sim",
+            help="Основной конфиг симулятора"
         )
-    with col_f2:
-        taker_bps = st.number_input(
-            "taker_bps (bps)",
-            min_value=0.0,
-            value=float(fees.get("taker_bps", 5.0)),
-            step=0.1,
+    with cfg_cols[1]:
+        slippage_yaml_path = st.text_input(
+            "slippage.yaml",
+            value="configs/slippage.yaml",
+            key="sim_settings_slippage_yaml",
+            help="Файл с параметрами слиппеджа"
+        )
+    with cfg_cols[2]:
+        fees_yaml_path = st.text_input(
+            "fees.yaml",
+            value="configs/fees.yaml",
+            key="sim_settings_fees_yaml",
+            help="Файл с параметрами комиссий"
         )
 
-    st.markdown("### Слиппедж/спред (slippage)")
-    col_s1, col_s2, col_s3 = st.columns(3)
-    with col_s1:
-        k_slip = st.number_input(
-            "k (множитель слиппеджа)",
-            min_value=0.0,
-            value=float(slippage.get("k", 0.8)),
-            step=0.1,
+    sim_data, _ = _load_yaml_file(sim_yaml_path)
+    slip_data, _ = _load_yaml_file(slippage_yaml_path)
+    fees_data, _ = _load_yaml_file(fees_yaml_path)
+
+    if sim_yaml_path and not os.path.exists(sim_yaml_path):
+        st.warning(
+            f"Файл {sim_yaml_path} не найден — будет создан при сохранении.",
         )
-    with col_s2:
-        default_spread_bps = st.number_input(
-            "default_spread_bps (bps)",
-            min_value=0.0,
-            value=float(slippage.get("default_spread_bps", 3.0)),
-            step=0.5,
+    if slippage_yaml_path and not os.path.exists(slippage_yaml_path):
+        st.info(
+            f"Файл {slippage_yaml_path} пока не существует; значения будут записаны при сохранении.",
         )
-    with col_s3:
-        min_half_spread_bps = st.number_input(
-            "min_half_spread_bps (bps)",
-            min_value=0.0,
-            value=float(slippage.get("min_half_spread_bps", 0.0)),
-            step=0.1,
+    if fees_yaml_path and not os.path.exists(fees_yaml_path):
+        st.info(
+            f"Файл {fees_yaml_path} пока не существует; значения будут записаны при сохранении.",
         )
 
-    st.markdown("### PnL")
-    mark_to = st.selectbox(
-        "mark_to",
-        options=["side", "mid", "close"],
-        index=["side", "mid", "close"].index(
-            str(pnl.get("mark_to", "side"))
-            if pnl.get("mark_to") in ["side", "mid", "close"]
-            else "side"
-        ),
+    def _save_yaml(path: str, payload: Dict[str, Any], label: str) -> bool:
+        if not path:
+            st.error(f"Не задан путь для {label}")
+            return False
+        try:
+            atomic_write_with_retry(path, _dump_yaml(payload))
+        except Exception as exc:
+            st.error(f"Не удалось сохранить {label}: {exc}")
+            return False
+        st.success(f"Сохранено: {label}")
+        return True
+
+    def _parse_optional_float(text_value: str, field_name: str, errors: list[str], *, min_value: float | None = None, max_value: float | None = None) -> float | None:
+        text = str(text_value).strip()
+        if text == "":
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            errors.append(f"{field_name}: не удалось преобразовать '{text_value}' к числу")
+            return None
+        if min_value is not None and value < min_value:
+            errors.append(f"{field_name}: значение {value} < {min_value}")
+        if max_value is not None and value > max_value:
+            errors.append(f"{field_name}: значение {value} > {max_value}")
+        return value
+
+    def _parse_optional_int(text_value: str, field_name: str, errors: list[str], *, min_value: int | None = None) -> int | None:
+        text = str(text_value).strip()
+        if text == "":
+            return None
+        try:
+            value = int(float(text))
+        except ValueError:
+            errors.append(f"{field_name}: не удалось преобразовать '{text_value}' к целому")
+            return None
+        if min_value is not None and value < min_value:
+            errors.append(f"{field_name}: значение {value} < {min_value}")
+        return value
+
+    st.markdown("### Быстрый бэктест (bar-level отчёт)")
+    tail_rows = int(
+        st.number_input(
+            "Сколько последних баров показать",
+            min_value=5,
+            max_value=200,
+            value=20,
+            step=5,
+            key="sim_short_bt_tail",
+        )
     )
-
-    st.markdown("### Leakguard (защита от утечек времени)")
-    decision_delay_ms = st.number_input(
-        "decision_delay_ms (мс)",
-        min_value=0,
-        value=int(leakguard.get("decision_delay_ms", 500)),
-        step=50,
-    )
-
-    st.markdown("### Риск-менеджмент")
-    col_r1, col_r2, col_r3 = st.columns(3)
-    with col_r1:
-        max_order_notional = st.number_input(
-            "max_order_notional",
-            min_value=0.0,
-            value=float(risk.get("max_order_notional", 200.0)),
-            step=10.0,
-            format="%.6f",
-        )
-    with col_r2:
-        max_abs_position_notional = st.number_input(
-            "max_abs_position_notional",
-            min_value=0.0,
-            value=float(risk.get("max_abs_position_notional", 1000.0)),
-            step=10.0,
-            format="%.6f",
-        )
-    with col_r3:
-        max_orders_per_min = st.number_input(
-            "max_orders_per_min",
-            min_value=0,
-            value=int(risk.get("max_orders_per_min", 10)),
-            step=1,
-        )
-
-    st.divider()
-    col_act1, col_act2, col_act3 = st.columns(3)
-
-    with col_act1:
-        if st.button("Сохранить в configs/sim.yaml", type="primary", key="sim_save"):
-            try:
-                # обновим только известные секции, остальные ключи сохраним
-                new_current = dict(current) if isinstance(current, dict) else {}
-                new_current["fees"] = {
-                    "maker_bps": float(maker_bps),
-                    "taker_bps": float(taker_bps),
-                }
-                new_current["slippage"] = {
-                    "k": float(k_slip),
-                    "default_spread_bps": float(default_spread_bps),
-                    "min_half_spread_bps": float(min_half_spread_bps),
-                }
-                new_current["pnl"] = {
-                    "mark_to": str(mark_to),
-                }
-                new_current["leakguard"] = {
-                    "decision_delay_ms": int(decision_delay_ms),
-                }
-                new_current["risk"] = {
-                    "max_order_notional": float(max_order_notional),
-                    "max_abs_position_notional": float(max_abs_position_notional),
-                    "max_orders_per_min": int(max_orders_per_min),
-                }
-
-                _ensure_dir(cfg_sim)
-                with open(cfg_sim, "w", encoding="utf-8") as f:
-                    yaml.safe_dump(new_current, f, sort_keys=False, allow_unicode=True)
-                st.success(f"Сохранено: {cfg_sim}")
-            except Exception as e:
-                st.error(f"Не удалось сохранить {cfg_sim}: {e}")
-
-    with col_act2:
-        if st.button("Показать текущий sim.yaml", key="sim_show"):
-            try:
-                with open(cfg_sim, "r", encoding="utf-8") as f:
-                    st.code(f.read(), language="yaml")
-            except Exception as e:
-                st.error(str(e))
-
-    with col_act3:
-        if st.button("Проверить структуру", key="sim_check"):
-            issues = []
-            try:
-                data = load_config(cfg_sim).model_dump()
-                # мягкая проверка ожидаемых ключей
-                for sect in ["fees", "slippage", "pnl", "leakguard", "risk"]:
-                    if sect not in data:
-                        issues.append(f"нет блока '{sect}'")
-                if "fees" in data:
-                    for k in ["maker_bps", "taker_bps"]:
-                        if k not in (data["fees"] or {}):
-                            issues.append(f"fees: нет ключа '{k}'")
-                if "slippage" in data:
-                    for k in ["k", "default_spread_bps", "min_half_spread_bps"]:
-                        if k not in (data["slippage"] or {}):
-                            issues.append(f"slippage: нет ключа '{k}'")
-                if "pnl" in data and "mark_to" not in (data["pnl"] or {}):
-                    issues.append("pnl: нет ключа 'mark_to'")
-                if "leakguard" in data and "decision_delay_ms" not in (
-                    data["leakguard"] or {}
-                ):
-                    issues.append("leakguard: нет ключа 'decision_delay_ms'")
-                if "risk" in data:
-                    for k in [
-                        "max_order_notional",
-                        "max_abs_position_notional",
-                        "max_orders_per_min",
-                    ]:
-                        if k not in (data["risk"] or {}):
-                            issues.append(f"risk: нет ключа '{k}'")
-                if issues:
-                    st.warning("Замечания по структуре:")
-                    for it in issues:
-                        st.write(f"- {it}")
+    if st.button("Run short backtest", key="sim_run_short_backtest", type="primary"):
+        if not cfg_sandbox or not os.path.exists(cfg_sandbox):
+            st.error(f"Sandbox YAML не найден: {cfg_sandbox}")
+        else:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                reports_tmp = os.path.join(tmpdir, "reports.csv")
+                bar_report_tmp = os.path.join(tmpdir, "bar_report.csv")
+                try:
+                    run_backtest_from_yaml(
+                        cfg_sandbox,
+                        reports_tmp,
+                        logs_dir,
+                        bar_report_path=bar_report_tmp,
+                    )
+                except Exception as exc:
+                    st.error(f"Ошибка короткого бэктеста: {exc}")
                 else:
-                    st.success("Структура sim.yaml выглядит корректной")
-            except Exception as e:
-                st.error(f"Ошибка проверки: {e}")
+                    summary_path = os.path.splitext(bar_report_tmp)[0]
+                    summary_path = f"{summary_path}_summary.csv" if summary_path else f"{bar_report_tmp}_summary.csv"
+                    try:
+                        summary_df = pd.read_csv(summary_path)
+                    except FileNotFoundError:
+                        summary_df = pd.DataFrame()
+                    except Exception as exc:
+                        st.warning(f"Не удалось прочитать summary: {exc}")
+                        summary_df = pd.DataFrame()
+                    if not summary_df.empty:
+                        st.subheader("Bar summary (spread/impact/fees bps)")
+                        st.dataframe(summary_df)
+                        st.download_button(
+                            "Скачать summary CSV",
+                            summary_df.to_csv(index=False).encode("utf-8"),
+                            "bar_summary.csv",
+                            "text/csv",
+                        )
+                    else:
+                        st.info("Summary пуст или не создан (нет баров).")
+
+                    try:
+                        bar_df = pd.read_csv(bar_report_tmp)
+                    except FileNotFoundError:
+                        bar_df = pd.DataFrame()
+                    except Exception as exc:
+                        st.warning(f"Не удалось прочитать bar-level отчёт: {exc}")
+                        bar_df = pd.DataFrame()
+                    if not bar_df.empty:
+                        st.subheader("Bar report — последние строки")
+                        st.dataframe(bar_df.tail(tail_rows))
+                        st.download_button(
+                            "Скачать bar report CSV",
+                            bar_df.to_csv(index=False).encode("utf-8"),
+                            "bar_report.csv",
+                            "text/csv",
+                        )
+                    else:
+                        st.info("Bar-level отчёт пуст.")
 
     st.divider()
-    st.subheader("Подсказка: связь параметров с симуляцией")
-    st.markdown(
-        "- **fees.maker_bps / taker_bps**: комиссии (базисные пункты). Влияют на цену исполнения и PnL.\n"
-        "- **slippage.k**: множитель функции слиппеджа. Чем выше — тем дороже исполнение при той же волатильности/ликвидности.\n"
-        "- **slippage.default_spread_bps**: базовый спред, используется когда нет bid/ask. С динамическими котировками служит нижней гранью.\n"
-        "- **slippage.min_half_spread_bps**: минимальный half-spread для защиты от нереалистично узких спредов.\n"
-        "- **pnl.mark_to**: расчёт PnL (side = по стороне сделки, mid/close — альтернативы).\n"
-        "- **leakguard.decision_delay_ms**: моделирует задержку принятия решения.\n"
-        "- **risk.***: ограничения по размеру ордера, общей позиции и частоте сигналов."
-    )
 
+    exec_cfg = copy.deepcopy(sim_data.get("execution") or {})
+    clip_cfg = copy.deepcopy(exec_cfg.get("clip_to_bar") or {})
+    bar_cap_cfg = copy.deepcopy(exec_cfg.get("bar_capacity_base") or {})
+
+    def _normalise_intrabar(value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip().lower()
+        if text in {"", "default", "none"}:
+            return ""
+        if text in {"bridge", "brownian", "brownian_bridge"}:
+            return "bridge"
+        if text in {"linear", "open_close_linear", "open-close-linear", "oc_linear", "linear_oc"}:
+            return "linear"
+        if text in {"ohlc", "ohlc-linear", "ohlc_linear"}:
+            return "ohlc"
+        return text
+
+    intrabar_options = [
+        ("Отключено / legacy", ""),
+        ("Mid (midpoint)", "mid"),
+        ("Linear (open→close)", "linear"),
+        ("OHLC экстремумы", "ohlc"),
+        ("Bridge (Brownian)", "bridge"),
+        ("Open", "open"),
+        ("Close", "close"),
+        ("High", "high"),
+        ("Low", "low"),
+    ]
+    intrabar_map = {label: value for label, value in intrabar_options}
+    current_intrabar = _normalise_intrabar(exec_cfg.get("intrabar_price_model"))
+    intrabar_index = 0
+    for idx, (_, val) in enumerate(intrabar_options):
+        if val == current_intrabar:
+            intrabar_index = idx
+            break
+
+    with st.expander("Execution: intrabar, clip и bar capacity", expanded=True):
+        with st.form("sim_execution_form"):
+            mode_choice = st.selectbox(
+                "Модель intrabar",
+                [label for label, _ in intrabar_options],
+                index=intrabar_index,
+                help="Определяет, как симулятор выбирает цену внутри бара",
+            )
+            use_latency_from = st.text_input(
+                "use_latency_from (опционально)",
+                value=str(exec_cfg.get("use_latency_from") or ""),
+            )
+            latency_value = st.number_input(
+                "latency_constant_ms (опционально)",
+                min_value=0.0,
+                value=float(exec_cfg.get("latency_constant_ms") or 0.0),
+                step=1.0,
+            )
+            latency_enabled = st.checkbox(
+                "Применять latency_constant_ms",
+                value=exec_cfg.get("latency_constant_ms") is not None,
+            )
+
+            clip_cols = st.columns(2)
+            with clip_cols[0]:
+                clip_enabled = st.checkbox(
+                    "Включить clip_to_bar",
+                    value=bool(clip_cfg.get("enabled", True)),
+                )
+            with clip_cols[1]:
+                strict_open = st.checkbox(
+                    "strict_open_fill",
+                    value=bool(clip_cfg.get("strict_open_fill", False)),
+                )
+
+            cap_cols = st.columns(3)
+            with cap_cols[0]:
+                bar_cap_enabled = st.checkbox(
+                    "Bar capacity (ADV)",
+                    value=bool(bar_cap_cfg.get("enabled", False)),
+                )
+                capacity_frac = st.number_input(
+                    "Доля ADV на бар",
+                    min_value=0.0,
+                    max_value=1.0,
+                    step=0.05,
+                    value=float(
+                        min(
+                            max(bar_cap_cfg.get("capacity_frac_of_ADV_base", 1.0), 0.0),
+                            1.0,
+                        )
+                    ),
+                )
+            with cap_cols[1]:
+                adv_path = st.text_input(
+                    "adv_base_path",
+                    value=str(bar_cap_cfg.get("adv_base_path") or ""),
+                )
+                floor_text = st.text_input(
+                    "floor_base (опц.)",
+                    value="" if bar_cap_cfg.get("floor_base") in (None, "") else str(bar_cap_cfg.get("floor_base")),
+                )
+            with cap_cols[2]:
+                timeframe_text = st.text_input(
+                    "timeframe_ms override (опц.)",
+                    value="" if bar_cap_cfg.get("timeframe_ms") in (None, "") else str(bar_cap_cfg.get("timeframe_ms")),
+                )
+
+            submitted_exec = st.form_submit_button("Сохранить execution")
+
+        if submitted_exec:
+            errors: list[str] = []
+            warnings: list[str] = []
+            floor_value = _parse_optional_float(floor_text, "floor_base", errors, min_value=0.0)
+            timeframe_value = _parse_optional_int(timeframe_text, "timeframe_ms", errors, min_value=0)
+            if errors:
+                for msg in errors:
+                    st.error(msg)
+            else:
+                new_sim = copy.deepcopy(sim_data)
+                exec_block = copy.deepcopy(new_sim.get("execution") or {})
+                mode_value = intrabar_map.get(mode_choice, "")
+                if mode_value:
+                    exec_block["intrabar_price_model"] = mode_value
+                else:
+                    exec_block.pop("intrabar_price_model", None)
+
+                latency_source = use_latency_from.strip()
+                if latency_source:
+                    exec_block["use_latency_from"] = latency_source
+                else:
+                    exec_block.pop("use_latency_from", None)
+                if latency_enabled:
+                    exec_block["latency_constant_ms"] = float(latency_value)
+                else:
+                    exec_block.pop("latency_constant_ms", None)
+
+                clip_block = copy.deepcopy(exec_block.get("clip_to_bar") or {})
+                clip_block["enabled"] = bool(clip_enabled)
+                clip_block["strict_open_fill"] = bool(strict_open)
+                exec_block["clip_to_bar"] = clip_block
+
+                cap_block = copy.deepcopy(exec_block.get("bar_capacity_base") or {})
+                cap_block["enabled"] = bool(bar_cap_enabled)
+                cap_block["capacity_frac_of_ADV_base"] = float(capacity_frac)
+                if adv_path.strip():
+                    cap_block["adv_base_path"] = adv_path.strip()
+                else:
+                    cap_block.pop("adv_base_path", None)
+                if floor_value is None:
+                    cap_block.pop("floor_base", None)
+                else:
+                    cap_block["floor_base"] = float(floor_value)
+                if timeframe_value is None:
+                    cap_block.pop("timeframe_ms", None)
+                else:
+                    cap_block["timeframe_ms"] = int(timeframe_value)
+                exec_block["bar_capacity_base"] = cap_block
+                new_sim["execution"] = exec_block
+
+                if _save_yaml(sim_yaml_path, new_sim, "config_sim.yaml"):
+                    sim_data = new_sim
+                    if bar_cap_enabled and not adv_path.strip():
+                        warnings.append("Bar capacity включён, но путь к ADV пуст — потребуется заполнить adv_base_path.")
+                    if not clip_enabled:
+                        warnings.append("Clip_to_bar отключён — возможны цены вне диапазона бара.")
+                    for msg in warnings:
+                        st.warning(msg)
+
+    st.divider()
+
+    slip_section = copy.deepcopy(slip_data.get("slippage") or {})
+    sim_slip_section = copy.deepcopy(sim_data.get("slippage") or {})
+    base_k = float(slip_section.get("k", sim_slip_section.get("k", 0.8)))
+    base_default_spread = float(slip_section.get("default_spread_bps", sim_slip_section.get("default_spread_bps", 2.0)))
+    base_min_half = float(slip_section.get("min_half_spread_bps", sim_slip_section.get("min_half_spread_bps", 0.0)))
+    dyn_section = copy.deepcopy(slip_section.get("dynamic") or {})
+
+    with st.expander("Slippage: статический и динамический спред", expanded=True):
+        with st.form("slippage_form"):
+            slip_cols = st.columns(3)
+            with slip_cols[0]:
+                k_value = st.number_input(
+                    "Impact k",
+                    min_value=0.0,
+                    value=float(base_k),
+                    step=0.05,
+                )
+            with slip_cols[1]:
+                default_spread_value = st.number_input(
+                    "default_spread_bps",
+                    min_value=0.0,
+                    value=float(base_default_spread),
+                    step=0.1,
+                )
+            with slip_cols[2]:
+                min_half_value = st.number_input(
+                    "min_half_spread_bps",
+                    min_value=0.0,
+                    value=float(base_min_half),
+                    step=0.1,
+                )
+
+            dynamic_enabled = st.checkbox(
+                "Включить динамический спред",
+                value=bool(dyn_section.get("enabled", False)),
+            )
+            dyn_cols = st.columns(3)
+            with dyn_cols[0]:
+                alpha_bps_value = st.number_input(
+                    "alpha_bps",
+                    min_value=0.0,
+                    value=float(dyn_section.get("alpha_bps", 0.0)),
+                    step=0.1,
+                )
+            with dyn_cols[1]:
+                beta_coef_value = st.number_input(
+                    "beta_coef",
+                    min_value=0.0,
+                    value=float(dyn_section.get("beta_coef", 0.0)),
+                    step=0.1,
+                )
+            with dyn_cols[2]:
+                smoothing_text = st.text_input(
+                    "smoothing_alpha (0..1, опц.)",
+                    value="" if dyn_section.get("smoothing_alpha") in (None, "") else str(dyn_section.get("smoothing_alpha")),
+                )
+
+            dyn_cols2 = st.columns(3)
+            with dyn_cols2[0]:
+                min_spread_value = st.number_input(
+                    "min_spread_bps",
+                    min_value=0.0,
+                    value=float(dyn_section.get("min_spread_bps", 0.0)),
+                    step=0.1,
+                )
+            with dyn_cols2[1]:
+                max_spread_value = st.number_input(
+                    "max_spread_bps",
+                    min_value=0.0,
+                    value=float(dyn_section.get("max_spread_bps", 20.0)),
+                    step=0.5,
+                )
+            with dyn_cols2[2]:
+                fallback_text = st.text_input(
+                    "fallback_spread_bps (опц.)",
+                    value="" if dyn_section.get("fallback_spread_bps") in (None, "") else str(dyn_section.get("fallback_spread_bps")),
+                )
+
+            vol_metric_value = st.text_input(
+                "vol_metric (опц.)",
+                value=str(dyn_section.get("vol_metric") or ""),
+            )
+            vol_window_text = st.text_input(
+                "vol_window (bars, опц.)",
+                value="" if dyn_section.get("vol_window") in (None, "") else str(dyn_section.get("vol_window")),
+            )
+
+            submitted_slip = st.form_submit_button("Сохранить slippage")
+
+        if submitted_slip:
+            errors: list[str] = []
+            warnings: list[str] = []
+            smoothing_value = _parse_optional_float(smoothing_text, "smoothing_alpha", errors, min_value=0.0, max_value=1.0)
+            fallback_value = _parse_optional_float(fallback_text, "fallback_spread_bps", errors, min_value=0.0)
+            vol_window_value = _parse_optional_int(vol_window_text, "vol_window", errors, min_value=1)
+            if max_spread_value < min_spread_value:
+                errors.append("max_spread_bps должен быть ≥ min_spread_bps")
+            if errors:
+                for msg in errors:
+                    st.error(msg)
+            else:
+                new_slip = copy.deepcopy(slip_section)
+                new_slip["k"] = float(k_value)
+                new_slip["default_spread_bps"] = float(default_spread_value)
+                new_slip["min_half_spread_bps"] = float(min_half_value)
+
+                new_dyn = copy.deepcopy(dyn_section)
+                new_dyn["enabled"] = bool(dynamic_enabled)
+                new_dyn["alpha_bps"] = float(alpha_bps_value)
+                new_dyn["beta_coef"] = float(beta_coef_value)
+                new_dyn["min_spread_bps"] = float(min_spread_value)
+                new_dyn["max_spread_bps"] = float(max_spread_value)
+                if smoothing_value is None:
+                    new_dyn.pop("smoothing_alpha", None)
+                else:
+                    new_dyn["smoothing_alpha"] = float(smoothing_value)
+                if fallback_value is None:
+                    new_dyn.pop("fallback_spread_bps", None)
+                else:
+                    new_dyn["fallback_spread_bps"] = float(fallback_value)
+                if vol_metric_value.strip():
+                    new_dyn["vol_metric"] = vol_metric_value.strip()
+                else:
+                    new_dyn.pop("vol_metric", None)
+                if vol_window_value is None:
+                    new_dyn.pop("vol_window", None)
+                else:
+                    new_dyn["vol_window"] = int(vol_window_value)
+                new_slip["dynamic"] = new_dyn
+
+                sim_slip = copy.deepcopy(sim_slip_section)
+                sim_slip.update({
+                    "k": new_slip["k"],
+                    "default_spread_bps": new_slip["default_spread_bps"],
+                    "min_half_spread_bps": new_slip["min_half_spread_bps"],
+                })
+                sim_slip["dynamic"] = copy.deepcopy(new_dyn)
+
+                slip_payload = copy.deepcopy(slip_data)
+                slip_payload["slippage"] = new_slip
+                sim_payload = copy.deepcopy(sim_data)
+                sim_payload["slippage"] = sim_slip
+                slip_saved = _save_yaml(slippage_yaml_path, slip_payload, "slippage.yaml")
+                sim_saved = _save_yaml(sim_yaml_path, sim_payload, "config_sim.yaml (slippage)")
+                if slip_saved and sim_saved:
+                    slip_data = slip_payload
+                    slip_section = new_slip
+                    sim_data = sim_payload
+                    warnings.append("Slippage обновлён. Проверьте, что динамический режим соответствует данным.")
+                    if not dynamic_enabled and (
+                        alpha_bps_value > 0 or beta_coef_value > 0 or vol_metric_value.strip()
+                    ):
+                        warnings.append(
+                            "Динамический спред отключён, но заданы параметры > 0 — включите флаг 'Включить динамический спред'."
+                        )
+                    if dynamic_enabled and beta_coef_value > 0 and not vol_metric_value.strip():
+                        warnings.append("beta_coef > 0, но vol_metric не задан — модель не будет использовать коэффициент волатильности.")
+                    for msg in warnings:
+                        st.warning(msg)
+
+    st.divider()
+
+    fees_section = copy.deepcopy(fees_data.get("fees") or {})
+    sim_fees_section = copy.deepcopy(sim_data.get("fees") or {})
+    maker_bps_value = float(fees_section.get("maker_bps", sim_fees_section.get("maker_bps", 1.0)))
+    taker_bps_value = float(fees_section.get("taker_bps", sim_fees_section.get("taker_bps", 5.0)))
+    maker_share_override = fees_section.get("maker_share_default", sim_fees_section.get("maker_share_default"))
+    maker_share_override_text = "" if maker_share_override in (None, "") else str(maker_share_override)
+    mt_section = copy.deepcopy(fees_section.get("maker_taker_share") or {})
+
+    with st.expander("Fees: базовые ставки и maker/taker share", expanded=True):
+        with st.form("fees_form"):
+            fee_cols = st.columns(2)
+            with fee_cols[0]:
+                maker_bps_new = st.number_input(
+                    "maker_bps",
+                    min_value=0.0,
+                    value=float(maker_bps_value),
+                    step=0.1,
+                )
+            with fee_cols[1]:
+                taker_bps_new = st.number_input(
+                    "taker_bps",
+                    min_value=0.0,
+                    value=float(taker_bps_value),
+                    step=0.1,
+                )
+
+            maker_share_override_input = st.text_input(
+                "fees.maker_share_default (0..1, опц.)",
+                value=maker_share_override_text,
+            )
+
+            mt_enabled = st.checkbox(
+                "Включить maker/taker share",
+                value=bool(mt_section.get("enabled", False)),
+            )
+            mode_options = ["fixed", "model", "predictor"]
+            current_mode = str(mt_section.get("mode", "fixed")).lower()
+            if current_mode not in mode_options:
+                current_mode = "fixed"
+            mt_mode = st.selectbox("Режим maker/taker share", mode_options, index=mode_options.index(current_mode))
+            maker_share_default_value = st.number_input(
+                "maker_share_default",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(mt_section.get("maker_share_default", 0.5)),
+                step=0.05,
+            )
+            spread_cost_maker_value = st.number_input(
+                "spread_cost_maker_bps",
+                min_value=0.0,
+                value=float(mt_section.get("spread_cost_maker_bps", 0.0)),
+                step=0.1,
+            )
+            spread_cost_taker_value = st.number_input(
+                "spread_cost_taker_bps",
+                min_value=0.0,
+                value=float(mt_section.get("spread_cost_taker_bps", 0.0)),
+                step=0.1,
+            )
+            taker_override_text = st.text_input(
+                "taker_fee_override_bps (опц.)",
+                value="" if mt_section.get("taker_fee_override_bps") in (None, "") else str(mt_section.get("taker_fee_override_bps")),
+            )
+            coeffs = copy.deepcopy((mt_section.get("model") or {}).get("coefficients") or {})
+            coeff_cols = st.columns(3)
+            with coeff_cols[0]:
+                intercept_text = st.text_input(
+                    "intercept (опц.)",
+                    value="" if coeffs.get("intercept") in (None, "") else str(coeffs.get("intercept")),
+                )
+            with coeff_cols[1]:
+                dist_coef_text = st.text_input(
+                    "distance_to_mid (опц.)",
+                    value="" if coeffs.get("distance_to_mid") in (None, "") else str(coeffs.get("distance_to_mid")),
+                )
+            with coeff_cols[2]:
+                latency_coef_text = st.text_input(
+                    "latency (опц.)",
+                    value="" if coeffs.get("latency") in (None, "") else str(coeffs.get("latency")),
+                )
+
+            submitted_fees = st.form_submit_button("Сохранить fees")
+
+        if submitted_fees:
+            errors: list[str] = []
+            warnings: list[str] = []
+            maker_share_override_value = _parse_optional_float(
+                maker_share_override_input,
+                "fees.maker_share_default",
+                errors,
+                min_value=0.0,
+                max_value=1.0,
+            )
+            taker_override_value = _parse_optional_float(
+                taker_override_text,
+                "taker_fee_override_bps",
+                errors,
+                min_value=0.0,
+            )
+            intercept_value = _parse_optional_float(intercept_text, "intercept", errors)
+            dist_coef_value = _parse_optional_float(dist_coef_text, "distance_to_mid", errors)
+            latency_coef_value = _parse_optional_float(latency_coef_text, "latency", errors)
+            if errors:
+                for msg in errors:
+                    st.error(msg)
+            else:
+                new_fees = copy.deepcopy(fees_section)
+                new_fees["maker_bps"] = float(maker_bps_new)
+                new_fees["taker_bps"] = float(taker_bps_new)
+                if maker_share_override_value is None:
+                    new_fees.pop("maker_share_default", None)
+                else:
+                    new_fees["maker_share_default"] = float(maker_share_override_value)
+
+                new_mt = copy.deepcopy(mt_section)
+                new_mt["enabled"] = bool(mt_enabled)
+                new_mt["mode"] = mt_mode
+                new_mt["maker_share_default"] = float(maker_share_default_value)
+                new_mt["spread_cost_maker_bps"] = float(spread_cost_maker_value)
+                new_mt["spread_cost_taker_bps"] = float(spread_cost_taker_value)
+                if taker_override_value is None:
+                    new_mt.pop("taker_fee_override_bps", None)
+                else:
+                    new_mt["taker_fee_override_bps"] = float(taker_override_value)
+                if "model" not in new_mt or not isinstance(new_mt["model"], dict):
+                    new_mt["model"] = {}
+                model_block = copy.deepcopy(new_mt["model"])
+                coeff_block = copy.deepcopy(model_block.get("coefficients") or {})
+                if intercept_value is None:
+                    coeff_block.pop("intercept", None)
+                else:
+                    coeff_block["intercept"] = float(intercept_value)
+                if dist_coef_value is None:
+                    coeff_block.pop("distance_to_mid", None)
+                else:
+                    coeff_block["distance_to_mid"] = float(dist_coef_value)
+                if latency_coef_value is None:
+                    coeff_block.pop("latency", None)
+                else:
+                    coeff_block["latency"] = float(latency_coef_value)
+                model_block["coefficients"] = coeff_block
+                new_mt["model"] = model_block
+                new_fees["maker_taker_share"] = new_mt
+
+                sim_fees = copy.deepcopy(sim_fees_section)
+                sim_fees.update({
+                    "maker_bps": new_fees["maker_bps"],
+                    "taker_bps": new_fees["taker_bps"],
+                })
+                if maker_share_override_value is None:
+                    sim_fees.pop("maker_share_default", None)
+                else:
+                    sim_fees["maker_share_default"] = float(maker_share_override_value)
+                sim_fees["maker_taker_share"] = copy.deepcopy(new_mt)
+
+                fees_payload = copy.deepcopy(fees_data)
+                fees_payload["fees"] = new_fees
+                sim_payload = copy.deepcopy(sim_data)
+                sim_payload["fees"] = sim_fees
+                fees_saved = _save_yaml(fees_yaml_path, fees_payload, "fees.yaml")
+                sim_saved = _save_yaml(sim_yaml_path, sim_payload, "config_sim.yaml (fees)")
+                if fees_saved and sim_saved:
+                    fees_data = fees_payload
+                    fees_section = new_fees
+                    sim_data = sim_payload
+                    if not mt_enabled and (
+                        mt_mode != "fixed" or spread_cost_maker_value > 0 or spread_cost_taker_value > 0 or taker_override_value is not None
+                    ):
+                        warnings.append(
+                            "Maker/taker share выключен, но заданы параметры — включите флаг, чтобы применить модель."
+                        )
+                    for msg in warnings:
+                        st.warning(msg)
+
+    st.divider()
+    st.markdown("#### Калибровка слиппеджа и t-cost")
+
+    calib_cols = st.columns(2)
+    with calib_cols[0]:
+        slippage_calib_cfg = st.text_input(
+            "Slippage calibrate YAML",
+            value="configs/slippage_calibrate.yaml",
+            key="sim_slippage_calib_cfg",
+        )
+        apply_slip_update = st.checkbox(
+            "Перезаписать slippage.yaml и config_sim",
+            value=True,
+            key="sim_apply_slip_update",
+        )
+        if st.button("Calibrate slippage", key="sim_calibrate_slippage"):
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    report_path = os.path.join(tmpdir, "slippage_calibration.json")
+                    report = calibrate_slippage_from_config(slippage_calib_cfg, out=report_path)
+            except Exception as exc:
+                st.error(f"Ошибка калибровки slippage: {exc}")
+            else:
+                st.success("Slippage калиброван")
+                st.json(report)
+                if apply_slip_update:
+                    try:
+                        slip_after, _ = _load_yaml_file(slippage_yaml_path)
+                        sim_after, _ = _load_yaml_file(sim_yaml_path)
+                        new_slip = copy.deepcopy(slip_after.get("slippage") or {})
+                        for key in ["k", "default_spread_bps", "min_half_spread_bps"]:
+                            if key in report:
+                                new_slip[key] = float(report[key])
+                        new_slip.setdefault("dynamic", copy.deepcopy(new_slip.get("dynamic") or {}))
+                        slip_after["slippage"] = new_slip
+                        sim_slip = copy.deepcopy(sim_after.get("slippage") or {})
+                        for key in ["k", "default_spread_bps", "min_half_spread_bps"]:
+                            if key in report:
+                                sim_slip[key] = float(report[key])
+                        sim_slip.setdefault("dynamic", copy.deepcopy(sim_slip.get("dynamic") or {}))
+                        sim_after["slippage"] = sim_slip
+                        saved_slip = _save_yaml(slippage_yaml_path, slip_after, "slippage.yaml")
+                        saved_sim = _save_yaml(sim_yaml_path, sim_after, "config_sim.yaml")
+                        if saved_slip and saved_sim:
+                            slip_data = slip_after
+                            sim_data = sim_after
+                            st.success("Параметры slippage обновлены после калибровки")
+                    except Exception as exc:
+                        st.error(f"Не удалось обновить YAML после калибровки slippage: {exc}")
+
+    with calib_cols[1]:
+        tcost_target = st.selectbox(
+            "T-cost target",
+            options=["hl", "oc"],
+            index=0,
+            key="sim_tcost_target",
+        )
+        tcost_k = st.number_input(
+            "T-cost k",
+            min_value=0.0,
+            value=0.25,
+            step=0.05,
+            key="sim_tcost_k",
+        )
+        tcost_update_sandbox = st.checkbox(
+            "Обновить sandbox.yaml",
+            value=False,
+            key="sim_tcost_update_sandbox",
+        )
+        tcost_update_slippage = st.checkbox(
+            "Обновить slippage.dynamic",
+            value=True,
+            key="sim_tcost_update_slip",
+        )
+        if st.button("Calibrate t-cost", key="sim_calibrate_tcost"):
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    report_path = os.path.join(tmpdir, "tcost_calibration.json")
+                    cfg = TCostCalibrateConfig(
+                        sandbox_config=cfg_sandbox,
+                        out=report_path,
+                        target=str(tcost_target),
+                        k=float(tcost_k),
+                        dry_run=not tcost_update_sandbox,
+                    )
+                    report = calibrate_tcost_run(cfg)
+            except Exception as exc:
+                st.error(f"Ошибка калибровки t-cost: {exc}")
+            else:
+                st.success("T-cost калиброван")
+                st.json(report)
+                if tcost_update_slippage:
+                    try:
+                        fitted = report.get("fitted_params") or {}
+                        alpha_bps = float(fitted.get("base_bps", 0.0))
+                        beta_coef = float(fitted.get("alpha_vol", 0.0))
+                        slip_after, _ = _load_yaml_file(slippage_yaml_path)
+                        sim_after, _ = _load_yaml_file(sim_yaml_path)
+                        slip_dyn = copy.deepcopy((slip_after.get("slippage") or {}).get("dynamic") or {})
+                        slip_dyn["enabled"] = True
+                        slip_dyn["alpha_bps"] = alpha_bps
+                        slip_dyn["beta_coef"] = beta_coef
+                        slip_block = copy.deepcopy(slip_after.get("slippage") or {})
+                        slip_block["dynamic"] = slip_dyn
+                        slip_after["slippage"] = slip_block
+
+                        sim_slip_dyn = copy.deepcopy((sim_after.get("slippage") or {}).get("dynamic") or {})
+                        sim_slip_dyn["enabled"] = True
+                        sim_slip_dyn["alpha_bps"] = alpha_bps
+                        sim_slip_dyn["beta_coef"] = beta_coef
+                        sim_slip_block = copy.deepcopy(sim_after.get("slippage") or {})
+                        sim_slip_block["dynamic"] = sim_slip_dyn
+                        sim_after["slippage"] = sim_slip_block
+
+                        saved_slip = _save_yaml(slippage_yaml_path, slip_after, "slippage.yaml")
+                        saved_sim = _save_yaml(sim_yaml_path, sim_after, "config_sim.yaml")
+                        if saved_slip and saved_sim:
+                            slip_data = slip_after
+                            sim_data = sim_after
+                            st.success("Slippage.dynamic обновлён из t-cost калибровки")
+                    except Exception as exc:
+                        st.error(f"Не удалось обновить slippage после t-cost калибровки: {exc}")
 with tabs[13]:
     st.subheader(
         "T-cost Calibrate — калибровка модели издержек (base_bps, alpha_vol, beta_illiquidity)"

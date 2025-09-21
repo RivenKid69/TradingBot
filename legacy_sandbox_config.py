@@ -31,6 +31,7 @@ class SandboxConfig(BaseModel):
     data: DataConfig
     dynamic_spread: Dict[str, Any] = Field(default_factory=dict)
     out_reports: Optional[str] = None
+    bar_report_path: Optional[str] = None
 
 
 def load_config(path: str) -> SandboxConfig:

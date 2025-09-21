@@ -667,6 +667,7 @@ class BacktestConfig:
     artifacts_dir: Optional[str] = None
     logs_dir: Optional[str] = None
     run_id: Optional[str] = None
+    bar_report_path: Optional[str] = None
     timing_config: Optional[Dict[str, Any]] = None
 
 
@@ -941,6 +942,11 @@ class ServiceBacktest:
         component_sums: Dict[str, float] = {}
         component_counts: Dict[str, int] = {}
         reason_counts: Dict[str, int] = {}
+        spread_component_values: List[float] = []
+        impact_component_values: List[float] = []
+        fee_component_values: List[float] = []
+        clip_ratio_values: List[float] = []
+        bar_report_rows: List[Dict[str, Any]] = []
         for rep in reports:
             if not isinstance(rep, dict):
                 continue
@@ -968,44 +974,124 @@ class ServiceBacktest:
             total_fill_sum += per_fill_sum
             total_fill_count += per_fill_count
 
+            fill_ratio_avg = self._safe_float(
+                rep.get("bar_capacity_base_fill_ratio_avg")
+            )
+            if fill_ratio_avg is not None:
+                clip_ratio_values.append(fill_ratio_avg)
+
             maker_share_raw = rep.get("maker_share")
             fee_bps_raw = rep.get("expected_fee_bps")
             spread_bps_raw = rep.get("expected_spread_bps")
             try:
-                maker_share_val = float(maker_share_raw)
+                maker_candidate = float(maker_share_raw)
             except (TypeError, ValueError):
                 maker_share_val = None
             else:
-                if math.isfinite(maker_share_val):
-                    share_values.append(maker_share_val)
+                if math.isfinite(maker_candidate):
+                    maker_share_val = maker_candidate
+                    share_values.append(maker_candidate)
+                else:
+                    maker_share_val = None
             try:
-                fee_val = float(fee_bps_raw)
+                fee_candidate = float(fee_bps_raw)
             except (TypeError, ValueError):
                 fee_val = None
             else:
-                if math.isfinite(fee_val):
-                    fee_values.append(fee_val)
+                if math.isfinite(fee_candidate):
+                    fee_val = fee_candidate
+                    fee_values.append(fee_candidate)
+                else:
+                    fee_val = None
             try:
-                spread_val = float(spread_bps_raw)
+                spread_candidate = float(spread_bps_raw)
             except (TypeError, ValueError):
                 spread_val = None
             else:
-                if math.isfinite(spread_val):
-                    spread_values.append(spread_val)
+                if math.isfinite(spread_candidate):
+                    spread_val = spread_candidate
+                    spread_values.append(spread_candidate)
+                else:
+                    spread_val = None
+
+            detail_row: Dict[str, Any] = {
+                "ts_ms": rep.get("ts_ms"),
+                "symbol": rep.get("symbol"),
+                "equity": self._safe_float(rep.get("equity")),
+                "position_qty": self._safe_float(rep.get("position_qty")),
+                "mark_price": self._safe_float(rep.get("mark_price")),
+                "spread_bps": self._safe_float(rep.get("spread_bps")),
+                "vol_factor": self._safe_float(rep.get("vol_factor")),
+                "liquidity": self._safe_float(rep.get("liquidity")),
+                "maker_share": maker_share_val,
+                "expected_fee_bps": fee_val,
+                "expected_spread_bps": spread_val,
+                "fill_ratio": self._safe_float(rep.get("fill_ratio")),
+                "clip_ratio": fill_ratio_avg,
+                "cap_base_per_bar": self._safe_float(rep.get("cap_base_per_bar")),
+                "used_base_before": self._safe_float(rep.get("used_base_before")),
+                "used_base_after": self._safe_float(rep.get("used_base_after")),
+                "bar_capacity_base_trade_count": per_count,
+                "bar_capacity_base_fill_ratio_avg": fill_ratio_avg,
+                "capacity_reason": rep.get("capacity_reason"),
+                "exec_status": rep.get("exec_status"),
+                "status": rep.get("status"),
+            }
+
+            trades_payload = rep.get("trades")
+            if isinstance(trades_payload, Sequence) and not isinstance(
+                trades_payload, (str, bytes)
+            ):
+                detail_row["trades_count"] = len(trades_payload)
+            else:
+                detail_row["trades_count"] = 0
+
+            intents_payload = rep.get("core_order_intents")
+            if isinstance(intents_payload, Sequence) and not isinstance(
+                intents_payload, (str, bytes)
+            ):
+                detail_row["core_order_intents_count"] = len(intents_payload)
+            else:
+                detail_row["core_order_intents_count"] = 0
 
             components = rep.get("expected_cost_components")
+            component_spread_found = False
+            component_fee_found = False
             if isinstance(components, Mapping):
                 for key, value in components.items():
-                    try:
-                        num = float(value)
-                    except (TypeError, ValueError):
+                    comp_val = self._safe_float(value)
+                    detail_row[f"cost_{key}"] = comp_val
+                    if comp_val is None:
                         continue
-                    if not math.isfinite(num):
-                        continue
-                    component_sums[key] = component_sums.get(key, 0.0) + num
+                    component_sums[key] = component_sums.get(key, 0.0) + comp_val
                     component_counts[key] = component_counts.get(key, 0) + 1
+                    if key == "spread_bps":
+                        component_spread_found = True
+                        spread_component_values.append(comp_val)
+                    elif key == "fee_bps":
+                        component_fee_found = True
+                        fee_component_values.append(comp_val)
+                    if "impact" in key:
+                        impact_component_values.append(comp_val)
+
+            if "cost_spread_bps" not in detail_row:
+                detail_row["cost_spread_bps"] = spread_val
+            if "cost_fee_bps" not in detail_row:
+                detail_row["cost_fee_bps"] = fee_val
+            if spread_val is not None and not component_spread_found:
+                spread_component_values.append(spread_val)
+            if fee_val is not None and not component_fee_found:
+                fee_component_values.append(fee_val)
 
             reason_payload = rep.get("reason")
+            reason_code: Optional[str] = None
+            if isinstance(reason_payload, Mapping):
+                reason_code = str(reason_payload.get("code")) if "code" in reason_payload else None
+            elif reason_payload is not None:
+                reason_code = str(reason_payload)
+            if reason_code is not None:
+                detail_row["reason_code"] = reason_code
+
             collected_reasons = _collect_filter_rejection_counts(
                 reason_counts, reason_payload
             )
@@ -1015,6 +1101,8 @@ class ServiceBacktest:
                     _collect_filter_rejection_counts(
                         reason_counts, meta_payload.get("filter_rejection")
                     )
+
+            bar_report_rows.append(detail_row)
 
         if fees_enabled and expected_payload:
             default_share = self._safe_float(expected_payload.get("maker_share"))
@@ -1075,6 +1163,43 @@ class ServiceBacktest:
             if count > 0:
                 component_avg[key] = total / count
 
+        summary_payload: Optional[Dict[str, Any]] = None
+        if bar_report_rows:
+            spread_component_avg = _avg(spread_component_values) or spread_bps_avg
+            fee_component_avg = _avg(fee_component_values) or fee_bps_avg
+            impact_component_avg = _avg(impact_component_values)
+            clip_ratio_avg = _avg(clip_ratio_values)
+            summary_payload = {
+                "rows": len(bar_report_rows),
+                "spread_bps_avg": spread_component_avg,
+                "spread_bps_count": (
+                    len(spread_component_values)
+                    if spread_component_values
+                    else len(spread_values)
+                ),
+                "impact_bps_avg": impact_component_avg,
+                "impact_bps_count": len(impact_component_values),
+                "fee_bps_avg": fee_component_avg,
+                "fee_bps_count": (
+                    len(fee_component_values)
+                    if fee_component_values
+                    else len(fee_values)
+                ),
+                "clip_ratio_avg": clip_ratio_avg,
+                "clip_ratio_weighted": (
+                    total_fill_sum / total_fill_count
+                    if total_fill_count
+                    else None
+                ),
+                "clip_ratio_count": len(clip_ratio_values),
+            }
+            if maker_share_avg is not None:
+                summary_payload["maker_share_avg"] = maker_share_avg
+            if spread_bps_avg is not None and spread_component_avg is None:
+                summary_payload["spread_bps_overall_avg"] = spread_bps_avg
+            if fee_bps_avg is not None and fee_component_avg is None:
+                summary_payload["fee_bps_overall_avg"] = fee_bps_avg
+
         if (
             maker_share_avg is not None
             or fee_bps_avg is not None
@@ -1111,6 +1236,14 @@ class ServiceBacktest:
                 _fmt(spread_bps_avg),
                 comp_avg_repr,
                 comp_sum_repr,
+            )
+
+        bar_report_path = getattr(self.cfg, "bar_report_path", None)
+        if bar_report_path:
+            self._write_bar_reports(
+                bar_report_path,
+                records=bar_report_rows,
+                summary=summary_payload,
             )
 
         if reason_counts:
@@ -1273,6 +1406,59 @@ class ServiceBacktest:
         )
 
     @staticmethod
+    def _bar_summary_path(path: str) -> str:
+        base, _ext = os.path.splitext(path)
+        if base:
+            return f"{base}_summary.csv"
+        return f"{path}_summary.csv"
+
+    def _write_bar_reports(
+        self,
+        path: str,
+        *,
+        records: Sequence[Mapping[str, Any]],
+        summary: Optional[Mapping[str, Any]],
+    ) -> None:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        except Exception:
+            logger.exception(
+                "%s: failed to prepare directory for bar report %s",
+                "service_backtest",
+                path,
+            )
+            return
+
+        try:
+            pd.DataFrame(list(records)).to_csv(path, index=False)
+        except Exception:
+            logger.exception(
+                "%s: failed to write bar-level report to %s",
+                "service_backtest",
+                path,
+            )
+        else:
+            logger.info(
+                "%s: wrote %d bar rows to %s",
+                "service_backtest",
+                len(records),
+                path,
+            )
+
+        if not summary:
+            return
+
+        summary_path = self._bar_summary_path(path)
+        try:
+            pd.DataFrame([dict(summary)]).to_csv(summary_path, index=False)
+        except Exception:
+            logger.exception(
+                "%s: failed to write bar summary to %s",
+                "service_backtest",
+                summary_path,
+            )
+
+    @staticmethod
     def _safe_float(value: Any) -> Optional[float]:
         try:
             num = float(value)
@@ -1361,6 +1547,7 @@ def from_config(
         artifacts_dir=cfg.artifacts_dir,
         logs_dir=bt_kwargs.get("logs_dir") or cfg.logs_dir,
         run_id=bt_kwargs.get("run_id") or cfg.run_id,
+        bar_report_path=bt_kwargs.get("bar_report_path"),
         timing_config=bt_kwargs.get("timing_config") or cfg.timing.dict(),
     )
 
