@@ -1,9 +1,28 @@
+# Enables persistent runner state. Leave disabled for stateless sessions.
 enabled: false
+
+# Storage backend to use: "json" writes plain files, "sqlite" keeps a compact DB.
 backend: json
+
+# Directory that will store the state files. Created automatically when enabled.
+dir: state
+
+# Primary state file location. Relative paths are resolved against the project root.
 path: state/state_store.json
+
+# Interval between background snapshots in seconds (0 disables the scheduler).
 snapshot_interval_s: 60
+# Optional override in milliseconds; takes precedence over seconds when set.
+# snapshot_interval_ms: null
+
+# Flush state immediately whenever the runner emits a flush event.
 flush_on_event: true
-# number of backup files to keep (rotated as .bak1, .bak2, ...); 0 disables
+
+# Number of backup files to keep (rotated as .bak1, .bak2, ...); 0 disables.
 backup_keep: 3
-# separate lock file to prevent concurrent state access
+
+# Separate lock file to prevent concurrent access to the same state file.
 lock_path: state/state.lock
+
+# Persist per-symbol checkpoints when supported by the runner.
+last_processed_per_symbol: false

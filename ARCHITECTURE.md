@@ -104,26 +104,31 @@ latency:
 ### Сохранение состояния
 
 Параметры сохранения промежуточного состояния находятся в файле
-`configs/state.yaml`. Он задаёт расположение и периодичность создания
-снапшотов:
+`configs/state.yaml`. Он задаёт расположение, тип хранилища и периодичность
+создания снапшотов:
 
 ```yaml
 enabled: false
 backend: json
+dir: state
 path: state/state_store.json
 snapshot_interval_s: 60
+# snapshot_interval_ms: null
 flush_on_event: true
 backup_keep: 3
 lock_path: state/state.lock
+last_processed_per_symbol: false
 ```
 
 * `enabled` — включить сохранение состояния.
-* `backend` — тип хранилища (`json` по умолчанию).
-* `path` — путь к файлу с состоянием.
-* `snapshot_interval_s` — периодичность автосохранения.
+* `backend` — тип хранилища (`json` или `sqlite`).
+* `dir` — каталог, в котором будут храниться файлы состояния (создаётся автоматически).
+* `path` — путь к основному файлу с состоянием.
+* `snapshot_interval_s` / `snapshot_interval_ms` — периодичность автосохранения.
 * `flush_on_event` — писать состояние при принудительном сбросе.
 * `backup_keep` — количество резервных копий.
 * `lock_path` — путь к файлу блокировки.
+* `last_processed_per_symbol` — сохранять прогресс по каждому инструменту, если доступно.
 
 ### Профили исполнения
 
