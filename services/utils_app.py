@@ -182,12 +182,30 @@ def background_running(pid_file: str) -> bool:
 
 
 def tail_file(path: str, n: int = 200) -> str:
-    if not os.path.exists(path):
+    if n <= 0 or not os.path.exists(path):
         return ""
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()[-n:]
-        return "".join(lines)
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            end = fh.tell()
+            if end <= 0:
+                return ""
+            block_size = 8192
+            chunks: list[bytes] = []
+            lines_found = 0
+            while end > 0 and lines_found <= n:
+                read_size = block_size if end >= block_size else end
+                fh.seek(end - read_size)
+                chunk = fh.read(read_size)
+                chunks.append(chunk)
+                lines_found += chunk.count(b"\n")
+                end -= read_size
+            data = b"".join(reversed(chunks))
+            text = data.decode("utf-8", errors="ignore")
+            lines = text.splitlines()
+            if len(lines) > n:
+                lines = lines[-n:]
+            return "\n".join(lines)
     except Exception:
         return ""
 
