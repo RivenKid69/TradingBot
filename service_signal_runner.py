@@ -589,25 +589,79 @@ class _Worker:
             st = None
         self._positions = {}
         self._pending_exposure = {}
-        stored_state: Mapping[str, Any]
-        stored_state = {}
+        stored_state: Mapping[str, Any] = {}
         if st is not None:
             raw_state = getattr(st, "exposure_state", {}) or {}
             if isinstance(raw_state, MappingABC):
                 stored_state = dict(raw_state)
-        raw_positions = stored_state.get("positions", {}) if isinstance(stored_state, MappingABC) else {}
+
+        if st is not None:
+            raw_positions = getattr(st, "positions", {}) or {}
+            if isinstance(raw_positions, MappingABC):
+                for symbol, payload in raw_positions.items():
+                    sym = str(symbol).upper()
+                    if not sym:
+                        continue
+                    qty_val: float | None
+                    try:
+                        qty_val = float(payload)
+                    except (TypeError, ValueError):
+                        if hasattr(payload, "qty"):
+                            try:
+                                qty_val = float(getattr(payload, "qty"))
+                            except Exception:
+                                qty_val = None
+                        else:
+                            qty_val = None
+                    if qty_val is None or math.isclose(qty_val, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                        continue
+                    self._positions[sym] = qty_val
+
+        raw_positions = (
+            stored_state.get("positions", {}) if isinstance(stored_state, MappingABC) else {}
+        )
         if isinstance(raw_positions, MappingABC):
             for symbol, qty in raw_positions.items():
+                sym = str(symbol).upper()
+                if not sym or sym in self._positions:
+                    continue
                 try:
                     qty_val = float(qty)
                 except (TypeError, ValueError):
                     continue
                 if math.isclose(qty_val, 0.0, rel_tol=0.0, abs_tol=1e-12):
                     continue
-                sym = str(symbol).upper()
-                if not sym:
-                    continue
                 self._positions[sym] = qty_val
+
+        pending_summary: Dict[str, Dict[str, float]] = {}
+        if isinstance(stored_state, MappingABC):
+            raw_pending = stored_state.get("pending", {})
+            if isinstance(raw_pending, MappingABC):
+                for symbol, legs in raw_pending.items():
+                    sym = str(symbol).upper()
+                    if not sym or not isinstance(legs, MappingABC):
+                        continue
+                    sanitized_legs: Dict[str, float] = {}
+                    for leg, delta in legs.items():
+                        leg_name = str(leg)
+                        try:
+                            delta_val = float(delta)
+                        except (TypeError, ValueError):
+                            continue
+                        if not math.isfinite(delta_val) or math.isclose(
+                            delta_val, 0.0, rel_tol=0.0, abs_tol=1e-12
+                        ):
+                            continue
+                        sanitized_legs[leg_name] = delta_val
+                        key = f"state:{sym}:{leg_name}"
+                        self._pending_exposure[key] = {
+                            "symbol": sym,
+                            "leg": leg_name,
+                            "delta": delta_val,
+                            "source": "state",
+                        }
+                    if sanitized_legs:
+                        pending_summary[sym] = sanitized_legs
         total_notional = 0.0
         updated_at_ms = 0
         if isinstance(stored_state, MappingABC):
@@ -626,7 +680,7 @@ class _Worker:
                 total_notional = 0.0
         self._exposure_state = {
             "positions": dict(self._positions),
-            "pending": {},
+            "pending": pending_summary,
             "updated_at_ms": updated_at_ms,
             "total_notional": total_notional,
         }
@@ -2655,14 +2709,104 @@ class ServiceSignalRunner:
             marker_path.unlink()
         except Exception:
             dirty_restart = True
+        loaded_state: Any | None = None
         if self.cfg.state.enabled:
+            state_path = self.cfg.state.path
+            try:
+                self.logger.info(
+                    "loading persistent state path=%s backend=%s",
+                    state_path,
+                    self.cfg.state.backend,
+                )
+            except Exception:
+                pass
             try:
                 loaded_state = state_storage.load_state(
-                    self.cfg.state.path,
+                    state_path,
                     backend=self.cfg.state.backend,
                     lock_path=self.cfg.state.lock_path,
                     backup_keep=self.cfg.state.backup_keep,
                 )
+            except Exception:
+                self.logger.exception(
+                    "failed to load persistent state from %s; continuing with empty state",
+                    state_path,
+                )
+            else:
+                state_version = getattr(loaded_state, "version", None)
+                try:
+                    self.logger.info(
+                        "persistent state restored: version=%s path=%s",
+                        state_version,
+                        state_path,
+                    )
+                except Exception:
+                    pass
+
+                positions_summary: Dict[str, float] = {}
+                try:
+                    raw_positions = getattr(loaded_state, "positions", {}) or {}
+                    if isinstance(raw_positions, MappingABC):
+                        for sym, payload in raw_positions.items():
+                            symbol = str(sym).upper()
+                            if not symbol:
+                                continue
+                            qty_val: float | None = None
+                            if hasattr(payload, "qty"):
+                                try:
+                                    qty_val = float(getattr(payload, "qty"))
+                                except Exception:
+                                    qty_val = None
+                            elif isinstance(payload, MappingABC):
+                                candidate = (
+                                    payload.get("qty")
+                                    or payload.get("quantity")
+                                    or payload.get("position_qty")
+                                )
+                                try:
+                                    qty_val = float(candidate)
+                                except (TypeError, ValueError):
+                                    qty_val = None
+                            else:
+                                try:
+                                    qty_val = float(payload)
+                                except (TypeError, ValueError):
+                                    qty_val = None
+                            if qty_val is None or not math.isfinite(qty_val):
+                                continue
+                            positions_summary[symbol] = qty_val
+                except Exception:
+                    positions_summary = {}
+
+                orders_summary: Dict[str, Dict[str, Any]] = {}
+                try:
+                    raw_orders = getattr(loaded_state, "open_orders", {}) or {}
+                    if isinstance(raw_orders, MappingABC):
+                        for oid, payload in raw_orders.items():
+                            order_data: Dict[str, Any] = {}
+                            if hasattr(payload, "to_dict"):
+                                try:
+                                    order_data = dict(payload.to_dict())  # type: ignore[misc]
+                                except Exception:
+                                    order_data = {}
+                            elif isinstance(payload, MappingABC):
+                                order_data = dict(payload)
+                            symbol = str(order_data.get("symbol", ""))
+                            qty = (
+                                order_data.get("qty")
+                                or order_data.get("quantity")
+                                or order_data.get("origQty")
+                            )
+                            orders_summary[str(oid)] = {
+                                "symbol": symbol,
+                                "side": order_data.get("side"),
+                                "qty": qty,
+                                "status": order_data.get("status"),
+                            }
+                except Exception:
+                    orders_summary = {}
+
+                entry_limits_state = None
                 try:
                     entry_limits_raw = getattr(loaded_state, "entry_limits", {}) or {}
                     if isinstance(entry_limits_raw, MappingABC):
@@ -2671,32 +2815,180 @@ class ServiceSignalRunner:
                             for symbol, payload in entry_limits_raw.items()
                             if isinstance(payload, MappingABC)
                         }
-                    else:
-                        entry_limits_state = None
                 except Exception:
                     entry_limits_state = None
+
+                seen_signals_map: Dict[str, int] = {}
+                try:
+                    raw_seen = getattr(loaded_state, "seen_signals", None) or []
+                    if isinstance(raw_seen, MappingABC):
+                        iterable = raw_seen.items()
+                    else:
+                        iterable = raw_seen
+                    for item in iterable:
+                        sid: str | None = None
+                        expires: Any = None
+                        if isinstance(item, MappingABC):
+                            sid_candidate = (
+                                item.get("sid")
+                                or item.get("id")
+                                or item.get("signal_id")
+                                or item.get("key")
+                            )
+                            expires = (
+                                item.get("expires_at_ms")
+                                or item.get("expires_at")
+                                or item.get("expiry")
+                                or item.get("value")
+                                or item.get("ts_ms")
+                            )
+                            sid = str(sid_candidate) if sid_candidate is not None else None
+                        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+                            sid = str(item[0])
+                            expires = item[1]
+                        else:
+                            continue
+                        if not sid:
+                            continue
+                        try:
+                            expires_int = int(expires)
+                        except (TypeError, ValueError):
+                            continue
+                        seen_signals_map[sid] = expires_int
+                except Exception:
+                    seen_signals_map = {}
+
+                signal_state_payload: Dict[str, Any] = {}
+                try:
+                    raw_states = getattr(loaded_state, "signal_states", {}) or {}
+                    if isinstance(raw_states, MappingABC):
+                        signal_state_payload = {str(k): v for k, v in raw_states.items()}
+                except Exception:
+                    signal_state_payload = {}
+
+                config_snapshot = {}
+                try:
+                    raw_snapshot = getattr(loaded_state, "config_snapshot", {}) or {}
+                    if isinstance(raw_snapshot, MappingABC):
+                        config_snapshot = dict(raw_snapshot)
+                except Exception:
+                    config_snapshot = {}
+
+                git_hash = None
+                try:
+                    git_hash = getattr(loaded_state, "git_hash", None)
+                except Exception:
+                    git_hash = None
+
+                last_processed = None
+                try:
+                    last_processed = getattr(loaded_state, "last_processed_bar_ms", None)
+                except Exception:
+                    last_processed = None
+
+                try:
+                    self.logger.info(
+                        "state summary: positions=%d open_orders=%d entry_limits=%d seen_signals=%d last_processed_bar_ms=%s",
+                        len(positions_summary),
+                        len(orders_summary),
+                        len(entry_limits_state or {}),
+                        len(seen_signals_map),
+                        last_processed,
+                    )
+                except Exception:
+                    pass
+
+                if positions_summary:
+                    try:
+                        preview_limit = 5
+                        preview_items = list(positions_summary.items())
+                        preview = dict(preview_items[:preview_limit])
+                        if len(preview_items) > preview_limit:
+                            preview["..."] = f"{len(preview_items) - preview_limit} more"
+                        self.logger.info("positions restored: %s", preview)
+                    except Exception:
+                        pass
+
+                if orders_summary:
+                    try:
+                        preview_limit = 5
+                        preview_items = list(orders_summary.items())
+                        preview_orders: Dict[str, Dict[str, Any]] = {}
+                        for oid, data in preview_items[:preview_limit]:
+                            preview_orders[oid] = {
+                                "symbol": data.get("symbol"),
+                                "side": data.get("side"),
+                                "qty": data.get("qty"),
+                                "status": data.get("status"),
+                            }
+                        if len(preview_items) > preview_limit:
+                            preview_orders["..."] = {"count": len(preview_items) - preview_limit}
+                        self.logger.info("open orders restored: %s", preview_orders)
+                    except Exception:
+                        pass
+
+                if config_snapshot:
+                    try:
+                        self.logger.info(
+                            "config snapshot restored (%d keys)", len(config_snapshot)
+                        )
+                    except Exception:
+                        pass
+
+                if git_hash:
+                    try:
+                        self.logger.info("state git hash: %s", git_hash)
+                    except Exception:
+                        pass
+
                 loader = getattr(self.policy, "load_signal_state", None)
                 if callable(loader):
                     try:
-                        loader(getattr(loaded_state, "signal_states", {}) or {})
+                        loader(signal_state_payload)
+                        try:
+                            self.logger.info(
+                                "policy signal state restored (%d entries)",
+                                len(signal_state_payload),
+                            )
+                        except Exception:
+                            pass
                     except Exception:
-                        pass
-                if self.ws_dedup_enabled:
+                        self.logger.exception("failed to restore policy signal state")
+
+                if self.ws_dedup_enabled and seen_signals_map:
                     try:
-                        seen = dict(getattr(loaded_state, "seen_signals", {}) or {})
-                        for sid, exp in seen.items():
+                        signal_bus.STATE.clear()
+                        for sid, exp in seen_signals_map.items():
                             signal_bus.STATE[str(sid)] = int(exp)
+                        try:
+                            self.logger.info(
+                                "restored %d websocket dedup entries",
+                                len(signal_bus.STATE),
+                            )
+                        except Exception:
+                            pass
                     except Exception:
-                        pass
+                        self.logger.exception(
+                            "failed to restore websocket dedup state from persistence"
+                        )
+
                 client = getattr(self.adapter, "client", None)
                 if client is not None:
                     try:
                         summary = reconcile_state(loaded_state, client)
                         self.logger.info("state reconciliation: %s", summary)
-                    except Exception as e:
-                        self.logger.warning("state reconciliation skipped: %s", e)
-            except Exception:
-                pass
+                    except Exception as exc:
+                        self.logger.warning(
+                            "state reconciliation failed: %s",
+                            exc,
+                        )
+                else:
+                    try:
+                        self.logger.info(
+                            "state reconciliation skipped: private client not configured"
+                        )
+                    except Exception:
+                        pass
         if dirty_restart and self.monitoring_cfg.enabled:
             try:
                 monitoring.reset_kill_switch_counters()
