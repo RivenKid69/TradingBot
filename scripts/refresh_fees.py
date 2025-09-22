@@ -49,6 +49,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Label stored in metadata.vip_tier (default: %(default)s)",
     )
     parser.add_argument(
+        "--vip-tier-int",
+        type=int,
+        dest="vip_tier_int",
+        help="Explicit VIP tier integer stored in metadata.account_overrides.vip_tier",
+    )
+    parser.add_argument(
         "--csv",
         help="Optional CSV export with fee information to use instead of HTTP",
     )
@@ -57,6 +63,31 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_BNB_DISCOUNT_RATE,
         help="Fractional taker discount when paying fees with BNB (default: 0.25)",
+    )
+    parser.add_argument(
+        "--use-bnb-discount",
+        dest="use_bnb_discount",
+        action="store_true",
+        help="Indicate that the account actively uses BNB fee discounts",
+    )
+    parser.add_argument(
+        "--no-bnb-discount",
+        dest="use_bnb_discount",
+        action="store_false",
+        help="Indicate that the account does not use BNB fee discounts",
+    )
+    parser.set_defaults(use_bnb_discount=None)
+    parser.add_argument(
+        "--maker-discount-mult",
+        type=float,
+        dest="maker_discount_mult",
+        help="Explicit maker fee multiplier to persist in metadata overrides",
+    )
+    parser.add_argument(
+        "--taker-discount-mult",
+        type=float,
+        dest="taker_discount_mult",
+        help="Explicit taker fee multiplier to persist in metadata overrides",
     )
     parser.add_argument(
         "--timeout",
@@ -160,6 +191,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     snapshot = load_public_fee_snapshot(
         vip_tier=args.vip_tier,
+        vip_tier_numeric=args.vip_tier_int,
+        use_bnb_discount=args.use_bnb_discount,
+        maker_discount_mult=args.maker_discount_mult,
+        taker_discount_mult=args.taker_discount_mult,
         timeout=args.timeout,
         public_url=args.public_url,
         csv_path=csv_path,

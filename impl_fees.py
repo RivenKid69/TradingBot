@@ -69,6 +69,28 @@ def _safe_str(value: Any) -> Optional[str]:
     return text or None
 
 
+def _safe_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if not text:
+            return None
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return None
+    if isinstance(value, (int, float)):
+        if value == 1 or value == 1.0:
+            return True
+        if value == 0 or value == 0.0:
+            return False
+    return None
+
+
 def _normalise_path(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -322,6 +344,7 @@ class FeesConfig:
     fee_rounding_step: Optional[float] = None
     rounding: Dict[str, Any] = field(default_factory=dict)
     settlement: Dict[str, Any] = field(default_factory=dict)
+    public_snapshot: Dict[str, Any] = field(default_factory=dict)
     symbol_fee_table: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     account_info: Dict[str, Any] = field(default_factory=dict)
@@ -360,6 +383,12 @@ class FeesConfig:
     auto_use_bnb_discount: Optional[bool] = field(init=False, default=None)
     auto_vip_tier: Optional[int] = field(init=False, default=None)
     auto_refresh_metadata: Dict[str, Any] = field(init=False, default_factory=dict)
+    public_snapshot_use_bnb_discount: Optional[bool] = field(init=False, default=None)
+    public_snapshot_maker_discount_mult: Optional[float] = field(init=False, default=None)
+    public_snapshot_taker_discount_mult: Optional[float] = field(init=False, default=None)
+    public_snapshot_vip_tier: Optional[int] = field(init=False, default=None)
+    public_snapshot_vip_label: Optional[str] = field(init=False, default=None)
+    public_snapshot_discount_rate: Optional[float] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
@@ -444,6 +473,48 @@ class FeesConfig:
             self.symbol_fee_table = table
         else:
             self.symbol_fee_table = {}
+
+        if isinstance(self.public_snapshot, Mapping):
+            snapshot_cfg = {k: v for k, v in self.public_snapshot.items()}
+        else:
+            snapshot_cfg = {}
+        self.public_snapshot = snapshot_cfg
+
+        ps_use = _safe_bool(snapshot_cfg.get("use_bnb_discount"))
+        if ps_use is not None:
+            self.public_snapshot_use_bnb_discount = ps_use
+
+        ps_maker_mult = _safe_non_negative_float(snapshot_cfg.get("maker_discount_mult"))
+        if ps_maker_mult is None:
+            ps_maker_mult = _safe_non_negative_float(snapshot_cfg.get("maker_discount_multiplier"))
+        if ps_maker_mult is not None:
+            self.public_snapshot_maker_discount_mult = ps_maker_mult
+
+        ps_taker_mult = _safe_non_negative_float(snapshot_cfg.get("taker_discount_mult"))
+        if ps_taker_mult is None:
+            ps_taker_mult = _safe_non_negative_float(snapshot_cfg.get("taker_discount_multiplier"))
+        if ps_taker_mult is not None:
+            self.public_snapshot_taker_discount_mult = ps_taker_mult
+
+        vip_snapshot = snapshot_cfg.get("vip_tier")
+        if vip_snapshot is None:
+            vip_snapshot = snapshot_cfg.get("vip")
+        vip_value = _safe_positive_int(vip_snapshot)
+        if vip_value is not None:
+            self.public_snapshot_vip_tier = vip_value
+
+        vip_label = _safe_str(
+            snapshot_cfg.get("vip_label") or snapshot_cfg.get("vip_tier_label")
+        )
+        if vip_label:
+            self.public_snapshot_vip_label = vip_label
+
+        discount_snapshot = snapshot_cfg.get("bnb_discount_rate")
+        if discount_snapshot is None:
+            discount_snapshot = snapshot_cfg.get("discount_rate")
+        discount_value = _safe_non_negative_float(discount_snapshot)
+        if discount_value is not None:
+            self.public_snapshot_discount_rate = discount_value
 
         if isinstance(self.metadata, Mapping):
             self.metadata = dict(self.metadata)
@@ -598,6 +669,54 @@ class FeesImpl:
             share_payload = table_payload.get("share")
             if isinstance(share_payload, Mapping):
                 self._table_share_raw = dict(share_payload)
+
+        meta_account = _plain_mapping(self.table_metadata.get("account_overrides"))
+        if meta_account or self._table_account_overrides:
+            combined_overrides: Dict[str, Any] = {}
+            if meta_account:
+                combined_overrides.update(meta_account)
+            if self._table_account_overrides:
+                combined_overrides.update(self._table_account_overrides)
+            self._table_account_overrides = combined_overrides
+        else:
+            self._table_account_overrides = {}
+
+        if self._table_account_overrides:
+            use_bnb_meta = _safe_bool(self._table_account_overrides.get("use_bnb_discount"))
+            if use_bnb_meta is None:
+                use_bnb_meta = _safe_bool(self.table_metadata.get("use_bnb_discount"))
+            if use_bnb_meta is not None:
+                self.cfg.auto_use_bnb_discount = use_bnb_meta
+
+            maker_mult_meta = _safe_non_negative_float(
+                self._table_account_overrides.get("maker_discount_mult")
+            )
+            if maker_mult_meta is None:
+                maker_mult_meta = _safe_non_negative_float(
+                    self.table_metadata.get("maker_discount_mult")
+                )
+            if maker_mult_meta is not None:
+                self.cfg.auto_maker_discount_mult = maker_mult_meta
+
+            taker_mult_meta = _safe_non_negative_float(
+                self._table_account_overrides.get("taker_discount_mult")
+            )
+            if taker_mult_meta is None:
+                taker_mult_meta = _safe_non_negative_float(
+                    self.table_metadata.get("taker_discount_mult")
+                )
+            if taker_mult_meta is not None:
+                self.cfg.auto_taker_discount_mult = taker_mult_meta
+
+            vip_meta = _safe_positive_int(self._table_account_overrides.get("vip_tier"))
+            if vip_meta is None:
+                vip_meta = _safe_positive_int(self.table_metadata.get("vip_tier_numeric"))
+            if vip_meta is None and isinstance(self.table_metadata.get("vip_tier"), str):
+                vip_meta = _safe_positive_int(
+                    self.table_metadata.get("vip_tier").split(" ")[-1]
+                )
+            if vip_meta is not None:
+                self.cfg.auto_vip_tier = vip_meta
 
         if not self.table_stale and self.table_error is None:
             self.symbol_fee_table.update(self.symbol_fee_table_raw)
@@ -1135,9 +1254,16 @@ class FeesImpl:
 
         discount_env = os.environ.get("BINANCE_BNB_DISCOUNT_RATE")
         try:
-            discount_rate = float(discount_env) if discount_env is not None else DEFAULT_BNB_DISCOUNT_RATE
+            discount_rate = (
+                float(discount_env) if discount_env is not None else DEFAULT_BNB_DISCOUNT_RATE
+            )
         except (TypeError, ValueError):
             discount_rate = DEFAULT_BNB_DISCOUNT_RATE
+        if self.cfg.public_snapshot_discount_rate is not None:
+            try:
+                discount_rate = float(self.cfg.public_snapshot_discount_rate)
+            except (TypeError, ValueError):
+                pass
 
         api_key = _safe_str(os.environ.get("BINANCE_API_KEY"))
         api_secret = _safe_str(os.environ.get("BINANCE_API_SECRET"))
@@ -1145,20 +1271,40 @@ class FeesImpl:
             api_key = None
             api_secret = None
 
-        vip_label = DEFAULT_VIP_TIER_LABEL
-        vip_candidate: Optional[int] = None
-        if self.cfg.vip_tier_overridden and self.cfg.vip_tier is not None:
-            vip_candidate = int(self.cfg.vip_tier)
-        elif self.cfg.auto_vip_tier is not None:
-            vip_candidate = int(self.cfg.auto_vip_tier)
-        if vip_candidate is not None:
-            vip_label = f"VIP {vip_candidate}"
-        elif isinstance(self.table_metadata.get("vip_tier"), str):
-            vip_label = str(self.table_metadata.get("vip_tier"))
+        vip_label = self.cfg.public_snapshot_vip_label or DEFAULT_VIP_TIER_LABEL
+        vip_numeric: Optional[int] = None
+        if self.cfg.public_snapshot_vip_tier is not None:
+            vip_numeric = int(self.cfg.public_snapshot_vip_tier)
+            if not self.cfg.public_snapshot_vip_label:
+                vip_label = f"VIP {vip_numeric}"
+        else:
+            vip_candidate: Optional[int] = None
+            if self.cfg.vip_tier_overridden and self.cfg.vip_tier is not None:
+                vip_candidate = int(self.cfg.vip_tier)
+            elif self.cfg.auto_vip_tier is not None:
+                vip_candidate = int(self.cfg.auto_vip_tier)
+            if vip_candidate is not None:
+                vip_numeric = vip_candidate
+                if not self.cfg.public_snapshot_vip_label:
+                    vip_label = f"VIP {vip_numeric}"
+            elif isinstance(self.table_metadata.get("vip_tier"), str):
+                vip_label = self.cfg.public_snapshot_vip_label or str(
+                    self.table_metadata.get("vip_tier")
+                )
+            elif self.cfg.public_snapshot_vip_label:
+                vip_label = self.cfg.public_snapshot_vip_label
+
+        snapshot_use_bnb = self.cfg.public_snapshot_use_bnb_discount
+        snapshot_maker_mult = self.cfg.public_snapshot_maker_discount_mult
+        snapshot_taker_mult = self.cfg.public_snapshot_taker_discount_mult
 
         try:
             snapshot = load_public_fee_snapshot(
                 vip_tier=vip_label,
+                vip_tier_numeric=vip_numeric,
+                use_bnb_discount=snapshot_use_bnb,
+                maker_discount_mult=snapshot_maker_mult,
+                taker_discount_mult=snapshot_taker_mult,
                 timeout=timeout_value,
                 public_url=public_url,
                 csv_path=csv_path,
@@ -1468,6 +1614,13 @@ class FeesImpl:
                 settlement_cfg = dict(block)
                 break
 
+        public_snapshot_cfg = None
+        for key in ("public_snapshot", "public_fee_snapshot", "public_fee_overrides"):
+            block = d.get(key)
+            if isinstance(block, Mapping):
+                public_snapshot_cfg = dict(block)
+                break
+
         path = None
         for key in ("path", "fees_path", "symbol_fee_path"):
             candidate = d.get(key)
@@ -1494,6 +1647,7 @@ class FeesImpl:
                 fee_rounding_step=fee_rounding_step,
                 rounding=rounding_cfg or {},
                 settlement=settlement_cfg or {},
+                public_snapshot=public_snapshot_cfg or {},
                 symbol_fee_table=symbol_table,
                 metadata=metadata,
                 account_info=account_info_cfg or {},

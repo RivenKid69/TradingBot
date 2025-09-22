@@ -350,14 +350,20 @@ def _build_payload(
     symbols: Iterable[str],
     vip_tier: str,
     source: str,
+    metadata_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     now = ensure_aware(_dt.datetime.utcnow())
-    metadata = {
+    metadata: dict[str, Any] = {
         "built_at": format_timestamp(now),
         "source": source,
         "vip_tier": vip_tier,
         "schema_version": SCHEMA_VERSION,
     }
+    if metadata_overrides:
+        for key, value in metadata_overrides.items():
+            if value is None:
+                continue
+            metadata[key] = value
     fees: dict[str, dict[str, float | int]] = {}
     missing: list[str] = []
     for symbol in sorted({str(s).upper() for s in symbols}):
@@ -424,6 +430,10 @@ class PublicFeeSnapshot:
 def load_public_fee_snapshot(
     *,
     vip_tier: str = DEFAULT_VIP_TIER_LABEL,
+    vip_tier_numeric: int | None = None,
+    use_bnb_discount: bool | None = None,
+    maker_discount_mult: float | None = None,
+    taker_discount_mult: float | None = None,
     timeout: int = 30,
     public_url: str = PUBLIC_FEE_URL,
     csv_path: Path | str | None = None,
@@ -449,25 +459,112 @@ def load_public_fee_snapshot(
     else:
         records, source = _collect_from_public(public_url, timeout)
 
-    _apply_discount(records, float(bnb_discount_rate))
-    payload = _build_payload(records=records, symbols=symbol_set, vip_tier=vip_tier, source=source)
-
+    discount_rate = float(bnb_discount_rate)
+    _apply_discount(records, discount_rate)
     maker_default = _most_common([r.maker_bps for r in records.values() if r.maker_bps is not None])
     taker_default = _most_common([r.taker_bps for r in records.values() if r.taker_bps is not None])
-    discount_mult = _compute_discount_multiplier(records)
-    use_discount = bool(discount_mult is not None and discount_mult < 0.9999)
-    maker_discount_mult = discount_mult if discount_mult is not None else None
-    taker_discount_mult = discount_mult if discount_mult is not None else None
+    discount_mult_estimate = _compute_discount_multiplier(records)
+
+    if maker_discount_mult is not None:
+        try:
+            maker_discount_mult = float(maker_discount_mult)
+        except (TypeError, ValueError):
+            maker_discount_mult = None
+    if taker_discount_mult is not None:
+        try:
+            taker_discount_mult = float(taker_discount_mult)
+        except (TypeError, ValueError):
+            taker_discount_mult = None
+
+    fallback_discount_mult = discount_mult_estimate
+    if fallback_discount_mult is None:
+        keep_fraction = 1.0 - discount_rate
+        if keep_fraction > 0.0:
+            fallback_discount_mult = keep_fraction
+
+    maker_discount = maker_discount_mult
+    if maker_discount is None and fallback_discount_mult is not None:
+        maker_discount = float(fallback_discount_mult)
+    taker_discount = taker_discount_mult
+    if taker_discount is None and fallback_discount_mult is not None:
+        taker_discount = float(fallback_discount_mult)
+
+    use_discount_flag = use_bnb_discount
+    if use_discount_flag is None:
+        use_discount_flag = any(
+            mult is not None and mult < 0.9999 for mult in (maker_discount, taker_discount)
+        )
+
+    if use_discount_flag is False:
+        if maker_discount_mult is None:
+            maker_discount = 1.0
+        if taker_discount_mult is None:
+            taker_discount = 1.0
+    elif use_discount_flag is True:
+        if maker_discount is None and fallback_discount_mult is not None:
+            maker_discount = float(fallback_discount_mult)
+        if taker_discount is None and fallback_discount_mult is not None:
+            taker_discount = float(fallback_discount_mult)
+        if maker_discount is None:
+            maker_discount = 1.0 - discount_rate if discount_rate < 1.0 else 1.0
+        if taker_discount is None:
+            taker_discount = 1.0 - discount_rate if discount_rate < 1.0 else 1.0
+
+    if maker_discount is not None:
+        maker_discount = float(maker_discount)
+    if taker_discount is not None:
+        taker_discount = float(taker_discount)
 
     vip_numeric: int | None = None
+    if vip_tier_numeric is not None:
+        try:
+            vip_numeric = int(vip_tier_numeric)
+        except (TypeError, ValueError):
+            vip_numeric = None
+        else:
+            if vip_numeric < 0:
+                vip_numeric = None
+
     vip_text = vip_tier.strip()
     for token in vip_text.replace("-", " ").split():
         if token.isdigit():
             try:
                 vip_numeric = int(token)
+                if vip_numeric < 0:
+                    vip_numeric = None
+                    continue
                 break
             except ValueError:
                 continue
+
+    metadata_overrides: dict[str, Any] = {
+        "bnb_discount_rate": discount_rate,
+    }
+    if vip_numeric is not None:
+        metadata_overrides["vip_tier_numeric"] = vip_numeric
+
+    account_overrides: dict[str, Any] = {}
+    if vip_numeric is not None:
+        account_overrides["vip_tier"] = vip_numeric
+    if use_discount_flag is not None:
+        account_overrides["use_bnb_discount"] = bool(use_discount_flag)
+    if maker_discount is not None:
+        account_overrides["maker_discount_mult"] = float(maker_discount)
+    if taker_discount is not None:
+        account_overrides["taker_discount_mult"] = float(taker_discount)
+    if account_overrides:
+        metadata_overrides["account_overrides"] = account_overrides
+        metadata_overrides.setdefault("use_bnb_discount", account_overrides.get("use_bnb_discount"))
+        metadata_overrides.setdefault("maker_discount_mult", account_overrides.get("maker_discount_mult"))
+        metadata_overrides.setdefault("taker_discount_mult", account_overrides.get("taker_discount_mult"))
+
+    payload = _build_payload(
+        records=records,
+        symbols=symbol_set,
+        vip_tier=vip_tier,
+        source=source,
+        metadata_overrides=metadata_overrides,
+    )
 
     return PublicFeeSnapshot(
         payload=payload,
@@ -478,10 +575,10 @@ def load_public_fee_snapshot(
         vip_tier=vip_numeric,
         maker_bps_default=maker_default,
         taker_bps_default=taker_default,
-        maker_discount_mult=maker_discount_mult,
-        taker_discount_mult=taker_discount_mult,
-        discount_rate=float(bnb_discount_rate),
-        use_bnb_discount=use_discount,
+        maker_discount_mult=maker_discount,
+        taker_discount_mult=taker_discount,
+        discount_rate=discount_rate,
+        use_bnb_discount=bool(use_discount_flag),
     )
 
 
