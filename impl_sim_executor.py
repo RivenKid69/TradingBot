@@ -14,6 +14,7 @@ impl_sim_executor.py
 """
 
 from __future__ import annotations
+import os
 from dataclasses import dataclass
 import logging
 import math
@@ -31,7 +32,7 @@ from config import DataDegradationConfig
 # новые компонентные имплементации
 from impl_quantizer import QuantizerImpl, QuantizerConfig
 from impl_fees import FeesImpl, FeesConfig
-from impl_slippage import SlippageImpl, SlippageCfg
+from impl_slippage import SlippageImpl, SlippageCfg, load_calibration_artifact
 from impl_latency import LatencyImpl, LatencyCfg
 from impl_risk_basic import RiskBasicImpl, RiskBasicCfg
 
@@ -83,6 +84,25 @@ class SimExecutor(TradeExecutor):
                 if isinstance(payload, dict):
                     return dict(payload)
         if isinstance(cfg, dict):
+            return dict(cfg)
+        try:
+            return dict(cfg)  # type: ignore[arg-type]
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _slippage_dict(cfg: Any) -> Dict[str, Any]:
+        if cfg is None:
+            return {}
+        if hasattr(cfg, "dict"):
+            try:
+                payload = cfg.dict(exclude_unset=False)  # type: ignore[call-arg]
+            except Exception:
+                payload = {}
+            else:
+                if isinstance(payload, dict):
+                    return dict(payload)
+        if isinstance(cfg, Mapping):
             return dict(cfg)
         try:
             return dict(cfg)  # type: ignore[arg-type]
@@ -178,6 +198,157 @@ class SimExecutor(TradeExecutor):
             if override_value is None:
                 continue
             payload[key] = override_value
+
+        return payload
+
+    @staticmethod
+    def _resolve_calibration_path(
+        path: Any,
+        *,
+        run_config: Any | None,
+    ) -> Optional[str]:
+        candidates: list[str] = []
+        env_path = os.getenv("SLIPPAGE_CALIBRATION_PATH")
+        if env_path:
+            candidates.append(env_path)
+        if path:
+            candidates.append(str(path))
+        if run_config is not None:
+            art_dir = getattr(run_config, "artifacts_dir", None)
+            if art_dir:
+                base_dir = str(art_dir)
+                if path:
+                    candidates.append(os.path.join(base_dir, str(path)))
+                candidates.append(os.path.join(base_dir, "slippage_calibration.json"))
+                candidates.append(os.path.join(base_dir, "slippage", "calibration.json"))
+        candidates.append("data/slippage/live_slippage_calibration.json")
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate:
+                continue
+            resolved = os.path.expanduser(str(candidate))
+            if not os.path.isabs(resolved):
+                resolved = os.path.abspath(resolved)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if os.path.isfile(resolved):
+                return resolved
+        return None
+
+    @staticmethod
+    def _prepare_slippage_payload(
+        raw_cfg: Any,
+        *,
+        run_config: Any | None,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        payload = SimExecutor._slippage_dict(raw_cfg)
+
+        existing_profiles: Optional[Dict[str, Any]] = None
+        existing = payload.get("calibrated_profiles")
+        if isinstance(existing, Mapping):
+            existing_profiles = dict(existing)
+        elif existing is not None:
+            try:
+                existing_profiles = dict(existing)
+            except Exception:
+                existing_profiles = None
+        if existing_profiles is not None:
+            payload["calibrated_profiles"] = existing_profiles
+
+        calibration_enabled = (
+            bool(getattr(run_config, "slippage_calibration_enabled", False))
+            if run_config is not None
+            else False
+        )
+
+        if not calibration_enabled:
+            if existing_profiles is not None:
+                existing_profiles["enabled"] = False
+            return payload
+
+        calibration_payload: Optional[Dict[str, Any]] = None
+        resolved_path: Optional[str] = None
+        calibration_path = (
+            getattr(run_config, "slippage_calibration_path", None)
+            if run_config is not None
+            else None
+        )
+        resolved_path = SimExecutor._resolve_calibration_path(
+            calibration_path,
+            run_config=run_config,
+        )
+        if resolved_path is None:
+            logger.warning(
+                "Slippage calibration enabled but artifact not found (path=%s)",
+                calibration_path,
+            )
+        else:
+            default_symbol = (
+                getattr(run_config, "slippage_calibration_default_symbol", None)
+                if run_config is not None
+                else None
+            )
+            if not default_symbol:
+                default_symbol = symbol
+            calibration_payload = load_calibration_artifact(
+                resolved_path,
+                default_symbol=default_symbol,
+                symbols=[symbol],
+                enabled=calibration_enabled,
+            )
+            if calibration_payload is None:
+                logger.warning(
+                    "Failed to load slippage calibration artifact from %s",
+                    resolved_path,
+                )
+
+        merged_profiles: Dict[str, Any]
+        if calibration_payload:
+            merged_profiles = dict(existing_profiles or {})
+            calib_symbols = calibration_payload.get("symbols")
+            if isinstance(calib_symbols, Mapping):
+                existing_symbols: Dict[str, Any] = {}
+                symbols_block = merged_profiles.get("symbols")
+                if isinstance(symbols_block, Mapping):
+                    try:
+                        existing_symbols = dict(symbols_block)
+                    except Exception:
+                        existing_symbols = symbols_block  # type: ignore[assignment]
+                if existing_symbols:
+                    existing_symbols.update(calib_symbols)  # type: ignore[arg-type]
+                else:
+                    existing_symbols = dict(calib_symbols)
+                merged_profiles["symbols"] = existing_symbols
+            for key in ("path", "default_symbol", "last_refresh_ts"):
+                value = calibration_payload.get(key)
+                if value is not None:
+                    merged_profiles[key] = value
+            metadata = calibration_payload.get("metadata")
+            if isinstance(metadata, Mapping):
+                existing_meta = merged_profiles.get("metadata")
+                if isinstance(existing_meta, Mapping):
+                    meta_dict = dict(existing_meta)
+                    meta_dict.update(metadata)
+                    merged_profiles["metadata"] = meta_dict
+                else:
+                    merged_profiles["metadata"] = dict(metadata)
+            merged_profiles["enabled"] = bool(
+                calibration_payload.get("enabled", calibration_enabled)
+            )
+            payload["calibrated_profiles"] = merged_profiles
+            if resolved_path:
+                has_symbols = bool(calibration_payload.get("symbols"))
+                log_level = logger.info if has_symbols else logger.warning
+                log_level(
+                    "Loaded slippage calibration artifact %s for symbol %s%s",
+                    resolved_path,
+                    symbol,
+                    " (no matching profiles)" if not has_symbols else "",
+                )
+        elif existing_profiles is not None:
+            existing_profiles["enabled"] = True
 
         return payload
 
@@ -490,6 +661,31 @@ class SimExecutor(TradeExecutor):
 
         return True
 
+    def _maybe_register_slippage_regime_listener(self) -> None:
+        if not getattr(self, "_slippage_regime_updates_enabled", True):
+            return
+        slippage = getattr(self, "_slippage_impl", None)
+        if slippage is None:
+            return
+        register_fn = getattr(self._sim, "register_market_regime_listener", None)
+        if callable(register_fn):
+            try:
+                register_fn(slippage.set_market_regime)
+                self._slippage_regime_listener_registered = True
+            except Exception:
+                logger.debug(
+                    "Failed to register market regime listener", exc_info=True
+                )
+        if not getattr(self, "_slippage_regime_listener_registered", False):
+            regime = getattr(self._sim, "_last_market_regime", None)
+            if regime is not None:
+                try:
+                    slippage.set_market_regime(regime)
+                except Exception:
+                    logger.debug(
+                        "Failed to seed slippage regime state", exc_info=True
+                    )
+
     def __init__(
         self,
         sim: ExecutionSimulator,
@@ -516,6 +712,13 @@ class SimExecutor(TradeExecutor):
         self._sim = sim
         self._run_id = str(getattr(run_config, "run_id", "sim") or "sim")
         self._ctx = _SimCtx(symbol=str(symbol), max_position_abs_base=float(max_position_abs_base))
+        self._slippage_impl: SlippageImpl | None = None
+        self._slippage_regime_updates_enabled = (
+            bool(getattr(run_config, "slippage_regime_updates", True))
+            if run_config is not None
+            else True
+        )
+        self._slippage_regime_listener_registered = False
 
         close_lag_value: int | None = None
         if run_config is not None:
@@ -550,7 +753,11 @@ class SimExecutor(TradeExecutor):
         rc_quantizer = getattr(run_config, "quantizer", {}) if run_config else {}
         rc_risk = getattr(run_config, "risk", None) if run_config else None
         rc_latency = getattr(run_config, "latency", None) if run_config else None
-        rc_slippage = getattr(run_config, "slippage", {}) if run_config else {}
+        rc_slippage = SimExecutor._prepare_slippage_payload(
+            getattr(run_config, "slippage", {}) if run_config else {},
+            run_config=run_config,
+            symbol=str(symbol),
+        )
         rc_fees = getattr(run_config, "fees", {}) if run_config else {}
         rc_degradation = getattr(run_config, "data_degradation", {}) if run_config else {}
         self._no_trade_cfg = getattr(run_config, "no_trade", {}) if run_config else {}
@@ -627,6 +834,7 @@ class SimExecutor(TradeExecutor):
             latency = LatencyImpl.from_dict(cfg_lat)
         if slippage is None:
             slippage = SlippageImpl.from_dict(rc_slippage, run_config=run_config)
+        self._slippage_impl = slippage
         if fees is None:
             fee_cfg_payload = self._build_fee_config(
                 rc_fees,
@@ -667,11 +875,40 @@ class SimExecutor(TradeExecutor):
         if fees is not None:
             fees.attach_to(self._sim)
 
+        self._maybe_register_slippage_regime_listener()
+
         SimExecutor.apply_execution_profile(
             self._sim,
             self._exec_profile,
             self._exec_params,
         )
+
+    def update_market_regime(self, regime: Any) -> None:
+        if not getattr(self, "_slippage_regime_updates_enabled", True):
+            return
+        slippage = getattr(self, "_slippage_impl", None)
+        if slippage is not None:
+            setter = getattr(slippage, "set_market_regime", None)
+            if callable(setter):
+                try:
+                    setter(regime)
+                except Exception:
+                    logger.debug(
+                        "Failed to forward market regime to slippage", exc_info=True
+                    )
+        hint_fn = getattr(self._sim, "set_market_regime_hint", None)
+        if callable(hint_fn):
+            try:
+                hint_fn(regime)
+            except Exception:
+                logger.debug(
+                    "Failed to update simulator regime hint", exc_info=True
+                )
+        else:
+            try:
+                setattr(self._sim, "_last_market_regime", regime)
+            except Exception:
+                pass
 
     @staticmethod
     def from_config(

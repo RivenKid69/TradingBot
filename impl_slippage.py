@@ -21,6 +21,11 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 from adv_store import ADVStore
 
+try:  # pragma: no cover - optional dependency when YAML support is unavailable
+    import yaml
+except Exception:  # pragma: no cover
+    yaml = None  # type: ignore[assignment]
+
 try:
     from slippage import (
         SlippageConfig,
@@ -130,6 +135,158 @@ def _safe_positive_int(value: Any) -> Optional[int]:
     if num <= 0:
         return None
     return num
+
+
+def _parse_generated_timestamp(value: Any) -> Optional[int]:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    cleaned = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    try:
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def load_calibration_artifact(
+    path: str,
+    *,
+    default_symbol: Optional[str] = None,
+    symbols: Optional[Sequence[str]] = None,
+    enabled: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Load a calibrated slippage artifact and normalise it for ``SlippageImpl``.
+
+    The helper accepts JSON or YAML payloads produced by ``calibrate_live_slippage``
+    and converts them into a structure consumable by
+    :class:`CalibratedProfilesConfig`.
+    """
+
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw_text = fh.read()
+    except FileNotFoundError:
+        logger.warning("Slippage calibration artifact not found: %s", path)
+        return None
+    except Exception:
+        logger.exception("Failed to read slippage calibration artifact: %s", path)
+        return None
+
+    data: Any
+    try:
+        lower = path.lower()
+        if lower.endswith((".yaml", ".yml")) and yaml is not None:
+            data = yaml.safe_load(raw_text)  # type: ignore[call-arg]
+        else:
+            data = json.loads(raw_text)
+    except Exception:
+        logger.exception("Failed to parse slippage calibration artifact: %s", path)
+        return None
+
+    if not isinstance(data, Mapping):
+        logger.warning(
+            "Slippage calibration artifact %s has unexpected structure (expected mapping)",
+            path,
+        )
+        return None
+
+    symbols_block = data.get("symbols")
+    if not isinstance(symbols_block, Mapping) or not symbols_block:
+        logger.warning(
+            "Slippage calibration artifact %s does not contain symbol profiles", path
+        )
+        return None
+
+    symbols_filter: Optional[set[str]] = None
+    if symbols:
+        symbols_filter = {
+            str(sym).upper()
+            for sym in symbols
+            if sym is not None and str(sym).strip()
+        }
+        if not symbols_filter:
+            symbols_filter = None
+
+    normalised_symbols: Dict[str, Dict[str, Any]] = {}
+    for key, entry in symbols_block.items():
+        if not isinstance(entry, Mapping):
+            continue
+        symbol_key = str(key).upper()
+        if symbols_filter and symbol_key not in symbols_filter:
+            continue
+        metadata: Dict[str, Any] = {}
+        for meta_key in ("samples", "impact_mean_bps", "impact_std_bps"):
+            if meta_key in entry:
+                metadata[meta_key] = entry[meta_key]
+        exec_counts = entry.get("execution_profile_counts")
+        if isinstance(exec_counts, Mapping):
+            try:
+                metadata["execution_profile_counts"] = dict(exec_counts)
+            except Exception:
+                metadata["execution_profile_counts"] = exec_counts
+        profile_payload: Dict[str, Any] = {"symbol": symbol_key}
+        if entry.get("notional_curve") is not None:
+            profile_payload["notional_curve"] = entry.get("notional_curve")
+        if entry.get("hourly_multipliers") is not None:
+            profile_payload["hourly_multipliers"] = entry.get("hourly_multipliers")
+        if entry.get("regime_multipliers") is not None:
+            profile_payload["regime_multipliers"] = entry.get("regime_multipliers")
+        for key_name in ("k", "default_spread_bps", "min_half_spread_bps"):
+            if entry.get(key_name) is not None:
+                profile_payload[key_name] = entry.get(key_name)
+        if metadata:
+            profile_payload["metadata"] = metadata
+        normalised_symbols[symbol_key] = profile_payload
+
+    has_profiles = bool(normalised_symbols)
+    if not has_profiles:
+        logger.warning(
+            "Slippage calibration artifact %s did not yield usable symbol profiles",
+            path,
+        )
+
+    generated_at = data.get("generated_at")
+    last_refresh_ts = _parse_generated_timestamp(generated_at)
+    metadata_payload = {
+        "generated_at": generated_at,
+        "source_files": data.get("source_files"),
+        "regime_column": data.get("regime_column"),
+        "total_samples": data.get("total_samples"),
+        "artifact_path": path,
+    }
+
+    config_payload: Dict[str, Any] = {
+        "enabled": bool(enabled) and has_profiles,
+        "path": path,
+        "symbols": normalised_symbols,
+        "metadata": metadata_payload,
+    }
+    if last_refresh_ts is not None:
+        config_payload["last_refresh_ts"] = last_refresh_ts
+
+    default_candidate = None
+    if default_symbol:
+        candidate = str(default_symbol).upper()
+        if candidate in normalised_symbols:
+            default_candidate = candidate
+    if default_candidate is None and len(normalised_symbols) == 1:
+        default_candidate = next(iter(normalised_symbols))
+    if default_candidate is not None:
+        config_payload["default_symbol"] = default_candidate
+
+    return config_payload
 
 
 def _cfg_attr(block: Any, key: str, default: Any = None) -> Any:
@@ -833,6 +990,8 @@ class SlippageImpl:
         self._calibration_global_regime: Dict[str, CalibratedRegimeOverride] = {}
         self._calibration_base_dir: Optional[str] = None
         self._calibration_lock = threading.Lock()
+        self._current_market_regime: Any = None
+        self._calibration_enabled: bool = False
         dyn_cfg_obj: Optional[DynamicSpreadConfig] = None
         adv_cfg_obj: Optional[Any] = None
         impact_cfg_obj: Optional[Any] = None
@@ -1486,6 +1645,13 @@ class SlippageImpl:
                 setattr(self._cfg_obj, "calibrated_profiles", cfg_obj)
             except Exception:
                 logger.exception("Failed to attach calibrated profiles to config")
+        enabled_flag = False
+        if cfg_obj is not None:
+            try:
+                enabled_flag = bool(getattr(cfg_obj, "enabled"))
+            except Exception:
+                enabled_flag = False
+        self._calibration_enabled = enabled_flag and bool(self._calibration_symbols)
 
     def _get_calibrated_profile(
         self, symbol: Optional[str]
@@ -1507,6 +1673,11 @@ class SlippageImpl:
         if profile is not None:
             self._ensure_profile_loaded(profile)
         return profile
+
+    def set_market_regime(self, regime: Any) -> None:
+        """Update the cached market regime used by calibrated profiles."""
+
+        self._current_market_regime = regime
 
     def get_calibrated_trade_cost_bps(
         self,
@@ -1998,6 +2169,11 @@ class SlippageImpl:
         bar_close_ts: Any = None,
         order_seq: Any = None,
         vol_metrics: Optional[Mapping[str, Any]] = None,
+        market_regime: Any = None,
+        symbol: Any = None,
+        ts_ms: Any = None,
+        hour_of_week: Any = None,
+        notional: Any = None,
     ) -> float:
         base_spread = _safe_float(spread_bps)
         if base_spread is None or base_spread < 0.0:
@@ -2024,8 +2200,10 @@ class SlippageImpl:
             notional_hint = _safe_float(metrics.get("notional"))
             if notional_hint is not None and notional_hint > 0.0:
                 order_notional = notional_hint
-        symbol = self._symbol
-        adv_val = self._resolve_adv_value(symbol=symbol, metrics=metrics)
+        symbol_key = self._normalise_symbol(symbol) if symbol is not None else None
+        if symbol_key is None:
+            symbol_key = self._symbol
+        adv_val = self._resolve_adv_value(symbol=symbol_key, metrics=metrics)
         participation_ratio: Optional[float] = None
         if order_notional is not None and adv_val is not None and adv_val > 0.0:
             try:
@@ -2040,68 +2218,142 @@ class SlippageImpl:
             participation_ratio = qty_val
         participation_ratio = max(float(participation_ratio), float(self.cfg.eps))
 
-        impact_cfg = self._impact_cfg
-        k_base = float(self.cfg.k)
-        k_effective = k_base
-        vol_mult = 1.0
-        metrics_available = False
-        if impact_cfg is not None:
-            enabled = _cfg_attr(impact_cfg, "enabled")
-            try:
-                impact_enabled = bool(enabled)
-            except Exception:
-                impact_enabled = False
-            if impact_enabled:
-                state = self._trade_cost_state
-                vol_value = None
-                if state.vol_metric and metrics:
-                    metric_val = _lookup_metric(metrics, state.vol_metric)
-                    vol_value = _safe_float(metric_val)
-                if vol_value is None:
-                    vol_value = _safe_float(metrics.get("vol_factor"))
-                part_metric_value = None
-                if state.participation_metric and metrics:
-                    metric_val = _lookup_metric(metrics, state.participation_metric)
-                    part_metric_value = _safe_float(metric_val)
-                if part_metric_value is None and participation_ratio is not None:
-                    part_metric_value = float(participation_ratio)
-                vol_norm = state.normalise_vol(vol_value)
-                part_norm = state.normalise_part(part_metric_value)
-                beta_vol = _safe_float(_cfg_attr(impact_cfg, "beta_vol")) or 0.0
-                beta_part = _safe_float(_cfg_attr(impact_cfg, "beta_participation")) or 0.0
-                if vol_norm is not None:
-                    vol_mult += beta_vol * vol_norm
-                    metrics_available = True
-                if part_norm is not None:
-                    vol_mult += beta_part * part_norm
-                    metrics_available = True
-                if not math.isfinite(vol_mult):
-                    vol_mult = 1.0
-                if vol_mult < 0.0:
-                    vol_mult = 0.0
-                if metrics_available:
-                    k_effective = k_base * vol_mult
-                else:
-                    fallback_k = _safe_float(_cfg_attr(impact_cfg, "fallback_k"))
-                    if fallback_k is not None and fallback_k > 0.0:
-                        k_effective = fallback_k
-                min_k = _safe_float(_cfg_attr(impact_cfg, "min_k"))
-                max_k = _safe_float(_cfg_attr(impact_cfg, "max_k"))
-                if min_k is not None or max_k is not None:
-                    k_effective = _clamp(k_effective, min_k, max_k)
-                k_effective = self._trade_cost_state.apply_k_smoothing(k_effective)
+        regime_value = market_regime
+        if regime_value is not None:
+            self._current_market_regime = regime_value
+        else:
+            regime_value = self._current_market_regime
 
-        impact_term = k_effective * math.sqrt(max(participation_ratio, float(self.cfg.eps)))
-        base_cost = half_spread + impact_term
-        tail_mult, tail_bps = self._evaluate_tail_shock(
-            side=side, bar_close_ts=bar_close_ts, order_seq=order_seq
-        )
-        total_cost = base_cost * tail_mult + tail_bps
-        if not math.isfinite(total_cost):
-            total_cost = base_cost
-        if total_cost < 0.0:
-            total_cost = 0.0
-        taker_cost = float(total_cost)
+        ts_hint = None
+        if ts_ms is not None:
+            try:
+                ts_hint = int(ts_ms)
+            except (TypeError, ValueError):
+                ts_hint = None
+        if ts_hint is None and bar_close_ts is not None:
+            try:
+                ts_hint = int(bar_close_ts)
+            except (TypeError, ValueError):
+                ts_hint = None
+
+        hour_hint = None
+        if hour_of_week is not None:
+            try:
+                hour_hint = int(hour_of_week)
+            except (TypeError, ValueError):
+                hour_hint = None
+
+        notional_override = _safe_float(notional)
+        if notional_override is None:
+            notional_override = order_notional
+
+        liq_for_calibration = _safe_float(metrics.get("liquidity"))
+        if liq_for_calibration is None and adv_val is not None:
+            liq_for_calibration = adv_val
+
+        vol_factor_val = _safe_float(metrics.get("vol_factor"))
+        if vol_factor_val is None:
+            vol_factor_val = _safe_float(metrics.get("sigma"))
+        if vol_factor_val is None:
+            vol_factor_val = _safe_float(self._last_vol_factor)
+
+        calibration_meta: Dict[str, Any] = {}
+        total_cost: Optional[float] = None
+        taker_cost: float
+
+        if self._calibration_enabled:
+            calibration_cost = self.get_calibrated_trade_cost_bps(
+                side=side,
+                qty=qty_val,
+                spread_bps=base_spread,
+                liquidity=liq_for_calibration,
+                vol_factor=vol_factor_val,
+                ts_ms=ts_hint,
+                market_regime=regime_value,
+                hour_of_week=hour_hint,
+                notional=notional_override,
+                mid=mid_val,
+                symbol=symbol_key,
+            )
+            if calibration_cost is not None:
+                total_cost = float(calibration_cost)
+                taker_cost = float(total_cost)
+                calibration_meta["calibration_profile"] = True
+                if symbol_key is not None:
+                    calibration_meta["calibration_symbol"] = symbol_key
+                if regime_value is not None:
+                    regime_repr = getattr(regime_value, "name", None) or str(regime_value)
+                    calibration_meta["calibration_regime"] = regime_repr
+                if ts_hint is not None:
+                    calibration_meta["calibration_ts_ms"] = int(ts_hint)
+
+        if total_cost is None:
+            impact_cfg = self._impact_cfg
+            k_base = float(self.cfg.k)
+            k_effective = k_base
+            vol_mult = 1.0
+            metrics_available = False
+            if impact_cfg is not None:
+                enabled = _cfg_attr(impact_cfg, "enabled")
+                try:
+                    impact_enabled = bool(enabled)
+                except Exception:
+                    impact_enabled = False
+                if impact_enabled:
+                    state = self._trade_cost_state
+                    vol_value = None
+                    if state.vol_metric and metrics:
+                        metric_val = _lookup_metric(metrics, state.vol_metric)
+                        vol_value = _safe_float(metric_val)
+                    if vol_value is None:
+                        vol_value = _safe_float(metrics.get("vol_factor"))
+                    part_metric_value = None
+                    if state.participation_metric and metrics:
+                        metric_val = _lookup_metric(metrics, state.participation_metric)
+                        part_metric_value = _safe_float(metric_val)
+                    if part_metric_value is None and participation_ratio is not None:
+                        part_metric_value = float(participation_ratio)
+                    vol_norm = state.normalise_vol(vol_value)
+                    part_norm = state.normalise_part(part_metric_value)
+                    beta_vol = _safe_float(_cfg_attr(impact_cfg, "beta_vol")) or 0.0
+                    beta_part = _safe_float(_cfg_attr(impact_cfg, "beta_participation")) or 0.0
+                    if vol_norm is not None:
+                        vol_mult += beta_vol * vol_norm
+                        metrics_available = True
+                    if part_norm is not None:
+                        vol_mult += beta_part * part_norm
+                        metrics_available = True
+                    if not math.isfinite(vol_mult):
+                        vol_mult = 1.0
+                    if vol_mult < 0.0:
+                        vol_mult = 0.0
+                    if metrics_available:
+                        k_effective = k_base * vol_mult
+                    else:
+                        fallback_k = _safe_float(_cfg_attr(impact_cfg, "fallback_k"))
+                        if fallback_k is not None and fallback_k > 0.0:
+                            k_effective = fallback_k
+                    min_k = _safe_float(_cfg_attr(impact_cfg, "min_k"))
+                    max_k = _safe_float(_cfg_attr(impact_cfg, "max_k"))
+                    if min_k is not None or max_k is not None:
+                        k_effective = _clamp(k_effective, min_k, max_k)
+                    k_effective = self._trade_cost_state.apply_k_smoothing(k_effective)
+
+            impact_term = k_effective * math.sqrt(
+                max(participation_ratio, float(self.cfg.eps))
+            )
+            base_cost = half_spread + impact_term
+            tail_mult, tail_bps = self._evaluate_tail_shock(
+                side=side, bar_close_ts=bar_close_ts, order_seq=order_seq
+            )
+            total_cost = base_cost * tail_mult + tail_bps
+            if not math.isfinite(total_cost):
+                total_cost = base_cost
+            if total_cost < 0.0:
+                total_cost = 0.0
+            taker_cost = float(total_cost)
+
+        trade_meta = dict(calibration_meta)
         if self._maker_taker_share_enabled:
             share_metric: Any = None
             maker_cost_metric: Any = None
@@ -2126,14 +2378,18 @@ class SlippageImpl:
                 expected_spread = taker_cost_effective
             if expected_spread < 0.0:
                 expected_spread = 0.0
-            trade_meta = {
-                "maker_share": float(share_value),
-                "spread_cost_maker_bps": float(maker_cost),
-                "spread_cost_taker_bps": float(taker_cost_effective),
-                "taker_spread_bps": float(taker_cost_effective),
-                "expected_spread_bps": float(expected_spread),
-            }
+            trade_meta.update(
+                {
+                    "maker_share": float(share_value),
+                    "spread_cost_maker_bps": float(maker_cost),
+                    "spread_cost_taker_bps": float(taker_cost_effective),
+                    "taker_spread_bps": float(taker_cost_effective),
+                    "expected_spread_bps": float(expected_spread),
+                }
+            )
             self._last_trade_cost_meta = trade_meta
         else:
-            self._last_trade_cost_meta = {}
+            self._last_trade_cost_meta = trade_meta
+        if total_cost is None:
+            total_cost = float(half_spread)
         return float(total_cost)

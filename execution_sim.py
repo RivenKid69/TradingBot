@@ -2059,6 +2059,9 @@ class ExecutionSimulator:
         self._last_spread_bps: Optional[float] = None
         self._last_vol_factor: Optional[float] = None
         self._last_vol_raw: Optional[Dict[str, float]] = None
+        self._last_hour_of_week: Optional[int] = None
+        self._last_market_regime: Any = None
+        self._market_regime_listeners: list[Callable[[Any], None]] = []
         self._last_liquidity: Optional[float] = None
         self._snapshot_hour: Optional[int] = None
 
@@ -4487,10 +4490,21 @@ class ExecutionSimulator:
         if bar_ts_val is None:
             bar_ts_val = getattr(self, "_last_bar_close_ts", None)
         if bar_ts_val is not None:
+            ts_candidate: Optional[int]
             try:
-                kwargs["bar_close_ts"] = int(bar_ts_val)
+                ts_candidate = int(bar_ts_val)
             except (TypeError, ValueError):
-                pass
+                ts_candidate = None
+            if ts_candidate is not None:
+                kwargs["bar_close_ts"] = ts_candidate
+                kwargs["ts_ms"] = ts_candidate
+        if "ts_ms" not in kwargs:
+            ts_state = getattr(self, "_last_bar_close_ts", None)
+            if ts_state is not None:
+                try:
+                    kwargs["ts_ms"] = int(ts_state)
+                except (TypeError, ValueError):
+                    pass
         if order_seq is not None:
             try:
                 kwargs["order_seq"] = int(order_seq)
@@ -4523,6 +4537,7 @@ class ExecutionSimulator:
             notional = base_val * qty_val
             if math.isfinite(notional) and notional > 0.0:
                 metrics["notional"] = notional
+                kwargs["notional"] = float(notional)
             metrics["mid"] = base_val
         if spread_bps is not None:
             try:
@@ -4540,6 +4555,15 @@ class ExecutionSimulator:
                 pass
         if metrics_payload:
             kwargs["vol_metrics"] = dict(metrics_payload)
+        regime_val = getattr(self, "_last_market_regime", None)
+        if regime_val is not None:
+            kwargs["market_regime"] = regime_val
+        hour_val = getattr(self, "_last_hour_of_week", None)
+        if hour_val is not None and "hour_of_week" not in kwargs:
+            try:
+                kwargs["hour_of_week"] = int(hour_val)
+            except (TypeError, ValueError):
+                pass
         result, used_kwargs = self._call_trade_cost_getter(kwargs)
         if result is None:
             return None
@@ -5333,12 +5357,23 @@ class ExecutionSimulator:
         bar_high: Optional[float] = None,
         bar_low: Optional[float] = None,
         bar_close: Optional[float] = None,
+        market_regime: Optional[Any] = None,
     ) -> None:
         """
         Установить последний рыночный снапшот: bid/ask (для вычисления spread и mid),
         vol_factor (например ATR% за бар), liquidity (например rolling_volume_shares).
         """
         self._maybe_reset_intrabar_reference(ts_ms)
+        if ts_ms is not None:
+            try:
+                self._last_bar_close_ts = int(ts_ms)
+            except (TypeError, ValueError):
+                pass
+        if market_regime is not None:
+            try:
+                self.set_market_regime_hint(market_regime)
+            except Exception:
+                logger.debug("Failed to propagate market regime hint", exc_info=True)
         self._last_bid = float(bid) if bid is not None else None
         self._last_ask = float(ask) if ask is not None else None
 
@@ -5364,6 +5399,13 @@ class ExecutionSimulator:
                     self._spread_seasonality,
                     interpolate=self.seasonality_interpolate,
                 )
+        if how is not None:
+            try:
+                self._last_hour_of_week = int(how)
+            except (TypeError, ValueError):
+                self._last_hour_of_week = None
+        else:
+            self._last_hour_of_week = None
 
         sbps: Optional[float]
         if spread_bps is not None:
@@ -5539,6 +5581,36 @@ class ExecutionSimulator:
             bar_close=bar_close_val,
             timeframe_ms=None,
         )
+
+    def _notify_market_regime_listeners(self, regime: Any) -> None:
+        for callback in list(self._market_regime_listeners):
+            try:
+                callback(regime)
+            except Exception:
+                logger.debug(
+                    "Market regime listener %r failed", callback, exc_info=True
+                )
+
+    def register_market_regime_listener(self, callback: Callable[[Any], None]) -> None:
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        self._market_regime_listeners.append(callback)
+        if self._last_market_regime is not None:
+            try:
+                callback(self._last_market_regime)
+            except Exception:
+                logger.debug(
+                    "Market regime listener %r failed on replay", callback, exc_info=True
+                )
+
+    def set_market_regime_hint(self, regime: Any) -> None:
+        if regime is None:
+            return
+        previous = getattr(self, "_last_market_regime", None)
+        self._last_market_regime = regime
+        if previous == regime:
+            return
+        self._notify_market_regime_listeners(regime)
 
     def set_intrabar_timeframe_ms(self, timeframe_ms: Optional[int]) -> None:
         """Сохранить продолжительность бара для intrabar-логики."""
