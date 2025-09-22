@@ -10,6 +10,8 @@ Fully modern pipeline (Dict action‑space). Legacy box/array paths removed.
 import os
 import json
 import logging
+import math
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
@@ -234,6 +236,24 @@ class TradingEnv(gym.Env):
         else:
             self._close_actual = pd.Series(dtype="float64")
 
+        # --- bar interval & intrabar path metadata ---
+        self._bar_interval_columns = [
+            col
+            for col in (
+                "bar_interval_ms",
+                "bar_timeframe_ms",
+                "interval_ms",
+                "bar_duration_ms",
+                "timeframe_ms",
+                "step_ms",
+            )
+            if col in self.df.columns
+        ]
+        self.bar_interval_ms: int | None = self._infer_bar_interval_from_dataframe()
+        self._exec_intrabar_timeframe_configured = False
+        self._intrabar_path_columns = self._detect_intrabar_path_columns()
+        self._exec_intrabar_path_method: str | bool | None = None
+
         # --- load liquidity seasonality coefficients ---
         liq_path = liquidity_seasonality_path or kwargs.get(
             "liquidity_seasonality_path", "configs/liquidity_seasonality.json"
@@ -430,6 +450,7 @@ class TradingEnv(gym.Env):
         self._mediator = Mediator(self)
         if not hasattr(self._mediator, "calls"):
             self._mediator.calls = []
+        self._maybe_configure_exec_timeframe()
 
     # ------------------------------------------------ helpers
     def _init_state(self) -> Tuple[np.ndarray, dict]:
@@ -470,6 +491,334 @@ class TradingEnv(gym.Env):
                 val = row[col]
                 if pd.notna(val) and int(val) > dec_ts:
                     raise AssertionError(f"{col}={int(val)} > decision_ts={dec_ts}")
+
+
+    def _infer_bar_interval_from_dataframe(self) -> int | None:
+        """Infer bar interval in milliseconds using explicit columns or timestamp diffs."""
+
+        for col in self._bar_interval_columns:
+            series = pd.to_numeric(self.df[col], errors="coerce")
+            for value in series:
+                if pd.isna(value):
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(numeric) or numeric <= 0:
+                    continue
+                return int(round(numeric))
+
+        ts_candidates = [
+            "decision_ts",
+            "ts_ms",
+            "close_ts",
+            "open_ts",
+        ]
+        for col in ts_candidates:
+            if col not in self.df.columns:
+                continue
+            series = pd.to_numeric(self.df[col], errors="coerce").to_numpy(dtype="float64")
+            if series.size < 2:
+                continue
+            mask = np.isfinite(series)
+            if mask.sum() < 2:
+                continue
+            finite_vals = series[mask]
+            diffs = np.diff(finite_vals)
+            diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+            if not diffs.size:
+                continue
+            median = float(np.median(diffs))
+            if median <= 0:
+                continue
+            is_ms = "ms" in col.lower()
+            if not is_ms:
+                median *= 1000.0
+            return int(round(median))
+        return None
+
+    def _detect_intrabar_path_columns(self) -> list[str]:
+        cols: list[str] = []
+        for col in self.df.columns:
+            if not isinstance(col, str):
+                continue
+            lower = col.lower()
+            if any(key in lower for key in ("intrabar_path", "intrabar_points")):
+                cols.append(col)
+                continue
+            if "m1" in lower and any(token in lower for token in ("path", "points", "series")):
+                cols.append(col)
+        # Preserve order while removing duplicates
+        seen: set[str] = set()
+        unique: list[str] = []
+        for name in cols:
+            if name in seen:
+                continue
+            seen.add(name)
+            unique.append(name)
+        return unique
+
+    def _safe_float(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple, dict, set)):
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return numeric
+
+    def _diff_to_ms(self, start: Any, end: Any, col_name: str) -> int | None:
+        try:
+            if pd.isna(start) or pd.isna(end):
+                return None
+        except Exception:
+            pass
+        try:
+            diff = float(end) - float(start)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(diff) or diff <= 0:
+            return None
+        if "ms" not in col_name.lower():
+            diff *= 1000.0
+        return int(round(diff))
+
+    def _bar_interval_from_row(self, row: pd.Series) -> int | None:
+        for col in self._bar_interval_columns:
+            if col not in row.index:
+                continue
+            candidate = self._safe_float(row.get(col))
+            if candidate is None or candidate <= 0:
+                continue
+            return int(round(candidate))
+        return None
+
+    def _bar_interval_from_index(self, idx: int) -> int | None:
+        ts_cols = ["decision_ts", "ts_ms", "close_ts", "open_ts"]
+        for col in ts_cols:
+            if col not in self.df.columns:
+                continue
+            series = pd.to_numeric(self.df[col], errors="coerce")
+            if idx > 0:
+                diff = self._diff_to_ms(series.iloc[idx - 1], series.iloc[idx], col)
+                if diff:
+                    return diff
+            if idx + 1 < len(series):
+                diff = self._diff_to_ms(series.iloc[idx], series.iloc[idx + 1], col)
+                if diff:
+                    return diff
+        return None
+
+    def _update_bar_interval(self, row: pd.Series, idx: int) -> None:
+        candidate = self._bar_interval_from_row(row)
+        if candidate is None:
+            candidate = self._bar_interval_from_index(idx)
+        if candidate is not None and candidate > 0:
+            self.bar_interval_ms = int(candidate)
+
+    def _coerce_timestamp(self, value: Any, is_ms: bool | None, column_name: str) -> int | None:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        if is_ms is None:
+            is_ms = "ms" in column_name.lower()
+        if not is_ms:
+            numeric *= 1000.0
+        return int(round(numeric))
+
+    def _resolve_snapshot_timestamp(self, row: pd.Series) -> int:
+        for col, is_ms in (
+            ("decision_ts", True),
+            ("ts_ms", True),
+            ("close_ts", None),
+            ("open_ts", None),
+            ("timestamp_ms", True),
+            ("timestamp", False),
+            ("ts", False),
+        ):
+            if col not in row.index:
+                continue
+            ts = self._coerce_timestamp(row.get(col), is_ms, col)
+            if ts is not None:
+                return ts
+        time_fn = getattr(self.time, "time_ms", None)
+        if callable(time_fn):
+            try:
+                return int(time_fn())
+            except Exception:
+                pass
+        return int(time.time() * 1000)
+
+    def _normalize_intrabar_path_payload(self, payload: Any) -> list[Any] | None:
+        if payload is None:
+            return None
+        if isinstance(payload, bytes):
+            try:
+                payload = payload.decode("utf-8")
+            except Exception:
+                return None
+        if isinstance(payload, str):
+            data = payload.strip()
+            if not data:
+                return None
+            try:
+                payload = json.loads(data)
+            except Exception:
+                return None
+        if isinstance(payload, pd.Series):
+            payload = payload.tolist()
+        elif isinstance(payload, np.ndarray):
+            payload = payload.tolist()
+        elif hasattr(payload, "tolist") and not isinstance(payload, (str, bytes)):
+            try:
+                payload = payload.tolist()
+            except Exception:
+                pass
+        if isinstance(payload, dict):
+            for key in ("points", "path", "prices", "data"):
+                if key in payload:
+                    return self._normalize_intrabar_path_payload(payload.get(key))
+            return None
+        if isinstance(payload, (list, tuple)):
+            normalized: list[Any] = []
+            for item in payload:
+                if item is None:
+                    continue
+                if isinstance(item, float) and not math.isfinite(item):
+                    continue
+                normalized.append(item)
+            return normalized if normalized else None
+        return None
+
+    def _maybe_forward_intrabar_path(self, exec_sim: Any, row: pd.Series) -> None:
+        if not exec_sim or not self._intrabar_path_columns:
+            return
+        path_payload: list[Any] | None = None
+        for col in self._intrabar_path_columns:
+            if col not in row.index:
+                continue
+            value = row.get(col)
+            try:
+                if pd.isna(value):
+                    continue
+            except Exception:
+                pass
+            path_payload = self._normalize_intrabar_path_payload(value)
+            if path_payload:
+                break
+        if not path_payload:
+            return
+
+        method_name = getattr(self, "_exec_intrabar_path_method", None)
+        method = None
+        if isinstance(method_name, str):
+            method = getattr(exec_sim, method_name, None)
+            if not callable(method):
+                method = None
+                self._exec_intrabar_path_method = None
+        elif method_name is False:
+            return
+        if method is None:
+            for cand in (
+                "set_intrabar_reference_path",
+                "set_intrabar_reference_points",
+                "set_intrabar_price_path",
+                "set_intrabar_m1_points",
+                "set_intrabar_path_points",
+                "set_intrabar_path",
+            ):
+                fn = getattr(exec_sim, cand, None)
+                if callable(fn):
+                    self._exec_intrabar_path_method = cand
+                    method = fn
+                    break
+            else:
+                self._exec_intrabar_path_method = False
+                return
+        if not callable(method):
+            return
+        try:
+            method(path_payload)
+        except Exception:
+            logger.debug(
+                "Failed to forward intrabar path via %s", self._exec_intrabar_path_method, exc_info=True
+            )
+            self._exec_intrabar_path_method = False
+
+    def _maybe_configure_exec_timeframe(self) -> None:
+        if self._exec_intrabar_timeframe_configured:
+            return
+        if self.bar_interval_ms is None:
+            return
+        exec_sim = getattr(self._mediator, "exec", None)
+        if exec_sim is None or not hasattr(exec_sim, "set_intrabar_timeframe_ms"):
+            self._exec_intrabar_timeframe_configured = True
+            return
+        try:
+            current = getattr(exec_sim, "_intrabar_timeframe_ms", None)
+        except Exception:
+            current = None
+        should_set = True
+        if current is not None:
+            try:
+                should_set = int(current) <= 0
+            except (TypeError, ValueError):
+                should_set = True
+        if should_set:
+            try:
+                exec_sim.set_intrabar_timeframe_ms(int(self.bar_interval_ms))
+            except Exception:
+                pass
+        self._exec_intrabar_timeframe_configured = True
+
+    def _extract_trade_price(self, row: pd.Series) -> float | None:
+        for key in (
+            "trade_price",
+            "last_price",
+            "agg_trade_price",
+            "trade_px",
+        ):
+            if key not in row.index:
+                continue
+            val = self._safe_float(row.get(key))
+            if val is not None:
+                return val
+        return None
+
+    def _extract_trade_qty(self, row: pd.Series) -> float | None:
+        for key in (
+            "trade_qty",
+            "trade_volume",
+            "last_trade_qty",
+            "agg_trade_volume",
+            "agg_trade_qty",
+        ):
+            if key not in row.index:
+                continue
+            val = self._safe_float(row.get(key))
+            if val is not None:
+                return val
+        return None
 
 
 
@@ -514,6 +863,7 @@ class TradingEnv(gym.Env):
             row_idx = max(0, row_idx - self.latency_steps)
         row = self.df.iloc[row_idx]
         self._assert_feature_timestamps(row)
+        self._update_bar_interval(row, row_idx)
 
         bid_col = next((c for c in ("bid", "best_bid", "bid_price") if c in row.index), None)
         ask_col = next((c for c in ("ask", "best_ask", "ask_price") if c in row.index), None)
@@ -543,13 +893,26 @@ class TradingEnv(gym.Env):
 
         exec_sim = getattr(self._mediator, "exec", None)
         if exec_sim is not None and hasattr(exec_sim, "set_market_snapshot"):
+            if not self._exec_intrabar_timeframe_configured:
+                self._maybe_configure_exec_timeframe()
+            ts_ms = self._resolve_snapshot_timestamp(row)
+            trade_price = self._extract_trade_price(row)
+            trade_qty = self._extract_trade_qty(row)
             exec_sim.set_market_snapshot(
                 bid=bid,
                 ask=ask,
                 spread_bps=spread_bps,
                 vol_factor=vol_factor,
                 liquidity=liquidity,
+                ts_ms=ts_ms,
+                trade_price=trade_price,
+                trade_qty=trade_qty,
+                bar_open=self._safe_float(row.get("open")),
+                bar_high=self._safe_float(row.get("high")),
+                bar_low=self._safe_float(row.get("low")),
+                bar_close=self._safe_float(row.get("close")),
             )
+            self._maybe_forward_intrabar_path(exec_sim, row)
 
         self.last_bid = bid
         self.last_ask = ask
