@@ -428,10 +428,10 @@ cdef class EnvState:
     cdef public double bankruptcy_threshold, bankruptcy_penalty, max_drawdown
 
     # Параметры Shaping-а и риска
-    cdef public bint use_potential_shaping, use_dynamic_risk
+    cdef public bint use_potential_shaping, use_dynamic_risk, use_legacy_log_reward
     cdef public double gamma, last_potential, potential_shaping_coef
     cdef public double risk_aversion_variance, risk_aversion_drawdown
-    cdef public double trade_frequency_penalty, risk_off_level, risk_on_level
+    cdef public double trade_frequency_penalty, turnover_penalty_coef, risk_off_level, risk_on_level
     cdef public double max_position_risk_off, max_position_risk_on, market_impact_k
     cdef public long long price_scale # <-- ДОБАВЛЕНО ПОЛЕ ДЛЯ МАСШТАБА
 
@@ -514,6 +514,7 @@ cdef struct StateUpdateDelta:
     double final_peak_value
     double final_last_potential
     double final_last_pos
+    double executed_notional
 
     # Изменения в ордерах агента
     vector[long long] agent_orders_to_remove
@@ -571,7 +572,7 @@ cpdef tuple run_full_step_logic_cython(
     cdef int trades_made, i
     cdef double best_bid, best_ask
     # --- ИСПРАВЛЕНИЕ: Объявляем переменные здесь, чтобы они были доступны во всей функции ---
-    cdef double final_price, volatility_factor, old_units_for_commit
+    cdef double final_price, volatility_factor, old_units_for_commit, prev_net_worth_before_step, step_pnl
     cdef object order_id_to_remove, order_info_dict
     cdef tuple generated_events
     cdef np.ndarray limit_sides_bool, limit_prices, limit_sizes, cancel_sides, public_market_sides_bool, public_market_sizes
@@ -618,6 +619,7 @@ cpdef tuple run_full_step_logic_cython(
     delta.cash_delta = 0.0
     delta.units_delta = 0.0
     delta.position_value_delta = 0.0
+    delta.executed_notional = 0.0
     
     delta.clear_all_agent_orders = False
     delta.pos_was_closed = False
@@ -625,6 +627,7 @@ cpdef tuple run_full_step_logic_cython(
     delta.is_bankrupt = False
     delta.sl_tp_triggered = False
     old_units_for_commit = state.units # <--- Сохраняем состояние юнитов до всех изменений
+    prev_net_worth_before_step = state.prev_net_worth
 
     try:
         cdef CythonLOB lob_clone = lob.clone()
@@ -782,6 +785,8 @@ cpdef tuple run_full_step_logic_cython(
                     fee = state.taker_fee if is_taker else state.maker_fee
                     d_units = vol if is_buy_side_all_arr[j] else -vol
 
+                    delta.executed_notional += c_abs(vol * price)
+
                     delta.cash_delta -= d_units * price
                     delta.cash_delta -= vol * price * fee
 
@@ -913,11 +918,17 @@ else:
         
         delta.final_peak_value = max(state.peak_value, delta.final_net_worth)
         reward, delta.final_last_potential = _compute_reward_cython(
-            delta.final_net_worth, state.prev_net_worth, event_reward, state.use_potential_shaping, 
-            state.gamma, state.last_potential, state.potential_shaping_coef, final_units, bar_atr, 
-            state.risk_aversion_variance, delta.final_peak_value, state.risk_aversion_drawdown, 
-            trades_this_step, state.trade_frequency_penalty
+            delta.final_net_worth, prev_net_worth_before_step, event_reward,
+            state.use_legacy_log_reward, state.use_potential_shaping,
+            state.gamma, state.last_potential, state.potential_shaping_coef, final_units, bar_atr,
+            state.risk_aversion_variance, delta.final_peak_value, state.risk_aversion_drawdown,
+            trades_this_step, state.trade_frequency_penalty,
+            delta.executed_notional, state.turnover_penalty_coef
         )
+
+        step_pnl = delta.final_net_worth - prev_net_worth_before_step
+        info['step_pnl'] = step_pnl
+        info['turnover'] = <float>delta.executed_notional
 
         # Risk termination handled in Mediator/RiskGuard — do not set `done` or penalties here.
         # (bankruptcy_threshold / max_drawdown checks removed to avoid double counting)
@@ -1044,7 +1055,7 @@ else:
     # 4. Коэффициент исполнения тейкер-ордеров агента (fill ratio)
     cdef double agent_intended_taker_volume = 0.0
     if abs(delta_ratio) > 0.01: # Если агент вообще хотел торговать
-        agent_intended_taker_volume = abs(delta_ratio) * state.prev_net_worth / current_price
+        agent_intended_taker_volume = abs(delta_ratio) * prev_net_worth_before_step / current_price
     
     cdef double agent_actual_taker_volume = agent_taker_buy_vol_this_step + agent_taker_sell_vol_this_step
     
@@ -1052,7 +1063,9 @@ else:
         info['agent_fill_ratio'] = agent_actual_taker_volume / agent_intended_taker_volume
     else:
         info['agent_fill_ratio'] = 0.0
-    
+
+    state.prev_net_worth = state.net_worth
+
     # Возвращаем результат
     return reward, done, info
 
@@ -1062,54 +1075,41 @@ else:
 # ==============================================================================
 cdef _compute_reward_cython(
     float net_worth, float prev_net_worth, float event_reward,
-    bint use_potential_shaping, float gamma, float last_potential, float potential_shaping_coef,
+    bint use_legacy_log_reward, bint use_potential_shaping,
+    float gamma, float last_potential, float potential_shaping_coef,
     float units, float atr, float risk_aversion_variance,
     float peak_value, float risk_aversion_drawdown,
-    int trades_this_step, float trade_frequency_penalty
+    int trades_this_step, float trade_frequency_penalty,
+    double executed_notional, double turnover_penalty_coef
 ):
-    """
-    Вычисляет вознаграждение с использованием логарифмического дохода и 
-    корректной формулы Potential-Based Shaping.
-    """
-    # 1. Рассчитать базовый логарифмический доход (log return)
-    # Используем clip для стабильности логарифма
-    cdef double clipped_ratio = fmax(0.1, fmin(net_worth / (prev_net_worth + 1e-9), 10.0))
-    cdef double log_return = log(clipped_ratio)
+    ""
+    Вознаграждение с базовым сигналом ΔPnL и опциональным наследуемым логарифмическим компонентом.
+    ""
+    cdef double reward = net_worth - prev_net_worth
+    cdef double current_potential = 0.0
 
-    # 2. Рассчитать штраф за частоту сделок
-    cdef double transaction_penalty = trades_this_step * trade_frequency_penalty
+    if use_legacy_log_reward:
+        cdef double clipped_ratio = fmax(0.1, fmin(net_worth / (prev_net_worth + 1e-9), 10.0))
+        reward += log(clipped_ratio)
 
-    # 3. Рассчитать вознаграждение за формирование потенциала (Potential-Based Shaping)
-    cdef double shaping_reward = 0.0
-    cdef double current_potential = 0.0 # Инициализируем нулем
-    
-    if use_potential_shaping:
-        # ===== ИСПРАВЛЕНИЕ: Инициализация переменных для избежания UnboundLocalError =====
-        cdef double risk_penalty = 0.0
-        cdef double dd_penalty = 0.0
-        # ================================================================================
+        if use_potential_shaping:
+            cdef double risk_penalty = 0.0
+            cdef double dd_penalty = 0.0
 
-        # Компоненты потенциала
-        
-        # Штраф за открытый риск (зависит от размера позиции и волатильности)
-        if net_worth > 1e-9 and units != 0 and atr > 0:
-            risk_penalty = -risk_aversion_variance * abs(units) * atr / (abs(net_worth) + 1e-9)
+            if net_worth > 1e-9 and units != 0 and atr > 0:
+                risk_penalty = -risk_aversion_variance * abs(units) * atr / (abs(net_worth) + 1e-9)
 
-        # Штраф за просадку от пикового значения капитала
-        if peak_value > 1e-9:
-            # Нормализуем просадку на пиковое значение
-            dd_penalty = -risk_aversion_drawdown * (peak_value - net_worth) / peak_value
+            if peak_value > 1e-9:
+                dd_penalty = -risk_aversion_drawdown * (peak_value - net_worth) / peak_value
 
-        # Итоговая формула для текущего потенциала, обернутая в tanh для сглаживания
-        current_potential = potential_shaping_coef * tanh(risk_penalty + dd_penalty)
-        
-        # Формула шейпинга: дисконтированный будущий потенциал минус предыдущий
-        shaping_reward = gamma * current_potential - last_potential
+            current_potential = potential_shaping_coef * tanh(risk_penalty + dd_penalty)
+            reward += gamma * current_potential - last_potential
 
-    # 4. Собрать итоговое вознаграждение
-    # reward = log_return (основной сигнал) + event_reward (бонусы/штрафы за SL/TP) 
-    #        + shaping_reward (сигнал для формирования поведения) - transaction_penalty (штраф за активность)
-    cdef double reward = log_return + event_reward + shaping_reward - transaction_penalty
+    reward -= trades_this_step * trade_frequency_penalty
 
-    # Возвращаем итоговое вознаграждение и новый потенциал для использования на следующем шаге
+    if turnover_penalty_coef > 0.0 and executed_notional > 0.0:
+        reward -= turnover_penalty_coef * executed_notional
+
+    reward += event_reward
+
     return reward, current_potential
