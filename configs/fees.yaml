@@ -34,6 +34,13 @@ fees:
     per_symbol:
       ETHUSDT:
         enabled: false             # На уровне символа можно отключить альтернативное взыскание комиссий.
+  public_snapshot:                 # Опции для автоматического публичного снапшота (без приватных API).
+    vip_tier: null                 # Явный VIP-уровень аккаунта; null → используем конфиг/метаданные.
+    vip_label: null                # Текстовая метка VIP (override metadata.vip_tier).
+    use_bnb_discount: null         # true/false → принудительно считать скидку BNB активной/выключенной.
+    maker_discount_mult: null      # Множитель мейкера при BNB/VIP скидке (например 0.75).
+    taker_discount_mult: null      # Множитель тейкера при BNB/VIP скидке.
+    bnb_discount_rate: null        # Номинальная скидка Binance (по умолчанию 0.25 → множитель 0.75).
   symbol_fee_table:                # Inline-таблица ставок; может дополнять/override внешний файл.
     BTCUSDT:
       maker_bps: 1.8
