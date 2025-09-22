@@ -4,7 +4,19 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
-from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Tuple, Protocol, Mapping
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Protocol,
+    Mapping,
+)
 
 from execution_sim import ExecutionSimulator  # type: ignore
 from adv_store import ADVStore
@@ -675,3 +687,49 @@ class SimAdapter:
                 yield rep
         except ValueError as e:
             raise ValueError(f"Market data error: {e}") from e
+
+    # ------------------------------------------------------------------
+    # Market regime helpers
+    # ------------------------------------------------------------------
+    def _market_regime_owner(self) -> Any:
+        """Return the underlying object managing market regime state."""
+
+        if hasattr(self.sim, "register_market_regime_listener"):
+            return self.sim
+        candidate = getattr(self, "_sim", None)
+        if candidate is not None and hasattr(
+            candidate, "register_market_regime_listener"
+        ):
+            return candidate
+        return None
+
+    def register_market_regime_listener(
+        self, callback: Callable[[Any], None]
+    ) -> None:
+        """Proxy registration to the simulator if it supports regime hooks."""
+
+        owner = self._market_regime_owner()
+        if owner is None:
+            return
+        register = getattr(owner, "register_market_regime_listener", None)
+        if callable(register):
+            register(callback)
+
+    def current_market_regime(self) -> Any:
+        """Return the last known market regime if available."""
+
+        owner = self._market_regime_owner()
+        if owner is None:
+            return None
+        if hasattr(owner, "current_market_regime"):
+            try:
+                return owner.current_market_regime  # type: ignore[attr-defined]
+            except Exception:
+                return None
+        getter = getattr(owner, "get_market_regime", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                return None
+        return getattr(owner, "_last_market_regime", None)
