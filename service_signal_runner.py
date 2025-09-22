@@ -3110,6 +3110,7 @@ class ServiceSignalRunner:
         ws_dedup_log_skips: bool = False,
         ws_dedup_timeframe_ms: int = 0,
         signal_writer_options: Mapping[str, Any] | None = None,
+        signal_bus_config: Mapping[str, Any] | None = None,
     ) -> None:
         self.adapter = adapter
         self.feature_pipe = feature_pipe
@@ -3151,6 +3152,16 @@ class ServiceSignalRunner:
         self._signal_writer_stats: Dict[str, Any] = {}
         self._signal_writer_ref: SignalCSVWriter | None = None
         self._signal_writer_reopen_flag_path = logs_dir / "signal_writer_reopen.flag"
+        self._signal_bus_config: Dict[str, Any] = dict(signal_bus_config or {})
+        self._reload_history: deque[Dict[str, Any]] = deque(maxlen=20)
+        self._last_reload_event: Dict[str, Any] | None = None
+        self._dirty_restart = False
+        self._dirty_restart_detected_at: int | None = None
+        self._dirty_marker_path: Path | None = None
+        self._shutdown_ref: ShutdownManager | None = None
+        self._base_pipeline_cfg = pipeline_cfg or PipelineConfig()
+        self._ops_pipeline_cfg = PipelineConfig()
+        self._runtime_pipeline_cfg = PipelineConfig()
 
         monitoring.clear_runtime_aggregator()
         if self.monitoring_cfg.enabled:
@@ -3345,6 +3356,14 @@ class ServiceSignalRunner:
         }
         if self._signal_writer_stats:
             status["signal_writer"] = dict(self._signal_writer_stats)
+        status["dirty_restart"] = {
+            "active": bool(self._dirty_restart),
+            "detected_at_ms": self._dirty_restart_detected_at,
+        }
+        if self._last_reload_event is not None:
+            status["last_reload"] = dict(self._last_reload_event)
+        if self._reload_history:
+            status["reloads"] = list(self._reload_history)
         return status
 
     def _write_runner_status_unlocked(self) -> None:
@@ -3411,15 +3430,20 @@ class ServiceSignalRunner:
             self._signal_writer_stats = {}
         return True
 
-    def _reload_runtime_config(self, path: Path) -> None:
-        try:
-            with path.open("r", encoding="utf-8") as fh:
-                data = yaml.safe_load(fh) or {}
-        except Exception:
-            self.logger.exception("failed to read runtime config from %s", path)
-            return
+    def _apply_pipeline_configs(self) -> None:
+        combined = (self._base_pipeline_cfg or PipelineConfig()).merge(
+            self._ops_pipeline_cfg or PipelineConfig()
+        )
+        combined = combined.merge(self._runtime_pipeline_cfg or PipelineConfig())
+        self.pipeline_cfg = combined
+        if self._worker_ref is not None:
+            try:
+                self._worker_ref.update_pipeline_config(combined)
+            except Exception:
+                self.logger.exception("failed to update pipeline config")
+
+    def _apply_runtime_overrides(self, data: Mapping[str, Any]) -> None:
         if not isinstance(data, MappingABC):
-            self.logger.warning("runtime config %s is not a mapping", path)
             return
         throttle_data = data.get("throttle")
         if throttle_data is not None:
@@ -3430,7 +3454,10 @@ class ServiceSignalRunner:
             else:
                 self.throttle_cfg = new_throttle
                 if self._worker_ref is not None:
-                    self._worker_ref.update_throttle_config(new_throttle)
+                    try:
+                        self._worker_ref.update_throttle_config(new_throttle)
+                    except Exception:
+                        self.logger.exception("failed to apply throttle override")
         ws_data = data.get("ws") or {}
         if isinstance(ws_data, MappingABC):
             enabled = ws_data.get("enabled")
@@ -3448,59 +3475,430 @@ class ServiceSignalRunner:
                 except (TypeError, ValueError):
                     pass
             if self._worker_ref is not None:
-                self._worker_ref.update_ws_settings(
-                    enabled=self.ws_dedup_enabled,
-                    log_skips=self.ws_dedup_log_skips,
-                    timeframe_ms=self.ws_dedup_timeframe_ms,
-                )
+                try:
+                    self._worker_ref.update_ws_settings(
+                        enabled=self.ws_dedup_enabled,
+                        log_skips=self.ws_dedup_log_skips,
+                        timeframe_ms=self.ws_dedup_timeframe_ms,
+                    )
+                except Exception:
+                    self.logger.exception("failed to update ws settings")
+
+    def _apply_ops_config(self, data: Mapping[str, Any]) -> None:
+        if not isinstance(data, MappingABC):
+            return
+        self._apply_runtime_overrides(data)
+        runtime_section = data.get("runtime")
+        if isinstance(runtime_section, MappingABC):
+            self._apply_runtime_overrides(runtime_section)
         pipeline_data = data.get("pipeline")
         if pipeline_data is not None:
-            new_pipeline = _parse_pipeline_config(pipeline_data)
-            if self.pipeline_cfg is None:
-                self.pipeline_cfg = new_pipeline
+            try:
+                self._ops_pipeline_cfg = _parse_pipeline_config(pipeline_data)
+            except Exception as exc:
+                self.logger.warning("invalid ops pipeline override: %s", exc)
             else:
-                self.pipeline_cfg = self.pipeline_cfg.merge(new_pipeline)
-            if self._worker_ref is not None:
-                self._worker_ref.update_pipeline_config(self.pipeline_cfg)
-        self.logger.info("runtime overrides reloaded from %s", path)
-        self._write_runner_status()
+                self._apply_pipeline_configs()
+        kill_cfg = data.get("kill_switch") or {}
+        if isinstance(kill_cfg, MappingABC):
+            cfg_obj = self.cfg.kill_switch_ops
+            try:
+                cfg_obj.enabled = bool(kill_cfg.get("enabled", cfg_obj.enabled))
+            except Exception:
+                pass
+            for key, attr in (
+                ("error_limit", "error_limit"),
+                ("duplicate_limit", "duplicate_limit"),
+                ("stale_intervals_limit", "stale_intervals_limit"),
+            ):
+                if key in kill_cfg:
+                    try:
+                        setattr(cfg_obj, attr, int(kill_cfg.get(key)))
+                    except Exception:
+                        pass
+            if "reset_cooldown_sec" in kill_cfg:
+                try:
+                    cfg_obj.reset_cooldown_sec = int(kill_cfg.get("reset_cooldown_sec"))
+                except Exception:
+                    pass
+            if "flag_path" in kill_cfg:
+                cfg_obj.flag_path = kill_cfg.get("flag_path")
+            if "alert_command" in kill_cfg:
+                cfg_obj.alert_command = kill_cfg.get("alert_command")
+            ops_cfg = {
+                "rest_limit": cfg_obj.error_limit,
+                "ws_limit": cfg_obj.error_limit,
+                "duplicate_limit": cfg_obj.duplicate_limit,
+                "stale_limit": cfg_obj.stale_intervals_limit,
+                "reset_cooldown_sec": cfg_obj.reset_cooldown_sec,
+            }
+            if cfg_obj.flag_path:
+                ops_cfg["flag_path"] = cfg_obj.flag_path
+            if cfg_obj.alert_command:
+                ops_cfg["alert_command"] = (
+                    shlex.split(cfg_obj.alert_command)
+                    if isinstance(cfg_obj.alert_command, str)
+                    else cfg_obj.alert_command
+                )
+            try:
+                ops_kill_switch.init(ops_cfg)
+            except Exception:
+                self.logger.exception("failed to reconfigure ops kill switch")
 
-    def _handle_reload_request(self) -> None:
+    def _reconfigure_signal_writer(self) -> None:
+        existing = self._signal_writer_ref
+        if existing is not None:
+            try:
+                existing.close()
+            except Exception:
+                pass
+        self._signal_writer_ref = None
+        self._signal_writer_stats = {}
+        out_csv = getattr(signal_bus, "OUT_CSV", None)
+        if not out_csv:
+            return
+        opts = self._signal_writer_options
+        try:
+            writer = SignalCSVWriter(
+                out_csv,
+                fsync_mode=str(opts.get("fsync_mode", "batch")),
+                rotate_daily=bool(opts.get("rotate_daily", True)),
+                flush_interval_s=opts.get("flush_interval_s"),
+            )
+        except Exception:
+            self.logger.exception("failed to initialise signal writer")
+            return
+        signal_bus.OUT_WRITER = writer
+        self._signal_writer_ref = writer
+        try:
+            self._signal_writer_stats = writer.stats()
+        except Exception:
+            self._signal_writer_stats = {}
+        shutdown = self._shutdown_ref
+        if shutdown is not None:
+            shutdown.on_flush(lambda w=writer: w.flush_fsync(force=True))
+            shutdown.on_finalize(writer.close)
+
+    def _apply_signal_bus_config(self, data: Mapping[str, Any]) -> None:
+        if not isinstance(data, MappingABC):
+            return
+        enabled = bool(data.get("enabled", self._signal_bus_config.get("enabled", False)))
+        ttl = int(data.get("ttl_seconds", self._signal_bus_config.get("ttl_seconds", 0)) or 0)
+        persist_path = data.get("dedup_persist", self._signal_bus_config.get("persist_path"))
+        out_csv = data.get("out_csv", self._signal_bus_config.get("out_csv"))
+        flush_interval = data.get(
+            "flush_interval_s", self._signal_bus_config.get("flush_interval_s", 60.0)
+        )
+        try:
+            flush_interval = float(flush_interval)
+        except (TypeError, ValueError):
+            flush_interval = 60.0
+        bus_cfg = {
+            "enabled": enabled,
+            "ttl_seconds": ttl,
+            "persist_path": persist_path,
+            "out_csv": out_csv,
+            "flush_interval_s": flush_interval,
+        }
+        self._signal_bus_config.update(bus_cfg)
+        try:
+            signal_bus.init(**bus_cfg)
+        except Exception:
+            self.logger.exception("failed to reconfigure signal bus")
+        self.ws_dedup_enabled = enabled
+        fsync_mode = str(data.get("fsync_mode", self._signal_writer_options.get("fsync_mode", "batch")) or "batch")
+        rotate_daily = bool(
+            data.get("rotate_daily", self._signal_writer_options.get("rotate_daily", True))
+        )
+        flush_opt = data.get(
+            "flush_interval_s", self._signal_writer_options.get("flush_interval_s")
+        )
+        try:
+            flush_opt_val: float | None
+            if flush_opt is None:
+                flush_opt_val = None
+            else:
+                flush_opt_val = float(flush_opt)
+        except (TypeError, ValueError):
+            flush_opt_val = None
+        self._signal_writer_options.update(
+            {
+                "fsync_mode": fsync_mode,
+                "rotate_daily": rotate_daily,
+                "flush_interval_s": flush_opt_val,
+            }
+        )
+        self._reconfigure_signal_writer()
+
+    def _record_reload_event(self, event: Dict[str, Any]) -> None:
+        with self._runner_status_lock:
+            self._reload_history.append(event)
+            self._last_reload_event = event
+            self._write_runner_status_unlocked()
+
+    def _reload_config_bundle(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        timestamp = clock.now_ms()
+        details: list[Dict[str, Any]] = []
+        errors: list[str] = []
+        success = True
+
+        def _append(name: str, path: Path | None, ok: bool, error: str | None = None) -> None:
+            nonlocal success
+            entry: Dict[str, Any] = {"name": name, "success": bool(ok)}
+            if path is not None:
+                entry["path"] = str(path)
+            if error:
+                entry["error"] = error
+                errors.append(error)
+            if not ok:
+                success = False
+            details.append(entry)
+
+        # Validate and capture base config (config_live)
+        live_path_raw = (
+            payload.get("config_live")
+            or payload.get("config")
+            or self.cfg.snapshot_config_path
+            or "configs/config_live.yaml"
+        )
+        live_path = Path(str(live_path_raw))
+        try:
+            cfg_obj = load_config(str(live_path))
+        except FileNotFoundError:
+            _append("config_live", live_path, False, "missing")
+        except Exception as exc:
+            _append("config_live", live_path, False, str(exc))
+        else:
+            _append("config_live", live_path, True)
+            try:
+                with live_path.open("r", encoding="utf-8") as fh:
+                    live_raw = yaml.safe_load(fh) or {}
+            except Exception:
+                live_raw = {}
+            if isinstance(live_raw, MappingABC):
+                try:
+                    self._base_pipeline_cfg = _parse_pipeline_config(
+                        live_raw.get("pipeline", {})
+                    )
+                except Exception as exc:
+                    self.logger.warning("invalid base pipeline config: %s", exc)
+                else:
+                    self._apply_pipeline_configs()
+            self.cfg.run_id = getattr(cfg_obj, "run_id", self.cfg.run_id)
+
+        # Runtime overrides
+        runtime_targets: list[Path] = []
+        paths_field = payload.get("paths")
+        if isinstance(paths_field, str):
+            runtime_targets.append(Path(paths_field))
+        elif isinstance(paths_field, SequenceABC):
+            for item in paths_field:
+                if not item:
+                    continue
+                runtime_targets.append(Path(str(item)))
+        runtime_key = payload.get("runtime")
+        if runtime_key:
+            runtime_targets.append(Path(str(runtime_key)))
+        if not runtime_targets:
+            runtime_targets.append(Path("configs/runtime.yaml"))
+        seen_paths: set[str] = set()
+        unique_runtime: list[Path] = []
+        for item in runtime_targets:
+            key = str(item)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            unique_runtime.append(item)
+        for rt_path in unique_runtime:
+            ok, err = self._reload_runtime_config(rt_path)
+            _append("runtime", rt_path, ok, err)
+
+        # Ops configuration (YAML or JSON)
+        ops_override = payload.get("ops") or payload.get("ops_path")
+        candidate_paths: list[Path] = []
+        if ops_override:
+            candidate_paths.append(Path(str(ops_override)))
+        else:
+            candidate_paths.extend([Path("configs/ops.yaml"), Path("configs/ops.json")])
+        ops_data: Mapping[str, Any] | None = None
+        ops_path_used: Path | None = None
+        last_error: str | None = None
+        for candidate in candidate_paths:
+            if not candidate.exists():
+                continue
+            try:
+                with candidate.open("r", encoding="utf-8") as fh:
+                    if candidate.suffix.lower() == ".json":
+                        ops_data = json.load(fh) or {}
+                    else:
+                        ops_data = yaml.safe_load(fh) or {}
+                ops_path_used = candidate
+            except Exception as exc:
+                last_error = str(exc)
+                ops_data = None
+                ops_path_used = candidate
+                break
+            else:
+                break
+        if ops_data is None:
+            if ops_path_used is not None:
+                _append("ops", ops_path_used, False, last_error or "failed to load")
+            else:
+                fallback = candidate_paths[0] if candidate_paths else None
+                _append("ops", fallback, False, "missing")
+        else:
+            _append("ops", ops_path_used, True)
+            self._apply_ops_config(ops_data)
+
+        # Signals configuration
+        signals_path_raw = payload.get("signals") or "configs/signals.yaml"
+        signals_path = Path(str(signals_path_raw))
+        try:
+            with signals_path.open("r", encoding="utf-8") as fh:
+                signals_data = yaml.safe_load(fh) or {}
+        except FileNotFoundError:
+            _append("signals", signals_path, False, "missing")
+        except Exception as exc:
+            _append("signals", signals_path, False, str(exc))
+        else:
+            if not isinstance(signals_data, MappingABC):
+                _append("signals", signals_path, False, "invalid format")
+            else:
+                self._apply_signal_bus_config(signals_data)
+                _append("signals", signals_path, True)
+
+        event: Dict[str, Any] = {
+            "timestamp_ms": timestamp,
+            "success": success,
+            "details": details,
+        }
+        if errors:
+            event["errors"] = errors
+        return event
+
+def clear_dirty_restart(
+    marker_path: str | Path,
+    state_cfg: StateConfig,
+    *,
+    runner_status_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Remove dirty restart marker and wipe persistent state."""
+
+    result: Dict[str, Any] = {
+        "marker_removed": False,
+        "state_cleared": False,
+        "status_updated": False,
+        "errors": [],
+    }
+
+    marker = Path(marker_path)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        result["errors"].append(str(exc))
+    else:
+        result["marker_removed"] = True
+
+    if getattr(state_cfg, "enabled", False) and getattr(state_cfg, "path", None):
+        try:
+            state_storage.clear_state(
+                state_cfg.path,
+                backend=getattr(state_cfg, "backend", "json"),
+                lock_path=getattr(state_cfg, "lock_path", None),
+                backup_keep=getattr(state_cfg, "backup_keep", 0),
+            )
+        except Exception as exc:
+            result["errors"].append(str(exc))
+        else:
+            result["state_cleared"] = True
+
+    if runner_status_path:
+        status_path = Path(runner_status_path)
+        try:
+            current_status: Dict[str, Any] = {}
+            if status_path.exists():
+                with status_path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh) or {}
+                if isinstance(payload, MappingABC):
+                    current_status = dict(payload)
+            dirty_payload = current_status.get("dirty_restart")
+            update = {
+                "active": False,
+                "cleared_at_ms": clock.now_ms(),
+            }
+            if isinstance(dirty_payload, MappingABC):
+                dirty_payload = dict(dirty_payload)
+                dirty_payload.update(update)
+                current_status["dirty_restart"] = dirty_payload
+            else:
+                current_status["dirty_restart"] = update
+            atomic_write_with_retry(
+                status_path,
+                json.dumps(current_status, ensure_ascii=False),
+                retries=3,
+                backoff=0.1,
+            )
+        except Exception as exc:
+            result["errors"].append(str(exc))
+        else:
+            result["status_updated"] = True
+    return result
+
+
+    def _reload_runtime_config(self, path: Path) -> tuple[bool, str | None]:
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        except FileNotFoundError:
+            self.logger.warning("runtime config missing: %s", path)
+            return False, "missing"
+        except Exception as exc:
+            self.logger.exception("failed to read runtime config from %s", path)
+            return False, str(exc)
+        if not isinstance(data, MappingABC):
+            self.logger.warning("runtime config %s is not a mapping", path)
+            return False, "invalid format"
+        self._apply_runtime_overrides(data)
+        pipeline_data = data.get("pipeline")
+        if pipeline_data is not None:
+            try:
+                self._runtime_pipeline_cfg = _parse_pipeline_config(pipeline_data)
+            except Exception as exc:
+                self.logger.warning("invalid runtime pipeline override: %s", exc)
+            else:
+                self._apply_pipeline_configs()
+        self.logger.info("runtime overrides reloaded from %s", path)
+        return True, None
+
+    def _handle_reload_request(self) -> bool:
         flag = self._reload_flag_path
         if not flag.exists():
-            return
+            return False
+        payload: Mapping[str, Any]
         try:
             with flag.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh) or {}
-        except Exception:
+                raw_payload = json.load(fh) or {}
+            payload = raw_payload if isinstance(raw_payload, MappingABC) else {}
+        except Exception as exc:
             self.logger.exception("failed to parse reload request")
+            event = {
+                "timestamp_ms": clock.now_ms(),
+                "success": False,
+                "details": [],
+                "errors": [str(exc)],
+            }
+            self._record_reload_event(event)
             payload = {}
         finally:
             try:
                 flag.unlink()
             except Exception:
                 pass
-        paths = payload.get("paths")
-        if isinstance(paths, str):
-            paths = [paths]
-        elif not isinstance(paths, SequenceABC):
-            paths = []
-        resolved_paths = []
-        for item in paths:
-            if not item:
-                continue
-            resolved_paths.append(Path(item))
-        if not resolved_paths:
-            resolved_paths = [Path("configs/runtime.yaml")]
-        for candidate in resolved_paths:
-            try:
-                target = candidate if candidate.is_absolute() else Path(candidate)
-                if not target.exists():
-                    self.logger.warning("reload target missing: %s", target)
-                    continue
-                self._reload_runtime_config(target)
-            except Exception:
-                self.logger.exception("failed to reload %s", candidate)
+        event = self._reload_config_bundle(payload)
+        self._record_reload_event(event)
+        return True
 
     def _handle_safe_stop_flag(
         self, shutdown: ShutdownManager, stop_event: threading.Event
@@ -3528,8 +3926,18 @@ class ServiceSignalRunner:
             changed = True
         if self._refresh_signal_writer_stats():
             changed = True
-        self._handle_reload_request()
+        if self._handle_reload_request():
+            changed = True
         self._handle_safe_stop_flag(shutdown, stop_event)
+        marker_path = self._dirty_marker_path
+        if (
+            self._dirty_restart
+            and marker_path is not None
+            and not marker_path.exists()
+        ):
+            self._dirty_restart = False
+            self._dirty_restart_detected_at = None
+            changed = True
         current_state = self._current_safe_mode_state()
         if current_state != self._last_safe_mode_state:
             changed = True
@@ -3545,14 +3953,19 @@ class ServiceSignalRunner:
         marker_path = Path(
             self.cfg.marker_path or os.path.join(logs_dir, "shutdown.marker")
         )
-        dirty_restart = True
-        entry_limits_state: Dict[str, Dict[str, Any]] | None = None
         try:
-            if marker_path.exists():
-                dirty_restart = False
-            marker_path.unlink()
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:
-            dirty_restart = True
+            pass
+        dirty_restart = marker_path.exists()
+        self._dirty_marker_path = marker_path
+        self._dirty_restart = dirty_restart
+        self._dirty_restart_detected_at = clock.now_ms() if dirty_restart else None
+        try:
+            marker_path.touch()
+        except Exception:
+            pass
+        entry_limits_state: Dict[str, Dict[str, Any]] | None = None
         loaded_state: Any | None = None
         if self.cfg.state.enabled:
             state_path = self.cfg.state.path
@@ -3850,6 +4263,7 @@ class ServiceSignalRunner:
                 pass
 
         shutdown = ShutdownManager(self.shutdown_cfg)
+        self._shutdown_ref = shutdown
         stop_event = threading.Event()
         shutdown.on_stop(stop_event.set)
 
@@ -3879,8 +4293,8 @@ class ServiceSignalRunner:
 
         def _ops_flush_loop() -> None:
             nonlocal rest_failures
-            limit = int(self.cfg.kill_switch_ops.error_limit)
             while not ops_flush_stop.wait(1.0):
+                limit = int(self.cfg.kill_switch_ops.error_limit)
                 try:
                     ops_kill_switch.tick()
                     if rest_failures:
@@ -4235,9 +4649,11 @@ class ServiceSignalRunner:
 
             shutdown.on_flush(_flush_persistent_state)
 
-        def _write_marker() -> None:
+        def _remove_marker() -> None:
             try:
-                marker_path.touch()
+                marker_path.unlink()
+            except FileNotFoundError:
+                pass
             except Exception:
                 pass
 
@@ -4248,7 +4664,7 @@ class ServiceSignalRunner:
             except Exception:
                 pass
 
-        shutdown.on_finalize(_write_marker)
+        shutdown.on_finalize(_remove_marker)
         if snapshot_thread is not None:
             shutdown.on_finalize(lambda: snapshot_thread.join(timeout=1.0))
         if self.cfg.state.enabled:
@@ -4799,6 +5215,13 @@ def from_config(
         "rotate_daily": rotate_daily,
         "flush_interval_s": flush_interval_s,
     }
+    signal_bus_config = {
+        "enabled": bus_enabled,
+        "ttl_seconds": ttl,
+        "persist_path": dedup_persist,
+        "out_csv": out_csv,
+        "flush_interval_s": flush_interval_s,
+    }
 
     signal_bus.init(
         enabled=bus_enabled,
@@ -5137,6 +5560,7 @@ def from_config(
         ws_dedup_log_skips=cfg.ws_dedup.log_skips,
         ws_dedup_timeframe_ms=cfg.timing.timeframe_ms,
         signal_writer_options=signal_writer_options,
+        signal_bus_config=signal_bus_config,
     )
     return service.run()
 
@@ -5146,5 +5570,6 @@ __all__ = [
     "SignalRunnerConfig",
     "RunnerConfig",
     "ServiceSignalRunner",
+    "clear_dirty_restart",
     "from_config",
 ]
