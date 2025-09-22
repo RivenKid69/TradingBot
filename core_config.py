@@ -7,13 +7,14 @@ Pydantic-модели конфигураций: sim/live/train/eval + декла
 
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, List, Mapping, Union, Literal, Sequence
+from typing import Dict, Any, Optional, List, Mapping, Union, Literal, Sequence, Tuple
 from enum import Enum
 from dataclasses import dataclass, field
 
 import yaml
 from pydantic import BaseModel, Field, root_validator, model_validator
 import logging
+import math
 
 from services.universe import get_symbols
 
@@ -70,6 +71,41 @@ class TimingConfig(BaseModel):
     enforce_closed_bars: bool = Field(default=True)
     timeframe_ms: int = Field(default=60_000)
     close_lag_ms: int = Field(default=2000)
+
+
+class TimingProfileSpec(BaseModel):
+    """Профиль тайминга для конкретного :class:`ExecutionProfile`."""
+
+    decision_mode: Optional[str] = Field(default=None)
+    decision_delay_ms: Optional[int] = Field(default=None)
+    latency_steps: Optional[int] = Field(default=None)
+    min_lookback_ms: Optional[int] = Field(default=None)
+
+    @model_validator(mode="after")
+    def _sanitize(cls, values: "TimingProfileSpec") -> "TimingProfileSpec":
+        delay = getattr(values, "decision_delay_ms", None)
+        if delay is not None:
+            object.__setattr__(values, "decision_delay_ms", max(0, int(delay)))
+        latency = getattr(values, "latency_steps", None)
+        if latency is not None:
+            object.__setattr__(values, "latency_steps", max(0, int(latency)))
+        lookback = getattr(values, "min_lookback_ms", None)
+        if lookback is not None:
+            object.__setattr__(values, "min_lookback_ms", max(0, int(lookback)))
+        mode = getattr(values, "decision_mode", None)
+        if mode is not None:
+            object.__setattr__(values, "decision_mode", str(mode).strip())
+        return values
+
+
+@dataclass(frozen=True)
+class ResolvedTiming:
+    """Разрешённые параметры тайминга для среды исполнения."""
+
+    decision_mode: str
+    decision_delay_ms: int
+    latency_steps: int
+    min_lookback_ms: int
 
 
 class WSDedupConfig(BaseModel):
@@ -523,6 +559,105 @@ class ExecutionProfile(str, Enum):
     LIMIT_MID_BPS = "LIMIT_MID_BPS"
 
 
+def _coerce_execution_profile(value: Any) -> ExecutionProfile:
+    if isinstance(value, ExecutionProfile):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("empty execution profile")
+    if text in ExecutionProfile.__members__:
+        return ExecutionProfile[text]
+    try:
+        return ExecutionProfile(text)
+    except ValueError as exc:
+        raise ValueError(f"Unknown execution profile: {value}") from exc
+
+
+def _initial_timing_profile_map() -> Dict[ExecutionProfile, TimingProfileSpec]:
+    return {prof: TimingProfileSpec() for prof in ExecutionProfile}
+
+
+def load_timing_profiles(
+    path: str = "configs/timing.yaml",
+) -> Tuple[TimingConfig, Dict[ExecutionProfile, TimingProfileSpec]]:
+    """Загрузить конфигурацию тайминга и профили исполнения из YAML."""
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        defaults = TimingConfig()
+        return defaults, _initial_timing_profile_map()
+
+    if not isinstance(raw, Mapping):
+        raw = {}
+
+    if "defaults" in raw or "profiles" in raw:
+        defaults_payload = raw.get("defaults") or {}
+        profiles_payload = raw.get("profiles") or {}
+    else:
+        defaults_payload = dict(raw)
+        profiles_payload = defaults_payload.pop("profiles", {}) if isinstance(defaults_payload, dict) else {}
+
+    defaults_cfg = TimingConfig.parse_obj(defaults_payload)
+    profile_map = _initial_timing_profile_map()
+
+    for key, payload in (profiles_payload or {}).items():
+        prof = _coerce_execution_profile(key)
+        profile_map[prof] = TimingProfileSpec.parse_obj(payload or {})
+
+    return defaults_cfg, profile_map
+
+
+def resolve_execution_timing(
+    profile: ExecutionProfile,
+    timing_defaults: TimingConfig,
+    profiles: Mapping[ExecutionProfile, TimingProfileSpec] | None,
+) -> ResolvedTiming:
+    """Сформировать параметры тайминга для среды по профилю исполнения."""
+
+    spec = profiles.get(profile) if profiles else None
+    if spec is None:
+        spec = TimingProfileSpec()
+
+    delay = spec.decision_delay_ms
+    if delay is None:
+        delay = int(getattr(timing_defaults, "close_lag_ms", 0) or 0)
+    delay = max(0, int(delay))
+
+    min_lookback = int(getattr(spec, "min_lookback_ms", 0) or 0)
+
+    mode_text = spec.decision_mode or "CLOSE_TO_OPEN"
+    mode_key = mode_text.strip().upper()
+    valid_modes = {"CLOSE_TO_OPEN", "INTRA_HOUR_WITH_LATENCY"}
+    if mode_key not in valid_modes:
+        raise ValueError(
+            f"Unsupported decision_mode '{mode_text}' for execution profile {profile.value}"
+        )
+
+    latency = spec.latency_steps
+    if latency is None:
+        if mode_key == "INTRA_HOUR_WITH_LATENCY":
+            timeframe_ms = int(getattr(timing_defaults, "timeframe_ms", 0) or 0)
+            if timeframe_ms > 0:
+                latency = max(1, math.ceil(delay / timeframe_ms))
+            else:
+                latency = 1
+        else:
+            latency = 0
+    else:
+        latency = max(0, int(latency))
+        if mode_key != "INTRA_HOUR_WITH_LATENCY":
+            latency = max(0, latency)
+
+    return ResolvedTiming(
+        decision_mode=mode_key,
+        decision_delay_ms=int(delay),
+        latency_steps=int(latency),
+        min_lookback_ms=int(max(0, min_lookback)),
+    )
+
+
 class ExecutionParams(BaseModel):
     slippage_bps: float = 0.0
     limit_offset_bps: float = 0.0
@@ -776,6 +911,8 @@ __all__ = [
     "Components",
     "ClockSyncConfig",
     "TimingConfig",
+    "TimingProfileSpec",
+    "ResolvedTiming",
     "WSDedupConfig",
     "TTLConfig",
     "ThrottleConfig",
@@ -803,6 +940,8 @@ __all__ = [
     "EvalConfig",
     "ExecutionProfile",
     "ExecutionParams",
+    "load_timing_profiles",
+    "resolve_execution_timing",
     "load_config",
     "load_config_from_str",
 ]

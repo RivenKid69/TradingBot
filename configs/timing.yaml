@@ -1,3 +1,17 @@
-enforce_closed_bars: true
-timeframe_ms: 60000
-close_lag_ms: 2000
+defaults:
+  enforce_closed_bars: true
+  timeframe_ms: 60000
+  close_lag_ms: 2000
+
+profiles:
+  MKT_OPEN_NEXT_H1:
+    decision_mode: CLOSE_TO_OPEN
+    decision_delay_ms: 2000
+  VWAP_CURRENT_H1:
+    decision_mode: INTRA_HOUR_WITH_LATENCY
+    decision_delay_ms: 15000
+    latency_steps: 1
+  LIMIT_MID_BPS:
+    decision_mode: INTRA_HOUR_WITH_LATENCY
+    decision_delay_ms: 30000
+    latency_steps: 1

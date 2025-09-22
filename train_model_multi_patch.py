@@ -33,7 +33,12 @@ import hashlib
 from features_pipeline import FeaturePipeline
 from pathlib import Path
 
-from core_config import load_config
+from core_config import (
+    load_config,
+    ExecutionProfile,
+    load_timing_profiles,
+    resolve_execution_timing,
+)
 
 from distributional_ppo import DistributionalPPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, DummyVecEnv, VecEnv
@@ -46,7 +51,7 @@ from optuna.pruners import HyperbandPruner
 from optuna.exceptions import TrialPruned
 from torch.optim.lr_scheduler import OneCycleLR
 import multiprocessing as mp
-from leakguard import LeakGuard
+from leakguard import LeakGuard, LeakConfig
 class AdversarialCallback(BaseCallback):
     """
     Проводит стресс-тесты в специальных рыночных режимах и СОХРАНЯЕТ
@@ -132,7 +137,7 @@ if torch.cuda.is_available() and int(torch.version.cuda.split(".")[0]) >= 11:
 torch.backends.cudnn.benchmark = True
 
 
-from trading_patchnew import TradingEnv
+from trading_patchnew import TradingEnv, DecisionTiming
 from custom_policy_patch import CustomActorCriticPolicy
 from fetch_all_data_patch import load_all_data
 # --- ИЗМЕНЕНИЕ: Импортируем быструю Cython-функцию оценки ---
@@ -406,8 +411,8 @@ def objective(trial: optuna.Trial,
 
     n_envs = 8
     print(f"Запускаем {n_envs} параллельных сред...")
-    leak_guard_train = LeakGuard()
-    leak_guard_val = LeakGuard()
+    leak_guard_train = LeakGuard(LeakConfig(**leak_guard_kwargs))
+    leak_guard_val = LeakGuard(LeakConfig(**leak_guard_kwargs))
 
     def make_env_train(rank: int):
         def _init():
@@ -451,6 +456,7 @@ def objective(trial: optuna.Trial,
 
             }
             env_params.update(sim_config)
+            env_params.update(timing_env_kwargs)
 
             # Создаем и возвращаем экземпляр среды
             return TradingEnv(**env_params, leak_guard=leak_guard_train)
@@ -494,6 +500,7 @@ def objective(trial: optuna.Trial,
             "obv_ma_window": OBV_MA_WINDOW
         }
         env_val_params.update(sim_config)
+        env_val_params.update(timing_env_kwargs)
         return TradingEnv(**env_val_params, leak_guard=leak_guard_val)
 
     monitored_env_va = VecMonitor(DummyVecEnv([make_env_val]))
@@ -606,7 +613,11 @@ def objective(trial: optuna.Trial,
                 "cci_window": CCI_WINDOW, "bb_window": BB_WINDOW, "obv_ma_window": OBV_MA_WINDOW,
             }
             final_env_params.update(sim_config)
-            return TradingEnv(**final_env_params, leak_guard=LeakGuard())
+            final_env_params.update(timing_env_kwargs)
+            return TradingEnv(
+                **final_env_params,
+                leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs))
+            )
 
         check_model_compat(str(train_stats_path))
         final_eval_env = VecMonitor(
@@ -701,6 +712,19 @@ def main():
     for block, params in overrides.items():
         cfg_dict.setdefault(block, {}).update(params)
     cfg = cfg.__class__.parse_obj(cfg_dict)
+
+    timing_defaults, timing_profiles = load_timing_profiles()
+    exec_profile = getattr(cfg, "execution_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
+    resolved_timing = resolve_execution_timing(exec_profile, timing_defaults, timing_profiles)
+    timing_env_kwargs = {
+        "decision_mode": DecisionTiming[resolved_timing.decision_mode],
+        "decision_delay_ms": resolved_timing.decision_delay_ms,
+        "latency_steps": resolved_timing.latency_steps,
+    }
+    leak_guard_kwargs = {
+        "decision_delay_ms": resolved_timing.decision_delay_ms,
+        "min_lookback_ms": resolved_timing.min_lookback_ms,
+    }
 
     sim_config = {k: getattr(cfg, k) for k in ("quantizer", "slippage", "fees", "latency", "risk", "no_trade")}
     sim_config["liquidity_seasonality_path"] = args.liquidity_seasonality
@@ -926,7 +950,11 @@ def main():
                 "obv_ma_window": OBV_MA_WINDOW,
             }
             env_val_params.update(sim_config)
-            return TradingEnv(**env_val_params)
+            env_val_params.update(timing_env_kwargs)
+            return TradingEnv(
+                **env_val_params,
+                leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs))
+            )
 
         monitored_eval_env = VecMonitor(DummyVecEnv([_make_env_val]))
         check_model_compat(str(best_stats_path))
