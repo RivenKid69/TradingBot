@@ -16,6 +16,7 @@ from sb3_contrib import RecurrentPPO
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from stable_baselines3.common.utils import explained_variance
 from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env.vec_normalize import VecNormalize, unwrap_vec_normalize
 import torch.nn.functional as F
 from typing import Any, Dict, Optional, Type, Union
 
@@ -143,6 +144,23 @@ class DistributionalPPO(RecurrentPPO):
 
         self.policy.set_training_mode(False)
 
+        vec_normalize_env: Optional[VecNormalize] = None
+        for candidate_env in (env, getattr(self, "env", None)):
+            if candidate_env is None:
+                continue
+            if isinstance(candidate_env, VecNormalize):
+                vec_normalize_env = candidate_env
+            else:
+                try:
+                    vec_normalize_env = unwrap_vec_normalize(candidate_env)
+                except ValueError:
+                    vec_normalize_env = None
+            if vec_normalize_env is not None:
+                break
+
+        if vec_normalize_env is not None and getattr(vec_normalize_env, "norm_reward", False):
+            raise AssertionError("VecNormalize reward normalization must be disabled to recover raw ΔPnL.")
+
         n_steps = 0
         rollout_buffer.reset()
         callback.on_rollout_start()
@@ -166,6 +184,15 @@ class DistributionalPPO(RecurrentPPO):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+            normalized_rewards = rewards
+            raw_rewards = rewards
+            if vec_normalize_env is not None and hasattr(vec_normalize_env, "get_original_reward"):
+                raw_rewards = vec_normalize_env.get_original_reward()
+            raw_rewards = np.asarray(raw_rewards)
+            rewards = raw_rewards
+            if raw_rewards.size > 0:
+                self.logger.record("rollout/raw_reward_mean", float(np.mean(raw_rewards)))
+
             self.num_timesteps += env.num_envs
 
             callback.update_locals(locals())
