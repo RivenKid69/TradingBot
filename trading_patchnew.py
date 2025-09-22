@@ -356,6 +356,10 @@ class TradingEnv(gym.Env):
         self.last_mid: float | None = None
         self.last_mtm_price: float | None = None
 
+        # reward / cost toggles (keep backward-compatible defaults)
+        self.turnover_penalty_coef = float(kwargs.get("turnover_penalty_coef", 0.0) or 0.0)
+        self._turnover_total = 0.0
+
         # optional strict data validation
         if validate_data or os.getenv("DATA_VALIDATE") == "1":
             try:
@@ -466,6 +470,7 @@ class TradingEnv(gym.Env):
             max_position=1.0,
             max_position_risk_on=1.0,
         )
+        self._turnover_total = 0.0
         obs = np.zeros(self.observation_space.shape, dtype=np.float32)
         return obs, {}
 
@@ -938,13 +943,69 @@ class TradingEnv(gym.Env):
             else:
                 proto = self._to_proto(action)
 
+        prev_net_worth = float(getattr(self.state, "net_worth", 0.0) or 0.0)
+        prev_turnover_total = float(getattr(self, "_turnover_total", 0.0) or 0.0)
         pre_len = len(getattr(self._mediator, "calls", []))
         result = self._mediator.step(proto)
         if hasattr(self._mediator, "calls") and len(self._mediator.calls) == pre_len:
             self._mediator.calls.append(proto)
         obs, reward, terminated, truncated, info = result
+        info = dict(info or {})
+
+        # --- recompute ΔPnL / turnover adjusted reward -----------------
+        mark_price = self.last_mtm_price
+        if mark_price is None:
+            mark_price = self.last_mid
+        if mark_price is None:
+            mark_price = info.get("mark_price")
+        try:
+            mark_price = float(mark_price)
+        except (TypeError, ValueError):
+            mark_price = 0.0
+
+        cash = float(getattr(self.state, "cash", 0.0) or 0.0)
+        units = float(getattr(self.state, "units", 0.0) or 0.0)
+        new_net_worth = float(getattr(self.state, "net_worth", prev_net_worth) or prev_net_worth)
+        if not math.isfinite(new_net_worth):
+            new_net_worth = prev_net_worth
+        if abs(new_net_worth - prev_net_worth) < 1e-12:
+            new_net_worth = cash + units * mark_price
+            try:
+                self.state.net_worth = float(new_net_worth)
+            except Exception:
+                pass
+
+        delta_pnl = float(new_net_worth - prev_net_worth)
+
+        step_turnover = info.get("turnover")
+        if step_turnover is None:
+            step_turnover = info.get("executed_notional", 0.0)
+        try:
+            step_turnover = float(step_turnover)
+        except (TypeError, ValueError):
+            step_turnover = 0.0
+        if not math.isfinite(step_turnover):
+            step_turnover = 0.0
+        step_turnover = abs(step_turnover)
+        self._turnover_total = prev_turnover_total + step_turnover
+
+        turnover_penalty = info.get("turnover_penalty")
+        if turnover_penalty is None:
+            turnover_penalty = self.turnover_penalty_coef * step_turnover
+        try:
+            turnover_penalty = float(turnover_penalty)
+        except (TypeError, ValueError):
+            turnover_penalty = 0.0
+
+        reward = float(delta_pnl - turnover_penalty)
+
+        info["delta_pnl"] = float(delta_pnl)
+        info["equity"] = float(new_net_worth)
+        info["turnover"] = float(step_turnover)
+        info["cum_turnover"] = float(self._turnover_total)
+        info["turnover_penalty"] = float(turnover_penalty)
+
         if terminated or truncated:
-            info = dict(info)
             info["no_trade_stats"] = self.get_no_trade_stats()
         return obs, reward, terminated, truncated, info
 
