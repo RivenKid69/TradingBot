@@ -517,6 +517,36 @@ class SimExecutor(TradeExecutor):
         self._run_id = str(getattr(run_config, "run_id", "sim") or "sim")
         self._ctx = _SimCtx(symbol=str(symbol), max_position_abs_base=float(max_position_abs_base))
 
+        close_lag_value: int | None = None
+        if run_config is not None:
+            timing_cfg = getattr(run_config, "timing", None)
+            if timing_cfg is not None:
+                candidate = getattr(timing_cfg, "close_lag_ms", None)
+                if candidate is None and isinstance(timing_cfg, Mapping):
+                    candidate = timing_cfg.get("close_lag_ms")
+                try:
+                    if candidate is not None:
+                        close_lag_value = int(candidate)
+                except (TypeError, ValueError):
+                    close_lag_value = None
+        if close_lag_value is not None and close_lag_value < 0:
+            close_lag_value = 0
+        if close_lag_value is not None:
+            self._close_lag_ms = close_lag_value
+            for attr in ("close_lag_ms", "_timing_close_lag_ms"):
+                try:
+                    setattr(self._sim, attr, int(self._close_lag_ms))
+                except Exception:
+                    continue
+        else:
+            existing_close_lag = getattr(self._sim, "close_lag_ms", None)
+            try:
+                self._close_lag_ms = int(existing_close_lag)
+            except (TypeError, ValueError):
+                self._close_lag_ms = 0
+            if self._close_lag_ms < 0:
+                self._close_lag_ms = 0
+
         rc_quantizer = getattr(run_config, "quantizer", {}) if run_config else {}
         rc_risk = getattr(run_config, "risk", None) if run_config else None
         rc_latency = getattr(run_config, "latency", None) if run_config else None
@@ -771,11 +801,15 @@ class SimExecutor(TradeExecutor):
 
         profile = getattr(self, "_exec_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
 
+        client_tag = getattr(order, "client_order_id", "") or ""
         if profile == ExecutionProfile.LIMIT_MID_BPS:
-            proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=float(vol_frac))
-            setattr(proto, "tif", tif)
-            setattr(proto, "ttl_steps", ttl_steps)
-            setattr(proto, "client_tag", getattr(order, "client_order_id", "") or "")
+            proto_kwargs = dict(
+                action_type=ActionType.LIMIT,
+                volume_frac=float(vol_frac),
+                ttl_steps=ttl_steps,
+                tif=tif,
+                client_tag=client_tag,
+            )
             price = getattr(order, "price", None)
             if price is None:
                 mid = getattr(self._sim, "_last_ref_price", None)
@@ -791,13 +825,17 @@ class SimExecutor(TradeExecutor):
                     else:
                         price = mid * (1 + off)
             if price is not None:
-                setattr(proto, "abs_price", float(price))
+                proto_kwargs["abs_price"] = float(price)
+            proto = ActionProto(**proto_kwargs)
             return ActionType.LIMIT, proto
 
-        proto = ActionProto(action_type=ActionType.MARKET, volume_frac=float(vol_frac))
-        setattr(proto, "tif", tif)
-        setattr(proto, "ttl_steps", ttl_steps)
-        setattr(proto, "client_tag", getattr(order, "client_order_id", "") or "")
+        proto = ActionProto(
+            action_type=ActionType.MARKET,
+            volume_frac=float(vol_frac),
+            ttl_steps=ttl_steps,
+            tif=tif,
+            client_tag=client_tag,
+        )
         return ActionType.MARKET, proto
 
     def _quantizer_precheck_enabled(self) -> bool:
@@ -1100,6 +1138,7 @@ class SimExecutor(TradeExecutor):
         # Для остальных случаев сохраняем прежний NONE-fallback.
         return ExecReport.from_dict({
             "ts": int(order.ts),
+            "run_id": self._run_id,
             "symbol": self._ctx.symbol,
             "side": "BUY" if side_str.upper().endswith("BUY") else "SELL",
             "order_type": "MARKET" if order_type_str.upper().endswith("MARKET") else "LIMIT",
@@ -1108,7 +1147,7 @@ class SimExecutor(TradeExecutor):
             "fee": 0.0,
             "fee_asset": None,
             "pnl": 0.0,
-            "exec_status": "NONE",
+            "exec_status": "NEW",
             "liquidity": "UNKNOWN",
             "client_order_id": str(getattr(order, "client_order_id", "") or ""),
             "order_id": None,
