@@ -744,6 +744,10 @@ class LiveConfig(CommonRunConfig):
     limits: Dict[str, Any] = Field(default_factory=dict)
     fees: Dict[str, Any] = Field(default_factory=dict)
     slippage: Dict[str, Any] = Field(default_factory=dict)
+    execution_profile: ExecutionProfile = Field(
+        default=ExecutionProfile.MKT_OPEN_NEXT_H1
+    )
+    execution_params: ExecutionParams = Field(default_factory=ExecutionParams)
 
 
 class TrainDataConfig(BaseModel):
