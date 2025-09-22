@@ -76,3 +76,29 @@ slippage:
     multipliers: []          # Inline-мультипликаторы (например, 168 значений).
     zscore_clip: null        # Z-score clip при нормализации ADV.
     liquidity_buffer: 1.0    # Коэффициент >1 → добавочный запас ликвидности.
+
+  # --- Калиброванные профили стоимости исполнения (пример конфигурации) ---
+  # calibrated_profiles:
+  #   enabled: true             # Включаем использование файлов калибровки.
+  #   path: data/slippage/global.json   # Общий JSON/YAML (symbol → {impact_curve, hourly, regimes}).
+  #   default_symbol: BTCUSDT    # Опциональный фолбек, если нет данных для текущего символа.
+  #   hourly_multipliers:        # Глобальные почасовые мультипликаторы (используются как фолбек).
+  #     multipliers: []
+  #   regime_overrides:          # Общие overrides по MarketRegime.
+  #     NORMAL:
+  #       multiplier: 1.0
+  #   symbols:
+  #     BTCUSDT:
+  #       path: data/slippage/btcusdt.json   # Полный профиль символа с notional-бакетами, сезонностью и режимами.
+  #       curve_path: null        # Отдельный файл с notional → impact, если хранится отдельно.
+  #       hourly_path: null       # Отдельный файл с мультипликаторами по часам недели.
+  #       regime_path: null       # Отдельный файл с overrides по режимам рынка.
+  #       impact_curve: []        # Inline-список бакетов (lower_notional, upper_notional, mean_impact_bps, ...).
+  #       hourly_multipliers:
+  #         multipliers: []
+  #         counts: []
+  #       regime_overrides:
+  #         NORMAL:
+  #           multiplier: 1.0
+  #           impact_mean_bps: null
+  #           k: null

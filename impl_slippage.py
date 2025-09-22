@@ -28,6 +28,11 @@ try:
         DynamicImpactConfig,
         TailShockConfig,
         AdvConfig,
+        CalibratedProfilesConfig,
+        SymbolCalibratedProfile,
+        CalibratedHourlyProfile,
+        CalibratedRegimeOverride,
+        _estimate_calibrated_slippage,
     )
 except Exception:  # pragma: no cover
     SlippageConfig = None  # type: ignore
@@ -35,6 +40,11 @@ except Exception:  # pragma: no cover
     DynamicImpactConfig = None  # type: ignore
     TailShockConfig = None  # type: ignore
     AdvConfig = None  # type: ignore
+    CalibratedProfilesConfig = None  # type: ignore
+    SymbolCalibratedProfile = None  # type: ignore
+    CalibratedHourlyProfile = None  # type: ignore
+    CalibratedRegimeOverride = None  # type: ignore
+    _estimate_calibrated_slippage = None  # type: ignore
 
 try:  # pragma: no cover - optional during tests
     from core_config import AdvRuntimeConfig
@@ -817,10 +827,17 @@ class SlippageImpl:
         self._spread_cost_maker_bps_default: float = 0.0
         self._spread_cost_taker_bps_default: float = 0.0
         self._last_trade_cost_meta: Dict[str, Any] = {}
+        self._calibrated_cfg: Optional[Any] = None
+        self._calibration_symbols: Dict[str, SymbolCalibratedProfile] = {}
+        self._calibration_global_hourly: Optional[CalibratedHourlyProfile] = None
+        self._calibration_global_regime: Dict[str, CalibratedRegimeOverride] = {}
+        self._calibration_base_dir: Optional[str] = None
+        self._calibration_lock = threading.Lock()
         dyn_cfg_obj: Optional[DynamicSpreadConfig] = None
         adv_cfg_obj: Optional[Any] = None
         impact_cfg_obj: Optional[Any] = None
         tail_cfg_obj: Optional[Any] = None
+        calibrated_cfg_obj: Optional[Any] = None
         adv_runtime_payload: Dict[str, Any] = {}
         cfg_dict: Dict[str, Any] = {
             "k": float(cfg.k),
@@ -943,6 +960,11 @@ class SlippageImpl:
             ("dynamic_impact", getattr(cfg, "dynamic_impact", None), DynamicImpactConfig),
             ("tail_shock", getattr(cfg, "tail_shock", None), TailShockConfig),
             ("adv", getattr(cfg, "adv", None), AdvConfig),
+            (
+                "calibrated_profiles",
+                getattr(cfg, "calibrated_profiles", None),
+                CalibratedProfilesConfig,
+            ),
         )
         for key, block, cfg_cls in extra_sections:
             payload = _normalise_section(block, cfg_cls)
@@ -981,6 +1003,19 @@ class SlippageImpl:
                         adv_cfg_obj = None
                 elif isinstance(payload, Mapping) and adv_cfg_obj is None:
                     adv_cfg_obj = dict(payload)
+            elif key == "calibrated_profiles":
+                if CalibratedProfilesConfig is not None and isinstance(
+                    block, CalibratedProfilesConfig
+                ):
+                    calibrated_cfg_obj = block
+                elif isinstance(payload, Mapping) and CalibratedProfilesConfig is not None:
+                    try:
+                        calibrated_cfg_obj = CalibratedProfilesConfig.from_dict(dict(payload))
+                    except Exception:
+                        logger.exception("Failed to parse calibrated slippage profiles")
+                        calibrated_cfg_obj = dict(payload)
+                elif isinstance(payload, Mapping) and calibrated_cfg_obj is None:
+                    calibrated_cfg_obj = dict(payload)
 
         self._cfg_obj = (
             SlippageConfig.from_dict(cfg_dict)
@@ -996,6 +1031,25 @@ class SlippageImpl:
                 self._adv_cfg = candidate
         self._impact_cfg = impact_cfg_obj
         self._tail_cfg = tail_cfg_obj
+        calibrated_candidate = calibrated_cfg_obj
+        if calibrated_candidate is None and self._cfg_obj is not None:
+            calibrated_candidate = getattr(self._cfg_obj, "calibrated_profiles", None)
+        if CalibratedProfilesConfig is not None and isinstance(
+            calibrated_candidate, CalibratedProfilesConfig
+        ):
+            self._calibrated_cfg = calibrated_candidate
+        elif isinstance(calibrated_candidate, Mapping) and CalibratedProfilesConfig is not None:
+            try:
+                self._calibrated_cfg = CalibratedProfilesConfig.from_dict(
+                    dict(calibrated_candidate)
+                )
+            except Exception:
+                logger.exception("Failed to interpret calibrated profiles mapping")
+                self._calibrated_cfg = None
+        elif isinstance(calibrated_candidate, CalibratedProfilesConfig):
+            self._calibrated_cfg = calibrated_candidate
+        else:
+            self._calibrated_cfg = None
         legacy_adv_overrides = self._adv_cfg
 
         def _adv_runtime_dict(block: Any) -> Dict[str, Any]:
@@ -1166,6 +1220,7 @@ class SlippageImpl:
             vol_metric=_normalise_str(impact_vol_metric),
             participation_metric=_normalise_str(part_metric),
         )
+        self._initialise_calibrations()
 
     @property
     def config(self):
@@ -1187,6 +1242,333 @@ class SlippageImpl:
             "spread_cost_maker_bps": float(self._spread_cost_maker_bps_default),
             "spread_cost_taker_bps": float(self._spread_cost_taker_bps_default),
         }
+
+    def _resolve_calibration_path(self, path: Any) -> Optional[str]:
+        if path is None:
+            return None
+        try:
+            text = str(path).strip()
+        except Exception:
+            return None
+        if not text:
+            return None
+        if os.path.isabs(text):
+            return text
+        base = self._calibration_base_dir
+        if base is None:
+            try:
+                base = os.getcwd()
+            except Exception:
+                base = None
+        if base is None:
+            return text
+        return os.path.normpath(os.path.join(base, text))
+
+    def _load_calibration_payload(self, path: str) -> Optional[Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = handle.read()
+        except Exception:
+            logger.exception("Failed to read calibration file: %s", path)
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            try:
+                import yaml  # type: ignore
+
+                return yaml.safe_load(raw)
+            except Exception:
+                logger.exception("Failed to parse calibration file: %s", path)
+        return None
+
+    def _profiles_from_payload(
+        self, payload: Any
+    ) -> Dict[str, SymbolCalibratedProfile]:
+        profiles: Dict[str, SymbolCalibratedProfile] = {}
+        if SymbolCalibratedProfile is None:
+            return profiles
+        if not isinstance(payload, Mapping):
+            return profiles
+        mapping: Mapping[str, Any]
+        symbols_block = payload.get("symbols") if isinstance(payload, Mapping) else None
+        if isinstance(symbols_block, Mapping):
+            mapping = symbols_block
+        else:
+            mapping = payload
+        for key, value in mapping.items():
+            if not isinstance(value, Mapping):
+                continue
+            try:
+                profile = SymbolCalibratedProfile.from_dict(value)
+            except Exception:
+                logger.exception("Failed to parse calibrated profile for %s", key)
+                continue
+            symbol_key = self._normalise_symbol(key) or profile.symbol
+            if symbol_key is None:
+                continue
+            profile.symbol = symbol_key
+            profiles[symbol_key] = profile
+        return profiles
+
+    def _apply_profile_update(
+        self, target: SymbolCalibratedProfile, source: SymbolCalibratedProfile
+    ) -> None:
+        if SymbolCalibratedProfile is None:
+            return
+        if source.symbol is not None:
+            target.symbol = self._normalise_symbol(source.symbol)
+        if source.path is not None:
+            target.path = source.path
+        if source.curve_path is not None:
+            target.curve_path = source.curve_path
+        if source.hourly_path is not None:
+            target.hourly_path = source.hourly_path
+        if source.regime_path is not None:
+            target.regime_path = source.regime_path
+        if source.impact_curve:
+            target.impact_curve = source.impact_curve
+        if source.hourly_multipliers is not None:
+            target.hourly_multipliers = source.hourly_multipliers
+        if source.regime_overrides:
+            merged = dict(target.regime_overrides)
+            merged.update(source.regime_overrides)
+            target.regime_overrides = merged
+        if source.k is not None:
+            target.k = source.k
+        if source.default_spread_bps is not None:
+            target.default_spread_bps = source.default_spread_bps
+        if source.min_half_spread_bps is not None:
+            target.min_half_spread_bps = source.min_half_spread_bps
+        if source.metadata:
+            meta = dict(target.metadata)
+            meta.update(source.metadata)
+            target.metadata = meta
+        if source.extra:
+            extra = dict(target.extra)
+            extra.update(source.extra)
+            target.extra = extra
+
+    def _extract_symbol_payload(
+        self, payload: Any, symbol: Optional[str]
+    ) -> Optional[Mapping[str, Any]]:
+        if not isinstance(payload, Mapping):
+            return None
+        symbol_key = self._normalise_symbol(symbol)
+        mapping = payload
+        symbols_block = payload.get("symbols") if isinstance(payload, Mapping) else None
+        if isinstance(symbols_block, Mapping):
+            mapping = symbols_block
+        if symbol_key:
+            if symbol_key in mapping and isinstance(mapping[symbol_key], Mapping):
+                return mapping[symbol_key]
+            for key, value in mapping.items():
+                if isinstance(key, str) and key.upper() == symbol_key and isinstance(value, Mapping):
+                    return value
+        return payload if isinstance(payload, Mapping) else None
+
+    def _ensure_profile_loaded(self, profile: SymbolCalibratedProfile) -> None:
+        if SymbolCalibratedProfile is None:
+            return
+        if profile is None:
+            return
+        base_dir = self._calibration_base_dir
+        if profile.path and not getattr(profile, "_path_loaded", False):
+            resolved = self._resolve_calibration_path(profile.path)
+            if resolved:
+                payload = self._load_calibration_payload(resolved)
+                block = self._extract_symbol_payload(payload, profile.symbol)
+                if isinstance(block, Mapping):
+                    try:
+                        update = SymbolCalibratedProfile.from_dict(block)
+                    except Exception:
+                        logger.exception("Failed to parse calibration profile from %s", resolved)
+                    else:
+                        self._apply_profile_update(profile, update)
+            profile._path_loaded = True
+        if profile.curve_path and not getattr(profile, "_curve_loaded", False):
+            resolved = self._resolve_calibration_path(profile.curve_path)
+            if resolved:
+                payload = self._load_calibration_payload(resolved)
+                block = self._extract_symbol_payload(payload, profile.symbol)
+                if isinstance(block, Mapping):
+                    curve_block = (
+                        block.get("impact_curve")
+                        or block.get("notional_curve")
+                        or block.get("buckets")
+                    )
+                    if isinstance(curve_block, Sequence):
+                        profile.impact_curve = tuple(
+                            dict(entry)
+                            for entry in curve_block
+                            if isinstance(entry, Mapping)
+                        )
+            profile._curve_loaded = True
+        if profile.hourly_path and not getattr(profile, "_hourly_loaded", False):
+            resolved = self._resolve_calibration_path(profile.hourly_path)
+            if resolved:
+                payload = self._load_calibration_payload(resolved)
+                block = self._extract_symbol_payload(payload, profile.symbol)
+                if isinstance(block, Mapping):
+                    try:
+                        profile.hourly_multipliers = CalibratedHourlyProfile.from_dict(block)
+                    except Exception:
+                        logger.exception("Failed to parse hourly multipliers from %s", resolved)
+            profile._hourly_loaded = True
+        if profile.regime_path and not getattr(profile, "_regime_loaded", False):
+            resolved = self._resolve_calibration_path(profile.regime_path)
+            if resolved:
+                payload = self._load_calibration_payload(resolved)
+                block = self._extract_symbol_payload(payload, profile.symbol)
+                if isinstance(block, Mapping):
+                    overrides: Dict[str, CalibratedRegimeOverride] = {}
+                    for key, value in block.items():
+                        if not isinstance(value, Mapping):
+                            continue
+                        try:
+                            overrides[self._normalise_symbol(key) or str(key)] = (
+                                CalibratedRegimeOverride.from_dict(value)
+                            )
+                        except Exception:
+                            logger.exception("Failed to parse regime override for %s", key)
+                    if overrides:
+                        merged = dict(profile.regime_overrides)
+                        merged.update(overrides)
+                        profile.regime_overrides = merged
+            profile._regime_loaded = True
+
+    def _initialise_calibrations(self) -> None:
+        if CalibratedProfilesConfig is None or SymbolCalibratedProfile is None:
+            self._calibrated_cfg = None
+            self._calibration_symbols = {}
+            return
+        cfg_obj = self._calibrated_cfg
+        if cfg_obj is None and self._cfg_obj is not None:
+            candidate = getattr(self._cfg_obj, "calibrated_profiles", None)
+            if isinstance(candidate, CalibratedProfilesConfig):
+                cfg_obj = candidate
+        if cfg_obj is None:
+            self._calibration_symbols = {}
+            return
+        self._calibrated_cfg = cfg_obj
+        self._calibration_global_hourly = getattr(cfg_obj, "hourly_multipliers", None)
+        regime_map = getattr(cfg_obj, "regime_overrides", None)
+        if isinstance(regime_map, Mapping):
+            self._calibration_global_regime = dict(regime_map)
+        else:
+            self._calibration_global_regime = {}
+        symbols: Dict[str, SymbolCalibratedProfile] = {}
+        base_path = getattr(cfg_obj, "path", None)
+        if base_path is not None:
+            resolved = self._resolve_calibration_path(base_path)
+            if resolved:
+                self._calibration_base_dir = os.path.dirname(resolved)
+                payload = self._load_calibration_payload(resolved)
+                for sym, profile in self._profiles_from_payload(payload).items():
+                    symbols[sym] = profile
+        inline_symbols = getattr(cfg_obj, "symbols", None)
+        if isinstance(inline_symbols, Mapping):
+            for key, profile in inline_symbols.items():
+                if not isinstance(profile, SymbolCalibratedProfile):
+                    continue
+                symbol_key = self._normalise_symbol(key) or profile.symbol
+                if symbol_key is None:
+                    continue
+                profile.symbol = symbol_key
+                if symbol_key in symbols:
+                    self._apply_profile_update(symbols[symbol_key], profile)
+                else:
+                    symbols[symbol_key] = profile
+        cfg_obj.symbols = symbols
+        self._calibration_symbols = symbols
+        if self._cfg_obj is not None:
+            try:
+                setattr(self._cfg_obj, "calibrated_profiles", cfg_obj)
+            except Exception:
+                logger.exception("Failed to attach calibrated profiles to config")
+
+    def _get_calibrated_profile(
+        self, symbol: Optional[str]
+    ) -> Optional[SymbolCalibratedProfile]:
+        if self._calibrated_cfg is None:
+            return None
+        profile: Optional[SymbolCalibratedProfile] = None
+        if hasattr(self._calibrated_cfg, "get_symbol_profile"):
+            try:
+                profile = self._calibrated_cfg.get_symbol_profile(symbol)
+            except Exception:
+                profile = None
+        if profile is None and symbol is not None:
+            symbol_key = self._normalise_symbol(symbol)
+            if symbol_key and symbol_key in self._calibration_symbols:
+                profile = self._calibration_symbols[symbol_key]
+        if profile is None and not symbol and len(self._calibration_symbols) == 1:
+            profile = next(iter(self._calibration_symbols.values()))
+        if profile is not None:
+            self._ensure_profile_loaded(profile)
+        return profile
+
+    def get_calibrated_trade_cost_bps(
+        self,
+        *,
+        side: Any,
+        qty: Any,
+        spread_bps: Any = None,
+        liquidity: Any = None,
+        vol_factor: Any = None,
+        ts_ms: Any = None,
+        market_regime: Any = None,
+        mid: Any = None,
+        notional: Any = None,
+        hour_of_week: Any = None,
+        symbol: Any = None,
+    ) -> Optional[float]:
+        if _estimate_calibrated_slippage is None:
+            return None
+        cfg_obj = self._cfg_obj
+        if cfg_obj is None:
+            return None
+        size_val = _safe_float(qty)
+        if size_val is None:
+            return None
+        liq_val = _safe_float(liquidity)
+        vf_val = _safe_float(vol_factor)
+        spread_val = _safe_float(spread_bps)
+        hour_idx: Optional[int] = None
+        if hour_of_week is not None:
+            try:
+                hour_idx = int(hour_of_week)
+            except (TypeError, ValueError):
+                hour_idx = None
+        notional_val = _safe_float(notional)
+        if notional_val is None and mid is not None:
+            mid_val = _safe_float(mid)
+            if mid_val is not None:
+                try:
+                    notional_val = abs(float(size_val)) * float(mid_val)
+                except Exception:
+                    notional_val = None
+        symbol_key = symbol
+        if symbol_key is None:
+            symbol_key = self._symbol
+        else:
+            symbol_key = self._normalise_symbol(symbol_key)
+        self._get_calibrated_profile(symbol_key)
+        result = _estimate_calibrated_slippage(
+            cfg=cfg_obj,
+            symbol=symbol_key,
+            spread_bps=spread_val,
+            size=float(size_val),
+            liquidity=liq_val,
+            vol_factor=vf_val,
+            ts_ms=ts_ms,
+            market_regime=market_regime,
+            hour_of_week=hour_idx,
+            notional=notional_val,
+        )
+        if result is None:
+            return None
+        return float(result)
 
     def attach_to(self, sim) -> None:
         prev_symbol = self._symbol
@@ -1231,6 +1613,10 @@ class SlippageImpl:
         except Exception:
             logger.exception("Failed to attach get_trade_cost_bps to simulator")
         try:
+            setattr(sim, "get_calibrated_trade_cost_bps", self.get_calibrated_trade_cost_bps)
+        except Exception:
+            logger.exception("Failed to attach get_calibrated_trade_cost_bps to simulator")
+        try:
             setattr(
                 sim,
                 "_slippage_consume_trade_cost_meta",
@@ -1251,6 +1637,16 @@ class SlippageImpl:
                 setattr(self._cfg_obj, "get_trade_cost_bps", self.get_trade_cost_bps)
             except Exception:
                 logger.exception("Failed to attach get_trade_cost_bps to config")
+            try:
+                setattr(
+                    self._cfg_obj,
+                    "get_calibrated_trade_cost_bps",
+                    self.get_calibrated_trade_cost_bps,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to attach get_calibrated_trade_cost_bps to config"
+                )
 
     @staticmethod
     def from_dict(d: Dict[str, Any], *, run_config: Any | None = None) -> "SlippageImpl":
