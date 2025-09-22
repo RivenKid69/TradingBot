@@ -105,11 +105,13 @@ class RewardParams:
     """Настройки функции вознаграждения."""
 
     use_potential_shaping: bool = False  # Использовать potential-based shaping
+    use_legacy_log_reward: bool = False  # Добавлять логарифмический доход к ΔPnL
     gamma: float = 0.99  # Коэффициент дисконтирования
     potential_shaping_coef: float = 1.0  # Масштаб коэффициента потенциала
     risk_aversion_variance: float = 1.0  # Штраф за открытый риск
     risk_aversion_drawdown: float = 1.0  # Штраф за просадку
     trade_frequency_penalty: float = 0.0  # Штраф за каждую сделку
+    turnover_penalty_coef: float = 0.0  # Штраф за оборот (ноционал)
     event_reward: bool = False  # Включить бонусы/штрафы за события закрытия позиций
     profit_close_bonus: float = 0.0  # Бонус за закрытие позиции с прибылью
     loss_close_penalty: float = 0.0  # Штраф за закрытие позиции с убытком
@@ -135,11 +137,13 @@ class RewardParams:
         """Возвращает словарь с параметрами RewardParams."""
         return {
             "use_potential_shaping": self.use_potential_shaping,
+            "use_legacy_log_reward": self.use_legacy_log_reward,
             "gamma": self.gamma,
             "potential_shaping_coef": self.potential_shaping_coef,
             "risk_aversion_variance": self.risk_aversion_variance,
             "risk_aversion_drawdown": self.risk_aversion_drawdown,
             "trade_frequency_penalty": self.trade_frequency_penalty,
+            "turnover_penalty_coef": self.turnover_penalty_coef,
             "event_reward": self.event_reward,
             "profit_close_bonus": self.profit_close_bonus,
             "loss_close_penalty": self.loss_close_penalty,

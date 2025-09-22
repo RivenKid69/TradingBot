@@ -66,7 +66,9 @@ def _initialize_environment(self):
     self.state.bankruptcy_threshold = self.config.risk.bankruptcy_threshold
     self.state.max_drawdown = self.config.risk.max_drawdown
     self.state.trade_frequency_penalty = self.config.reward.trade_frequency_penalty
+    self.state.turnover_penalty_coef = self.config.reward.turnover_penalty_coef
     self.state.use_potential_shaping = self.config.reward.use_potential_shaping
+    self.state.use_legacy_log_reward = self.config.reward.use_legacy_log_reward
     self.state.gamma = self.config.reward.gamma
     self.state.last_potential = 0.0
     self.state.potential_shaping_coef = self.config.reward.potential_shaping_coef
