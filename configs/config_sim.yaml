@@ -10,8 +10,9 @@ execution_params:
   ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
   tif: GTC               # e.g. IOC or FOK
 execution:
-  intrabar_price_model: null
-  timeframe_ms: null
+  intrabar_price_model: "bridge"  # Модель заполнения внутри бара (например: linear, bridge, reference).
+  timeframe_ms: 3600000           # Размер базового бара в миллисекундах (H1 = 60 минут = 3_600_000 мс).
+  reference_prices_path: null     # Путь к M1-референсу для режима intrabar "reference"; оставьте null для bridge/linear.
   use_latency_from: null
   latency_constant_ms: null
   entry_mode: default         # Режим входа для симулятора; default соответствует текущему легаси-поведению.
@@ -27,8 +28,9 @@ execution:
     floor_base: null         # Минимальный дневной ADV (в базовой валюте): используется как фолбек и нижняя граница.
     timeframe_ms: null       # Необязательный override размера бара (в мс) для конвертации дневного ADV в per-bar.
   bridge:
-    intrabar_price_model: null
-    timeframe_ms: null
+    intrabar_price_model: "bridge"  # Пример конфигурации для симулятора в режиме моста (bridge adapter).
+    timeframe_ms: 3600000           # Должен совпадать с целевым таймфреймом бара.
+    reference_prices_path: null     # Опциональный путь к M1-референсу для bridge/reference адаптера.
     use_latency_from: null
     latency_constant_ms: null
 execution_config:

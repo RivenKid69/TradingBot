@@ -312,6 +312,10 @@ class ExecutionBridgeConfig(BaseModel):
     timeframe_ms: Optional[int] = Field(default=None)
     use_latency_from: Optional[str] = Field(default=None)
     latency_constant_ms: Optional[int] = Field(default=None)
+    reference_prices_path: Optional[str] = Field(
+        default=None,
+        description="Optional path to an intrabar reference dataset consumed by bridge adapters.",
+    )
 
     class Config:
         extra = "allow"
@@ -344,6 +348,10 @@ class ExecutionRuntimeConfig(BaseModel):
     timeframe_ms: Optional[int] = Field(default=None)
     use_latency_from: Optional[str] = Field(default=None)
     latency_constant_ms: Optional[int] = Field(default=None)
+    reference_prices_path: Optional[str] = Field(
+        default=None,
+        description="Path to M1 reference bars used by the 'reference' intrabar price model.",
+    )
     entry_mode: ExecutionEntryMode = Field(
         default=ExecutionEntryMode.DEFAULT,
         description="Режим выбора точки входа; ``default`` соответствует текущему поведению.",

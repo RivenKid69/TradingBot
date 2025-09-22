@@ -16,8 +16,9 @@ execution_params:
   ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
   tif: GTC               # e.g. IOC or FOK
 execution:
-  intrabar_price_model: null
-  timeframe_ms: null
+  intrabar_price_model: "bridge"  # Intrabar price sampling model (e.g. linear, bridge, reference).
+  timeframe_ms: 3600000           # Base bar length in milliseconds (H1 = 60 minutes = 3_600_000 ms).
+  reference_prices_path: null     # Optional path to an M1 reference dataset used by the "reference" intrabar mode.
   use_latency_from: null
   latency_constant_ms: null
   entry_mode: default         # Entry mode for fills; default keeps the legacy behaviour.
@@ -25,8 +26,9 @@ execution:
     enabled: true             # true preserves legacy clipping; false disables it.
     strict_open_fill: false   # true enforces clipped open fills; false keeps legacy logic.
   bridge:
-    intrabar_price_model: null
-    timeframe_ms: null
+    intrabar_price_model: "bridge"  # Example bridge adapter configuration; align with the main execution block.
+    timeframe_ms: 3600000           # Must match the target bar timeframe in milliseconds.
+    reference_prices_path: null     # Optional path to an intrabar reference dataset for bridge/reference adapters.
     use_latency_from: null
     latency_constant_ms: null
 execution_config:
