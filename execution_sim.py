@@ -531,6 +531,7 @@ class SimStepReport:
     latency_p95_ms: float = 0.0
     execution_profile: str = ""
     latency_timeout_ratio: float = 0.0
+    market_regime: Any | None = None
     vol_raw: Optional[Dict[str, float]] = None
     cap_base_per_bar: float = 0.0
     used_base_before: float = 0.0
@@ -611,6 +612,7 @@ class SimStepReport:
             "latency_p95_ms": float(self.latency_p95_ms),
             "latency_timeout_ratio": float(self.latency_timeout_ratio),
             "execution_profile": str(self.execution_profile),
+            "market_regime": self.market_regime,
             "vol_raw": (
                 {str(k): float(v) for k, v in self.vol_raw.items()}
                 if isinstance(self.vol_raw, dict)
@@ -2828,6 +2830,7 @@ class ExecutionSimulator:
             latency_p95_ms=float(lat_stats.get("p95_ms", 0.0)),
             latency_timeout_ratio=float(lat_stats.get("timeout_rate", 0.0)),
             execution_profile=str(getattr(self, "execution_profile", "")),
+            market_regime=getattr(self, "_last_market_regime", None),
             vol_raw=self._last_vol_raw,
         )
         if trades:
@@ -9125,6 +9128,7 @@ class ExecutionSimulator:
             latency_p95_ms=float(lat_stats.get("p95_ms", 0.0)),
             latency_timeout_ratio=float(lat_stats.get("timeout_rate", 0.0)),
             execution_profile=str(getattr(self, "execution_profile", "")),
+            market_regime=getattr(self, "_last_market_regime", None),
             vol_raw=self._last_vol_raw,
         )
 

@@ -51,6 +51,7 @@ class _CompatReport:
     latency_p95_ms: float = 0.0
     latency_timeout_ratio: float = 0.0
     execution_profile: str = ""
+    market_regime: Any | None = None
     vol_raw: Optional[Dict[str, float]] = None
     status: str = ""
     reason: Optional[Dict[str, Any]] = None

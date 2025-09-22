@@ -29,6 +29,7 @@ def test_execution_profile_logging_and_metrics(tmp_path):
     reports_path = tmp_path / "reports.csv"
     sim = ExecutionSimulator(execution_profile="MKT_OPEN_NEXT_H1")
     sim.set_market_snapshot(bid=100.0, ask=101.0, liquidity=1.0)
+    setattr(sim, "_last_market_regime", "BULL")
 
     class Proto:
         def __init__(self):
@@ -39,6 +40,7 @@ def test_execution_profile_logging_and_metrics(tmp_path):
 
     proto = Proto()
     sim.submit(proto)
+    sim.pop_ready(ref_price=100.5)
     rep = sim.pop_ready(ref_price=100.5)
     log = LogWriter(LogConfig(trades_path=str(trades_path), reports_path=str(reports_path), flush_every=1))
     log.append(rep, symbol="BTCUSDT", ts_ms=0)
@@ -46,6 +48,8 @@ def test_execution_profile_logging_and_metrics(tmp_path):
     df = pd.read_csv(trades_path)
     assert "execution_profile" in df.columns
     assert set(df["execution_profile"]) == {"MKT_OPEN_NEXT_H1"}
+    assert "market_regime" in df.columns
+    assert set(df["market_regime"].dropna()) == {"BULL"}
 
     trades = pd.DataFrame({
         "ts_ms": [1, 2, 3, 4],
