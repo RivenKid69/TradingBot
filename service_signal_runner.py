@@ -75,6 +75,9 @@ from core_config import (
     OpsKillSwitchConfig,
     MonitoringConfig,
     StateConfig,
+    ExecutionProfile,
+    load_timing_profiles,
+    resolve_execution_timing,
 )
 from no_trade import (
     _parse_daily_windows_min,
@@ -5364,6 +5367,60 @@ def from_config(
     snapshot_config_path: str | None = None,
 ) -> Iterator[Dict[str, Any]]:
     """Build dependencies from ``cfg`` and run :class:`ServiceSignalRunner`."""
+
+    timing_defaults, timing_profiles = load_timing_profiles()
+    exec_profile = getattr(
+        cfg, "execution_profile", ExecutionProfile.MKT_OPEN_NEXT_H1
+    )
+    resolved_timing = resolve_execution_timing(
+        exec_profile, timing_defaults, timing_profiles
+    )
+
+    def _parse_timeframe_to_ms(value: Any) -> int:
+        try:
+            raw_int = int(value)
+        except (TypeError, ValueError):
+            if value is None:
+                return 0
+            text = str(value).strip().lower()
+            if not text:
+                return 0
+            unit = text[-1]
+            multipliers = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+            if unit not in multipliers:
+                return 0
+            try:
+                magnitude = float(text[:-1] or 0)
+            except ValueError:
+                return 0
+            value_ms = int(magnitude * multipliers[unit])
+        else:
+            value_ms = raw_int
+        return int(value_ms) if value_ms > 0 else 0
+
+    timeframe_candidates: list[Any] = [getattr(cfg.timing, "timeframe_ms", None)]
+    timeframe_candidates.append(getattr(cfg.execution, "timeframe_ms", None))
+    data_cfg = getattr(cfg, "data", None)
+    if data_cfg is not None:
+        timeframe_candidates.append(getattr(data_cfg, "timeframe_ms", None))
+        timeframe_candidates.append(getattr(data_cfg, "timeframe", None))
+    timeframe_candidates.append(getattr(timing_defaults, "timeframe_ms", None))
+
+    timeframe_ms = 0
+    for candidate in timeframe_candidates:
+        timeframe_ms = _parse_timeframe_to_ms(candidate)
+        if timeframe_ms > 0:
+            break
+    if timeframe_ms <= 0:
+        timeframe_ms = 60_000
+
+    cfg.timing.timeframe_ms = int(timeframe_ms)
+    cfg.timing.close_lag_ms = int(resolved_timing.decision_delay_ms)
+    cfg.execution.timeframe_ms = int(timeframe_ms)
+    cfg.execution.latency_constant_ms = int(resolved_timing.decision_delay_ms)
+    cfg.execution.latency_steps = int(resolved_timing.latency_steps)
+    cfg.execution.min_lookback_ms = int(resolved_timing.min_lookback_ms)
+    cfg.execution.decision_mode = resolved_timing.decision_mode
 
     logging.getLogger(__name__).info("timing settings: %s", cfg.timing.dict())
 
