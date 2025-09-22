@@ -354,6 +354,7 @@ def objective(trial: optuna.Trial,
     params = {
         "window_size": trial.suggest_categorical("window_size", [10, 20, 30]),
         "trade_frequency_penalty": trial.suggest_float("trade_frequency_penalty", 1e-5, 5e-4, log=True),
+        "turnover_penalty_coef": trial.suggest_float("turnover_penalty_coef", 0.0, 5e-4),
         "n_steps": trial.suggest_categorical("n_steps", [512, 1024, 2048]),
         "n_epochs": trial.suggest_int("n_epochs", 1, 5),
         "batch_size": trial.suggest_categorical("batch_size", [64, 128, 256]),
@@ -429,6 +430,7 @@ def objective(trial: optuna.Trial,
                 "window_size": params.get("window_size", 20),
                 "gamma": params["gamma"],
                 "trade_frequency_penalty": params["trade_frequency_penalty"],
+                "turnover_penalty_coef": params["turnover_penalty_coef"],
                 "momentum_factor": params["momentum_factor"],
                 "mean_reversion_factor": params["mean_reversion_factor"],
                 "adversarial_factor": params["adversarial_factor"],
@@ -440,7 +442,7 @@ def objective(trial: optuna.Trial,
 
                 # 3. Статические параметры и параметры индикаторов
                 "mode": "train",
-                "reward_shaping": True,
+                "reward_shaping": False,
                 "warmup_period": warmup_period,
                 "ma5_window": MA5_WINDOW,
                 "ma20_window": MA20_WINDOW,
@@ -468,7 +470,13 @@ def objective(trial: optuna.Trial,
 
     base_env_tr = WatchdogVecEnv(env_constructors)
     monitored_env_tr = VecMonitor(base_env_tr)
-    env_tr = VecNormalize(monitored_env_tr, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=params["gamma"])
+    env_tr = VecNormalize(
+        monitored_env_tr,
+        norm_obs=False,
+        norm_reward=False,
+        clip_reward=None,
+        gamma=params["gamma"],
+    )
 
     env_tr.save(str(train_stats_path))
     save_sidecar_metadata(str(train_stats_path), extra={"kind": "vecnorm_stats", "phase": "train"})
@@ -484,6 +492,7 @@ def objective(trial: optuna.Trial,
             "trailing_atr_mult": params["trailing_atr_mult"],
             "tp_atr_mult": params["tp_atr_mult"],
             "trade_frequency_penalty": params["trade_frequency_penalty"],
+            "turnover_penalty_coef": params["turnover_penalty_coef"],
             "mode": "val",
             "reward_shaping": False,
             "warmup_period": warmup_period,
@@ -508,6 +517,7 @@ def objective(trial: optuna.Trial,
     env_va = VecNormalize.load(str(train_stats_path), monitored_env_va)
     env_va.training = False
     env_va.norm_reward = False
+    env_va.clip_reward = None
 
     val_stats_path = trials_dir / f"vec_normalize_val_{trial.number}.pkl"
     env_va.save(str(val_stats_path))
@@ -605,7 +615,8 @@ def objective(trial: optuna.Trial,
                 "norm_stats": norm_stats, "window_size": params["window_size"],
                 "gamma": params["gamma"], "atr_multiplier": params["atr_multiplier"],
                 "trailing_atr_mult": params["trailing_atr_mult"], "tp_atr_mult": params["tp_atr_mult"],
-                "trade_frequency_penalty": params["trade_frequency_penalty"], "mode": "val",
+                "trade_frequency_penalty": params["trade_frequency_penalty"],
+                "turnover_penalty_coef": params["turnover_penalty_coef"], "mode": "val",
                 "reward_shaping": False, "warmup_period": warmup_period,
                 "ma5_window": MA5_WINDOW, "ma20_window": MA20_WINDOW, "atr_window": ATR_WINDOW,
                 "rsi_window": RSI_WINDOW, "macd_fast": MACD_FAST, "macd_slow": MACD_SLOW,
@@ -620,14 +631,17 @@ def objective(trial: optuna.Trial,
             )
 
         check_model_compat(str(train_stats_path))
-        final_eval_env = VecMonitor(
-            VecNormalize.load(str(train_stats_path), DummyVecEnv([make_final_eval_env]))
+        final_eval_norm = VecNormalize.load(
+            str(train_stats_path),
+            DummyVecEnv([make_final_eval_env]),
         )
-        final_eval_env.training = False
-        final_eval_env.norm_reward = False
+        final_eval_norm.training = False
+        final_eval_norm.norm_reward = False
+        final_eval_norm.clip_reward = None
+        final_eval_env = VecMonitor(final_eval_norm)
         test_stats_path = trials_dir / f"vec_normalize_test_{trial.number}.pkl"
         if not test_stats_path.exists():
-            final_eval_env.save(str(test_stats_path))
+            final_eval_norm.save(str(test_stats_path))
             save_sidecar_metadata(str(test_stats_path), extra={"kind": "vecnorm_stats", "phase": "test"})
 
         if regime != 'normal':
@@ -934,6 +948,7 @@ def main():
                 "trailing_atr_mult": params["trailing_atr_mult"],
                 "tp_atr_mult": params["tp_atr_mult"],
                 "trade_frequency_penalty": params["trade_frequency_penalty"],
+                "turnover_penalty_coef": params["turnover_penalty_coef"],
                 "mode": "val",
                 "reward_shaping": False,
                 "warmup_period": warmup_period,
@@ -961,6 +976,7 @@ def main():
         eval_env = VecNormalize.load(str(best_stats_path), monitored_eval_env)
         eval_env.training = False
         eval_env.norm_reward = False
+        eval_env.clip_reward = None
 
         best_model = DistributionalPPO.load(str(best_model_path), env=eval_env)
 
