@@ -16,6 +16,7 @@ ActionType = exec_mod.ActionType
 ExecutionSimulator = exec_mod.ExecutionSimulator
 TWAPExecutor = exec_mod.TWAPExecutor
 POVExecutor = exec_mod.POVExecutor
+VWAPExecutor = exec_mod.VWAPExecutor
 
 
 latency_cfg = {"base_ms": 0, "jitter_ms": 0, "spike_p": 0.0, "timeout_ms": 1000, "retries": 0}
@@ -114,3 +115,42 @@ def test_pov_determinism():
     trades1 = [(t.ts, t.qty, t.price) for t in rep1.trades]
     trades2 = [(t.ts, t.qty, t.price) for t in rep2.trades]
     assert trades1 == trades2
+
+
+def test_vwap_profile_planning():
+    execu = VWAPExecutor()
+    snap = {
+        "bar_timeframe_ms": 1_000,
+        "bar_start_ts": 0,
+        "intrabar_volume_profile": [
+            {"ts": 100, "volume": 1.0},
+            {"ts": 400, "volume": 3.0},
+            {"ts": 900, "volume": 1.0},
+        ],
+    }
+    plan = execu.plan_market(now_ts_ms=100, side="BUY", target_qty=50.0, snapshot=snap)
+    assert len(plan) == 3
+    offsets = [child.ts_offset_ms for child in plan]
+    assert offsets == [0, 300, 800]
+    qtys = [child.qty for child in plan]
+    assert qtys[0] == pytest.approx(10.0)
+    assert qtys[1] == pytest.approx(30.0)
+    assert qtys[2] == pytest.approx(10.0)
+    for child in plan:
+        assert child.liquidity_hint == pytest.approx(child.qty)
+
+
+def test_vwap_fallback_plan():
+    execu = VWAPExecutor(fallback_parts=4)
+    snap = {
+        "bar_timeframe_ms": 400,
+        "bar_start_ts": 0,
+        "bar_end_ts": 400,
+        "intrabar_volume_profile": [],
+    }
+    plan = execu.plan_market(now_ts_ms=100, side="BUY", target_qty=40.0, snapshot=snap)
+    assert len(plan) == 4
+    assert plan[0].ts_offset_ms == 0
+    assert plan[-1].ts_offset_ms == 300
+    qty_total = sum(child.qty for child in plan)
+    assert qty_total == pytest.approx(40.0)

@@ -45,11 +45,14 @@ class DummyQuantizer:
 
 
 class DummyFees:
-    def compute(self, *, side, price, qty, liquidity):
+    def compute(self, *, side, price, qty, liquidity, **_):
         return float(price) * float(qty) * 0.001
 
     def attach_to(self, sim):
         sim.fees = self
+
+    def get_fee_bps(self, symbol, is_maker):
+        return 0.0 if is_maker else 10.0
 
 
 from dataclasses import dataclass, field
@@ -108,7 +111,7 @@ def base_sim():
     sim = ExecutionSimulator()
     sim.set_symbol("BTCUSDT")
     sim.set_quantizer(DummyQuantizer())
-    sim.fees = DummyFees()
+    DummyFees().attach_to(sim)
     sim.risk = DummyRisk()
     return sim
 
@@ -146,14 +149,17 @@ def test_vwap_current_h1_profile(base_sim):
         ask=201.0,
         vol_factor=1.0,
         liquidity=2.0,
+        bar_timeframe_ms=3_600_000,
         actions=[(ActionType.MARKET, proto)],
     )
-    assert len(rep.trades) == 1
-    trade = rep.trades[0]
-    assert trade.ts == 3_600_000
-    assert trade.price == pytest.approx(200.0)
-    assert rep.fee_total == pytest.approx(trade.price * trade.qty * 0.001)
-    assert rep.position_qty == pytest.approx(trade.qty)
+    assert len(rep.trades) == VWAPExecutor().fallback_parts
+    trade_ts = [t.ts for t in rep.trades]
+    assert trade_ts == sorted(trade_ts)
+    assert trade_ts[0] == 1_800_000
+    assert trade_ts[-1] == 3_600_000
+    qty_total = sum(t.qty for t in rep.trades)
+    assert rep.position_qty == pytest.approx(qty_total)
+    assert rep.fee_total == pytest.approx(sum(t.price * t.qty for t in rep.trades) * 0.001)
 def test_limit_mid_bps_params_build(base_sim):
     sim = base_sim
     params = {"limit_offset_bps": 50, "ttl_steps": 7, "tif": "IOC"}

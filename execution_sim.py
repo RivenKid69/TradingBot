@@ -8100,6 +8100,42 @@ class ExecutionSimulator:
                         executor = make_executor(algo, self._execution_cfg)
                     else:
                         executor = TakerExecutor()
+                timeframe_snapshot = self._intrabar_path_timeframe_ms
+                if timeframe_snapshot is None:
+                    timeframe_snapshot = self._resolve_intrabar_timeframe(ts)
+                try:
+                    timeframe_int = int(timeframe_snapshot)
+                except (TypeError, ValueError):
+                    timeframe_int = None
+                if timeframe_int is not None and timeframe_int <= 0:
+                    timeframe_int = None
+
+                bar_start_ts: Optional[int] = self._intrabar_path_start_ts
+                if bar_start_ts is None and timeframe_int is not None:
+                    try:
+                        base = int(ts // timeframe_int)
+                    except Exception:
+                        base = None
+                    if base is not None:
+                        bar_start_ts = base * timeframe_int
+                bar_end_ts: Optional[int] = None
+                if bar_start_ts is not None and timeframe_int is not None:
+                    bar_end_ts = bar_start_ts + timeframe_int
+
+                volume_profile_payload: List[Dict[str, float]] = []
+                for item in self._intrabar_volume_profile:
+                    if not isinstance(item, (tuple, list)) or len(item) < 2:
+                        continue
+                    ts_val, vol_val = item[0], item[1]
+                    try:
+                        ts_num = int(ts_val)
+                        vol_num = float(vol_val)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(vol_num) or vol_num <= 0.0:
+                        continue
+                    volume_profile_payload.append({"ts": ts_num, "volume": vol_num})
+
                 snapshot = {
                     "bid": self._last_bid,
                     "ask": self._last_ask,
@@ -8112,11 +8148,14 @@ class ExecutionSimulator:
                     "vol_factor": self._last_vol_factor,
                     "liquidity": self._effective_liquidity_cap(),
                     "ref_price": ref_market,
+                    "bar_timeframe_ms": timeframe_int,
+                    "bar_start_ts": bar_start_ts,
+                    "bar_end_ts": bar_end_ts,
+                    "intrabar_volume_profile": volume_profile_payload,
                 }
                 plan = executor.plan_market(
                     now_ts_ms=ts, side=side, target_qty=qty_total, snapshot=snapshot
                 )
-
                 # если план пуст — отклоняем
                 if not plan:
                     _cancel(p.client_order_id)
@@ -9125,6 +9164,13 @@ class ExecutionSimulator:
         adv_capacity_norm = (
             max(0.0, float(adv_capacity)) if adv_capacity is not None else None
         )
+        if (
+            adv_capacity_norm is not None
+            and adv_capacity_norm <= 0.0
+            and not self._adv_enabled
+            and not self._bar_cap_base_enabled
+        ):
+            adv_capacity_norm = None
         self._last_adv_bar_capacity = adv_capacity_norm
         self._last_liquidity = self._combine_liquidity(incoming_liq, adv_capacity_norm)
         self._last_ref_price = ref_val
