@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import json
 import logging
 import os
@@ -13,6 +14,15 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Mapping, Tuple
 
 from adapters.binance_spot_private import AccountFeeInfo, fetch_account_fee_info
+from binance_fee_refresh import (
+    DEFAULT_BNB_DISCOUNT_RATE,
+    DEFAULT_UPDATE_THRESHOLD_DAYS,
+    DEFAULT_VIP_TIER_LABEL,
+    PUBLIC_FEE_URL,
+    PublicFeeSnapshot,
+    load_public_fee_snapshot,
+    parse_timestamp,
+)
 
 try:
     from fees import FeesModel
@@ -303,9 +313,9 @@ class FeesConfig:
     enabled: bool = True
     path: Optional[str] = None
     refresh_days: Optional[int] = None
-    maker_bps: float = 1.0
-    taker_bps: float = 5.0
-    use_bnb_discount: bool = False
+    maker_bps: Optional[float] = None
+    taker_bps: Optional[float] = None
+    use_bnb_discount: Optional[bool] = None
     maker_discount_mult: Optional[float] = None
     taker_discount_mult: Optional[float] = None
     vip_tier: Optional[int] = None
@@ -337,34 +347,61 @@ class FeesConfig:
     account_info_timeout_s: Optional[float] = field(init=False, default=None)
     account_info_api_key: Optional[str] = field(init=False, default=None)
     account_info_api_secret: Optional[str] = field(init=False, default=None)
+    maker_bps_overridden: bool = field(init=False, default=False)
+    taker_bps_overridden: bool = field(init=False, default=False)
+    use_bnb_discount_overridden: bool = field(init=False, default=False)
+    maker_discount_overridden: bool = field(init=False, default=False)
+    taker_discount_overridden: bool = field(init=False, default=False)
+    vip_tier_overridden: bool = field(init=False, default=False)
+    auto_maker_bps: Optional[float] = field(init=False, default=None)
+    auto_taker_bps: Optional[float] = field(init=False, default=None)
+    auto_maker_discount_mult: Optional[float] = field(init=False, default=None)
+    auto_taker_discount_mult: Optional[float] = field(init=False, default=None)
+    auto_use_bnb_discount: Optional[bool] = field(init=False, default=None)
+    auto_vip_tier: Optional[int] = field(init=False, default=None)
+    auto_refresh_metadata: Dict[str, Any] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         self.enabled = bool(self.enabled)
         self.path = _normalise_path(self.path)
         self.refresh_days = _safe_positive_int(self.refresh_days)
 
-        maker_bps = _safe_float(self.maker_bps, 1.0)
-        self.maker_bps = maker_bps if maker_bps is not None else 1.0
-        taker_bps = _safe_float(self.taker_bps, 5.0)
-        self.taker_bps = taker_bps if taker_bps is not None else 5.0
+        maker_input = self.maker_bps
+        self.maker_bps_overridden = maker_input is not None
+        maker_bps = _safe_float(maker_input)
+        if maker_bps is None:
+            maker_bps = 1.0
+        self.maker_bps = maker_bps
 
-        self.use_bnb_discount = bool(self.use_bnb_discount)
-        maker_mult = _safe_float(self.maker_discount_mult)
-        taker_mult = _safe_float(self.taker_discount_mult)
-        if self.use_bnb_discount:
-            if maker_mult is None:
-                maker_mult = 0.75
-            if taker_mult is None:
-                taker_mult = 0.75
-        else:
-            if maker_mult is None:
-                maker_mult = 1.0
-            if taker_mult is None:
-                taker_mult = 1.0
+        taker_input = self.taker_bps
+        self.taker_bps_overridden = taker_input is not None
+        taker_bps = _safe_float(taker_input)
+        if taker_bps is None:
+            taker_bps = 5.0
+        self.taker_bps = taker_bps
+
+        use_bnb_input = self.use_bnb_discount
+        self.use_bnb_discount_overridden = use_bnb_input is not None
+        use_bnb_flag = bool(use_bnb_input) if use_bnb_input is not None else False
+        self.use_bnb_discount = use_bnb_flag
+
+        maker_mult_input = self.maker_discount_mult
+        self.maker_discount_overridden = maker_mult_input is not None
+        maker_mult = _safe_float(maker_mult_input)
+        if maker_mult is None:
+            maker_mult = 0.75 if self.use_bnb_discount else 1.0
         self.maker_discount_mult = maker_mult
+
+        taker_mult_input = self.taker_discount_mult
+        self.taker_discount_overridden = taker_mult_input is not None
+        taker_mult = _safe_float(taker_mult_input)
+        if taker_mult is None:
+            taker_mult = 0.75 if self.use_bnb_discount else 1.0
         self.taker_discount_mult = taker_mult
 
-        self.vip_tier = _safe_positive_int(self.vip_tier)
+        vip_input = self.vip_tier
+        self.vip_tier_overridden = vip_input is not None
+        self.vip_tier = _safe_positive_int(vip_input)
 
         step = _safe_float(self.fee_rounding_step)
         if step is not None and step <= 0.0:
@@ -521,6 +558,10 @@ class FeesImpl:
         self.account_fee_endpoint: Optional[str] = None
         self.account_fee_recv_window: Optional[int] = None
         self.account_fee_timeout: Optional[float] = None
+        self._public_fee_snapshot: PublicFeeSnapshot | None = None
+        self._public_refresh_reason: Optional[str] = None
+        self._public_refresh_error: Optional[str] = None
+        self._public_refresh_attempted: bool = False
         self._account_fee_applied: Dict[str, bool] = {
             "vip_tier": False,
             "maker_bps": False,
@@ -587,9 +628,19 @@ class FeesImpl:
                 self.account_fee_info = info
                 self.account_fee_overrides = info.to_fee_overrides()
 
-        self._maker_discount_mult = float(cfg.maker_discount_mult)
-        self._taker_discount_mult = float(cfg.taker_discount_mult)
-        self._use_bnb_discount = bool(cfg.use_bnb_discount)
+        maker_discount_mult = cfg.maker_discount_mult
+        if not cfg.maker_discount_overridden and cfg.auto_maker_discount_mult is not None:
+            maker_discount_mult = float(cfg.auto_maker_discount_mult)
+        taker_discount_mult = cfg.taker_discount_mult
+        if not cfg.taker_discount_overridden and cfg.auto_taker_discount_mult is not None:
+            taker_discount_mult = float(cfg.auto_taker_discount_mult)
+        use_bnb_discount = cfg.use_bnb_discount
+        if not cfg.use_bnb_discount_overridden and cfg.auto_use_bnb_discount is not None:
+            use_bnb_discount = bool(cfg.auto_use_bnb_discount)
+
+        self._maker_discount_mult = float(maker_discount_mult)
+        self._taker_discount_mult = float(taker_discount_mult)
+        self._use_bnb_discount = bool(use_bnb_discount)
 
         rounding_payload = (
             copy.deepcopy(cfg.rounding_options)
@@ -642,6 +693,8 @@ class FeesImpl:
         self.settlement_options = final_settlement_payload
 
         vip_tier = cfg.vip_tier
+        if vip_tier is None and not cfg.vip_tier_overridden and cfg.auto_vip_tier is not None:
+            vip_tier = int(cfg.auto_vip_tier)
         if vip_tier is None:
             vip_candidate = _safe_positive_int(
                 self._table_account_overrides.get("vip_tier")
@@ -657,7 +710,11 @@ class FeesImpl:
             vip_tier = 0
 
         maker_bps = float(cfg.maker_bps)
+        if not cfg.maker_bps_overridden and cfg.auto_maker_bps is not None:
+            maker_bps = float(cfg.auto_maker_bps)
         taker_bps = float(cfg.taker_bps)
+        if not cfg.taker_bps_overridden and cfg.auto_taker_bps is not None:
+            taker_bps = float(cfg.auto_taker_bps)
         account_maker_bps = _safe_float(self.account_fee_overrides.get("maker_bps"))
         if account_maker_bps is not None:
             maker_bps = account_maker_bps
@@ -762,6 +819,16 @@ class FeesImpl:
                 "settlement_from_file",
                 copy.deepcopy(self._table_settlement_normalised),
             )
+        if self._public_refresh_attempted:
+            table_meta.setdefault("auto_refresh_attempted", True)
+        if self._public_refresh_reason is not None:
+            table_meta.setdefault("auto_refresh_reason", self._public_refresh_reason)
+        if self._public_refresh_error is not None:
+            table_meta.setdefault("auto_refresh_error", self._public_refresh_error)
+        if self.cfg.auto_refresh_metadata:
+            table_meta.setdefault(
+                "public_refresh", copy.deepcopy(self.cfg.auto_refresh_metadata)
+            )
         meta["table"] = table_meta
         account_meta: Dict[str, Any] = {
             "enabled": bool(self.cfg.account_info_enabled),
@@ -796,6 +863,12 @@ class FeesImpl:
         meta["maker_discount_mult"] = self._maker_discount_mult
         meta["taker_discount_mult"] = self._taker_discount_mult
         meta["vip_tier"] = int(vip_tier)
+        if self.cfg.auto_maker_bps is not None:
+            meta.setdefault("maker_bps_auto", float(self.cfg.auto_maker_bps))
+        if self.cfg.auto_taker_bps is not None:
+            meta.setdefault("taker_bps_auto", float(self.cfg.auto_taker_bps))
+        if self.cfg.auto_use_bnb_discount is not None:
+            meta.setdefault("use_bnb_discount_auto", bool(self.cfg.auto_use_bnb_discount))
         if fee_rounding_step is not None:
             meta["fee_rounding_step"] = float(fee_rounding_step)
         meta["rounding"] = copy.deepcopy(rounding) if rounding is not None else None
@@ -930,27 +1003,38 @@ class FeesImpl:
     def _load_symbol_fee_table(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
         path_candidate = self.cfg.path
-        if path_candidate is None:
-            default_path = _DEFAULT_FEE_TABLE_PATH
-            if default_path.exists():
-                path_candidate = str(default_path)
-        if path_candidate is None:
-            return payload
-        abspath = os.path.abspath(path_candidate)
+        default_path = _DEFAULT_FEE_TABLE_PATH
+        if path_candidate is None and default_path.exists():
+            path_candidate = str(default_path)
+
+        abspath = (
+            os.path.abspath(path_candidate)
+            if path_candidate is not None
+            else os.path.abspath(str(default_path))
+        )
         self.table_path = abspath
-        data, mtime = self._read_fee_table(abspath)
+
+        data: Optional[Dict[str, Any]] = None
+        mtime: Optional[float] = None
+        auto_reason: Optional[str] = None
+
+        if path_candidate is not None:
+            data, mtime = self._read_fee_table(abspath)
+
         if data is None:
-            if os.path.exists(abspath):
+            if path_candidate is not None and os.path.exists(abspath):
                 logger.warning(
                     "Fees table %s is unusable; falling back to global fees", abspath
                 )
                 self.table_error = "invalid"
+                auto_reason = "invalid"
             else:
                 if self.cfg.path:
                     logger.warning(
                         "Fees table %s not found; falling back to global fees", abspath
                     )
                 self.table_error = "missing"
+                auto_reason = "missing"
             self.table_metadata = {
                 "path": abspath,
                 "age_days": None,
@@ -958,35 +1042,204 @@ class FeesImpl:
                 "stale": False,
                 "error": self.table_error,
             }
-            return payload
+        else:
+            payload = data
+            age_days: Optional[float] = None
+            if mtime is not None:
+                age_days = max((time.time() - mtime) / 86400.0, 0.0)
+                self.table_age_days = age_days
 
-        payload = data
-        if mtime is not None:
-            age_days = max((time.time() - mtime) / 86400.0, 0.0)
-            self.table_age_days = age_days
+            meta = dict(payload.get("meta", {}))
+            built_at = parse_timestamp(meta.get("built_at"))
+            if built_at is not None:
+                now = _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc)
+                meta_age = max((now - built_at).total_seconds() / 86400.0, 0.0)
+                if age_days is None or meta_age > age_days:
+                    age_days = meta_age
+                    self.table_age_days = meta_age
+
             refresh_days = self.cfg.refresh_days
+            threshold: Optional[float] = None
             if refresh_days is not None and refresh_days >= 0:
-                if age_days > float(refresh_days):
-                    self.table_stale = True
-                    logger.warning(
-                        "Fees table %s is stale (age %.1f days > refresh_days=%s); "
-                        "using global rates",
-                        abspath,
-                        age_days,
-                        refresh_days,
-                    )
-        meta = dict(payload.get("meta", {}))
+                threshold = float(refresh_days)
+            elif self._can_auto_refresh(abspath):
+                threshold = float(DEFAULT_UPDATE_THRESHOLD_DAYS)
+
+            if (
+                threshold is not None
+                and age_days is not None
+                and age_days > threshold
+            ):
+                self.table_stale = True
+                auto_reason = "stale"
+                logger.warning(
+                    "Fees table %s is stale (age %.1f days > %.1f); refreshing", abspath, age_days, threshold
+                )
+
+            if not payload.get("table"):
+                auto_reason = auto_reason or "empty"
+
+            meta.update(
+                {
+                    "path": abspath,
+                    "age_days": self.table_age_days,
+                    "refresh_days": self.cfg.refresh_days,
+                    "stale": self.table_stale,
+                    "error": self.table_error,
+                }
+            )
+            self.table_metadata = meta
+
+        if auto_reason and self._can_auto_refresh(abspath):
+            refreshed = self._refresh_symbol_fee_table(reason=auto_reason, target_path=abspath)
+            if refreshed is not None:
+                return refreshed
+        return payload
+
+    def _can_auto_refresh(self, path: Optional[str]) -> bool:
+        if path is None:
+            return False
+        disable = os.environ.get("BINANCE_PUBLIC_FEES_DISABLE_AUTO", "").strip().lower()
+        if disable in {"1", "true", "yes", "on"}:
+            return False
+        default_abspath = os.path.abspath(str(_DEFAULT_FEE_TABLE_PATH))
+        path_norm = os.path.abspath(path)
+        if self.cfg.path:
+            try:
+                return os.path.abspath(self.cfg.path) == path_norm
+            except Exception:
+                return False
+        return path_norm == default_abspath
+
+    def _refresh_symbol_fee_table(
+        self, *, reason: str, target_path: Optional[str]
+    ) -> Dict[str, Any] | None:
+        self._public_refresh_attempted = True
+        csv_env = _safe_str(os.environ.get("BINANCE_FEE_SNAPSHOT_CSV"))
+        csv_path: Path | None = None
+        if csv_env:
+            csv_candidate = Path(os.path.expanduser(csv_env)).expanduser()
+            if csv_candidate.exists():
+                csv_path = csv_candidate
+            else:
+                logger.warning(
+                    "Configured BINANCE_FEE_SNAPSHOT_CSV %s not found; ignoring", csv_candidate
+                )
+
+        public_url = _safe_str(os.environ.get("BINANCE_PUBLIC_FEE_URL")) or PUBLIC_FEE_URL
+
+        timeout_env = os.environ.get("BINANCE_FEE_TIMEOUT")
+        timeout_value = _safe_positive_int(timeout_env)
+        if timeout_value is None or timeout_value <= 0:
+            timeout_value = 30
+
+        discount_env = os.environ.get("BINANCE_BNB_DISCOUNT_RATE")
+        try:
+            discount_rate = float(discount_env) if discount_env is not None else DEFAULT_BNB_DISCOUNT_RATE
+        except (TypeError, ValueError):
+            discount_rate = DEFAULT_BNB_DISCOUNT_RATE
+
+        api_key = _safe_str(os.environ.get("BINANCE_API_KEY"))
+        api_secret = _safe_str(os.environ.get("BINANCE_API_SECRET"))
+        if not api_key or not api_secret:
+            api_key = None
+            api_secret = None
+
+        vip_label = DEFAULT_VIP_TIER_LABEL
+        vip_candidate: Optional[int] = None
+        if self.cfg.vip_tier_overridden and self.cfg.vip_tier is not None:
+            vip_candidate = int(self.cfg.vip_tier)
+        elif self.cfg.auto_vip_tier is not None:
+            vip_candidate = int(self.cfg.auto_vip_tier)
+        if vip_candidate is not None:
+            vip_label = f"VIP {vip_candidate}"
+        elif isinstance(self.table_metadata.get("vip_tier"), str):
+            vip_label = str(self.table_metadata.get("vip_tier"))
+
+        try:
+            snapshot = load_public_fee_snapshot(
+                vip_tier=vip_label,
+                timeout=timeout_value,
+                public_url=public_url,
+                csv_path=csv_path,
+                api_key=api_key,
+                api_secret=api_secret,
+                bnb_discount_rate=discount_rate,
+            )
+        except Exception as exc:  # pragma: no cover - network/environment issues
+            error_text = f"{exc.__class__.__name__}: {exc}"
+            self._public_refresh_error = error_text
+            meta = dict(self.table_metadata)
+            meta.setdefault("auto_refresh_attempted", True)
+            meta.setdefault("auto_refresh_reason", reason)
+            meta["auto_refresh_error"] = error_text
+            self.table_metadata = meta
+            self.cfg.auto_refresh_metadata = {"reason": reason, "error": error_text}
+            logger.warning("Failed to refresh public fee snapshot: %s", exc, exc_info=True)
+            return None
+
+        logger.info(
+            "Auto-refreshed Binance fee table using %s (reason=%s)",
+            snapshot.source,
+            reason,
+        )
+        self._public_fee_snapshot = snapshot
+        self._public_refresh_reason = reason
+        self._public_refresh_error = None
+        return self._apply_public_snapshot(snapshot, reason=reason, target_path=target_path)
+
+    def _apply_public_snapshot(
+        self, snapshot: PublicFeeSnapshot, *, reason: str, target_path: Optional[str]
+    ) -> Dict[str, Any]:
+        fees_payload = snapshot.payload.get("fees", {})
+        table: Dict[str, Any] = {}
+        if isinstance(fees_payload, Mapping):
+            for symbol, entry in fees_payload.items():
+                if not isinstance(symbol, str) or not isinstance(entry, Mapping):
+                    continue
+                table[symbol.upper()] = dict(entry)
+
+        meta = dict(snapshot.payload.get("metadata") or {})
         meta.update(
             {
-                "path": abspath,
-                "age_days": self.table_age_days,
+                "path": target_path,
+                "age_days": 0.0,
                 "refresh_days": self.cfg.refresh_days,
-                "stale": self.table_stale,
-                "error": self.table_error,
+                "stale": False,
+                "error": None,
+                "auto_refreshed": True,
+                "auto_reason": reason,
+                "auto_source": snapshot.source,
+                "auto_refresh_attempted": True,
             }
         )
         self.table_metadata = meta
-        return payload
+        self.table_error = None
+        self.table_stale = False
+        self.table_age_days = 0.0
+
+        self.cfg.auto_maker_bps = snapshot.maker_bps_default
+        self.cfg.auto_taker_bps = snapshot.taker_bps_default
+        self.cfg.auto_maker_discount_mult = snapshot.maker_discount_mult
+        self.cfg.auto_taker_discount_mult = snapshot.taker_discount_mult
+        self.cfg.auto_use_bnb_discount = snapshot.use_bnb_discount
+        self.cfg.auto_vip_tier = snapshot.vip_tier
+        self.cfg.auto_refresh_metadata = {
+            "reason": reason,
+            "source": snapshot.source,
+            "built_at": meta.get("built_at"),
+            "maker_bps": snapshot.maker_bps_default,
+            "taker_bps": snapshot.taker_bps_default,
+            "maker_discount_mult": snapshot.maker_discount_mult,
+            "taker_discount_mult": snapshot.taker_discount_mult,
+            "use_bnb_discount": snapshot.use_bnb_discount,
+            "discount_rate": snapshot.discount_rate,
+            "vip_label": snapshot.vip_label,
+            "vip_tier": snapshot.vip_tier,
+        }
+
+        meta.setdefault("auto_refresh_metadata", dict(self.cfg.auto_refresh_metadata))
+        return {"table": table, "meta": meta, "account": {}, "share": None}
 
     def _load_account_fee_info(self) -> AccountFeeInfo | None:
         self.account_fee_status = "pending"
@@ -1161,7 +1414,7 @@ class FeesImpl:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "FeesImpl":
-        use_bnb = bool(d.get("use_bnb_discount", False))
+        use_bnb = d.get("use_bnb_discount")
         maker_mult = d.get("maker_discount_mult")
         taker_mult = d.get("taker_discount_mult")
 
@@ -1232,8 +1485,8 @@ class FeesImpl:
                 enabled=d.get("enabled", True),
                 path=path,
                 refresh_days=refresh_days,
-                maker_bps=d.get("maker_bps", 1.0),
-                taker_bps=d.get("taker_bps", 5.0),
+                maker_bps=d.get("maker_bps"),
+                taker_bps=d.get("taker_bps"),
                 use_bnb_discount=use_bnb,
                 maker_discount_mult=maker_mult,
                 taker_discount_mult=taker_mult,
