@@ -2749,10 +2749,10 @@ class ExecutionSimulator:
                 )
             for state in pending_states:
                 cancelled_ids.append(state.client_order_id)
-                cancelled_reasons[state.client_order_id] = "EXPIRED_NO_BAR_DATA"
+                cancelled_reasons[state.client_order_id] = "NO_BAR_DATA"
                 risk_events_all.extend(state.risk_events)
             self._pending_next_open.clear()
-            status = "EXPIRED_NEXT_BAR"
+            status = "CANCELED_NEXT_BAR"
             reason = {"code": "MISSING_NEXT_BAR"}
             added_cancelled = len(cancelled_ids) - cancelled_before
             if added_cancelled > 0:

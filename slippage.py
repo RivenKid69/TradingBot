@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Sequence
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Sequence, Mapping, Iterable
 
 
 @dataclass
@@ -398,6 +399,474 @@ class AdvConfig:
         return data
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return num
+
+
+def _coerce_float_tuple(values: Iterable[Any]) -> tuple[float, ...]:
+    result: list[float] = []
+    for raw in values:
+        num = _safe_float(raw)
+        if num is None:
+            continue
+        result.append(float(num))
+    return tuple(result)
+
+
+def _coerce_int_tuple(values: Iterable[Any]) -> tuple[int, ...]:
+    result: list[int] = []
+    for raw in values:
+        try:
+            num = int(raw)
+        except (TypeError, ValueError):
+            continue
+        result.append(int(num))
+    return tuple(result)
+
+
+def _normalise_symbol_key(symbol: Optional[str]) -> Optional[str]:
+    if symbol is None:
+        return None
+    try:
+        text = str(symbol).strip().upper()
+    except Exception:
+        return None
+    return text or None
+
+
+@dataclass
+class CalibratedHourlyProfile:
+    multipliers: tuple[float, ...] = ()
+    hours: tuple[int, ...] = ()
+    counts: tuple[int, ...] = ()
+    path: Optional[str] = None
+    default_multiplier: float = 1.0
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CalibratedHourlyProfile":
+        if not isinstance(data, Mapping):
+            raise TypeError("hourly profile must be a mapping")
+        multipliers_raw = data.get("multipliers")
+        hours_raw = data.get("hour_of_week") or data.get("hours")
+        counts_raw = data.get("counts")
+        multipliers: tuple[float, ...] = ()
+        if isinstance(multipliers_raw, Iterable) and not isinstance(
+            multipliers_raw, (str, bytes, bytearray)
+        ):
+            multipliers = _coerce_float_tuple(multipliers_raw)
+        hours: tuple[int, ...] = ()
+        if isinstance(hours_raw, Iterable) and not isinstance(hours_raw, (str, bytes, bytearray)):
+            hours = _coerce_int_tuple(hours_raw)
+        counts: tuple[int, ...] = ()
+        if isinstance(counts_raw, Iterable) and not isinstance(counts_raw, (str, bytes, bytearray)):
+            counts = _coerce_int_tuple(counts_raw)
+        default_multiplier = _safe_float(data.get("default_multiplier"))
+        extra = {
+            key: value
+            for key, value in data.items()
+            if key
+            not in {
+                "multipliers",
+                "hour_of_week",
+                "hours",
+                "counts",
+                "path",
+                "default_multiplier",
+            }
+        }
+        return cls(
+            multipliers=multipliers,
+            hours=hours,
+            counts=counts,
+            path=str(data.get("path")) if data.get("path") is not None else None,
+            default_multiplier=float(default_multiplier) if default_multiplier is not None else 1.0,
+            extra=extra,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = dict(self.extra)
+        if self.multipliers:
+            payload["multipliers"] = [float(x) for x in self.multipliers]
+        if self.hours:
+            payload["hour_of_week"] = [int(x) for x in self.hours]
+        if self.counts:
+            payload["counts"] = [int(x) for x in self.counts]
+        if self.path is not None:
+            payload["path"] = str(self.path)
+        if self.default_multiplier != 1.0:
+            payload["default_multiplier"] = float(self.default_multiplier)
+        return payload
+
+    def get_multiplier(self, hour_of_week: Optional[int]) -> float:
+        if hour_of_week is None:
+            return float(self.default_multiplier)
+        if not self.multipliers:
+            return float(self.default_multiplier)
+        if self.hours and len(self.hours) == len(self.multipliers):
+            for idx, hour in enumerate(self.hours):
+                if hour == hour_of_week:
+                    return float(self.multipliers[idx])
+        if len(self.multipliers) == 168:
+            try:
+                return float(self.multipliers[hour_of_week % 168])
+            except Exception:
+                return float(self.default_multiplier)
+        try:
+            return float(self.multipliers[hour_of_week % len(self.multipliers)])
+        except Exception:
+            return float(self.default_multiplier)
+
+
+@dataclass
+class CalibratedRegimeOverride:
+    multiplier: Optional[float] = None
+    impact_mean_bps: Optional[float] = None
+    k: Optional[float] = None
+    default_spread_bps: Optional[float] = None
+    min_half_spread_bps: Optional[float] = None
+    count: Optional[int] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CalibratedRegimeOverride":
+        if not isinstance(data, Mapping):
+            raise TypeError("regime override must be a mapping")
+        known = {
+            "multiplier",
+            "impact_mean_bps",
+            "impact_bps",
+            "impact",
+            "k",
+            "default_spread_bps",
+            "min_half_spread_bps",
+            "count",
+        }
+        impact_mean = _safe_float(
+            data.get("impact_mean_bps")
+            or data.get("impact_bps")
+            or data.get("impact")
+        )
+        count_val = data.get("count")
+        count_int = None
+        if isinstance(count_val, (int, float)):
+            try:
+                count_int = int(count_val)
+            except (TypeError, ValueError):
+                count_int = None
+        return cls(
+            multiplier=_safe_float(data.get("multiplier")),
+            impact_mean_bps=float(impact_mean) if impact_mean is not None else None,
+            k=_safe_float(data.get("k")),
+            default_spread_bps=_safe_float(data.get("default_spread_bps")),
+            min_half_spread_bps=_safe_float(data.get("min_half_spread_bps")),
+            count=count_int,
+            extra={key: value for key, value in data.items() if key not in known},
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = dict(self.extra)
+        if self.multiplier is not None:
+            payload["multiplier"] = float(self.multiplier)
+        if self.impact_mean_bps is not None:
+            payload["impact_mean_bps"] = float(self.impact_mean_bps)
+        if self.k is not None:
+            payload["k"] = float(self.k)
+        if self.default_spread_bps is not None:
+            payload["default_spread_bps"] = float(self.default_spread_bps)
+        if self.min_half_spread_bps is not None:
+            payload["min_half_spread_bps"] = float(self.min_half_spread_bps)
+        if self.count is not None:
+            payload["count"] = int(self.count)
+        return payload
+
+
+@dataclass
+class SymbolCalibratedProfile:
+    symbol: Optional[str] = None
+    path: Optional[str] = None
+    curve_path: Optional[str] = None
+    hourly_path: Optional[str] = None
+    regime_path: Optional[str] = None
+    impact_curve: tuple[Mapping[str, Any], ...] = ()
+    hourly_multipliers: Optional[CalibratedHourlyProfile] = None
+    regime_overrides: Dict[str, CalibratedRegimeOverride] = field(default_factory=dict)
+    k: Optional[float] = None
+    default_spread_bps: Optional[float] = None
+    min_half_spread_bps: Optional[float] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)
+    _path_loaded: bool = field(default=False, init=False, repr=False)
+    _curve_loaded: bool = field(default=False, init=False, repr=False)
+    _hourly_loaded: bool = field(default=False, init=False, repr=False)
+    _regime_loaded: bool = field(default=False, init=False, repr=False)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SymbolCalibratedProfile":
+        if not isinstance(data, Mapping):
+            raise TypeError("symbol profile must be a mapping")
+        impact_curve_raw = data.get("impact_curve")
+        if impact_curve_raw is None:
+            impact_curve_raw = data.get("notional_curve") or data.get("buckets")
+        impact_curve: tuple[Mapping[str, Any], ...] = ()
+        if isinstance(impact_curve_raw, Iterable) and not isinstance(
+            impact_curve_raw, (str, bytes, bytearray)
+        ):
+            impact_curve = tuple(
+                dict(bucket)
+                for bucket in impact_curve_raw
+                if isinstance(bucket, Mapping)
+            )
+        hourly_block = data.get("hourly_multipliers") or data.get("hourly")
+        hourly_profile: Optional[CalibratedHourlyProfile] = None
+        if isinstance(hourly_block, Mapping):
+            hourly_profile = CalibratedHourlyProfile.from_dict(hourly_block)
+        regime_block = data.get("regime_overrides") or data.get("regime_multipliers")
+        regime_values: Dict[str, CalibratedRegimeOverride] = {}
+        if isinstance(regime_block, Mapping):
+            values = regime_block.get("values") if isinstance(regime_block.get("values"), Mapping) else regime_block
+            if isinstance(values, Mapping):
+                for key, value in values.items():
+                    if not isinstance(value, Mapping):
+                        continue
+                    regime_key = _normalise_symbol_key(key) or str(key)
+                    regime_values[regime_key] = CalibratedRegimeOverride.from_dict(value)
+        known = {
+            "symbol",
+            "path",
+            "curve_path",
+            "hourly_path",
+            "regime_path",
+            "impact_curve",
+            "notional_curve",
+            "buckets",
+            "hourly_multipliers",
+            "hourly",
+            "regime_overrides",
+            "regime_multipliers",
+            "k",
+            "default_spread_bps",
+            "min_half_spread_bps",
+            "metadata",
+        }
+        metadata_block = data.get("metadata")
+        metadata_dict: Dict[str, Any] = {}
+        if isinstance(metadata_block, Mapping):
+            metadata_dict = dict(metadata_block)
+        return cls(
+            symbol=_normalise_symbol_key(data.get("symbol")),
+            path=str(data.get("path")) if data.get("path") is not None else None,
+            curve_path=str(data.get("curve_path")) if data.get("curve_path") is not None else None,
+            hourly_path=str(data.get("hourly_path")) if data.get("hourly_path") is not None else None,
+            regime_path=str(data.get("regime_path")) if data.get("regime_path") is not None else None,
+            impact_curve=impact_curve,
+            hourly_multipliers=hourly_profile,
+            regime_overrides={k: v for k, v in regime_values.items() if k is not None},
+            k=_safe_float(data.get("k")),
+            default_spread_bps=_safe_float(data.get("default_spread_bps")),
+            min_half_spread_bps=_safe_float(data.get("min_half_spread_bps")),
+            metadata=metadata_dict,
+            extra={key: value for key, value in data.items() if key not in known},
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = dict(self.extra)
+        if self.symbol is not None:
+            payload["symbol"] = str(self.symbol)
+        if self.path is not None:
+            payload["path"] = str(self.path)
+        if self.curve_path is not None:
+            payload["curve_path"] = str(self.curve_path)
+        if self.hourly_path is not None:
+            payload["hourly_path"] = str(self.hourly_path)
+        if self.regime_path is not None:
+            payload["regime_path"] = str(self.regime_path)
+        if self.impact_curve:
+            payload["impact_curve"] = [dict(bucket) for bucket in self.impact_curve]
+        if self.hourly_multipliers is not None:
+            payload["hourly_multipliers"] = self.hourly_multipliers.to_dict()
+        if self.regime_overrides:
+            payload["regime_overrides"] = {
+                key: value.to_dict() for key, value in self.regime_overrides.items()
+            }
+        if self.k is not None:
+            payload["k"] = float(self.k)
+        if self.default_spread_bps is not None:
+            payload["default_spread_bps"] = float(self.default_spread_bps)
+        if self.min_half_spread_bps is not None:
+            payload["min_half_spread_bps"] = float(self.min_half_spread_bps)
+        if self.metadata:
+            payload["metadata"] = dict(self.metadata)
+        return payload
+
+
+@dataclass
+class CalibratedProfilesConfig:
+    enabled: bool = False
+    path: Optional[str] = None
+    symbols: Dict[str, SymbolCalibratedProfile] = field(default_factory=dict)
+    default_symbol: Optional[str] = None
+    hourly_multipliers: Optional[CalibratedHourlyProfile] = None
+    regime_overrides: Dict[str, CalibratedRegimeOverride] = field(default_factory=dict)
+    last_refresh_ts: Optional[int] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CalibratedProfilesConfig":
+        if not isinstance(data, Mapping):
+            raise TypeError("calibrated profile config must be a mapping")
+        symbols_block = data.get("symbols")
+        symbols: Dict[str, SymbolCalibratedProfile] = {}
+        if isinstance(symbols_block, Mapping):
+            for key, value in symbols_block.items():
+                if isinstance(value, SymbolCalibratedProfile):
+                    profile = value
+                elif isinstance(value, Mapping):
+                    profile = SymbolCalibratedProfile.from_dict(value)
+                else:
+                    continue
+                symbol_key = _normalise_symbol_key(key) or profile.symbol
+                if symbol_key is None:
+                    continue
+                profile.symbol = symbol_key
+                symbols[symbol_key] = profile
+        hourly_block = data.get("hourly_multipliers") or data.get("hourly")
+        hourly_profile: Optional[CalibratedHourlyProfile] = None
+        if isinstance(hourly_block, CalibratedHourlyProfile):
+            hourly_profile = hourly_block
+        elif isinstance(hourly_block, Mapping):
+            hourly_profile = CalibratedHourlyProfile.from_dict(hourly_block)
+        regime_block = data.get("regime_overrides")
+        regime_overrides: Dict[str, CalibratedRegimeOverride] = {}
+        if isinstance(regime_block, Mapping):
+            for key, value in regime_block.items():
+                if isinstance(value, CalibratedRegimeOverride):
+                    override = value
+                elif isinstance(value, Mapping):
+                    override = CalibratedRegimeOverride.from_dict(value)
+                else:
+                    continue
+                regime_key = _normalise_symbol_key(key) or str(key)
+                regime_overrides[regime_key] = override
+        known = {
+            "enabled",
+            "path",
+            "data_path",
+            "symbols",
+            "default_symbol",
+            "hourly_multipliers",
+            "hourly",
+            "regime_overrides",
+            "last_refresh_ts",
+        }
+        extra = {key: value for key, value in data.items() if key not in known}
+        path_value = data.get("path") or data.get("data_path")
+        last_refresh = data.get("last_refresh_ts")
+        last_refresh_int = None
+        if isinstance(last_refresh, (int, float)):
+            try:
+                last_refresh_int = int(last_refresh)
+            except (TypeError, ValueError):
+                last_refresh_int = None
+        cfg = cls(
+            enabled=bool(data.get("enabled", bool(symbols))),
+            path=str(path_value) if path_value is not None else None,
+            symbols=symbols,
+            default_symbol=_normalise_symbol_key(data.get("default_symbol")),
+            hourly_multipliers=hourly_profile,
+            regime_overrides=regime_overrides,
+            last_refresh_ts=last_refresh_int,
+            extra=extra,
+        )
+        return cfg
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = dict(self.extra)
+        payload["enabled"] = bool(self.enabled)
+        if self.path is not None:
+            payload["path"] = str(self.path)
+        if self.symbols:
+            payload["symbols"] = {key: value.to_dict() for key, value in self.symbols.items()}
+        if self.default_symbol is not None:
+            payload["default_symbol"] = str(self.default_symbol)
+        if self.hourly_multipliers is not None:
+            payload["hourly_multipliers"] = self.hourly_multipliers.to_dict()
+        if self.regime_overrides:
+            payload["regime_overrides"] = {
+                key: value.to_dict() for key, value in self.regime_overrides.items()
+            }
+        if self.last_refresh_ts is not None:
+            payload["last_refresh_ts"] = int(self.last_refresh_ts)
+        return payload
+
+    def get_symbol_profile(self, symbol: Optional[str]) -> Optional[SymbolCalibratedProfile]:
+        if not self.symbols:
+            return None
+        symbol_key = _normalise_symbol_key(symbol)
+        if symbol_key and symbol_key in self.symbols:
+            return self.symbols[symbol_key]
+        if symbol_key:
+            for key, value in self.symbols.items():
+                if key.upper() == symbol_key:
+                    return value
+        if self.default_symbol and self.default_symbol in self.symbols:
+            return self.symbols[self.default_symbol]
+        if len(self.symbols) == 1:
+            return next(iter(self.symbols.values()))
+        return None
+
+    def get_hourly_profile(self, symbol_profile: Optional[SymbolCalibratedProfile]) -> Optional[CalibratedHourlyProfile]:
+        if symbol_profile and symbol_profile.hourly_multipliers is not None:
+            return symbol_profile.hourly_multipliers
+        return self.hourly_multipliers
+
+    def get_regime_override(
+        self,
+        symbol_profile: Optional[SymbolCalibratedProfile],
+        regime: Any,
+    ) -> Optional[CalibratedRegimeOverride]:
+        regime_key_candidates: list[str] = []
+        if isinstance(regime, str):
+            text = regime.strip()
+            if text:
+                regime_key_candidates.extend({text, text.upper(), text.lower()})
+        elif isinstance(regime, (int, float)):
+            try:
+                regime_key_candidates.append(str(int(regime)))
+            except (TypeError, ValueError):
+                pass
+        else:
+            name = getattr(regime, "name", None)
+            value = getattr(regime, "value", None)
+            if name:
+                text = str(name)
+                regime_key_candidates.extend({text, text.upper(), text.lower()})
+            if value is not None:
+                try:
+                    regime_key_candidates.append(str(int(value)))
+                except (TypeError, ValueError):
+                    pass
+        if not regime_key_candidates:
+            return None
+        search_maps: list[Dict[str, CalibratedRegimeOverride]] = []
+        if symbol_profile is not None and symbol_profile.regime_overrides:
+            search_maps.append(symbol_profile.regime_overrides)
+        if self.regime_overrides:
+            search_maps.append(self.regime_overrides)
+        for mapping in search_maps:
+            for candidate in regime_key_candidates:
+                for key, value in mapping.items():
+                    if key == candidate or (isinstance(key, str) and key.lower() == candidate.lower()):
+                        return value
+        return None
+
+
 @dataclass
 class SlippageConfig:
     """
@@ -418,6 +887,7 @@ class SlippageConfig:
     dynamic_impact: DynamicImpactConfig = field(default_factory=DynamicImpactConfig)
     tail_shock: TailShockConfig = field(default_factory=TailShockConfig)
     adv: AdvConfig = field(default_factory=AdvConfig)
+    calibrated_profiles: Optional[CalibratedProfilesConfig] = None
 
     def get_dynamic_block(self) -> Optional[Any]:
         dyn = getattr(self, "dynamic_spread", None)
@@ -474,6 +944,17 @@ class SlippageConfig:
         else:
             adv_cfg = AdvConfig()
 
+        calibrated_cfg: Optional[CalibratedProfilesConfig] = None
+        calib_block = (
+            d.get("calibrated_profiles")
+            or d.get("calibrated")
+            or d.get("calibration")
+        )
+        if isinstance(calib_block, CalibratedProfilesConfig):
+            calibrated_cfg = calib_block
+        elif isinstance(calib_block, Mapping):
+            calibrated_cfg = CalibratedProfilesConfig.from_dict(calib_block)
+
         return cls(
             k=float(d.get("k", 0.8)),
             min_half_spread_bps=float(d.get("min_half_spread_bps", 0.0)),
@@ -483,6 +964,7 @@ class SlippageConfig:
             dynamic_impact=dynamic_impact_cfg,
             tail_shock=tail_shock_cfg,
             adv=adv_cfg,
+            calibrated_profiles=calibrated_cfg,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -502,6 +984,10 @@ class SlippageConfig:
             data["tail_shock"] = self.tail_shock.to_dict()
         if self.adv is not None:
             data["adv"] = self.adv.to_dict()
+        if self.calibrated_profiles is not None:
+            payload = self.calibrated_profiles.to_dict()
+            data["calibrated_profiles"] = payload
+            data.setdefault("calibrated", dict(payload))
         return data
 
     @classmethod
@@ -514,6 +1000,188 @@ class SlippageConfig:
         return cls.from_dict(data)
 
 
+def _hour_of_week_from_timestamp(ts_ms: Optional[Any]) -> Optional[int]:
+    if ts_ms is None:
+        return None
+    try:
+        ts_val = int(ts_ms)
+    except (TypeError, ValueError):
+        return None
+    try:
+        dt = datetime.fromtimestamp(ts_val / 1000.0, tz=timezone.utc)
+    except Exception:
+        return None
+    return int(dt.weekday()) * 24 + int(dt.hour)
+
+
+def _curve_impact(
+    curve: Sequence[Mapping[str, Any]],
+    *,
+    notional: float,
+    half_spread_bps: float,
+) -> Optional[float]:
+    if not curve:
+        return None
+    buckets: list[tuple[float, Optional[float], Optional[float], Mapping[str, Any]]] = []
+    for bucket in curve:
+        if not isinstance(bucket, Mapping):
+            continue
+        lower = _safe_float(
+            bucket.get("lower_notional")
+            or bucket.get("lower")
+            or bucket.get("min_notional")
+            or bucket.get("lower_size")
+        )
+        upper = _safe_float(
+            bucket.get("upper_notional")
+            or bucket.get("upper")
+            or bucket.get("max_notional")
+            or bucket.get("upper_size")
+        )
+        mean_notional = _safe_float(
+            bucket.get("mean_notional") or bucket.get("median_notional")
+        )
+        key = lower
+        if key is None:
+            key = mean_notional
+        if key is None:
+            key = 0.0
+        buckets.append((float(key), lower, upper, bucket))
+    if not buckets:
+        return None
+    buckets.sort(key=lambda item: item[0])
+    selected: Optional[Mapping[str, Any]] = None
+    value = float(notional)
+    for _, lower, upper, bucket in buckets:
+        lower_bound = lower if lower is not None else None
+        upper_bound = upper if upper is not None else None
+        if lower_bound is not None and value < lower_bound:
+            continue
+        if upper_bound is not None and value > upper_bound:
+            continue
+        selected = bucket
+        break
+    if selected is None:
+        selected = buckets[-1][3]
+    if selected is None:
+        return None
+    impact = _safe_float(
+        selected.get("mean_impact_bps")
+        or selected.get("impact_mean_bps")
+        or selected.get("impact_bps")
+    )
+    if impact is not None:
+        return float(max(0.0, impact))
+    slip = _safe_float(
+        selected.get("mean_slippage_bps") or selected.get("slippage_bps")
+    )
+    if slip is None:
+        return None
+    value = float(slip) - float(half_spread_bps)
+    if value < 0.0:
+        value = 0.0
+    return float(value)
+
+
+def _estimate_calibrated_slippage(
+    *,
+    cfg: SlippageConfig,
+    symbol: Optional[str],
+    spread_bps: Optional[float],
+    size: float,
+    liquidity: Optional[float],
+    vol_factor: Optional[float],
+    ts_ms: Optional[Any],
+    market_regime: Optional[Any],
+    hour_of_week: Optional[int],
+    notional: Optional[float],
+) -> Optional[float]:
+    calibrated = getattr(cfg, "calibrated_profiles", None)
+    if calibrated is None:
+        return None
+    if not getattr(calibrated, "enabled", False) and not calibrated.symbols:
+        return None
+    profile = calibrated.get_symbol_profile(symbol)
+    if profile is None:
+        return None
+    spread_default = _safe_float(spread_bps)
+    if spread_default is None:
+        if profile.default_spread_bps is not None:
+            spread_default = float(profile.default_spread_bps)
+        else:
+            spread_default = float(cfg.default_spread_bps)
+    min_half_candidates = [float(cfg.min_half_spread_bps)]
+    if profile.min_half_spread_bps is not None:
+        min_half_candidates.append(float(profile.min_half_spread_bps))
+    regime_override = calibrated.get_regime_override(profile, market_regime)
+    regime_multiplier = 1.0
+    override_k = None
+    override_impact = None
+    if regime_override is not None:
+        if regime_override.default_spread_bps is not None:
+            spread_default = float(regime_override.default_spread_bps)
+        if regime_override.min_half_spread_bps is not None:
+            min_half_candidates.append(float(regime_override.min_half_spread_bps))
+        if regime_override.multiplier is not None:
+            regime_multiplier = float(regime_override.multiplier)
+        if regime_override.k is not None:
+            override_k = float(regime_override.k)
+        if regime_override.impact_mean_bps is not None:
+            override_impact = float(regime_override.impact_mean_bps)
+    min_half_spread = max(float(candidate) for candidate in min_half_candidates if candidate is not None)
+    base_spread = float(spread_default)
+    half_spread = max(0.5 * base_spread, float(min_half_spread))
+    notional_val = _safe_float(notional)
+    if notional_val is None:
+        notional_val = _safe_float(size)
+    if notional_val is None:
+        notional_val = 0.0
+    impact = _curve_impact(
+        profile.impact_curve,
+        notional=abs(float(notional_val)),
+        half_spread_bps=half_spread,
+    )
+    hour_profile = calibrated.get_hourly_profile(profile)
+    hour_index = hour_of_week if hour_of_week is not None else _hour_of_week_from_timestamp(ts_ms)
+    hour_multiplier = 1.0
+    if hour_profile is not None:
+        hour_multiplier = float(hour_profile.get_multiplier(hour_index))
+    vf = _safe_float(vol_factor)
+    if vf is None or vf <= 0.0:
+        vf = 1.0
+    if impact is None:
+        if override_impact is not None:
+            impact = max(0.0, float(override_impact))
+        else:
+            size_val = _safe_float(size)
+            liquidity_val = _safe_float(liquidity)
+            if size_val is None or size_val <= 0.0:
+                size_val = 0.0
+            if liquidity_val is None or liquidity_val <= 0.0:
+                liquidity_val = 1.0
+            k_base = profile.k if profile.k is not None else cfg.k
+            if override_k is not None:
+                k_base = override_k
+            k_base = float(k_base)
+            if regime_multiplier != 1.0:
+                k_base *= float(regime_multiplier)
+            impact = k_base * float(vf) * math.sqrt(
+                max(abs(float(size_val)), cfg.eps) / max(abs(float(liquidity_val)), cfg.eps)
+            )
+    else:
+        impact = float(impact) * float(vf)
+        if regime_multiplier != 1.0:
+            impact *= float(regime_multiplier)
+    if hour_multiplier != 1.0:
+        impact *= float(hour_multiplier)
+    total = half_spread + float(impact)
+    if not math.isfinite(total):
+        return None
+    if total < 0.0:
+        total = 0.0
+    return float(total)
+
+
 def estimate_slippage_bps(
     *,
     spread_bps: Optional[float],
@@ -521,11 +1189,30 @@ def estimate_slippage_bps(
     liquidity: Optional[float],
     vol_factor: Optional[float],
     cfg: SlippageConfig,
+    symbol: Optional[str] = None,
+    ts_ms: Optional[Any] = None,
+    market_regime: Optional[Any] = None,
+    hour_of_week: Optional[int] = None,
+    notional: Optional[float] = None,
 ) -> float:
     """
     Оценка слиппеджа в bps по простой калибруемой формуле.
     Если spread_bps/liquidity/vol_factor отсутствуют — используются дефолты/единицы.
     """
+    calibrated_estimate = _estimate_calibrated_slippage(
+        cfg=cfg,
+        symbol=symbol,
+        spread_bps=spread_bps,
+        size=size,
+        liquidity=liquidity,
+        vol_factor=vol_factor,
+        ts_ms=ts_ms,
+        market_regime=market_regime,
+        hour_of_week=hour_of_week,
+        notional=notional,
+    )
+    if calibrated_estimate is not None:
+        return float(calibrated_estimate)
     try:
         size_val = float(size)
     except (TypeError, ValueError):

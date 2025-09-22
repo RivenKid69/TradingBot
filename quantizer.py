@@ -169,8 +169,16 @@ class Quantizer:
     def _snap(value: Number, step: Number) -> Number:
         if step <= 0:
             return float(value)
-        # Binance требует округление вниз к ближайшему валидному шагу
-        return math.floor(float(value) / step) * step
+        # Binance требует округление вниз к ближайшему валидному шагу.
+        # В арифметике с плавающей точкой деление ``value / step`` может
+        # давать результат на несколько ULP ниже ожидаемого целого числа,
+        # что в сочетании с ``floor`` приводит к «срезанию» дополнительного
+        # шага (например, 2.0 -> 1.99999 при step=1e-5). Добавляем малый
+        # положительный допуск перед ``floor`` для компенсации накопленной
+        # погрешности.
+        ratio = float(value) / step
+        snapped_units = math.floor(ratio + 1e-9)
+        return snapped_units * step
 
     # ------------ Публичные методы ------------
     def has_symbol(self, symbol: str) -> bool:
