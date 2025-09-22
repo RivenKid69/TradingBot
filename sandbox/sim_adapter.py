@@ -436,6 +436,35 @@ class SimAdapter:
             run_config.timing.enforce_closed_bars if run_config is not None else True
         )
 
+        close_lag_value: Optional[int] = None
+        if run_config is not None:
+            timing_cfg = getattr(run_config, "timing", None)
+            if timing_cfg is not None:
+                candidate = getattr(timing_cfg, "close_lag_ms", None)
+                if candidate is None and isinstance(timing_cfg, Mapping):
+                    candidate = timing_cfg.get("close_lag_ms")
+                try:
+                    if candidate is not None:
+                        close_lag_value = int(candidate)
+                except (TypeError, ValueError):
+                    close_lag_value = None
+        if close_lag_value is None:
+            existing_lag = getattr(self.sim, "close_lag_ms", None)
+            try:
+                if existing_lag is not None:
+                    close_lag_value = int(existing_lag)
+            except (TypeError, ValueError):
+                close_lag_value = None
+        if close_lag_value is not None and close_lag_value < 0:
+            close_lag_value = 0
+        self.close_lag_ms = close_lag_value if close_lag_value is not None else 0
+        if close_lag_value is not None:
+            for attr in ("close_lag_ms", "_timing_close_lag_ms"):
+                try:
+                    setattr(self.sim, attr, int(close_lag_value))
+                except Exception:
+                    continue
+
         latency_cfg = (
             getattr(run_config, "latency", None) if run_config is not None else None
         )

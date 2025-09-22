@@ -23,6 +23,7 @@ ExecutionSimulator v2
 """
 
 import collections
+import copy
 from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -1065,6 +1066,7 @@ class ExecutionSimulator:
         seasonality_auto_reload: bool = False,
         data_degradation: Optional[DataDegradationConfig] = None,
         adv_store: Optional["ADVStore"] = None,
+        close_lag_ms: Optional[int] = None,
         run_config: Any = None,
     ):
         self.symbol = str(symbol).upper()
@@ -1108,6 +1110,7 @@ class ExecutionSimulator:
         self._next_open_expected_ts: Optional[int] = None
         self._next_open_metrics: Dict[str, int] = {}
         self._reset_next_open_metrics()
+        self._close_lag_pending: Deque[tuple[int, SimStepReport]] = deque()
 
         def _convert_to_plain_mapping(obj: Any) -> Dict[str, Any]:
             if isinstance(obj, Mapping):
@@ -1151,6 +1154,7 @@ class ExecutionSimulator:
         self._last_bar_close: Optional[float] = None
         self._last_bar_close_ts: Optional[int] = None
         self._intrabar_timeframe_ms: Optional[int] = None
+        self._timing_close_lag_ms: int = 0
         self._intrabar_path: list[tuple[int, float]] = []
         self._intrabar_volume_profile: list[tuple[int, float]] = []
         self._intrabar_path_bar_ts: Optional[int] = None
@@ -1876,6 +1880,34 @@ class ExecutionSimulator:
                     timeframe_int = None
                 if timeframe_int is not None and timeframe_int > 0:
                     self._timing_timeframe_ms = timeframe_int
+                close_lag_val = getattr(timing_cfg, "close_lag_ms", None)
+                if close_lag_val is None and isinstance(timing_cfg, Mapping):
+                    close_lag_val = timing_cfg.get("close_lag_ms")
+                try:
+                    close_lag_int = (
+                        int(close_lag_val) if close_lag_val is not None else None
+                    )
+                except (TypeError, ValueError):
+                    close_lag_int = None
+                if close_lag_int is not None:
+                    if close_lag_int < 0:
+                        close_lag_int = 0
+                    self._timing_close_lag_ms = close_lag_int
+        override_close_lag = None
+        try:
+            override_close_lag = (
+                int(close_lag_ms) if close_lag_ms is not None else None
+            )
+        except (TypeError, ValueError):
+            override_close_lag = None
+        if override_close_lag is not None:
+            if override_close_lag < 0:
+                override_close_lag = 0
+            self._timing_close_lag_ms = override_close_lag
+        try:
+            self.close_lag_ms = int(self._timing_close_lag_ms)
+        except Exception:
+            self.close_lag_ms = int(max(0, float(self._timing_close_lag_ms or 0)))
         self._executor: Optional[BaseExecutor] = None
         self._build_executor()
 
@@ -2473,6 +2505,11 @@ class ExecutionSimulator:
         risk_events: List[RiskEvent] = []  # type: ignore[var-annotated]
         fee_total = 0.0
         open_price = self._float_or_none(snapshot.open)
+        if (
+            (open_price is None or not math.isfinite(open_price))
+            and self._next_h1_open_price is not None
+        ):
+            open_price = self._float_or_none(self._next_h1_open_price)
         high_price = self._float_or_none(snapshot.high)
         low_price = self._float_or_none(snapshot.low)
         ts = int(snapshot.ts_open or now_ms())
@@ -2626,7 +2663,7 @@ class ExecutionSimulator:
                     capacity_reason = "BAR_CAPACITY_BASE"
                     exec_status = "PARTIAL"
             trade = ExecTrade(
-                ts=ts,
+                ts=self._trade_timestamp_with_close_lag(ts),
                 side=state.side,
                 price=filled_price,
                 qty=qty_total,
@@ -6990,6 +7027,39 @@ class ExecutionSimulator:
             return None
         return val
 
+    def _apply_close_lag(self, ts: Optional[int]) -> Optional[int]:
+        if ts is None:
+            return None
+        try:
+            base_ts = int(ts)
+        except (TypeError, ValueError):
+            return None
+        try:
+            lag_ms = int(getattr(self, "close_lag_ms", 0))
+        except (TypeError, ValueError):
+            lag_ms = 0
+        if lag_ms < 0:
+            lag_ms = 0
+        try:
+            return base_ts + lag_ms
+        except Exception:
+            return base_ts
+
+    def _trade_timestamp_with_close_lag(self, ts: Optional[int]) -> int:
+        effective = self._apply_close_lag(ts)
+        if effective is None:
+            base = ts
+            if base is None:
+                base = now_ms()
+            try:
+                return int(base)
+            except (TypeError, ValueError):
+                return int(now_ms())
+        try:
+            return int(effective)
+        except (TypeError, ValueError):
+            return int(now_ms())
+
     def _current_symbol_filters(self) -> Optional[SymbolFilterSnapshot]:
         sym = str(self.symbol or "").upper()
         if not sym:
@@ -8012,7 +8082,7 @@ class ExecutionSimulator:
                         capacity_reason = "BAR_CAPACITY_BASE"
                         exec_status = "REJECTED_BY_CAPACITY"
                         trade = ExecTrade(
-                            ts=ts,
+                            ts=self._trade_timestamp_with_close_lag(ts),
                             side=side,
                             price=float(ref_market),
                             qty=0.0,
@@ -8053,7 +8123,7 @@ class ExecutionSimulator:
                         capacity_reason = "BAR_CAPACITY_BASE"
                         exec_status = "REJECTED_BY_CAPACITY"
                         trade = ExecTrade(
-                            ts=ts,
+                            ts=self._trade_timestamp_with_close_lag(ts),
                             side=side,
                             price=float(ref_market),
                             qty=0.0,
@@ -8293,7 +8363,7 @@ class ExecutionSimulator:
                         exec_status = "REJECTED_BY_CAPACITY"
                         cap_val = float(cap_base_per_bar)
                         trade = ExecTrade(
-                            ts=ts_zero,
+                            ts=self._trade_timestamp_with_close_lag(ts_zero),
                             side=side,
                             price=float(ref_child_price),
                             qty=0.0,
@@ -8520,7 +8590,7 @@ class ExecutionSimulator:
                     )
 
                     trade = ExecTrade(
-                        ts=ts_fill,
+                        ts=self._trade_timestamp_with_close_lag(ts_fill),
                         side=side,
                         price=filled_price,
                         qty=q_child,
@@ -8639,7 +8709,7 @@ class ExecutionSimulator:
             _ = self._apply_trade_inventory(side=side, price=filled_price, qty=qty)
 
             trade = ExecTrade(
-                ts=ts,
+                ts=self._trade_timestamp_with_close_lag(ts),
                 side=side,
                 price=filled_price,
                 qty=qty,
@@ -8796,7 +8866,7 @@ class ExecutionSimulator:
                     )
                     sbps = self._last_spread_bps
                     trade = ExecTrade(
-                        ts=ts,
+                        ts=self._trade_timestamp_with_close_lag(ts),
                         side=side,
                         price=filled_price,
                         qty=exec_qty,
@@ -8857,7 +8927,7 @@ class ExecutionSimulator:
                     )
                     sbps = self._last_spread_bps
                     trade = ExecTrade(
-                        ts=ts,
+                        ts=self._trade_timestamp_with_close_lag(ts),
                         side=side,
                         price=filled_price,
                         qty=qty_q,
@@ -9061,6 +9131,60 @@ class ExecutionSimulator:
         return report
 
     # Совместимость с интерфейсами некоторых обёрток
+    def _finalize_close_lag_report(
+        self, report: SimStepReport, ts_int: int
+    ) -> SimStepReport:
+        pending_queue = self._close_lag_pending
+        ready_report: Optional[SimStepReport] = None
+        while pending_queue:
+            ready_ts, candidate = pending_queue[0]
+            if ready_ts <= ts_int:
+                ready_report = candidate
+                pending_queue.popleft()
+                break
+            break
+        try:
+            close_lag_val = int(getattr(self, "close_lag_ms", 0))
+        except (TypeError, ValueError):
+            close_lag_val = 0
+        if close_lag_val < 0:
+            close_lag_val = 0
+        if close_lag_val <= 0:
+            if ready_report is not None:
+                pending_queue.appendleft((ts_int, copy.deepcopy(report)))
+                return ready_report
+            return report
+        ready_ts_current = ts_int + close_lag_val
+        pending_queue.append((ready_ts_current, copy.deepcopy(report)))
+        if ready_report is not None:
+            return ready_report
+        report.trades = []
+        report.cancelled_ids = []
+        report.cancelled_reasons = {}
+        report.new_order_ids = []
+        report.fee_total = 0.0
+        report.new_order_pos = []
+        report.funding_cashflow = 0.0
+        report.funding_events = []
+        report.risk_events = []  # type: ignore[assignment]
+        report.status = "WAITING_CLOSE_LAG"
+        report.reason = {
+            "code": "WAITING_CLOSE_LAG",
+            "lag_ms": close_lag_val,
+            "ready_ts": ready_ts_current,
+        }
+        report.exec_status = ""
+        report.capacity_reason = ""
+        report.cap_base_per_bar = 0.0
+        report.used_base_before = 0.0
+        report.used_base_after = 0.0
+        report.fill_ratio = 0.0
+        report.expected_cost_components = {}
+        report.maker_share = 0.0
+        report.expected_fee_bps = 0.0
+        report.expected_spread_bps = None
+        return report
+
     def run_step(
         self,
         *,
@@ -9090,9 +9214,11 @@ class ExecutionSimulator:
           - proto должен иметь атрибут volume_frac (знак = направление).
         """
         try:
-            self._last_bar_close_ts = int(ts)
+            ts_int = int(ts)
+            self._last_bar_close_ts = ts_int
         except (TypeError, ValueError):
             self._last_bar_close_ts = None
+            ts_int = int(now_ms())
         self._maybe_reset_intrabar_reference(ts)
         self._reset_intrabar_debug_counter()
         # --- обновить рыночный снапшот ---
@@ -9202,9 +9328,9 @@ class ExecutionSimulator:
         price_tick = trade_price if trade_price is not None else self._last_ref_price
         qty_tick = trade_qty if trade_qty is not None else liquidity
         if price_tick is not None and qty_tick is not None:
-            self._vwap_on_tick(int(ts), float(price_tick), float(qty_tick))
+            self._vwap_on_tick(ts_int, float(price_tick), float(qty_tick))
         if self._last_vol_factor is not None:
-            self._update_latency_volatility(int(ts), self._last_vol_factor, metrics)
+            self._update_latency_volatility(ts_int, self._last_vol_factor, metrics)
         self._update_next_open_context(
             ts_ms=ts,
             bar_open=bar_open_val,
@@ -9231,7 +9357,7 @@ class ExecutionSimulator:
                     getattr(atype, "name", getattr(atype, "__class__", type(atype)))
                 ).upper().endswith("MARKET") or str(atype).upper().endswith("MARKET"):
                     self._submit_next_open(proto, now_ts=ts)
-            return self._pop_ready_next_open(
+            report_next = self._pop_ready_next_open(
                 now_ts=ts,
                 ref_price=ref_price,
                 bid=self._last_bid,
@@ -9241,6 +9367,7 @@ class ExecutionSimulator:
                 bar_low=bar_low_val,
                 bar_close=bar_close_val,
             )
+            return self._finalize_close_lag_report(report_next, ts_int)
         if str(getattr(self, "execution_profile", "")).upper() == "LIMIT_MID_BPS":
             for atype, proto in acts:
                 if str(
@@ -9252,7 +9379,8 @@ class ExecutionSimulator:
                     built = self._build_limit_action(side, qty)
                     if built is not None:
                         self.submit(built, now_ts=ts)
-            return self.pop_ready(now_ts=ts, ref_price=ref_price)
+            report_limit = self.pop_ready(now_ts=ts, ref_price=ref_price)
+            return self._finalize_close_lag_report(report_limit, ts_int)
 
         def _cancel(cid: int | str, reason: str = "OTHER") -> None:
             cid_i = int(cid)
@@ -9368,7 +9496,7 @@ class ExecutionSimulator:
                         exec_status = "REJECTED_BY_CAPACITY"
                         cap_val = float(cap_base_per_bar)
                         trade = ExecTrade(
-                            ts=ts,
+                            ts=self._trade_timestamp_with_close_lag(ts),
                             side=side,
                             price=float(ref_market),
                             qty=0.0,
@@ -9408,7 +9536,7 @@ class ExecutionSimulator:
                         exec_status = "REJECTED_BY_CAPACITY"
                         cap_val = float(cap_base_per_bar)
                         trade = ExecTrade(
-                            ts=ts,
+                            ts=self._trade_timestamp_with_close_lag(ts),
                             side=side,
                             price=float(ref_market),
                             qty=0.0,
@@ -9606,7 +9734,7 @@ class ExecutionSimulator:
                         exec_status = "REJECTED_BY_CAPACITY"
                         cap_val = float(cap_base_per_bar)
                         trade = ExecTrade(
-                            ts=ts_zero,
+                            ts=self._trade_timestamp_with_close_lag(ts_zero),
                             side=side,
                             price=float(ref_child_price),
                             qty=0.0,
@@ -9813,7 +9941,7 @@ class ExecutionSimulator:
 
                     # запись трейда
                     trade = ExecTrade(
-                        ts=ts_fill,
+                        ts=self._trade_timestamp_with_close_lag(ts_fill),
                         side=side,
                         price=filled_price,
                         qty=q_child,
@@ -9915,7 +10043,7 @@ class ExecutionSimulator:
                 details={"rejections": entries},
                 extra=extra_payload,
             )
-        return report
+        return self._finalize_close_lag_report(report, ts_int)
 
     def stop(self) -> None:
         if self._stopped:

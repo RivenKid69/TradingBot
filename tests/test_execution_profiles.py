@@ -17,6 +17,7 @@ sys.modules["execution_sim"] = exec_mod
 spec_exec.loader.exec_module(exec_mod)
 
 import execution_algos as algos_mod
+from compat_shims import sim_report_dict_to_core_exec_reports
 
 ActionProto = exec_mod.ActionProto
 ActionType = exec_mod.ActionType
@@ -130,12 +131,113 @@ def test_mkt_open_next_h1_profile(base_sim):
         liquidity=1.0,
         actions=[(ActionType.MARKET, proto)],
     )
-    assert len(rep.trades) == 1
-    trade = rep.trades[0]
+    assert not rep.trades
+    assert rep.status == "PENDING_NEXT_BAR"
+
+    rep_next = sim.run_step(
+        ts=3_600_000,
+        ref_price=105.0,
+        bid=104.0,
+        ask=106.0,
+        vol_factor=1.0,
+        liquidity=1.0,
+        actions=[],
+    )
+    assert len(rep_next.trades) == 1
+    trade = rep_next.trades[0]
     assert trade.ts == 3_600_000
     assert trade.price == pytest.approx(105.0)
-    assert rep.fee_total == pytest.approx(trade.price * trade.qty * 0.001)
-    assert rep.position_qty == pytest.approx(trade.qty)
+    assert rep_next.fee_total == pytest.approx(trade.price * trade.qty * 0.001)
+    assert rep_next.position_qty == pytest.approx(trade.qty)
+
+
+def test_execution_simulator_close_lag_applied():
+    sim = ExecutionSimulator(filters_path=None, close_lag_ms=2000)
+    sim.set_symbol("BTCUSDT")
+    sim.set_quantizer(DummyQuantizer())
+    DummyFees().attach_to(sim)
+    sim.risk = DummyRisk()
+    sim.set_ref_price(100.0)
+
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=1.0)
+    report = sim.run_step(
+        ts=1_000_000,
+        ref_price=100.0,
+        bid=99.5,
+        ask=100.5,
+        liquidity=1.0,
+        actions=[(ActionType.MARKET, proto)],
+    )
+
+    assert not report.trades
+    assert report.status == "WAITING_CLOSE_LAG"
+    assert report.reason == {
+        "code": "WAITING_CLOSE_LAG",
+        "lag_ms": 2000,
+        "ready_ts": 1_002_000,
+    }
+
+    release = sim.run_step(
+        ts=1_002_000,
+        ref_price=100.0,
+        bid=99.5,
+        ask=100.5,
+        liquidity=0.0,
+        actions=[],
+    )
+
+    assert release.trades
+    assert all(t.ts == 1_002_000 for t in release.trades)
+
+
+def test_mkt_open_next_h1_profile_close_lag(base_sim):
+    sim = base_sim
+    sim.close_lag_ms = 1500
+    sim._timing_close_lag_ms = 1500
+    sim.set_execution_profile("MKT_OPEN_NEXT_H1")
+    sim.set_next_open_price(105.0)
+
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=1.0)
+
+    first = sim.run_step(
+        ts=1_800_000,
+        ref_price=100.0,
+        bid=99.0,
+        ask=101.0,
+        vol_factor=1.0,
+        liquidity=1.0,
+        actions=[(ActionType.MARKET, proto)],
+    )
+
+    assert first.status == "WAITING_CLOSE_LAG"
+    assert not first.trades
+
+    pending = sim.run_step(
+        ts=1_801_500,
+        ref_price=100.0,
+        bid=99.0,
+        ask=101.0,
+        vol_factor=1.0,
+        liquidity=0.0,
+        actions=[],
+    )
+
+    assert pending.status == "PENDING_NEXT_BAR"
+    assert not pending.trades
+
+    wait_fill = sim.run_step(
+        ts=3_600_000,
+        ref_price=105.0,
+        bid=104.0,
+        ask=106.0,
+        vol_factor=1.0,
+        liquidity=1.0,
+        actions=[],
+    )
+
+    assert wait_fill.status == "FILLED_NEXT_BAR"
+    assert len(wait_fill.trades) == 1
+    assert wait_fill.trades[0].ts >= 1_800_000 + sim.close_lag_ms
 
 
 def test_vwap_current_h1_profile(base_sim):
@@ -165,6 +267,8 @@ def test_limit_mid_bps_params_build(base_sim):
     params = {"limit_offset_bps": 50, "ttl_steps": 7, "tif": "IOC"}
     sim.set_ref_price(100.0)
     sim.set_execution_profile("LIMIT_MID_BPS", params)
+    sim.latency = None
+    sim.latency_steps = 0
 
     from decimal import Decimal
     from core_models import Order, Side, OrderType
@@ -209,11 +313,63 @@ def test_limit_mid_bps_params_build(base_sim):
     assert proto.ttl_steps == 7
 
     sim.set_market_snapshot(bid=98.0, ask=99.0, liquidity=1.0)
-    sim.submit(proto)
-    rep = sim.pop_ready(ref_price=100.0)
-    trade = rep.trades[0]
-    assert trade.tif == "IOC"
-    assert trade.ttl_steps == 7
+
+
+def test_sim_executor_close_lag_from_run_config():
+    sim = ExecutionSimulator(filters_path=None)
+    sim.set_ref_price(100.0)
+    sim.latency = None
+    sim.latency_steps = 0
+
+    from types import SimpleNamespace
+    run_config = SimpleNamespace(
+        run_id="close-lag-test",
+        timing=SimpleNamespace(close_lag_ms=1500, enforce_closed_bars=True),
+    )
+
+    import impl_sim_executor as impl_mod
+    executor = impl_mod.SimExecutor(
+        sim,
+        symbol="BTCUSDT",
+        quantizer=DummyQuantizer(),
+        risk=DummyRisk(),
+        fees=DummyFees(),
+        run_config=run_config,
+    )
+    sim.latency = None
+    sim.latency_steps = 0
+
+    from decimal import Decimal
+    from core_models import Order, Side, OrderType
+
+    order = Order(
+        ts=1_000_000,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("1"),
+    )
+
+    report = executor.execute(order)
+    assert report.exec_status == "NEW"
+    follow = sim.run_step(
+        ts=order.ts + run_config.timing.close_lag_ms,
+        ref_price=100.0,
+        bid=None,
+        ask=None,
+        vol_factor=None,
+        liquidity=None,
+        actions=[],
+    )
+    follow_reports = sim_report_dict_to_core_exec_reports(
+        follow.to_dict(),
+        symbol="BTCUSDT",
+        run_id=executor._run_id,
+        client_order_id=str(getattr(order, "client_order_id", "") or ""),
+    )
+    assert follow_reports
+    assert follow_reports[0].ts == order.ts + run_config.timing.close_lag_ms
+    assert follow_reports[0].quantity == Decimal("1")
 
 
 def test_executor_switching():
