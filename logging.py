@@ -66,6 +66,8 @@ class LogWriter:
         if not self.cfg.enabled:
             return
         rep_dict = report.to_dict() if hasattr(report, "to_dict") else {}
+        regime_value = rep_dict.get("market_regime", getattr(report, "market_regime", None))
+        wrote_trade = False
         for t in rep_dict.get("trades", []):
             er = trade_dict_to_core_exec_report(t, parent=rep_dict, symbol=str(symbol), run_id=self._run_id)
             for k in ["slippage_bps", "spread_bps", "latency_ms", "tif", "ttl_steps"]:
@@ -89,6 +91,8 @@ class LogWriter:
                 else (float(row["drawdown"]) if row.get("drawdown") is not None else None)
             )
             row["execution_profile"] = getattr(er, "execution_profile", None)
+            if regime_value is not None:
+                row["market_regime"] = regime_value
             try:
                 row["notional"] = float(row.get("notional", 0.0))
             except Exception:
@@ -96,6 +100,7 @@ class LogWriter:
                     Decimal(str(row.get("price", 0.0))) * Decimal(str(row.get("quantity", 0.0)))
                 )
             self._trades_buf.append(row)
+            wrote_trade = True
         cancel_map = rep_dict.get("cancelled_reasons", {}) or {}
         for cid in rep_dict.get("cancelled_ids", []):
             reason = cancel_map.get(cid) or cancel_map.get(str(cid)) or "OTHER"
@@ -124,7 +129,44 @@ class LogWriter:
                 },
             )
             row_cancel = TradeLogRow.from_exec(er_cancel).to_dict()
+            if regime_value is not None:
+                row_cancel["market_regime"] = regime_value
             self._trades_buf.append(row_cancel)
+            wrote_trade = True
+        if not wrote_trade:
+            placeholder_meta = {
+                "mark_price": float(getattr(report, "mark_price", 0.0)),
+                "equity": float(getattr(report, "equity", 0.0)),
+            }
+            drawdown_val = getattr(report, "drawdown", None)
+            if drawdown_val is not None:
+                placeholder_meta["drawdown"] = float(drawdown_val)
+            status_val = getattr(report, "status", None)
+            if status_val:
+                placeholder_meta["status"] = str(status_val)
+            synthetic_er = ExecReport(
+                ts=int(ts_ms),
+                run_id=self._run_id,
+                symbol=str(symbol),
+                execution_profile=str(getattr(report, "execution_profile", "")) or None,
+                side=Side.BUY,
+                order_type=OrderType.MARKET,
+                price=Decimal(str(getattr(report, "mark_price", 0.0))),
+                quantity=Decimal("0"),
+                fee=Decimal("0"),
+                fee_asset=None,
+                exec_status=ExecStatus.NEW,
+                liquidity=Liquidity.UNKNOWN,
+                client_order_id=None,
+                order_id=None,
+                trade_id=None,
+                pnl=None,
+                meta=placeholder_meta,
+            )
+            synthetic_row = TradeLogRow.from_exec(synthetic_er).to_dict()
+            if regime_value is not None:
+                synthetic_row["market_regime"] = regime_value
+            self._trades_buf.append(synthetic_row)
         eq = EquityPoint(
             ts=int(ts_ms),
             run_id=self._run_id,
@@ -151,6 +193,8 @@ class LogWriter:
         eq_dict["latency_p50_ms"] = getattr(report, "latency_p50_ms", None)
         eq_dict["latency_p95_ms"] = getattr(report, "latency_p95_ms", None)
         eq_dict["latency_timeout_ratio"] = getattr(report, "latency_timeout_ratio", None)
+        if regime_value is not None:
+            eq_dict["market_regime"] = regime_value
         self._reports_buf.append(eq_dict)
 
         # авто-сброс

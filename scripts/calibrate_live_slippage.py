@@ -127,6 +127,10 @@ def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     vol_series = _normalise_numeric(_resolve_column(df, DEFAULT_COLUMN_ALIASES["vol_factor"]))
     exec_profile_series = _resolve_column(df, DEFAULT_COLUMN_ALIASES["execution_profile"])
     regime_series = _resolve_column(df, DEFAULT_COLUMN_ALIASES["market_regime"])
+    if regime_series is not None:
+        regime_payload = regime_series
+    else:
+        regime_payload = pd.Series([None] * len(df), index=df.index, dtype=object)
 
     out = pd.DataFrame({
         "ts_ms": ts_series,
@@ -138,7 +142,7 @@ def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "liquidity": liquidity_series,
         "vol_factor": vol_series,
         "execution_profile": exec_profile_series,
-        "market_regime": regime_series,
+        "market_regime": regime_payload,
     })
 
     # Drop rows without symbols or slippage values

@@ -593,6 +593,8 @@ class SimAdapter:
             actions=actions,
         )
         d = report.to_dict()
+        if "market_regime" not in d:
+            d["market_regime"] = getattr(report, "market_regime", None)
 
         # Пишем унифицированный лог построчно (без изменения возврата)
         try:

@@ -36,7 +36,27 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
     Supports legacy schema: ts, price, volume, side, agent_flag, order_id
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json"])
+        return pd.DataFrame(
+            columns=[
+                "ts",
+                "run_id",
+                "symbol",
+                "side",
+                "order_type",
+                "price",
+                "quantity",
+                "fee",
+                "fee_asset",
+                "pnl",
+                "exec_status",
+                "liquidity",
+                "client_order_id",
+                "order_id",
+                "execution_profile",
+                "market_regime",
+                "meta_json",
+            ]
+        )
 
     cols = set(df.columns)
 
@@ -47,10 +67,41 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
         # ensure required cols exist
-        for c in ["fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json","execution_profile"]:
+        for c in [
+            "fee",
+            "fee_asset",
+            "pnl",
+            "exec_status",
+            "liquidity",
+            "client_order_id",
+            "order_id",
+            "meta_json",
+            "execution_profile",
+            "market_regime",
+        ]:
             if c not in df.columns:
                 df[c] = None
-        return df[["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","execution_profile","meta_json"]]
+        return df[
+            [
+                "ts",
+                "run_id",
+                "symbol",
+                "side",
+                "order_type",
+                "price",
+                "quantity",
+                "fee",
+                "fee_asset",
+                "pnl",
+                "exec_status",
+                "liquidity",
+                "client_order_id",
+                "order_id",
+                "execution_profile",
+                "market_regime",
+                "meta_json",
+            ]
+        ]
 
     # Legacy -> map
     if {"ts","price","volume","side"}.issubset(cols):
@@ -71,6 +122,7 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
         out["order_id"] = df["order_id"] if "order_id" in df.columns else None
         out["meta_json"] = "{}"
         out["execution_profile"] = None
+        out["market_regime"] = None
         return out
 
     # Unknown schema -> attempt minimal
@@ -88,17 +140,59 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
     df["symbol"] = "UNKNOWN"
     df["side"] = df.get("side", "BUY")
     df["order_type"] = df.get("order_type", "MARKET")
-    for c in ["fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","meta_json","execution_profile"]:
+    for c in [
+        "fee",
+        "fee_asset",
+        "pnl",
+        "exec_status",
+        "liquidity",
+        "client_order_id",
+        "order_id",
+        "meta_json",
+        "execution_profile",
+        "market_regime",
+    ]:
         if c not in df.columns:
             df[c] = None
-    return df[["ts","run_id","symbol","side","order_type","price","quantity","fee","fee_asset","pnl","exec_status","liquidity","client_order_id","order_id","execution_profile","meta_json"]]
+    return df[
+        [
+            "ts",
+            "run_id",
+            "symbol",
+            "side",
+            "order_type",
+            "price",
+            "quantity",
+            "fee",
+            "fee_asset",
+            "pnl",
+            "exec_status",
+            "liquidity",
+            "client_order_id",
+            "order_id",
+            "execution_profile",
+            "market_regime",
+            "meta_json",
+        ]
+    ]
 
 
 def _normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize equity reports to at least ts_ms and equity columns."""
     if df is None or df.empty:
         return pd.DataFrame(
-            columns=["ts_ms", "symbol", "equity", "fee_total", "funding_cashflow", "execution_profile"]
+            columns=[
+                "ts_ms",
+                "symbol",
+                "equity",
+                "fee_total",
+                "funding_cashflow",
+                "bid",
+                "ask",
+                "mtm_price",
+                "execution_profile",
+                "market_regime",
+            ]
         )
 
     r = df.copy()
@@ -113,7 +207,16 @@ def _normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
     if "symbol" not in r.columns:
         r["symbol"] = "UNKNOWN"
 
-    for c in ["equity", "fee_total", "funding_cashflow", "bid", "ask", "mtm_price", "execution_profile"]:
+    for c in [
+        "equity",
+        "fee_total",
+        "funding_cashflow",
+        "bid",
+        "ask",
+        "mtm_price",
+        "execution_profile",
+        "market_regime",
+    ]:
         if c not in r.columns:
             r[c] = pd.NA
 
@@ -125,7 +228,20 @@ def _normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
     r["ask"] = pd.to_numeric(r["ask"], errors="coerce")
     r["mtm_price"] = pd.to_numeric(r["mtm_price"], errors="coerce")
 
-    return r[["ts_ms", "symbol", "equity", "fee_total", "funding_cashflow", "bid", "ask", "mtm_price", "execution_profile"]]
+    return r[
+        [
+            "ts_ms",
+            "symbol",
+            "equity",
+            "fee_total",
+            "funding_cashflow",
+            "bid",
+            "ask",
+            "mtm_price",
+            "execution_profile",
+            "market_regime",
+        ]
+    ]
 
 
 def _bucket_ts_ms(ts_ms: pd.Series, *, bar_seconds: int) -> pd.Series:

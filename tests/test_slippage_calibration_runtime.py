@@ -1,9 +1,12 @@
 import json
 from types import SimpleNamespace
 
+import pandas as pd
+
 from impl_sim_executor import SimExecutor
 from impl_slippage import load_calibration_artifact
 from execution_sim import ExecutionSimulator
+from scripts.calibrate_live_slippage import _prepare_dataframe
 
 
 def _write_artifact(tmp_path, payload, name="slippage_calibration.json"):
@@ -135,6 +138,34 @@ def test_prepare_slippage_payload_disabled_keeps_profiles():
     profiles = result["calibrated_profiles"]
     assert profiles["enabled"] is False
     assert existing_cfg["calibrated_profiles"]["enabled"] is True
+
+
+def test_prepare_dataframe_includes_market_regime_column():
+    source = pd.DataFrame(
+        {
+            "ts_ms": [1, 2],
+            "symbol": ["BTCUSDT", "ETHUSDT"],
+            "slippage_bps": [1.0, 2.0],
+            "spread_bps": [0.1, 0.2],
+            "notional": [100.0, 200.0],
+            "size": [0.01, 0.02],
+            "liquidity": [10.0, 20.0],
+            "vol_factor": [0.5, 0.6],
+            "execution_profile": ["DEFAULT", "DEFAULT"],
+            "market_regime": ["TREND", None],
+        }
+    )
+
+    prepared = _prepare_dataframe(source)
+    assert "market_regime" in prepared.columns
+    values = prepared.set_index("symbol")["market_regime"].to_dict()
+    assert values["BTCUSDT"] == "TREND"
+    assert pd.isna(values["ETHUSDT"])
+
+    without_regime = source.drop(columns=["market_regime"])
+    prepared_no_regime = _prepare_dataframe(without_regime)
+    assert "market_regime" in prepared_no_regime.columns
+    assert prepared_no_regime["market_regime"].isna().all()
 
 
 def test_execution_simulator_market_regime_listener():
