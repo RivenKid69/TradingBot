@@ -548,6 +548,24 @@ class CommonRunConfig(BaseModel):
     adv: AdvRuntimeConfig = Field(default_factory=AdvRuntimeConfig)
     latency: LatencyConfig = Field(default_factory=LatencyConfig)
     execution: ExecutionRuntimeConfig = Field(default_factory=ExecutionRuntimeConfig)
+    slippage_calibration_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable loading calibrated slippage profiles from runtime artifacts when available."
+        ),
+    )
+    slippage_calibration_path: Optional[str] = Field(
+        default=None,
+        description="Optional override path to a calibrated slippage artifact (JSON/YAML).",
+    )
+    slippage_calibration_default_symbol: Optional[str] = Field(
+        default=None,
+        description="Default symbol key used when the calibration artifact omits explicit mapping.",
+    )
+    slippage_regime_updates: bool = Field(
+        default=True,
+        description="Forward market regime updates to the slippage component for calibrated overrides.",
+    )
     components: Components
 
 
