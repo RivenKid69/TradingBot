@@ -140,6 +140,18 @@ _NEXT_OPEN_EXPIRED_COUNTER = Counter(
     ["symbol", "reason"],
 )
 
+_INTRABAR_REFERENCE_APPLIED = Counter(
+    "sim_intrabar_reference_applied_total",
+    "Intrabar reference path interpolations",
+    ["symbol"],
+)
+
+_INTRABAR_REFERENCE_FALLBACK = Counter(
+    "sim_intrabar_reference_fallback_total",
+    "Fallbacks when intrabar reference path is unavailable",
+    ["symbol", "reason"],
+)
+
 try:
     import numpy as np
 except Exception:  # минимальная замена на случай отсутствия numpy на этапе интеграции
@@ -1076,6 +1088,7 @@ class ExecutionSimulator:
         self._next_cli_id = 1
         self._order_seq_counter: int = 0
         self._intrabar_debug_logged: int = 0
+        self._intrabar_reference_debug_logged: int = 0
         self._trade_cost_debug_logged: int = 0
         self._trade_cost_debug_limit: int = 100
         self._entry_mode: str = "default"
@@ -1138,6 +1151,13 @@ class ExecutionSimulator:
         self._last_bar_close: Optional[float] = None
         self._last_bar_close_ts: Optional[int] = None
         self._intrabar_timeframe_ms: Optional[int] = None
+        self._intrabar_path: list[tuple[int, float]] = []
+        self._intrabar_volume_profile: list[tuple[int, float]] = []
+        self._intrabar_path_bar_ts: Optional[int] = None
+        self._intrabar_path_start_ts: Optional[int] = None
+        self._intrabar_path_timeframe_ms: Optional[int] = None
+        self._intrabar_path_total_volume: Optional[float] = None
+        self._intrabar_volume_used: float = 0.0
         self.run_config = run_config
         self._run_config = run_config
         self._adv_store: Optional[ADVStore] = None
@@ -2526,7 +2546,7 @@ class ExecutionSimulator:
                     qty_total = remaining
             sbps = self._last_spread_bps
             vf = self._last_vol_factor
-            liq = self._last_liquidity
+            liq = self._limit_optional_by_intrabar_volume(self._last_liquidity)
             filled_price = float(open_price)
             slip_bps = 0.0
             if not state.strict:
@@ -5281,6 +5301,7 @@ class ExecutionSimulator:
         Установить последний рыночный снапшот: bid/ask (для вычисления spread и mid),
         vol_factor (например ATR% за бар), liquidity (например rolling_volume_shares).
         """
+        self._maybe_reset_intrabar_reference(ts_ms)
         self._last_bid = float(bid) if bid is not None else None
         self._last_ask = float(ask) if ask is not None else None
 
@@ -5617,7 +5638,391 @@ class ExecutionSimulator:
         """Reset per-step intrabar debug logging counter."""
 
         self._intrabar_debug_logged = 0
-        self._trade_cost_debug_logged = 0
+        self._intrabar_reference_debug_logged = 0
+
+    def _reset_intrabar_reference(self) -> None:
+        """Clear cached intrabar reference path information."""
+
+        self._intrabar_path = []
+        self._intrabar_volume_profile = []
+        self._intrabar_path_bar_ts = None
+        self._intrabar_path_start_ts = None
+        self._intrabar_path_timeframe_ms = None
+        self._intrabar_path_total_volume = None
+        self._intrabar_volume_used = 0.0
+
+    def _available_intrabar_volume(self) -> Optional[float]:
+        """Return remaining volume from intrabar profile, if provided."""
+
+        total = self._intrabar_path_total_volume
+        if total is None:
+            return None
+        try:
+            total_val = float(total)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(total_val):
+            return None
+        remaining = max(0.0, total_val - float(self._intrabar_volume_used))
+        if remaining <= 0.0:
+            return 0.0
+        return float(remaining)
+
+    def _consume_intrabar_volume(self, qty: float) -> None:
+        """Reduce remaining volume after execution."""
+
+        try:
+            amount = float(qty)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(amount) or amount <= 0.0:
+            return
+        self._intrabar_volume_used += float(amount)
+        # keep usage non-negative in case of numerical drift
+        if self._intrabar_volume_used < 0.0:
+            self._intrabar_volume_used = 0.0
+
+    def _limit_by_intrabar_volume(self, value: float) -> float:
+        """Limit ``value`` by remaining intrabar volume when available."""
+
+        cap = self._available_intrabar_volume()
+        if cap is None:
+            return float(value)
+        try:
+            cap_val = float(cap)
+        except (TypeError, ValueError):
+            return float(value)
+        if not math.isfinite(cap_val):
+            return float(value)
+        if cap_val < 0.0:
+            cap_val = 0.0
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return cap_val
+        if not math.isfinite(val):
+            return cap_val
+        if val < 0.0:
+            return 0.0
+        return min(val, cap_val)
+
+    def _limit_optional_by_intrabar_volume(
+        self, value: Optional[float]
+    ) -> Optional[float]:
+        """Limit optional liquidity values by remaining intrabar volume."""
+
+        if value is None:
+            return None
+        limited = self._limit_by_intrabar_volume(float(value))
+        return float(limited)
+
+    def _effective_liquidity_cap(self) -> Optional[float]:
+        """Combine last-liquidity estimate with intrabar profile cap."""
+
+        return self._combine_liquidity(
+            self._last_liquidity, self._available_intrabar_volume()
+        )
+
+    def _record_intrabar_reference_applied(self) -> None:
+        symbol_label = str(self.symbol).upper() if self.symbol is not None else ""
+        try:
+            _INTRABAR_REFERENCE_APPLIED.labels(symbol_label).inc()
+        except Exception:
+            pass
+
+    def _record_intrabar_reference_fallback(self, reason: str) -> None:
+        symbol_label = str(self.symbol).upper() if self.symbol is not None else ""
+        try:
+            _INTRABAR_REFERENCE_FALLBACK.labels(symbol_label, str(reason)).inc()
+        except Exception:
+            pass
+
+    def _maybe_reset_intrabar_reference(self, ts_ms: Optional[int]) -> None:
+        """Drop cached reference path when current bar changes."""
+
+        if self._intrabar_path_bar_ts is None:
+            return
+        if ts_ms is None:
+            return
+        try:
+            ts_val = int(ts_ms)
+        except (TypeError, ValueError):
+            return
+        timeframe = self._intrabar_path_timeframe_ms
+        if timeframe is None or timeframe <= 0:
+            timeframe = self._resolve_intrabar_timeframe(ts_val)
+        if timeframe <= 0:
+            return
+        try:
+            start = bar_start_ms(ts_val, timeframe)
+        except Exception:
+            start = ts_val - timeframe
+        current_bar_ts = start + timeframe
+        if current_bar_ts != self._intrabar_path_bar_ts:
+            if logger.isEnabledFor(logging.DEBUG):
+                limit = int(self._intrabar_debug_max_logs)
+                if limit <= 0 or self._intrabar_reference_debug_logged < limit:
+                    logger.debug(
+                        "reset intrabar reference path prev_ts=%s new_ts=%s timeframe=%s",
+                        self._intrabar_path_bar_ts,
+                        current_bar_ts,
+                        timeframe,
+                    )
+                    self._intrabar_reference_debug_logged += 1
+            self._reset_intrabar_reference()
+
+    def set_intrabar_reference(
+        self,
+        bar_ts: Optional[int],
+        path: Optional[Sequence[Any]],
+    ) -> None:
+        """Register intrabar reference path for deterministic interpolation.
+
+        ``path`` accepts a sequence of points. Each point may be a mapping with
+        keys ``ts``/``timestamp``/``ts_ms`` (absolute), ``offset_ms`` (relative to
+        bar start) or ``fraction`` (0..1), along with ``price``/``px`` and an
+        optional ``volume``. Tuple-like inputs ``(timestamp, price[, volume])``
+        are also supported.
+        """
+
+        self._reset_intrabar_reference()
+        if bar_ts is None or path is None:
+            return
+        try:
+            bar_ts_int = int(bar_ts)
+        except (TypeError, ValueError):
+            return
+        timeframe = self._resolve_intrabar_timeframe(bar_ts_int)
+        if timeframe <= 0:
+            return
+        start_ts = bar_ts_int - timeframe
+        end_ts = start_ts + timeframe
+
+        def _extract_point(entry: Any) -> tuple[Optional[int], Optional[float], Optional[float]]:
+            ts_raw: Any = None
+            price_raw: Any = None
+            volume_raw: Any = None
+            if isinstance(entry, Mapping):
+                data = dict(entry)
+                ts_raw = (
+                    data.get("ts")
+                    or data.get("timestamp")
+                    or data.get("ts_ms")
+                    or data.get("time")
+                )
+                if ts_raw is None:
+                    ts_raw = data.get("offset_ms")
+                if ts_raw is None:
+                    ts_raw = data.get("fraction")
+                price_raw = data.get("price") or data.get("px") or data.get("p")
+                volume_raw = (
+                    data.get("volume")
+                    or data.get("qty")
+                    or data.get("quantity")
+                )
+            elif isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
+                seq = list(entry)
+                if seq:
+                    ts_raw = seq[0]
+                if len(seq) > 1:
+                    price_raw = seq[1]
+                if len(seq) > 2:
+                    volume_raw = seq[2]
+            else:
+                return None, None, None
+
+            ts_val: Optional[int] = None
+            if ts_raw is not None:
+                if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool):
+                    if math.isfinite(ts_raw):
+                        if 0.0 <= float(ts_raw) <= 1.0:
+                            ts_val = int(round(start_ts + float(ts_raw) * timeframe))
+                        elif -2 * timeframe <= float(ts_raw) <= 2 * timeframe:
+                            ts_val = int(round(start_ts + float(ts_raw)))
+                        else:
+                            ts_val = int(round(float(ts_raw)))
+                elif isinstance(ts_raw, str):
+                    try:
+                        num = float(ts_raw.strip())
+                    except (TypeError, ValueError):
+                        ts_val = None
+                    else:
+                        if math.isfinite(num):
+                            if 0.0 <= num <= 1.0:
+                                ts_val = int(round(start_ts + num * timeframe))
+                            elif -2 * timeframe <= num <= 2 * timeframe:
+                                ts_val = int(round(start_ts + num))
+                            else:
+                                ts_val = int(round(num))
+            price_val: Optional[float] = None
+            if price_raw is not None:
+                try:
+                    price_val = float(price_raw)
+                except (TypeError, ValueError):
+                    price_val = None
+                else:
+                    if not math.isfinite(price_val):
+                        price_val = None
+            volume_val: Optional[float] = None
+            if volume_raw is not None:
+                try:
+                    volume_val = float(volume_raw)
+                except (TypeError, ValueError):
+                    volume_val = None
+                else:
+                    if not math.isfinite(volume_val) or volume_val <= 0.0:
+                        volume_val = None
+            return ts_val, price_val, volume_val
+
+        points: list[tuple[int, float]] = []
+        volumes: list[tuple[int, float]] = []
+        for node in path:
+            ts_val, price_val, volume_val = _extract_point(node)
+            if ts_val is None or price_val is None:
+                continue
+            if ts_val < start_ts:
+                ts_val = start_ts
+            if ts_val > end_ts:
+                ts_val = end_ts
+            points.append((int(ts_val), float(price_val)))
+            if volume_val is not None:
+                volumes.append((int(ts_val), float(volume_val)))
+
+        if not points:
+            return
+        points.sort(key=lambda item: item[0])
+        unique_points: list[tuple[int, float]] = []
+        for ts_val, price_val in points:
+            if unique_points and unique_points[-1][0] == ts_val:
+                unique_points[-1] = (ts_val, price_val)
+            else:
+                unique_points.append((ts_val, price_val))
+
+        if len(unique_points) < 2:
+            # Require at least two points for stable interpolation.
+            return
+
+        tolerance = max(1, timeframe // 20)
+        if unique_points[0][0] > start_ts + tolerance or unique_points[-1][0] < end_ts - tolerance:
+            return
+
+        volume_total: float = 0.0
+        volume_profile: list[tuple[int, float]] = []
+        if volumes:
+            volumes.sort(key=lambda item: item[0])
+            for ts_val, volume_val in volumes:
+                if volume_val <= 0.0 or not math.isfinite(volume_val):
+                    continue
+                volume_total += float(volume_val)
+                volume_profile.append((ts_val, float(volume_val)))
+        self._intrabar_path = unique_points
+        self._intrabar_volume_profile = volume_profile
+        self._intrabar_path_bar_ts = int(bar_ts_int)
+        self._intrabar_path_start_ts = int(start_ts)
+        self._intrabar_path_timeframe_ms = int(timeframe)
+        self._intrabar_path_total_volume = (
+            float(volume_total) if volume_total > 0.0 else None
+        )
+        self._intrabar_volume_used = 0.0
+
+        if logger.isEnabledFor(logging.DEBUG):
+            limit = int(self._intrabar_debug_max_logs)
+            if limit <= 0 or self._intrabar_reference_debug_logged < limit:
+                logger.debug(
+                    "set intrabar reference len=%s volume_total=%s bar_ts=%s timeframe=%s",
+                    len(unique_points),
+                    self._intrabar_path_total_volume,
+                    bar_ts_int,
+                    timeframe,
+                )
+                self._intrabar_reference_debug_logged += 1
+
+    def _intrabar_price_from_path(
+        self,
+        *,
+        side: str,
+        time_fraction: float,
+        fallback: Optional[float],
+        bar_ts: Optional[int],
+    ) -> Optional[tuple[float, bool]]:
+        """Interpolate reference price from custom intrabar path."""
+
+        if not self._intrabar_path:
+            self._record_intrabar_reference_fallback("empty")
+            return None
+        if len(self._intrabar_path) < 2:
+            self._record_intrabar_reference_fallback("insufficient")
+            return None
+        timeframe = self._intrabar_path_timeframe_ms
+        if timeframe is None or timeframe <= 0:
+            anchor_ts = bar_ts if bar_ts is not None else self._intrabar_path_bar_ts
+            timeframe = self._resolve_intrabar_timeframe(anchor_ts)
+        if timeframe is None or timeframe <= 0:
+            self._record_intrabar_reference_fallback("timeframe")
+            return None
+        start_ts = self._intrabar_path_start_ts
+        if start_ts is None:
+            anchor_ts = bar_ts if bar_ts is not None else self._intrabar_path_bar_ts
+            if anchor_ts is not None:
+                try:
+                    anchor_val = int(anchor_ts)
+                except (TypeError, ValueError):
+                    anchor_val = None
+                else:
+                    start_ts = anchor_val - timeframe
+        if start_ts is None:
+            self._record_intrabar_reference_fallback("start_ts")
+            return None
+        end_ts = start_ts + timeframe
+        first_ts = self._intrabar_path[0][0]
+        last_ts = self._intrabar_path[-1][0]
+        tolerance = max(1, timeframe // 20)
+        if first_ts > start_ts + tolerance or last_ts < end_ts - tolerance:
+            self._record_intrabar_reference_fallback("coverage")
+            return None
+
+        target_ts = start_ts + float(time_fraction) * timeframe
+        prev_ts, prev_price = self._intrabar_path[0]
+        clipped_path = False
+        if target_ts <= first_ts:
+            price = float(self._intrabar_path[0][1])
+            clipped_path = True
+        elif target_ts >= last_ts:
+            price = float(self._intrabar_path[-1][1])
+            clipped_path = True
+        else:
+            price = float(self._intrabar_path[-1][1])
+            for ts_val, price_val in self._intrabar_path[1:]:
+                if target_ts <= ts_val:
+                    gap = ts_val - prev_ts
+                    if gap <= 0:
+                        price = float(price_val)
+                    else:
+                        weight = (target_ts - prev_ts) / gap
+                        if weight < 0.0:
+                            weight = 0.0
+                        if weight > 1.0:
+                            weight = 1.0
+                        price = float(prev_price) + (float(price_val) - float(prev_price)) * float(weight)
+                    break
+                prev_ts, prev_price = ts_val, price_val
+
+        clipped_price, clipped_flag = self._clip_to_bar_range(price)
+        if logger.isEnabledFor(logging.DEBUG):
+            limit = int(self._intrabar_debug_max_logs)
+            if limit <= 0 or self._intrabar_reference_debug_logged < limit:
+                logger.debug(
+                    "intrabar reference path side=%s t=%.4f price=%.6f clipped_path=%s clipped_bar=%s",
+                    side,
+                    time_fraction,
+                    float(price),
+                    bool(clipped_path),
+                    bool(clipped_flag),
+                )
+                self._intrabar_reference_debug_logged += 1
+        self._record_intrabar_reference_applied()
+        combined_clip = bool(clipped_flag or clipped_path)
+        return float(clipped_price), combined_clip
 
     def _intrabar_atr_hint(self) -> Optional[float]:
         """Extract an ATR/volatility hint from the latest metrics."""
@@ -5810,6 +6215,24 @@ class ExecutionSimulator:
         if mode in linear_modes and linear_value is not None:
             clipped, clipped_flag = self._clip_to_bar_range(linear_value)
             return clipped, clipped_flag, frac
+
+        reference_modes = {
+            "reference",
+            "intrabar_reference",
+            "path",
+            "intrabar_path",
+        }
+        if mode in reference_modes:
+            result = self._intrabar_price_from_path(
+                side=side,
+                time_fraction=frac,
+                fallback=fallback,
+                bar_ts=bar_ts,
+            )
+            if result is not None:
+                price, clipped_flag = result
+                return price, clipped_flag, frac
+            mode = "bridge"
 
         ohlc_modes = {"ohlc", "ohlc-linear", "ohlc_linear"}
         if mode in ohlc_modes and open_p is not None and close_p is not None:
@@ -7687,7 +8110,7 @@ class ExecutionSimulator:
                     ),
                     "spread_bps": self._last_spread_bps,
                     "vol_factor": self._last_vol_factor,
-                    "liquidity": self._last_liquidity,
+                    "liquidity": self._effective_liquidity_cap(),
                     "ref_price": ref_market,
                 }
                 plan = executor.plan_market(
@@ -7720,7 +8143,7 @@ class ExecutionSimulator:
                                 if hint_val < 0.0:
                                     hint_val = 0.0
                                 q_child = min(q_child, hint_val)
-                    last_liq_cap = self._last_liquidity
+                    last_liq_cap = self._effective_liquidity_cap()
                     if last_liq_cap is not None:
                         try:
                             cap_val = float(last_liq_cap)
@@ -7731,6 +8154,7 @@ class ExecutionSimulator:
                                 if cap_val < 0.0:
                                     cap_val = 0.0
                                 q_child = min(q_child, cap_val)
+                    q_child = self._limit_by_intrabar_volume(q_child)
                     if q_child <= 0.0:
                         continue
                     order_qty_base = max(0.0, float(q_child))
@@ -7862,6 +8286,7 @@ class ExecutionSimulator:
                         continue
 
                     q_child = float(fill_qty_base)
+                    self._consume_intrabar_volume(q_child)
                     if q_child <= 0.0:
                         continue
 
@@ -7917,6 +8342,7 @@ class ExecutionSimulator:
                         if (liq_override is not None)
                         else self._last_liquidity
                     )
+                    liq = self._limit_optional_by_intrabar_volume(liq)
                     pre_slip_price = float(filled_price)
                     cfg_slip = (
                         self.execution_params.get("slippage_bps")
@@ -8022,6 +8448,7 @@ class ExecutionSimulator:
                         continue
 
                     q_child = float(fill_qty_base)
+                    self._consume_intrabar_volume(q_child)
                     cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
                     if order_qty_base > 0.0:
                         fill_ratio = max(0.0, min(1.0, q_child / order_qty_base))
@@ -8089,7 +8516,7 @@ class ExecutionSimulator:
             is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
             side = "BUY" if is_buy else "SELL"
             qty = abs(float(getattr(proto, "volume_frac", 0.0)))
-            last_liq_cap = self._last_liquidity
+            last_liq_cap = self._effective_liquidity_cap()
             if last_liq_cap is not None:
                 try:
                     cap_val = float(last_liq_cap)
@@ -8113,7 +8540,7 @@ class ExecutionSimulator:
             slip_bps = 0.0
             sbps = self._last_spread_bps
             vf = self._last_vol_factor
-            liq = self._last_liquidity
+            liq = self._limit_optional_by_intrabar_volume(self._last_liquidity)
             pre_slip_price = float(filled_price)
             trade_cost: Optional[_TradeCostResult] = None
             fallback_slip: Optional[float] = None
@@ -8627,6 +9054,7 @@ class ExecutionSimulator:
             self._last_bar_close_ts = int(ts)
         except (TypeError, ValueError):
             self._last_bar_close_ts = None
+        self._maybe_reset_intrabar_reference(ts)
         self._reset_intrabar_debug_counter()
         # --- обновить рыночный снапшот ---
         self._last_bid = float(bid) if bid is not None else None
@@ -8981,7 +9409,7 @@ class ExecutionSimulator:
                     ),
                     "spread_bps": self._last_spread_bps,
                     "vol_factor": self._last_vol_factor,
-                    "liquidity": self._last_liquidity,
+                    "liquidity": self._effective_liquidity_cap(),
                     "ref_price": ref_market,
                 }
                 plan = executor.plan_market(
@@ -8997,6 +9425,7 @@ class ExecutionSimulator:
                     base_ts = int(ts + child_offset)
                     ts_fill = int(base_ts)
                     q_child = float(child.qty)
+                    q_child = self._limit_by_intrabar_volume(q_child)
                     if q_child <= 0.0:
                         continue
                     hint_raw = getattr(child, "liquidity_hint", None)
@@ -9010,7 +9439,7 @@ class ExecutionSimulator:
                                 if hint_val < 0.0:
                                     hint_val = 0.0
                                 q_child = min(q_child, hint_val)
-                    last_liq_cap = self._last_liquidity
+                    last_liq_cap = self._effective_liquidity_cap()
                     if last_liq_cap is not None:
                         try:
                             cap_val = float(last_liq_cap)
@@ -9163,6 +9592,7 @@ class ExecutionSimulator:
                         continue
 
                     q_child = float(fill_qty_base)
+                    self._consume_intrabar_volume(q_child)
                     if q_child <= 0.0:
                         continue
 
@@ -9207,7 +9637,7 @@ class ExecutionSimulator:
                     slip_bps = 0.0
                     sbps = self._last_spread_bps
                     vf = self._last_vol_factor
-                    liq = self._last_liquidity
+                    liq = self._limit_optional_by_intrabar_volume(self._last_liquidity)
                     pre_slip_price = float(filled_price)
                     trade_cost: Optional[_TradeCostResult] = None
                     fallback_slip: Optional[float] = None
@@ -9303,6 +9733,7 @@ class ExecutionSimulator:
                         continue
 
                     q_child = float(fill_qty_base)
+                    self._consume_intrabar_volume(q_child)
                     cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
                     if order_qty_base > 0.0:
                         fill_ratio = max(0.0, min(1.0, q_child / order_qty_base))
