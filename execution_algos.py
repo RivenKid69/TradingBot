@@ -1,8 +1,9 @@
 # sim/execution_algos.py
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 
 @dataclass
@@ -142,6 +143,133 @@ class MarketOpenH1Executor(BaseExecutor):
 
 
 class VWAPExecutor(BaseExecutor):
+    """Volume-weighted execution using intrabar volume profile when available."""
+
+    def __init__(self, *, fallback_parts: int = 6) -> None:
+        self.fallback_parts = max(1, int(fallback_parts))
+
+    @staticmethod
+    def _coerce_int(value: Any) -> Optional[int]:
+        try:
+            iv = int(value)
+        except (TypeError, ValueError):
+            return None
+        return iv
+
+    @staticmethod
+    def _extract_profile_entry(
+        entry: Any,
+        *,
+        bar_start: Optional[int],
+        timeframe: Optional[int],
+    ) -> Optional[tuple[int, float]]:
+        ts_raw: Any = None
+        vol_raw: Any = None
+        if isinstance(entry, Mapping):
+            data = dict(entry)
+            ts_raw = (
+                data.get("ts")
+                or data.get("timestamp")
+                or data.get("ts_ms")
+                or data.get("time")
+            )
+            if ts_raw is None and bar_start is not None:
+                offset_raw = data.get("offset_ms")
+                if offset_raw is not None:
+                    try:
+                        ts_raw = int(bar_start + float(offset_raw))
+                    except (TypeError, ValueError):
+                        ts_raw = None
+            if ts_raw is None and timeframe is not None and timeframe > 0:
+                frac_raw = data.get("fraction")
+                if frac_raw is not None and bar_start is not None:
+                    try:
+                        ts_raw = int(bar_start + float(frac_raw) * float(timeframe))
+                    except (TypeError, ValueError):
+                        ts_raw = None
+            vol_raw = (
+                data.get("volume")
+                or data.get("qty")
+                or data.get("quantity")
+                or data.get("vol")
+            )
+        elif isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
+            seq = list(entry)
+            if seq:
+                ts_raw = seq[0]
+            if len(seq) > 1:
+                vol_raw = seq[1]
+        else:
+            return None
+
+        try:
+            vol = float(vol_raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(vol) or vol <= 0.0:
+            return None
+
+        ts_val: Optional[int] = None
+        if isinstance(ts_raw, (int, float)) and not isinstance(ts_raw, bool):
+            if math.isfinite(float(ts_raw)):
+                ts_val = int(round(float(ts_raw)))
+        elif isinstance(ts_raw, str):
+            try:
+                ts_val = int(round(float(ts_raw.strip())))
+            except (TypeError, ValueError):
+                ts_val = None
+        if ts_val is None:
+            return None
+        return ts_val, float(vol)
+
+    def _fallback_plan(
+        self,
+        *,
+        now_ts_ms: int,
+        total_qty: float,
+        bar_end_ts: Optional[int],
+        timeframe_ms: Optional[int],
+    ) -> List[MarketChild]:
+        if total_qty <= 0.0:
+            return []
+        horizon_ms: Optional[int] = None
+        if bar_end_ts is not None and bar_end_ts > now_ts_ms:
+            horizon_ms = bar_end_ts - now_ts_ms
+        elif timeframe_ms is not None and timeframe_ms > 0:
+            horizon_ms = timeframe_ms
+        if horizon_ms is None or horizon_ms < 0:
+            horizon_ms = 0
+
+        parts = int(self.fallback_parts)
+        if parts <= 1:
+            return [MarketChild(ts_offset_ms=0, qty=total_qty, liquidity_hint=None)]
+
+        denominator = max(1, parts - 1)
+        offsets: List[int] = []
+        for i in range(parts):
+            if horizon_ms > 0:
+                frac = float(i) / float(denominator)
+                offsets.append(int(round(frac * horizon_ms)))
+            else:
+                offsets.append(0)
+
+        per = total_qty / float(parts)
+        plan: List[MarketChild] = []
+        produced = 0.0
+        for i, offset in enumerate(offsets):
+            qty = per
+            if i == parts - 1:
+                qty = max(0.0, total_qty - produced)
+            plan.append(
+                MarketChild(
+                    ts_offset_ms=max(0, int(offset)),
+                    qty=qty,
+                    liquidity_hint=None,
+                )
+            )
+            produced += qty
+        return [child for child in plan if child.qty > 0.0]
+
     def plan_market(
         self,
         *,
@@ -150,13 +278,110 @@ class VWAPExecutor(BaseExecutor):
         target_qty: float,
         snapshot: Dict[str, Any],
     ) -> List[MarketChild]:
-        q = float(abs(target_qty))
-        if q <= 0.0:
+        total_qty = float(abs(target_qty))
+        if total_qty <= 0.0:
             return []
-        hour_ms = 3_600_000
-        end = ((now_ts_ms // hour_ms) + 1) * hour_ms
-        offset = int(max(0, end - now_ts_ms))
-        return [MarketChild(ts_offset_ms=offset, qty=q, liquidity_hint=None)]
+
+        timeframe_ms = self._coerce_int(
+            snapshot.get("bar_timeframe_ms")
+            or snapshot.get("timeframe_ms")
+            or snapshot.get("intrabar_timeframe_ms")
+        )
+        bar_start = self._coerce_int(
+            snapshot.get("bar_start_ts")
+            or snapshot.get("intrabar_start_ts")
+            or snapshot.get("bar_start_ts_ms")
+        )
+        bar_end = self._coerce_int(
+            snapshot.get("bar_end_ts")
+            or snapshot.get("intrabar_end_ts")
+            or snapshot.get("bar_end_ts_ms")
+        )
+
+        if bar_start is not None and bar_end is None and timeframe_ms:
+            bar_end = bar_start + timeframe_ms
+        if bar_end is not None and bar_start is None and timeframe_ms:
+            bar_start = bar_end - timeframe_ms
+
+        if timeframe_ms is None and bar_start is not None and bar_end is not None:
+            timeframe_ms = max(0, bar_end - bar_start)
+
+        if timeframe_ms is None or timeframe_ms <= 0:
+            hour_ms = 3_600_000
+            timeframe_ms = hour_ms
+        if bar_start is None:
+            bar_start = (now_ts_ms // timeframe_ms) * timeframe_ms
+        if bar_end is None:
+            bar_end = bar_start + timeframe_ms
+
+        profile_raw = snapshot.get("intrabar_volume_profile") or []
+        entries: List[tuple[int, float]] = []
+        if isinstance(profile_raw, Sequence) and not isinstance(profile_raw, (str, bytes)):
+            for node in profile_raw:
+                extracted = self._extract_profile_entry(
+                    node, bar_start=bar_start, timeframe=timeframe_ms
+                )
+                if extracted is None:
+                    continue
+                ts_val, vol_val = extracted
+                if bar_start is not None and ts_val < bar_start:
+                    ts_val = bar_start
+                if bar_end is not None and ts_val > bar_end:
+                    ts_val = bar_end
+                entries.append((ts_val, vol_val))
+
+        if not entries:
+            return self._fallback_plan(
+                now_ts_ms=now_ts_ms,
+                total_qty=total_qty,
+                bar_end_ts=bar_end,
+                timeframe_ms=timeframe_ms,
+            )
+
+        aggregated: Dict[int, float] = {}
+        for ts_val, vol_val in entries:
+            if ts_val < now_ts_ms:
+                continue
+            aggregated[ts_val] = aggregated.get(ts_val, 0.0) + vol_val
+
+        if not aggregated:
+            return self._fallback_plan(
+                now_ts_ms=now_ts_ms,
+                total_qty=total_qty,
+                bar_end_ts=bar_end,
+                timeframe_ms=timeframe_ms,
+            )
+
+        timestamps = sorted(aggregated.keys())
+        total_volume = sum(aggregated[ts_val] for ts_val in timestamps)
+        if total_volume <= 0.0:
+            return self._fallback_plan(
+                now_ts_ms=now_ts_ms,
+                total_qty=total_qty,
+                bar_end_ts=bar_end,
+                timeframe_ms=timeframe_ms,
+            )
+
+        plan: List[MarketChild] = []
+        produced_qty = 0.0
+        for idx, ts_val in enumerate(timestamps):
+            vol_share = aggregated[ts_val] / total_volume
+            qty = total_qty * vol_share
+            if idx == len(timestamps) - 1:
+                qty = max(0.0, total_qty - produced_qty)
+            offset = ts_val - now_ts_ms
+            if offset < 0:
+                offset = 0
+            plan.append(
+                MarketChild(
+                    ts_offset_ms=int(offset),
+                    qty=qty,
+                    liquidity_hint=qty,
+                )
+            )
+            produced_qty += qty
+
+        return [child for child in plan if child.qty > 0.0]
 
 
 class MidOffsetLimitExecutor(BaseExecutor):
