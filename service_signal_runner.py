@@ -3109,6 +3109,7 @@ class ServiceSignalRunner:
         shutdown_cfg: Dict[str, Any] | None = None,
         monitoring_cfg: MonitoringConfig | None = None,
         monitoring_agg: MonitoringAggregator | None = None,
+        run_config: CommonRunConfig | None = None,
         *,
         enforce_closed_bars: bool = True,
         close_lag_ms: int = 0,
@@ -3135,6 +3136,7 @@ class ServiceSignalRunner:
         self.pipeline_cfg = pipeline_cfg
         self.shutdown_cfg = shutdown_cfg or {}
         self.monitoring_cfg = monitoring_cfg or MonitoringConfig()
+        self._run_config = run_config
         self.alerts: AlertManager | None = None
         self.monitoring_agg: MonitoringAggregator | None = None
         self._clock_safe_mode = False
@@ -3172,6 +3174,7 @@ class ServiceSignalRunner:
         self._base_pipeline_cfg = pipeline_cfg or PipelineConfig()
         self._ops_pipeline_cfg = PipelineConfig()
         self._runtime_pipeline_cfg = PipelineConfig()
+        self._slippage_regime_listener: Callable[[Any], None] | None = None
 
         monitoring.clear_runtime_aggregator()
         if self.monitoring_cfg.enabled:
@@ -3322,6 +3325,170 @@ class ServiceSignalRunner:
                 )
             except Exception:
                 pass
+
+        self._setup_market_regime_bridge()
+
+    def _iter_market_regime_sources(self) -> Iterator[Any]:
+        adapter = getattr(self, "adapter", None)
+        if adapter is None:
+            return
+        seen: set[int] = set()
+
+        def _candidates(obj: Any) -> Iterator[Any]:
+            if obj is None:
+                return
+            yield obj
+            for name in ("sim", "_sim", "executor", "_executor"):
+                nested = getattr(obj, name, None)
+                if nested is not None:
+                    yield nested
+
+        for candidate in _candidates(adapter):
+            if candidate is None:
+                continue
+            ident = id(candidate)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            yield candidate
+
+    @staticmethod
+    def _extract_market_regime(owner: Any) -> Any:
+        attr_names = (
+            "current_market_regime",
+            "market_regime",
+            "_current_market_regime",
+            "_last_market_regime",
+        )
+        for name in attr_names:
+            if not hasattr(owner, name):
+                continue
+            try:
+                value = getattr(owner, name)
+            except Exception:
+                continue
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    continue
+            if value is not None:
+                return value
+        getter = getattr(owner, "get_market_regime", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                return None
+        return None
+
+    def _resolve_market_regime_source(
+        self,
+    ) -> tuple[Callable[[Callable[[Any], None]], None], Any] | None:
+        for owner in self._iter_market_regime_sources():
+            register = getattr(owner, "register_market_regime_listener", None)
+            if not callable(register):
+                continue
+            initial = self._extract_market_regime(owner)
+            return register, initial
+        return None
+
+    def _resolve_slippage_target(self) -> tuple[Any, Callable[[Any], None]] | None:
+        adapter = getattr(self, "adapter", None)
+        if adapter is None:
+            return None
+        candidates: list[Any] = [adapter]
+        possible_attrs = [
+            "_slippage_impl",
+            "slippage_impl",
+            "slippage",
+            "executor",
+            "_executor",
+            "sim",
+            "_sim",
+        ]
+        for attr in possible_attrs:
+            obj = getattr(adapter, attr, None)
+            if obj is None:
+                continue
+            candidates.append(obj)
+            inner = getattr(obj, "_slippage_impl", None)
+            if inner is not None:
+                candidates.append(inner)
+        seen: set[int] = set()
+        for obj in candidates:
+            if obj is None:
+                continue
+            ident = id(obj)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            setter = getattr(obj, "set_market_regime", None)
+            if callable(setter):
+                return obj, setter
+        return None
+
+    def _setup_market_regime_bridge(self) -> None:
+        run_cfg = self._run_config
+        updates_enabled = True
+        calibration_enabled: bool | None = None
+        if run_cfg is not None:
+            updates_enabled = bool(getattr(run_cfg, "slippage_regime_updates", True))
+            calibration_enabled = bool(
+                getattr(run_cfg, "slippage_calibration_enabled", False)
+            )
+        slippage_target = self._resolve_slippage_target()
+        if not updates_enabled or slippage_target is None:
+            return
+        slippage_obj, setter = slippage_target
+        if calibration_enabled is None:
+            calibration_enabled = bool(
+                getattr(slippage_obj, "_calibration_enabled", False)
+            )
+        elif not calibration_enabled:
+            calibration_enabled = bool(
+                getattr(slippage_obj, "_calibration_enabled", False)
+            )
+        if not calibration_enabled:
+            return
+        source = self._resolve_market_regime_source()
+        if source is None:
+            initial = getattr(slippage_obj, "_current_market_regime", None)
+            if initial is None:
+                initial = self._extract_market_regime(slippage_obj)
+            if initial is not None:
+                try:
+                    setter(initial)
+                except Exception:
+                    self.logger.debug(
+                        "failed to seed slippage market regime", exc_info=True
+                    )
+            return
+        register, initial = source
+        if initial is not None:
+            try:
+                setter(initial)
+            except Exception:
+                self.logger.debug(
+                    "failed to seed slippage market regime", exc_info=True
+                )
+
+        def _listener(regime: Any) -> None:
+            try:
+                setter(regime)
+            except Exception:
+                self.logger.debug(
+                    "failed to forward market regime to slippage", exc_info=True
+                )
+
+        try:
+            register(_listener)
+        except Exception:
+            self.logger.debug(
+                "failed to register market regime listener", exc_info=True
+            )
+        else:
+            self._slippage_regime_listener = _listener
 
     def _current_safe_mode_state(self) -> Dict[str, bool]:
         clock_safe = bool(self._clock_safe_mode)
@@ -5573,6 +5740,7 @@ def from_config(
         ws_dedup_timeframe_ms=cfg.timing.timeframe_ms,
         signal_writer_options=signal_writer_options,
         signal_bus_config=signal_bus_config,
+        run_config=cfg,
     )
     return service.run()
 

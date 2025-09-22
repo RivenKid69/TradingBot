@@ -1,12 +1,16 @@
 import json
+from typing import Any, Callable
 from types import SimpleNamespace
 
 import pandas as pd
 
+from core_config import MonitoringConfig
 from impl_sim_executor import SimExecutor
-from impl_slippage import load_calibration_artifact
+from impl_slippage import SlippageImpl, load_calibration_artifact
 from execution_sim import ExecutionSimulator
 from scripts.calibrate_live_slippage import _prepare_dataframe
+from service_signal_runner import ServiceSignalRunner, SignalRunnerConfig
+from slippage import CalibratedProfilesConfig, SymbolCalibratedProfile
 
 
 def _write_artifact(tmp_path, payload, name="slippage_calibration.json"):
@@ -185,3 +189,95 @@ def test_execution_simulator_market_regime_listener():
     replay_events: list = []
     sim.register_market_regime_listener(replay_events.append)
     assert replay_events == ["FLAT"]
+
+
+def test_service_runner_bridges_market_regime_to_slippage(tmp_path):
+    logs_dir = tmp_path / "logs"
+    artifacts_dir = tmp_path / "artifacts"
+    logs_dir.mkdir()
+    artifacts_dir.mkdir()
+
+    profile = SymbolCalibratedProfile.from_dict(
+        {
+            "symbol": "BTCUSDT",
+            "impact_curve": [{"qty": 1, "impact_bps": 10}],
+        }
+    )
+    calibrated = CalibratedProfilesConfig.from_dict(
+        {
+            "enabled": True,
+            "symbols": {"BTCUSDT": profile.to_dict()},
+        }
+    )
+    slippage = SlippageImpl.from_dict({"calibrated_profiles": calibrated})
+    slippage._calibration_symbols = {"BTCUSDT": profile}
+    slippage._calibration_enabled = True
+
+    class _Sim:
+        def __init__(self) -> None:
+            self._listeners: list[Callable[[Any], None]] = []
+            self._last_market_regime: Any = "NORMAL"
+
+        def register_market_regime_listener(
+            self, callback: Callable[[Any], None]
+        ) -> None:
+            self._listeners.append(callback)
+            callback(self._last_market_regime)
+
+        def push(self, regime: Any) -> None:
+            self._last_market_regime = regime
+            for cb in list(self._listeners):
+                cb(regime)
+
+    class _Adapter:
+        def __init__(self, sim: _Sim, slip: SlippageImpl) -> None:
+            self.sim = sim
+            self._slippage_impl = slip
+
+        def run_events(self, worker):  # pragma: no cover - not exercised
+            return iter(())
+
+    class _Pipe:
+        spread_ttl_ms = 0
+
+        def warmup(self) -> None:
+            return None
+
+        def reset(self) -> None:
+            return None
+
+        def update(self, bar, skip_metrics: bool = False) -> dict:
+            return {}
+
+    class _Policy:
+        def decide(self, features, ctx):  # pragma: no cover - not exercised
+            return []
+
+    sim = _Sim()
+    adapter = _Adapter(sim, slippage)
+    cfg = SignalRunnerConfig(
+        logs_dir=str(logs_dir),
+        artifacts_dir=str(artifacts_dir),
+        marker_path=str(tmp_path / "marker"),
+        snapshot_metrics_json=str(tmp_path / "metrics.json"),
+        snapshot_metrics_csv=str(tmp_path / "metrics.csv"),
+    )
+    run_cfg = SimpleNamespace(
+        slippage_regime_updates=True,
+        slippage_calibration_enabled=True,
+    )
+
+    ServiceSignalRunner(
+        adapter,
+        _Pipe(),
+        _Policy(),
+        None,
+        cfg,
+        monitoring_cfg=MonitoringConfig(enabled=False),
+        run_config=run_cfg,
+    )
+
+    assert getattr(slippage, "_current_market_regime") == "NORMAL"
+
+    sim.push("TREND")
+    assert getattr(slippage, "_current_market_regime") == "TREND"
