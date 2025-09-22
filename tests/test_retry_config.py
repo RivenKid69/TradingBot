@@ -62,9 +62,18 @@ def test_retry_config_override(tmp_path, monkeypatch):
         symbols=["BTCUSDT"],
     )
 
+    class _DummyRunner:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self):
+            return iter(())
+
+    monkeypatch.setattr(service_signal_runner, "ServiceSignalRunner", _DummyRunner)
+
     with monkeypatch.context() as m:
         m.chdir(tmp_path)
-        service_signal_runner.from_config(cfg)
+        list(service_signal_runner.from_config(cfg))
 
     assert cfg.retry.max_attempts == 7
     assert cfg.retry.backoff_base_s == 0.5
