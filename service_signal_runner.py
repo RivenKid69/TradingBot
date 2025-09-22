@@ -438,6 +438,7 @@ class _Worker:
         safe_mode_fn: Callable[[], bool] | None = None,
         *,
         enforce_closed_bars: bool,
+        close_lag_ms: int = 0,
         ws_dedup_enabled: bool = False,
         ws_dedup_log_skips: bool = False,
         ws_dedup_timeframe_ms: int = 0,
@@ -460,6 +461,10 @@ class _Worker:
         self._guards = guards
         self._safe_mode_fn = safe_mode_fn or (lambda: False)
         self._enforce_closed_bars = enforce_closed_bars
+        try:
+            self._close_lag_ms = max(0, int(close_lag_ms))
+        except (TypeError, ValueError):
+            self._close_lag_ms = 0
         self._ws_dedup_enabled = ws_dedup_enabled
         self._ws_dedup_log_skips = ws_dedup_log_skips
         self._ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
@@ -482,6 +487,9 @@ class _Worker:
             "updated_at_ms": 0,
             "total_notional": 0.0,
         }
+        self._monitoring: MonitoringAggregator | None = (
+            monitoring if monitoring is not None else monitoring_agg
+        )
         self._portfolio_guard: PortfolioLimitGuard | None = None
         self._global_bucket = None
         self._symbol_bucket_factory = None
@@ -541,9 +549,6 @@ class _Worker:
         )
         self._rest_backoff_until: Dict[str, float] = {}
         self._rest_backoff_step: Dict[str, float] = {}
-        self._monitoring: MonitoringAggregator | None = (
-            monitoring if monitoring is not None else monitoring_agg
-        )
         if self._state_enabled:
             self._seed_last_prices_from_state()
             self._load_exposure_state()
@@ -2635,7 +2640,7 @@ class _Worker:
             bar=bar,
             now_ms=clock.now_ms(),
             enforce=self._enforce_closed_bars,
-            lag_ms=0,
+            lag_ms=self._close_lag_ms,
             stage_cfg=(
                 self._pipeline_cfg.get("closed_bar") if self._pipeline_cfg else None
             ),
@@ -3106,6 +3111,7 @@ class ServiceSignalRunner:
         monitoring_agg: MonitoringAggregator | None = None,
         *,
         enforce_closed_bars: bool = True,
+        close_lag_ms: int = 0,
         ws_dedup_enabled: bool = False,
         ws_dedup_log_skips: bool = False,
         ws_dedup_timeframe_ms: int = 0,
@@ -3135,6 +3141,10 @@ class ServiceSignalRunner:
         self._clock_stop = threading.Event()
         self._clock_thread: Optional[threading.Thread] = None
         self.enforce_closed_bars = enforce_closed_bars
+        try:
+            self.close_lag_ms = max(0, int(close_lag_ms))
+        except (TypeError, ValueError):
+            self.close_lag_ms = 0
         self.ws_dedup_enabled = ws_dedup_enabled
         self.ws_dedup_log_skips = ws_dedup_log_skips
         self.ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
@@ -4362,6 +4372,7 @@ def clear_dirty_restart(
             or monitoring.kill_switch_triggered()
             or ops_kill_switch.tripped(),
             enforce_closed_bars=self.enforce_closed_bars,
+            close_lag_ms=self.close_lag_ms,
             ws_dedup_enabled=self.ws_dedup_enabled,
             ws_dedup_log_skips=self.ws_dedup_log_skips,
             ws_dedup_timeframe_ms=self.ws_dedup_timeframe_ms,
@@ -5556,6 +5567,7 @@ def from_config(
         shutdown_cfg=shutdown_cfg,
         monitoring_cfg=monitoring_cfg,
         enforce_closed_bars=cfg.timing.enforce_closed_bars,
+        close_lag_ms=cfg.timing.close_lag_ms,
         ws_dedup_enabled=cfg.ws_dedup.enabled,
         ws_dedup_log_skips=cfg.ws_dedup.log_skips,
         ws_dedup_timeframe_ms=cfg.timing.timeframe_ms,
