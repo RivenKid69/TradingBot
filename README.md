@@ -46,6 +46,25 @@ Runners load the symbol universe from ``data/universe/symbols.json`` by default.
 Override it with the ``--symbols`` CLI flag or an explicit ``data.symbols``
 entry in the YAML configuration.
 
+### Intrabar price configuration
+
+Simulation and training configs now ship with explicit intrabar execution
+settings.  The block ``execution`` in
+[`configs/config_sim.yaml`](configs/config_sim.yaml) defines:
+
+- ``intrabar_price_model`` — choose the price sampling mode.  ``bridge`` keeps
+  the legacy Brownian bridge sampling, while ``reference`` uses an external M1
+  reference feed for deterministic fills.
+- ``timeframe_ms`` — bar length in milliseconds.  Set it to ``3600000`` for H1
+  profiles to align latency fractions with hourly candles.
+- ``reference_prices_path`` — optional path to the precomputed M1 reference
+  dataset required by the ``reference`` mode.  Leave it ``null`` when using
+  ``bridge``/``linear`` sampling.
+
+The nested ``execution.bridge`` block mirrors the same fields for scenarios
+where the simulator works as a bridge adapter.  Override the values there when
+the adapter consumes a different intrabar data source than the main simulator.
+
 The list is managed by ``services/universe.py`` which caches Binance spot
 symbols trading against USDT.  The cache is refreshed on first use if it is
 missing or older than 24 hours and can be updated manually:
