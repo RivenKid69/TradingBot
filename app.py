@@ -53,7 +53,11 @@ from service_calibrate_slippage import (
     from_config as calibrate_slippage_from_config,
 )
 from service_calibrate_tcost import TCostCalibrateConfig, run as calibrate_tcost_run
-from service_signal_runner import ServiceSignalRunner, RunnerConfig
+from service_signal_runner import (
+    ServiceSignalRunner,
+    RunnerConfig,
+    clear_dirty_restart,
+)
 from service_eval import ServiceEval, EvalConfig
 
 
@@ -947,7 +951,7 @@ with tabs[6]:
 
     safe_state = runner_status.get("safe_mode", {}) or {}
     queue_info = runner_status.get("queue", {}) or {}
-    status_cols = st.columns(4)
+    status_cols = st.columns(5)
     with status_cols[0]:
         st.metric("Safe mode", "ON" if safe_state.get("active") else "OFF")
     with status_cols[1]:
@@ -959,12 +963,114 @@ with tabs[6]:
         st.metric("Workers", len(runner_status.get("workers", [])))
     with status_cols[3]:
         st.metric("Процесс", "запущен" if running else "остановлен")
+    dirty_status = runner_status.get("dirty_restart") or {}
+    dirty_active = bool(dirty_status.get("active"))
+    detected_ms = dirty_status.get("detected_at_ms")
+    detected_label = ""
+    if detected_ms:
+        try:
+            ts = datetime.fromtimestamp(float(detected_ms) / 1000.0)
+            detected_label = ts.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            detected_label = str(detected_ms)
+    with status_cols[4]:
+        st.metric(
+            "Dirty restart",
+            "YES" if dirty_active else "NO",
+            help=f"detected at {detected_label}" if detected_label else None,
+        )
 
     workers_payload = runner_status.get("workers") or []
     if workers_payload:
         st.dataframe(pd.DataFrame(workers_payload), use_container_width=True)
     else:
         st.info("Статус воркеров пока не доступен.")
+
+    marker_path = os.path.join(logs_dir, "shutdown.marker")
+    cfg_state = None
+    state_error: str | None = None
+    try:
+        cfg_live_obj = load_config(live_yaml)
+    except Exception as exc:
+        state_error = f"Не удалось загрузить config: {exc}"
+    else:
+        cfg_state = getattr(cfg_live_obj, "state", None)
+
+    control_cols = st.columns([2, 1])
+    with control_cols[0]:
+        confirm_clear = st.checkbox(
+            "Подтверждаю очистку dirty marker", key="confirm_dirty_clear"
+        )
+    with control_cols[1]:
+        clear_clicked = st.button(
+            "Clear dirty marker",
+            type="secondary",
+            disabled=running or not confirm_clear or state_error is not None or cfg_state is None,
+        )
+    if clear_clicked:
+        if state_error:
+            st.error(state_error)
+        elif cfg_state is None:
+            st.error("StateConfig не найден в config_live.yaml")
+        else:
+            result = clear_dirty_restart(
+                marker_path,
+                cfg_state,
+                runner_status_path=os.path.join(logs_dir, "runner_status.json"),
+            )
+            messages = []
+            if result.get("marker_removed"):
+                messages.append("marker удалён")
+            if result.get("state_cleared"):
+                messages.append("persistent state очищено")
+            if result.get("status_updated"):
+                messages.append("runner_status обновлён")
+            if messages:
+                st.success(
+                    f"Очистка завершена: {', '.join(messages)}"
+                )
+            if result.get("errors"):
+                st.error("Ошибки: " + "; ".join(map(str, result["errors"])))
+    elif state_error:
+        st.warning(state_error)
+
+    last_reload = runner_status.get("last_reload") or {}
+    reload_history = runner_status.get("reloads") or []
+    if last_reload:
+        ts_val = last_reload.get("timestamp_ms")
+        timestamp_str = ""
+        if ts_val:
+            try:
+                timestamp_str = datetime.fromtimestamp(float(ts_val) / 1000.0).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            except Exception:
+                timestamp_str = str(ts_val)
+        status_text = "успешно" if last_reload.get("success") else "ошибка"
+        st.info(f"Последний reload: {status_text} ({timestamp_str})")
+    if reload_history:
+        table_rows = []
+        for event in reversed(reload_history):
+            ts_val = event.get("timestamp_ms")
+            if ts_val:
+                try:
+                    ts_label = datetime.fromtimestamp(float(ts_val) / 1000.0).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                except Exception:
+                    ts_label = str(ts_val)
+            else:
+                ts_label = ""
+            table_rows.append(
+                {
+                    "timestamp": ts_label,
+                    "success": bool(event.get("success")),
+                    "errors": "; ".join(event.get("errors", [])) if event.get("errors") else "",
+                }
+            )
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+        with st.expander("Детали последнего reload", expanded=False):
+            st.json(last_reload)
 
     st.divider()
     cols = st.columns(3)
@@ -1734,120 +1840,102 @@ with tabs[11]:
     )
 
     files = {
+        "configs/config_live.yaml": "configs/config_live.yaml",
+        "configs/runtime.yaml": "configs/runtime.yaml",
+        "configs/ops.yaml": "configs/ops.yaml",
+        "configs/signals.yaml": "configs/signals.yaml",
         "configs/ingest.yaml": cfg_ingest,
         "configs/sandbox.yaml": cfg_sandbox,
         "configs/sim.yaml": cfg_sim,
         "configs/realtime.yaml": cfg_realtime,
     }
 
-    col_top = st.columns(2)
-    with col_top[0]:
-        choice = st.selectbox(
-            "Выберите файл для редактирования",
-            options=list(files.keys()),
-            index=0,
-            key="yaml_editor_choice",
-        )
-    with col_top[1]:
-        path = files.get(choice, choice)
-        st.text_input(
-            "Полный путь к выбранному файлу",
-            value=path,
-            key="yaml_editor_path",
-            disabled=True,
-        )
-
-    # читаем содержимое
-    initial_text = ""
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                initial_text = f.read()
-        else:
-            initial_text = "# файл не существует — будет создан при сохранении\n"
-    except Exception as e:
-        initial_text = f"# ошибка чтения файла: {e}\n"
-
-    content = st.text_area(
-        "Содержимое YAML", value=initial_text, height=500, key="yaml_editor_content"
+    choice = st.selectbox(
+        "Выберите файл для редактирования",
+        options=list(files.keys()),
+        index=0,
+        key="yaml_editor_choice",
+    )
+    path = os.path.expanduser(str(files.get(choice, choice) or "").strip())
+    st.text_input(
+        "Полный путь к выбранному файлу",
+        value=path,
+        key="yaml_editor_path",
+        disabled=True,
     )
 
-    col_actions = st.columns(3)
-    with col_actions[0]:
-        if st.button("Проверить YAML", type="primary", key="yaml_editor_check"):
-            try:
-                fname = os.path.basename(path).lower()
-                if not content.strip():
-                    data = {}
-                elif fname == "ingest.yaml":
-                    data = parse_ingest_config(content).model_dump()
-                elif fname == "sandbox.yaml":
-                    data = parse_sandbox_config(content).model_dump()
-                else:
-                    data = load_config_from_str(content).model_dump()
-                st.success("YAML синтаксически корректен")
-                # базовая валидация по типичным ключам
-                issues = []
+    def _read_yaml_file(target: str) -> str:
+        if not target:
+            return ""
+        if not os.path.exists(target):
+            return "# файл не существует — будет создан при сохранении\n"
+        try:
+            with open(target, "r", encoding="utf-8") as fh:
+                return fh.read()
+        except Exception as exc:
+            return f"# ошибка чтения файла: {exc}\n"
 
-                if fname == "ingest.yaml":
-                    required = ["symbols", "market", "intervals", "period", "paths"]
-                    for k in required:
-                        if not isinstance(data, dict) or k not in data:
-                            issues.append(f"нет ключа '{k}'")
-                elif fname == "sandbox.yaml":
-                    required = ["mode", "symbol", "sim_config_path", "strategy", "data"]
-                    for k in required:
-                        if not isinstance(data, dict) or k not in data:
-                            issues.append(f"нет ключа '{k}'")
-                elif fname == "sim.yaml":
-                    soft_any = any(
-                        k in (data or {})
-                        for k in ["fees", "slippage", "risk", "pnl", "leakguard"]
-                    )
-                    if not soft_any:
-                        issues.append(
-                            "не найден ни один из ожидаемых блоков: fees/slippage/risk/pnl/leakguard"
-                        )
-                elif fname == "realtime.yaml":
-                    required = ["market", "symbols", "interval", "strategy", "out_csv"]
-                    for k in required:
-                        if not isinstance(data, dict) or k not in data:
-                            issues.append(f"нет ключа '{k}'")
+    initial_text = _read_yaml_file(path)
+    state_key = f"yaml_editor_content::{choice}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = initial_text
+    content = st.text_area(
+        "Содержимое YAML",
+        value=st.session_state[state_key],
+        height=500,
+        key=state_key,
+    )
 
-                if issues:
-                    st.warning("Базовая проверка структуры: замечания ниже")
-                    for it in issues:
-                        st.write(f"- {it}")
-                else:
-                    st.info("Базовая проверка структуры: ок")
-            except Exception as e:
-                st.error(f"Ошибка синтаксиса YAML: {e}")
+    st.caption("Diff с содержимым на диске")
+    _show_diff(initial_text, content, os.path.basename(path) or choice)
 
-    with col_actions[1]:
-        if st.button("Сохранить", type="secondary", key="yaml_editor_save"):
-            try:
-                fname = os.path.basename(path).lower()
-                if content.strip():
-                    if fname == "ingest.yaml":
-                        parse_ingest_config(content)
-                    elif fname == "sandbox.yaml":
-                        parse_sandbox_config(content)
-                    else:
-                        load_config_from_str(content)
-                _ensure_dir(path)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                st.success(f"Сохранено: {path}")
-            except Exception as e:
-                st.error(f"Не удалось сохранить: {e}")
+    action_cols = st.columns(3)
+    validate_clicked = action_cols[0].button(
+        "Validate", type="primary", key=f"yaml_validate::{choice}"
+    )
+    save_clicked = action_cols[1].button(
+        "Save", type="secondary", key=f"yaml_save::{choice}"
+    )
+    reload_clicked = action_cols[2].button(
+        "Reload", key=f"yaml_reload::{choice}"
+    )
 
-    with col_actions[2]:
-        if st.button("Открыть текущий файл", key="yaml_editor_open"):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    st.code(f.read(), language="yaml")
-            except Exception as e:
-                st.error(str(e))
+    if validate_clicked:
+        fname = os.path.basename(path).lower()
+        try:
+            if not content.strip():
+                yaml.safe_load("{}")
+            elif fname == "ingest.yaml":
+                parse_ingest_config(content)
+            elif fname == "sandbox.yaml":
+                parse_sandbox_config(content)
+            elif fname in {"sim.yaml", "realtime.yaml", "config_live.yaml"}:
+                load_config_from_str(content)
+            else:
+                yaml.safe_load(content)
+        except Exception as exc:
+            st.error(f"Ошибка проверки: {exc}")
+        else:
+            st.success("YAML синтаксически корректен")
+
+    if save_clicked:
+        try:
+            _ensure_dir(path)
+            atomic_write_with_retry(path, content)
+        except Exception as exc:
+            st.error(f"Не удалось сохранить: {exc}")
+        else:
+            st.session_state[state_key] = content
+            st.success(f"Сохранено: {path}")
+
+    if reload_clicked:
+        st.session_state[state_key] = _read_yaml_file(path)
+        st.session_state[f"yaml_reload_notice::{choice}"] = True
+        st.experimental_rerun()
+
+    notice_key = f"yaml_reload_notice::{choice}"
+    if st.session_state.pop(notice_key, False):
+        st.success(f"Перечитано с диска: {path}")
 
     st.divider()
     st.subheader("Подсказки по ключам (необязательные)")

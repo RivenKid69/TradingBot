@@ -840,3 +840,44 @@ def save_state(
                     with suppress(Exception):
                         shutil.copy2(bak, p)
             raise
+
+
+def clear_state(
+    path: str | Path,
+    *,
+    backend: str | StateBackend = "json",
+    lock_path: str | Path | None = None,
+    backup_keep: int = 0,
+) -> None:
+    """Remove persistent state files and reset in-memory snapshot."""
+
+    p = Path(path)
+    backend_obj = _get_backend(backend)
+    lock_p = Path(lock_path) if lock_path else p.with_suffix(p.suffix + ".lock")
+    with _file_lock(lock_p):
+        # Remove primary file and known artefacts
+        with suppress(Exception):
+            if p.exists():
+                p.unlink()
+        with suppress(Exception):
+            tmp_path = p.with_name(p.name + ".tmp")
+            if tmp_path.exists():
+                tmp_path.unlink()
+        if backup_keep != 0:
+            for candidate in p.parent.glob(f"{p.name}.bak*"):
+                with suppress(Exception):
+                    candidate.unlink()
+            plain_backup = p.with_name(p.name + ".bak")
+            with suppress(Exception):
+                if plain_backup.exists():
+                    plain_backup.unlink()
+        # Backend specific clean-up (sqlite writes auxiliary files)
+        if isinstance(backend_obj, SQLiteBackend):
+            for suffix in ("-wal", "-shm"):
+                sidecar = p.with_suffix(p.suffix + suffix)
+                with suppress(Exception):
+                    if sidecar.exists():
+                        sidecar.unlink()
+    global _state
+    with _state_lock:
+        _state = TradingState()
