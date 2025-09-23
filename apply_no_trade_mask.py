@@ -41,12 +41,42 @@ def _write_table(df: pd.DataFrame | Sequence[bool], path: str) -> None:
     raise ValueError(f"Неизвестный формат файла вывода: {ext}")
 
 
-def _blocked_durations(ts_ms: Sequence[int], mask: Sequence[bool]) -> np.ndarray:
-    """Return durations of consecutive blocked intervals in minutes."""
-    ts = pd.to_numeric(ts_ms, errors="coerce").to_numpy(dtype=np.int64)
+def _blocked_durations(
+    ts_ms: Sequence[int],
+    mask: Sequence[bool],
+    *,
+    bar_length_ms: int | None = None,
+) -> np.ndarray:
+    """Return durations of consecutive blocked intervals in minutes.
+
+    Args:
+        ts_ms: Timestamp of each bar in milliseconds.
+        mask: Boolean mask marking blocked bars.
+        bar_length_ms: Optional bar duration in milliseconds. If not provided,
+            the smallest positive step inferred from ``ts_ms`` is used.
+    """
+    ts_numeric = pd.to_numeric(ts_ms, errors="coerce")
+    if isinstance(ts_numeric, pd.Series):
+        ts = ts_numeric.to_numpy(dtype=np.int64)
+    else:
+        ts = np.asarray(ts_numeric, dtype=np.int64)
     m = np.asarray(mask, dtype=bool)
     if ts.size == 0 or not m.any():
         return np.empty(0, dtype=float)
+
+    inferred_step = None
+    if bar_length_ms is None:
+        unique_ts = np.unique(ts)
+        diffs = np.diff(unique_ts)
+        positive_diffs = diffs[diffs > 0]
+        if positive_diffs.size:
+            inferred_step = int(positive_diffs.min())
+    else:
+        inferred_step = int(bar_length_ms)
+
+    if inferred_step is None or inferred_step <= 0:
+        inferred_step = 0
+
     diff = np.diff(m.astype(int))
     start_idx = np.where(diff == 1)[0] + 1
     end_idx = np.where(diff == -1)[0] + 1
@@ -54,7 +84,7 @@ def _blocked_durations(ts_ms: Sequence[int], mask: Sequence[bool]) -> np.ndarray
         start_idx = np.r_[0, start_idx]
     if m[-1]:
         end_idx = np.r_[end_idx, len(m)]
-    durations_ms = ts[end_idx - 1] - ts[start_idx]
+    durations_ms = ts[end_idx - 1] - ts[start_idx] + inferred_step
     return durations_ms / 60_000.0
 
 
@@ -210,7 +240,11 @@ def main():
     def _maybe_emit_histogram(mask: Sequence[bool]) -> None:
         if args.histogram is None:
             return
-        durations = _blocked_durations(df[args.ts_col], mask)
+        durations = _blocked_durations(
+            df[args.ts_col],
+            mask,
+            bar_length_ms=int(tf_ms),
+        )
         if durations.size:
             hist, bin_edges = np.histogram(durations, bins="auto")
             lines = ["Гистограмма длительностей блоков (минуты):"]
