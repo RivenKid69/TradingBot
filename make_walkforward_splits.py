@@ -8,7 +8,7 @@ import os
 import pandas as pd
 import yaml
 
-from training.splits import make_walkforward_splits
+from splits import make_walkforward_splits
 
 
 def _read_table(path: str) -> pd.DataFrame:

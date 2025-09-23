@@ -8,7 +8,7 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
-from training.drift import make_baseline, save_baseline_json, default_feature_list
+from drift import make_baseline, save_baseline_json, default_feature_list
 
 
 def _read_table(path: str) -> pd.DataFrame:
