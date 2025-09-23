@@ -1,6 +1,7 @@
 # sim/fees.py
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 from decimal import (
@@ -972,9 +973,53 @@ class FeesModel:
             else:
                 requires_conversion = True
 
-        rounding_enabled, rounding_step, _ = self._resolve_rounding_context(symbol)
+        rounding_enabled, rounding_step, rounding_options = self._resolve_rounding_context(
+            symbol
+        )
+        adjusted_rounding_step = rounding_step
+        adjusted_rounding_options = rounding_options
+
+        if (
+            rounding_enabled
+            and use_bnb_settlement
+            and conversion_used is not None
+            and conversion_used > 0.0
+        ):
+            if rounding_step is not None and rounding_step > 0.0:
+                adjusted_rounding_step = float(rounding_step) / conversion_used
+
+            if rounding_options:
+                adjusted_rounding_options = copy.deepcopy(rounding_options)
+
+                def _scale_rounding_payload(payload: Dict[str, Any]) -> None:
+                    for key, value in list(payload.items()):
+                        if isinstance(value, Mapping):
+                            _scale_rounding_payload(value)
+                        elif isinstance(value, list):
+                            scaled_items = []
+                            for item in value:
+                                if isinstance(item, Mapping):
+                                    item_copy = copy.deepcopy(item)
+                                    _scale_rounding_payload(item_copy)
+                                    scaled_items.append(item_copy)
+                                elif isinstance(item, (int, float)) and not isinstance(item, bool):
+                                    scaled_items.append(float(item) / conversion_used)
+                                else:
+                                    scaled_items.append(item)
+                            payload[key] = scaled_items
+                        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                            if key not in {"precision", "decimals"}:
+                                payload[key] = float(value) / conversion_used
+
+                _scale_rounding_payload(adjusted_rounding_options)
+
         fee_before_rounding = float(effective_fee)
-        effective_fee = self._round_fee(effective_fee, symbol)
+        if rounding_enabled:
+            effective_fee = _apply_rounding_rules(
+                float(effective_fee),
+                step=adjusted_rounding_step,
+                options=adjusted_rounding_options,
+            )
         final_fee = float(_sanitize_non_negative(effective_fee, 0.0))
 
         if not return_details:
@@ -986,12 +1031,18 @@ class FeesModel:
             step_candidate = _sanitize_positive_float(cfg.commission_step)
             if step_candidate is not None and step_candidate > 0.0:
                 commission_step = float(step_candidate)
-        if commission_step is None and rounding_step is not None and rounding_step > 0.0:
-            commission_step = float(rounding_step)
+                if conversion_used is not None and conversion_used > 0.0:
+                    commission_step = commission_step / conversion_used
+        if (
+            commission_step is None
+            and adjusted_rounding_step is not None
+            and adjusted_rounding_step > 0.0
+        ):
+            commission_step = float(adjusted_rounding_step)
 
         rounded_step = None
-        if rounding_step is not None and rounding_step > 0.0:
-            rounded_step = float(rounding_step)
+        if adjusted_rounding_step is not None and adjusted_rounding_step > 0.0:
+            rounded_step = float(adjusted_rounding_step)
 
         return FeeComputation(
             fee=final_fee,
