@@ -9,7 +9,7 @@ import pandas as pd
 import yaml
 from pydantic import BaseModel, Field
 
-from training.tcost import effective_return_series
+from trainingtcost import effective_return_series
 
 
 class SimFeesConfig(BaseModel):

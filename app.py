@@ -3109,7 +3109,7 @@ with tabs[14]:
     import os
     import pandas as pd
     import yaml
-    from training.tcost import effective_return_series
+    from trainingtcost import effective_return_series
 
     def _read_table(path: str) -> pd.DataFrame:
         ext = os.path.splitext(path)[1].lower()
@@ -3199,7 +3199,7 @@ with tabs[15]:
 
     import os
     import pandas as pd
-    from training.no_trade import compute_no_trade_mask
+    from no_trade import compute_no_trade_mask
 
     def _read_table_mask(path: str) -> pd.DataFrame:
         ext = os.path.splitext(path)[1].lower()
@@ -3279,7 +3279,7 @@ with tabs[16]:
     import json
     import pandas as pd
     import yaml
-    from training.splits import make_walkforward_splits
+    from splits import make_walkforward_splits
 
     def _read_table_wf(path: str) -> pd.DataFrame:
         ext = os.path.splitext(path)[1].lower()
@@ -3397,7 +3397,7 @@ with tabs[17]:
 
     import os
     import pandas as pd
-    from training.threshold_tuner import (
+    from threshold_tuner import (
         TuneConfig,
         tune_threshold,
         load_min_signal_gap_s_from_yaml,
@@ -3686,7 +3686,7 @@ with tabs[19]:
     import os
     import numpy as np
     import pandas as pd
-    from training.drift import (
+    from drift import (
         make_baseline,
         save_baseline_json,
         load_baseline_json,

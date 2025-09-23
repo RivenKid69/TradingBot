@@ -3,7 +3,7 @@ import os
 
 import pandas as pd
 
-from training.threshold_tuner import (
+from threshold_tuner import (
     TuneConfig,
     tune_threshold,
     load_min_signal_gap_s_from_yaml,
