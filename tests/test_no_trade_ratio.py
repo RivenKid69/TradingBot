@@ -273,8 +273,10 @@ def test_maintenance_calendar_blocks_rows(tmp_path):
     reasons = mask.attrs.get("reasons")
     assert isinstance(reasons, pd.DataFrame)
     actual_calendar = reasons["maintenance_calendar"].tolist()
-    assert reasons["maintenance_daily"].tolist() == actual_calendar
-    assert reasons["maintenance_custom"].tolist() == actual_calendar
+    expected_false = [False] * len(df)
+    assert reasons["maintenance_daily"].tolist() == expected_false
+    assert reasons["maintenance_custom"].tolist() == expected_false
+    assert reasons["window"].tolist() == actual_calendar
 
     state_payload = mask.attrs.get("state")
     assert isinstance(state_payload, dict)
@@ -427,8 +429,10 @@ def test_calendar_format_override_and_merge(tmp_path):
     expected = [False, True, True, True, True]
     assert mask.tolist() == expected
     assert reasons["maintenance_calendar"].tolist() == expected
-    assert reasons["maintenance_daily"].tolist() == expected
-    assert reasons["maintenance_custom"].tolist() == expected
+    expected_false = [False] * len(df)
+    assert reasons["maintenance_daily"].tolist() == expected_false
+    assert reasons["maintenance_custom"].tolist() == expected_false
+    assert reasons["window"].tolist() == expected
 
     state_payload = mask.attrs.get("state") or {}
     calendar_state = (state_payload.get("maintenance") or {}).get("calendar") or {}
