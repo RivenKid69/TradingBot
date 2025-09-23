@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -20,6 +20,13 @@ from build_adv_base import (
 )
 from build_adv import _normalize_rest_budget_config, _load_offline_config as _load_offline_defaults
 from services.rest_budget import RestBudgetSession
+from scripts.offline_utils import (
+    SplitArtifact,
+    apply_split_tag,
+    ms_to_iso,
+    resolve_split_artifact,
+    window_days as compute_window_days,
+)
 
 
 STATS_PATH = Path("logs/offline/build_adv_hourly_stats.json")
@@ -237,6 +244,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Path to offline YAML config providing default rest budget settings",
     )
     parser.add_argument(
+        "--split",
+        default=None,
+        help="Dataset split identifier defined in the offline config",
+    )
+    parser.add_argument(
         "--clip-lower",
         type=float,
         default=5.0,
@@ -260,7 +272,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Minimum total valid days before computing ADV",
     )
-    parser.add_argument("--out", required=True, help="Destination JSON path")
+    parser.add_argument("--out", help="Destination JSON path")
     return parser.parse_args(argv)
 
 
@@ -285,7 +297,40 @@ def main(argv: Sequence[str] | None = None) -> None:
     refresh_default = _pick_meta_number(universe_meta, "refresh_days")
     floor_default = _pick_meta_number(universe_meta, "adv_floor")
 
+    offline_payload: Mapping[str, Any] | dict[str, Any] = {}
+    if args.config:
+        try:
+            offline_payload = _load_offline_defaults(Path(args.config))
+        except Exception:
+            offline_payload = {}
+
+    split_info: SplitArtifact | None = None
+    if args.split:
+        if not offline_payload:
+            raise SystemExit("Offline config required when using --split")
+        try:
+            split_info = resolve_split_artifact(offline_payload, args.split, "adv")
+        except KeyError as exc:
+            raise SystemExit(f"Unknown split {args.split!r} in offline config") from exc
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if (
+            split_info.config_start_ms is not None
+            and split_info.config_end_ms is not None
+            and split_info.config_end_ms < split_info.config_start_ms
+        ):
+            raise SystemExit(
+                f"Configured window for split {split_info.split_name!r} has end before start"
+            )
+
     window_days = int(args.window_days or window_default or 30)
+    if args.window_days is None and split_info:
+        derived = compute_window_days(split_info.config_start_ms, split_info.config_end_ms)
+        if derived:
+            window_days = int(derived)
+    if window_days <= 0:
+        window_days = 1
+
     refresh_days: int | None = None
     if args.refresh_days is not None:
         refresh_days = max(0, int(args.refresh_days))
@@ -309,21 +354,32 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("No symbols resolved; provide --symbols or --symbols-file")
 
     unique_symbols = _normalize_symbols(symbols)
-    out_path = Path(args.out)
+    if split_info:
+        base_out = Path(args.out) if args.out else split_info.output_path
+        if base_out is None:
+            raise SystemExit(
+                "offline config for split is missing adv.output_path; provide --out to override"
+            )
+        out_path = apply_split_tag(base_out, split_info.tag)
+    else:
+        if not args.out:
+            raise SystemExit("--out is required when --split is not provided")
+        out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    now = datetime.now(timezone.utc)
-    end_dt = now
-    start_dt = end_dt - timedelta(days=window_days)
-    start_ms = int(start_dt.timestamp() * 1000)
-    end_ms = int(end_dt.timestamp() * 1000)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    end_ms = now_ms
+    if split_info and split_info.config_end_ms is not None:
+        end_ms = min(end_ms, int(split_info.config_end_ms))
 
-    offline_payload: Mapping[str, Any] | dict[str, Any] = {}
-    if args.config:
-        try:
-            offline_payload = _load_offline_defaults(Path(args.config))
-        except Exception:
-            offline_payload = {}
+    if split_info and split_info.config_start_ms is not None:
+        start_ms = int(split_info.config_start_ms)
+    else:
+        start_ms = end_ms - window_days * 86_400_000
+    if start_ms < 0:
+        start_ms = 0
+    if end_ms < start_ms:
+        end_ms = start_ms
     offline_rest_cfg = _normalize_rest_budget_config(
         offline_payload.get("rest_budget") if isinstance(offline_payload, Mapping) else None
     )
@@ -456,6 +512,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         "data": results,
     }
 
+    data_window: dict[str, Any] = {
+        "actual": {
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "start": ms_to_iso(start_ms),
+            "end": ms_to_iso(end_ms),
+        }
+    }
+    if split_info:
+        data_window["config"] = split_info.configured_window
+        payload["meta"]["split"] = split_info.split_metadata
+    payload["meta"]["data_window"] = data_window
+
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -480,6 +549,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "symbols": unique_symbols,
                 "window_days": window_days,
                 "built_at": payload["meta"]["built_at"],
+                "data_window": data_window["actual"],
             },
             ensure_ascii=False,
         )

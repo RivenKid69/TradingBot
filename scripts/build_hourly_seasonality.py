@@ -20,6 +20,17 @@ import numpy as np
 import pandas as pd
 
 from utils.time import hour_of_week
+from scripts.offline_utils import (
+    SplitArtifact,
+    apply_split_tag,
+    load_offline_payload,
+    ms_to_iso,
+    resolve_split_artifact,
+    window_days as compute_window_days,
+)
+
+
+DEFAULT_OUTPUT = Path("data/latency/liquidity_latency_seasonality.json")
 
 
 def load_logs(path: Path) -> pd.DataFrame:
@@ -157,7 +168,7 @@ def main() -> None:
     )
     parser.add_argument(
         '--out',
-        default='data/latency/liquidity_latency_seasonality.json',
+        default=None,
         help='Output JSON path (backups stored in data/latency/backups)',
     )
     parser.add_argument(
@@ -211,7 +222,55 @@ def main() -> None:
         action='store_true',
         help='Aggregate by day-of-week and interpolate to 168-hour array',
     )
+    parser.add_argument(
+        '--config',
+        default='configs/offline.yaml',
+        help='Offline configuration with dataset split definitions',
+    )
+    parser.add_argument(
+        '--split',
+        default=None,
+        help='Dataset split identifier providing window bounds and output path',
+    )
     args = parser.parse_args()
+
+    split_info: SplitArtifact | None = None
+    if args.split:
+        try:
+            payload = load_offline_payload(args.config)
+        except FileNotFoundError:
+            raise SystemExit(f'Offline config not found: {args.config}')
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        try:
+            split_info = resolve_split_artifact(payload, args.split, 'seasonality')
+        except KeyError as exc:
+            raise SystemExit(f"Unknown split {args.split!r} in offline config") from exc
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if (
+            split_info.config_start_ms is not None
+            and split_info.config_end_ms is not None
+            and split_info.config_end_ms < split_info.config_start_ms
+        ):
+            raise SystemExit(
+                f"Configured window for split {split_info.split_name!r} has end before start"
+            )
+
+    base_out = Path(args.out) if args.out else DEFAULT_OUTPUT
+    if split_info:
+        if split_info.output_path is not None and not args.out:
+            base_out = split_info.output_path
+        out_path = apply_split_tag(base_out, split_info.tag)
+    else:
+        out_path = base_out
+
+    if split_info:
+        config_window_days = compute_window_days(
+            split_info.config_start_ms, split_info.config_end_ms
+        )
+    else:
+        config_window_days = None
 
     data_path = Path(args.data)
     df = load_logs(data_path)
@@ -222,14 +281,24 @@ def main() -> None:
     if ts_column is None:
         raise SystemExit('Input data must contain ts or ts_ms column')
 
+    ts_numeric = pd.to_numeric(df[ts_column], errors='coerce')
+    if ts_numeric.isna().all():
+        parsed = pd.to_datetime(df[ts_column], utc=True, errors='coerce')
+        ts_numeric = (parsed.view('int64') // 1_000_000)
+    mask = ts_numeric.notna()
+    if split_info and split_info.config_start_ms is not None:
+        mask &= ts_numeric >= split_info.config_start_ms
+    if split_info and split_info.config_end_ms is not None:
+        mask &= ts_numeric <= split_info.config_end_ms
+    if not mask.any():
+        raise SystemExit('No data available after applying split window filters')
+    if not mask.all():
+        df = df.loc[mask].copy()
+        ts_numeric = ts_numeric.loc[mask]
     if args.window_days and args.window_days > 0:
-        ts_numeric = pd.to_numeric(df[ts_column], errors='coerce')
-        if ts_numeric.isna().all():
-            raise SystemExit(
-                'Unable to apply --window-days filter because timestamp column contains only NaNs'
-            )
         cutoff = ts_numeric.max() - (args.window_days * 86_400_000)
-        filtered_df = df.loc[ts_numeric >= cutoff].copy()
+        mask_window = ts_numeric >= cutoff
+        filtered_df = df.loc[mask_window].copy()
         if filtered_df.empty:
             raise SystemExit(
                 'No data available after applying --window-days '
@@ -237,10 +306,15 @@ def main() -> None:
             )
         removed = len(df) - len(filtered_df)
         df = filtered_df
+        ts_numeric = ts_numeric.loc[mask_window]
         print(
             f'Applied --window-days={args.window_days}: kept {len(df)} rows, '
             f'removed {removed} rows.'
         )
+
+    observed = ts_numeric.dropna()
+    actual_start_ms = int(observed.min()) if not observed.empty else None
+    actual_end_ms = int(observed.max()) if not observed.empty else None
     prior: Optional[Dict[str, np.ndarray]] = None
     if args.prior_metrics:
         with open(args.prior_metrics, 'r') as f:
@@ -267,11 +341,17 @@ def main() -> None:
             mean = 1.0
         multipliers[key] = arr / mean
 
-    out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.window_days and args.window_days > 0:
+        window_days_meta = int(args.window_days)
+    elif config_window_days:
+        window_days_meta = int(config_window_days)
+    else:
+        computed_window = compute_window_days(actual_start_ms, actual_end_ms)
+        window_days_meta = int(computed_window) if computed_window else 0
     meta = {
         'built_at': datetime.utcnow().isoformat(timespec='seconds') + 'Z',
-        'window_days': int(args.window_days),
+        'window_days': window_days_meta,
         'smoothing': {
             'rolling_window': args.smooth_window,
             'regularization_alpha': args.smooth_alpha,
@@ -281,6 +361,18 @@ def main() -> None:
             'bottom': args.trim_bottom,
         },
     }
+    data_window_meta = {
+        'actual': {
+            'start_ms': actual_start_ms,
+            'end_ms': actual_end_ms,
+            'start': ms_to_iso(actual_start_ms),
+            'end': ms_to_iso(actual_end_ms),
+        }
+    }
+    if split_info:
+        data_window_meta['config'] = split_info.configured_window
+        meta['split'] = split_info.split_metadata
+    meta['data_window'] = data_window_meta
     if args.symbol:
         out_data = {
             str(args.symbol): {k: v.tolist() for k, v in multipliers.items()},
@@ -313,7 +405,7 @@ def main() -> None:
         for key, hours in imputed.items():
             print(f'Imputed {key} multipliers for hours: {sorted(hours)}')
     checksum_path = write_checksum(data_path)
-    print(f'Saved seasonality multipliers to {args.out} (backups in {backup_dir})')
+    print(f'Saved seasonality multipliers to {out_path} (backups in {backup_dir})')
     print(f'Input data checksum written to {checksum_path}')
 
 
