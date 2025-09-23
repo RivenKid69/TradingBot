@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 import yaml
 
 from build_adv_base import BuildAdvConfig, build_adv
+from offline_config import normalize_dataset_splits
 from services.rest_budget import RestBudgetSession
 from utils_time import parse_time_to_ms
 
@@ -106,7 +107,12 @@ def _load_offline_config(path: Path) -> dict[str, Any]:
             file=sys.stderr,
         )
         return {}
-    return dict(payload)
+    normalized: dict[str, Any] = dict(payload)
+    datasets_raw = payload.get("datasets")
+    if not isinstance(datasets_raw, Mapping):
+        datasets_raw = payload.get("dataset_splits")
+    normalized["datasets"] = normalize_dataset_splits(datasets_raw)
+    return normalized
 
 
 def _merge_mappings(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
