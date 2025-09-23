@@ -149,38 +149,43 @@ void OrderBook::swap(OrderBook& other)
 /* ------------------------------------------------------------------ /
 / remove_order /
 / ------------------------------------------------------------------ */
-template<typename MapT>
-static void erase_and_reindex(MapT& book,
-long long price,
-long long oid,
-std::unordered_map<long long, PriceLevelIdx>& idx)
+template <typename MapT>
+static void erase_and_reindex(
+    MapT& book,
+    long long price,
+    long long oid,
+    std::unordered_map<long long, PriceLevelIdx>& idx)
 {
-auto it = book.find(price);
-if (it == book.end()) return;
-
-perl
-Копировать код
-auto& dq = it->second;
-for (std::size_t i = 0; i < dq.size(); ++i) {
-    if (dq[i].id == oid) {
-        dq.erase(dq.begin() + static_cast<long long>(i));
-        idx.erase(oid);
-        for (std::size_t j = i; j < dq.size(); ++j)
-            idx[dq[j].id].position = static_cast<uint32_t>(j);
-        break;
+    auto it = book.find(price);
+    if (it == book.end()) {
+        return;
     }
-}
-if (dq.empty()) book.erase(it);
+
+    auto& dq = it->second;
+    for (std::size_t i = 0; i < dq.size(); ++i) {
+        if (dq[i].id == oid) {
+            dq.erase(dq.begin() + static_cast<long long>(i));
+            idx.erase(oid);
+            for (std::size_t j = i; j < dq.size(); ++j) {
+                idx[dq[j].id].position = static_cast<uint32_t>(j);
+            }
+            break;
+        }
+    }
+    if (dq.empty()) {
+        book.erase(it);
+    }
 }
 
 void OrderBook::remove_order(bool is_buy_side,
-long long price,
-long long order_id)
+                             long long price,
+                             long long order_id)
 {
-if (is_buy_side)
-erase_and_reindex(bids, price, order_id, idx_map);
-else
-erase_and_reindex(asks, price, order_id, idx_map);
+    if (is_buy_side) {
+        erase_and_reindex(bids, price, order_id, idx_map);
+    } else {
+        erase_and_reindex(asks, price, order_id, idx_map);
+    }
 }
 
 bool OrderBook::set_order_ttl(uint64_t order_id, int ttl_steps) {
