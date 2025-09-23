@@ -16,6 +16,7 @@ from typing import Any, Iterable, Iterator, List, Mapping, MutableMapping, Seque
 import yaml
 
 from binance_public import BinancePublicClient
+from offline_config import normalize_dataset_splits
 from services.rest_budget import RestBudgetSession
 
 DEFAULT_CHUNK_SIZE = 100
@@ -197,7 +198,9 @@ def _normalize_rest_budget_sections(
     return session_cfg, shuffle_cfg
 
 
-def _load_offline_config(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+def _load_offline_config(
+    path: Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     try:
         with path.open("r", encoding="utf-8") as f:
             payload = yaml.safe_load(f) or {}
@@ -230,7 +233,13 @@ def _load_offline_config(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     else:
         script_cfg = dict(script_cfg_raw)
 
-    return rest_cfg, script_cfg
+    datasets_raw = payload.get("datasets")
+    if not isinstance(datasets_raw, Mapping):
+        datasets_raw = payload.get("dataset_splits")
+
+    dataset_splits = normalize_dataset_splits(datasets_raw)
+
+    return rest_cfg, script_cfg, dataset_splits
 
 
 def _coerce_positive_int(value: Any) -> int | None:
@@ -443,7 +452,7 @@ def main(argv: List[str] | None = None) -> int:
     args = _parse_args(argv)
     symbols = _load_symbols(args)
     config_path = Path(args.config or _default_offline_config_path())
-    rest_cfg, script_cfg = _load_offline_config(config_path)
+    rest_cfg, script_cfg, _ = _load_offline_config(config_path)
     chunk_size = _resolve_chunk_size(script_cfg)
     checkpoint_threshold = _resolve_checkpoint_threshold(script_cfg, chunk_size)
 
