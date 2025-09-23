@@ -1,6 +1,7 @@
 import pathlib, sys
 sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent))
 from risk_guard import RiskGuard, RiskConfig, RiskEvent
+from action_proto import ActionProto, ActionType
 
 class DummyState:
     def __init__(self):
@@ -19,3 +20,24 @@ def test_risk_guard_reset():
     assert not rg._nw_hist
     assert not rg._peak_nw_window
     assert rg._last_event == RiskEvent.NONE
+
+
+class DummyStateNoMax:
+    def __init__(self):
+        self.cash = 0.0
+        self.units = 0.0
+
+
+def test_risk_guard_uses_cfg_limit_when_state_max_missing():
+    cfg = RiskConfig(max_abs_position=5.0)
+    rg = RiskGuard(cfg)
+    st = DummyStateNoMax()
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=1.0)
+
+    event = rg.on_action_proposed(st, proto)
+
+    assert event == RiskEvent.NONE
+    max_pos = rg._get_max_position_from_state_or_cfg(st, cfg)
+    assert max_pos == cfg.max_abs_position
+    proposed_units = st.units + proto.volume_frac * max_pos
+    assert proposed_units == cfg.max_abs_position

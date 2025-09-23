@@ -80,10 +80,13 @@ class RiskGuard:
     @staticmethod
     def _get_max_position_from_state_or_cfg(state, cfg: RiskConfig) -> float:
         mp = float(getattr(state, "max_position", 0.0) or 0.0)
-        if mp <= 0.0:
-            # если в стейте не задано — хеджируемся конфигом (не строже max_abs_position)
-            mp = min(1.0, cfg.max_abs_position)  # «1 контракт» как «минимум», но не выше hard-cap
-        return float(mp)
+        if mp > 0.0 and math.isfinite(mp):
+            return mp
+
+        cfg_mp = float(cfg.max_abs_position)
+        if not math.isfinite(cfg_mp) or cfg_mp <= 0.0:
+            cfg_mp = 1.0
+        return float(cfg_mp)
 
     @staticmethod
     def _notional(state, mid_price: float) -> float:
