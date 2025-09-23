@@ -75,11 +75,14 @@ def test_bnb_fee_conversion_updates_equity(volume_frac):
     trade = report.trades[0]
 
     discount_mult = 0.75
-    expected_fee = trade.price * trade.qty * (taker_bps * discount_mult) / 1e4
+    expected_fee_quote = trade.price * trade.qty * (taker_bps * discount_mult) / 1e4
+    expected_fee_bnb = expected_fee_quote / conversion_rate
 
     fees_delta = sim.fees_cum - fees_before
-    assert math.isclose(fees_delta, expected_fee, rel_tol=1e-9)
-    assert math.isclose(report.fee_total, expected_fee, rel_tol=1e-9)
+    assert math.isclose(fees_delta, expected_fee_quote, rel_tol=1e-9)
+    assert math.isclose(report.fee_total, expected_fee_bnb, rel_tol=1e-9)
+    assert math.isclose(trade.fee, expected_fee_bnb, rel_tol=1e-9)
+    assert math.isclose(report.fee_total * conversion_rate, expected_fee_quote, rel_tol=1e-9)
 
     eq_delta = report.equity - baseline.equity
     realized_delta = report.realized_pnl - baseline.realized_pnl
@@ -88,7 +91,7 @@ def test_bnb_fee_conversion_updates_equity(volume_frac):
 
     assert math.isclose(
         eq_delta - realized_delta - unrealized_delta - funding_delta,
-        -expected_fee,
+        -expected_fee_quote,
         rel_tol=1e-9,
     )
 
