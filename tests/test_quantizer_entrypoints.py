@@ -41,6 +41,7 @@ from core_config import Components, load_config
 from core_config import RetryConfig
 import di_registry
 from impl_quantizer import QuantizerImpl, QuantizerConfig
+from quantizer import Quantizer
 
 
 def _components_stub() -> Components:
@@ -162,3 +163,23 @@ def test_quantizer_refresh_is_debounced(monkeypatch, tmp_path):
     QuantizerImpl(cfg)
 
     assert len(run_calls) == 1
+
+
+def test_quantizer_accepts_percent_price_without_multipliers():
+    filters = {
+        "BTCUSDT": {
+            "PRICE_FILTER": {"tickSize": "0.01"},
+            "LOT_SIZE": {"stepSize": "0.001"},
+            "MIN_NOTIONAL": {"minNotional": "10"},
+            # Missing multiplierUp/multiplierDown should not raise
+            "PERCENT_PRICE_BY_SIDE": {
+                "bidMultiplierUp": "1.1",
+                "bidMultiplierDown": "0.9",
+            },
+        }
+    }
+
+    quantizer = Quantizer(filters)
+    symbol_filters = quantizer._filters["BTCUSDT"]
+    assert symbol_filters.multiplier_up is None
+    assert symbol_filters.multiplier_down is None

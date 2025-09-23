@@ -129,8 +129,8 @@ class SymbolFilters:
             qty_min=_to_float(ls.get("minQty"), 0.0),
             qty_max=_to_float(ls.get("maxQty"), float("inf")),
             min_notional=_to_float(mn.get("minNotional"), 0.0),
-            multiplier_up=_to_float(ppbs.get("multiplierUp"), None) if ppbs else None,
-            multiplier_down=_to_float(ppbs.get("multiplierDown"), None) if ppbs else None,
+            multiplier_up=_to_optional_float(ppbs.get("multiplierUp")) if ppbs else None,
+            multiplier_down=_to_optional_float(ppbs.get("multiplierDown")) if ppbs else None,
             quote_precision=quote_precision,
             commission_step=commission_step,
         )
