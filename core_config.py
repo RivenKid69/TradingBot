@@ -755,6 +755,15 @@ class TrainDataConfig(BaseModel):
     timeframe: str
     start_ts: Optional[int] = None
     end_ts: Optional[int] = None
+    val_start_ts: Optional[int] = None
+    val_end_ts: Optional[int] = None
+    test_start_ts: Optional[int] = None
+    test_end_ts: Optional[int] = None
+    processed_dir: str = Field(default="data/processed")
+    split_path: Optional[str] = None
+    split_version: Optional[str] = None
+    timestamp_column: str = Field(default="timestamp")
+    role_column: str = Field(default="wf_role")
     features_params: Dict[str, Any] = Field(default_factory=dict)
     target_params: Dict[str, Any] = Field(default_factory=dict)
 
