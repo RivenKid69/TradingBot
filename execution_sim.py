@@ -811,6 +811,95 @@ class ExecutionSimulator:
     same seed and inputs therefore yields identical child order trajectories.
     """
 
+    _KNOWN_QUOTE_SUFFIXES = tuple(
+        sorted(
+            {
+                "FDUSD",
+                "USDT",
+                "USDC",
+                "BUSD",
+                "TUSD",
+                "USDP",
+                "DAI",
+                "USDS",
+                "SUSD",
+                "USTC",
+                "UST",
+                "BIDR",
+                "BKRW",
+                "BVND",
+                "BRL",
+                "TRY",
+                "RUB",
+                "EUR",
+                "GBP",
+                "AUD",
+                "NZD",
+                "CAD",
+                "CHF",
+                "JPY",
+                "SGD",
+                "HKD",
+                "CNH",
+                "MXN",
+                "ARS",
+                "COP",
+                "CLP",
+                "PEN",
+                "VES",
+                "THB",
+                "KRW",
+                "NGN",
+                "UAH",
+                "ZAR",
+                "PLN",
+                "CZK",
+                "HUF",
+                "RON",
+                "SEK",
+                "NOK",
+                "DKK",
+                "IDRT",
+                "PAX",
+                "BNB",
+                "BTC",
+                "ETH",
+                "BCH",
+                "LTC",
+                "ETC",
+                "XRP",
+                "TRX",
+                "DOGE",
+                "DOT",
+                "SOL",
+                "ADA",
+                "ATOM",
+                "NEO",
+                "IOTA",
+                "EOS",
+                "XTZ",
+                "FIL",
+                "ICP",
+                "XLM",
+                "OP",
+                "ARB",
+                "AVAX",
+                "MATIC",
+                "APT",
+                "SUI",
+                "TIA",
+                "TON",
+                "PYTH",
+                "SEI",
+                "JUP",
+                "ENA",
+                "AEVO",
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+
     @staticmethod
     def _plain_mapping(obj: Any) -> Dict[str, Any]:
         """Best-effort conversion of arbitrary objects to a plain mapping."""
@@ -1379,6 +1468,7 @@ class ExecutionSimulator:
         self.fees_settlement: Dict[str, Any] = {}
         self.fees_commission_steps: Dict[str, float] = {}
         self.fees_conversion_rates: Dict[str, float] = {}
+        self._fees_quote_currency_cache: Dict[str, Optional[str]] = {}
         self._fees_conversion_requests: Dict[str, float] = {}
         self._maker_taker_share_cfg: Optional[Dict[str, Any]] = None
         self._maker_taker_share_enabled: bool = False
@@ -3001,6 +3091,7 @@ class ExecutionSimulator:
         self._latency_symbol = self.symbol
         self._reset_bar_capacity_base_cache()
         self._last_adv_bar_capacity = None
+        self._fees_quote_currency_cache.clear()
 
     def set_ref_price(self, price: float) -> None:
         self._last_ref_price = float(price)
@@ -4083,6 +4174,79 @@ class ExecutionSimulator:
         key = symbol.strip().upper()
         return key or None
 
+    @staticmethod
+    def _fees_extract_quote_currency(
+        mapping: Any,
+        symbol_key: Optional[str],
+    ) -> Optional[str]:
+        if not isinstance(mapping, Mapping):
+            return None
+        for key in ("quote_currency", "quoteCurrency", "quote_asset", "quoteAsset"):
+            value = mapping.get(key)
+            if isinstance(value, str):
+                value = value.strip().upper()
+                if value:
+                    return value
+        if symbol_key:
+            direct = mapping.get(symbol_key)
+            if isinstance(direct, Mapping):
+                nested = ExecutionSimulator._fees_extract_quote_currency(direct, symbol_key)
+                if nested:
+                    return nested
+        for value in mapping.values():
+            if isinstance(value, Mapping):
+                nested = ExecutionSimulator._fees_extract_quote_currency(value, symbol_key)
+                if nested:
+                    return nested
+            elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+                for item in value:
+                    if isinstance(item, Mapping):
+                        nested = ExecutionSimulator._fees_extract_quote_currency(
+                            item,
+                            symbol_key,
+                        )
+                        if nested:
+                            return nested
+        return None
+
+    def _resolve_quote_currency(self, symbol: Optional[str]) -> Optional[str]:
+        symbol_key = ExecutionSimulator._fees_symbol_key(symbol)
+        if not symbol_key:
+            return None
+        cached = self._fees_quote_currency_cache.get(symbol_key)
+        if cached is not None or symbol_key in self._fees_quote_currency_cache:
+            return cached
+
+        quantizer = getattr(self, "quantizer", None)
+        raw_filters = getattr(quantizer, "_filters_raw", None) if quantizer is not None else None
+        if isinstance(raw_filters, Mapping):
+            payload = raw_filters.get(symbol_key)
+            if isinstance(payload, Mapping):
+                quote = ExecutionSimulator._fees_extract_quote_currency(payload, symbol_key)
+                if quote:
+                    self._fees_quote_currency_cache[symbol_key] = quote
+                    return quote
+
+        sources = (
+            self.fees_metadata,
+            self.fees_config_payload,
+            self.fees_expected_payload,
+            self.fees_symbol_fee_table,
+        )
+        for source in sources:
+            quote = ExecutionSimulator._fees_extract_quote_currency(source, symbol_key)
+            if quote:
+                self._fees_quote_currency_cache[symbol_key] = quote
+                return quote
+
+        for suffix in ExecutionSimulator._KNOWN_QUOTE_SUFFIXES:
+            if symbol_key.endswith(suffix):
+                self._fees_quote_currency_cache[symbol_key] = suffix
+                return suffix
+
+        self._fees_quote_currency_cache[symbol_key] = None
+        return None
+
     def _resolve_fee_discount_multiplier(
         self,
         symbol: Optional[str],
@@ -4268,6 +4432,7 @@ class ExecutionSimulator:
                     self.fees_symbol_fee_table = normalised
                 elif table_payload is None:
                     self.fees_symbol_fee_table = {}
+                self._fees_quote_currency_cache.clear()
             else:
                 logger.debug("Received empty fees config payload; ignoring")
 
@@ -4277,6 +4442,7 @@ class ExecutionSimulator:
                 self.fees_metadata = mapping
             else:
                 logger.debug("Received empty fees metadata payload; ignoring")
+            self._fees_quote_currency_cache.clear()
 
         if expected_payload is not None:
             mapping = ExecutionSimulator._plain_mapping(expected_payload)
@@ -4284,6 +4450,7 @@ class ExecutionSimulator:
                 self.fees_expected_payload = mapping
             else:
                 logger.debug("Received empty expected fee payload; ignoring")
+            self._fees_quote_currency_cache.clear()
 
         if share_payload is not None:
             self._apply_maker_taker_share_payload(share_payload)
@@ -4854,10 +5021,16 @@ class ExecutionSimulator:
                                     fee_val, "settlement_currency", settlement_currency
                                 ),
                             )
-                        settlement_mode = getattr(fee_val, "settlement_mode", settlement_mode)
-                        settlement_currency = getattr(
+                        mode_candidate = getattr(
+                            fee_val, "settlement_mode", settlement_mode
+                        )
+                        if isinstance(mode_candidate, str) and mode_candidate:
+                            settlement_mode = mode_candidate.strip().lower()
+                        currency_candidate = getattr(
                             fee_val, "settlement_currency", settlement_currency
                         )
+                        if isinstance(currency_candidate, str) and currency_candidate:
+                            settlement_currency = currency_candidate.strip().upper()
                     else:
                         fee_num = ExecutionSimulator._trade_cost_float(fee_val)
                         if fee_num is not None and fee_num > 0.0:
@@ -4869,6 +5042,35 @@ class ExecutionSimulator:
                                 )
                     if fee_amount is not None and fee_amount > 0.0:
                         fee_out = float(fee_amount)
+                        quote_currency = self._resolve_quote_currency(symbol_value)
+                        settlement_amount: Optional[float] = None
+                        conversion_rate: Optional[float] = None
+                        if conversion_used is not None:
+                            try:
+                                conversion_rate = float(conversion_used)
+                            except (TypeError, ValueError):
+                                conversion_rate = None
+                            else:
+                                if not math.isfinite(conversion_rate) or conversion_rate <= 0.0:
+                                    conversion_rate = None
+                        settlement_cur = settlement_currency
+                        if settlement_cur is not None and not isinstance(
+                            settlement_cur, str
+                        ):
+                            settlement_cur = None
+                        if conversion_rate is not None and settlement_cur:
+                            if isinstance(settlement_cur, str):
+                                settlement_cur = settlement_cur.strip().upper()
+                                if not settlement_cur:
+                                    settlement_cur = None
+                        if (
+                            conversion_rate is not None
+                            and settlement_cur
+                            and quote_currency
+                            and settlement_cur != quote_currency
+                        ):
+                            settlement_amount = fee_out
+                            fee_out = float(fee_out * conversion_rate)
                         if logger.isEnabledFor(logging.DEBUG):
                             extra = {
                                 "event": "trade_fee",
@@ -4884,6 +5086,12 @@ class ExecutionSimulator:
                                 extra["settlement_mode"] = settlement_mode
                             if settlement_currency:
                                 extra["settlement_currency"] = settlement_currency
+                            if quote_currency:
+                                extra["quote_currency"] = quote_currency
+                            if settlement_amount is not None:
+                                extra["fee_settlement"] = settlement_amount
+                                if settlement_currency:
+                                    extra["fee_settlement_currency"] = settlement_currency
                             logger.debug("trade fee computed", extra=extra)
                         return fee_out
 
