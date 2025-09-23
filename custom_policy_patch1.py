@@ -199,8 +199,8 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
     def _get_action_dist_from_latent(self, latent_pi: torch.Tensor):
         if isinstance(self.action_space, spaces.Box):
             mean_actions = self.action_net(latent_pi)
-            # Гладкое отображение неурезанного параметра в диапазон [-5, 0]
-            # torch.tanh дает [-1, 1], мы масштабируем и сдвигаем его.
+            # Smoothly map the unconstrained parameter into the range [-5, 0]
+            # torch.tanh returns [-1, 1]; rescale and shift it accordingly.
             log_std = -2.5 + 2.5 * torch.tanh(self.unconstrained_log_std)
             return self.action_dist.proba_distribution(mean_actions, log_std)
         elif isinstance(self.action_space, spaces.Discrete):
