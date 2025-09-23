@@ -145,6 +145,7 @@ from scripts.validate_regime_distributions import compare_regime_distributions
 from data_validation import DataValidator
 from utils.model_io import save_sidecar_metadata, check_model_compat
 from watchdog_vec_env import WatchdogVecEnv
+from scripts.offline_utils import resolve_split_bundle
 
 # --- helper to compute SHA256 of liquidity seasonality file ---
 def _file_sha256(path: str | None) -> str | None:
@@ -887,13 +888,71 @@ def main():
         help="Path to market regime parameters",
     )
     parser.add_argument(
+        "--offline-config",
+        default="configs/offline.yaml",
+        help="Path to offline dataset configuration with artefact declarations",
+    )
+    parser.add_argument(
+        "--dataset-split",
+        default="train",
+        help="Dataset split identifier declared in the offline config",
+    )
+    parser.add_argument(
         "--liquidity-seasonality",
-        default="configs/liquidity_seasonality.json",
-        help="Path to liquidity seasonality coefficients",
+        default=None,
+        help="Override path to liquidity seasonality coefficients (defaults to offline bundle)",
     )
     args, unknown = parser.parse_known_args()
 
     os.environ["MARKET_REGIMES_JSON"] = args.regime_config
+
+    split_key = (args.dataset_split or "").strip()
+    offline_bundle = None
+    if split_key and split_key.lower() not in {"none", "null"}:
+        try:
+            offline_bundle = resolve_split_bundle(args.offline_config, split_key)
+        except FileNotFoundError as exc:
+            raise SystemExit(f"Offline config not found: {args.offline_config}") from exc
+        except KeyError as exc:
+            raise SystemExit(
+                f"Dataset split '{split_key}' not found in offline config {args.offline_config}"
+            ) from exc
+        except ValueError as exc:
+            raise SystemExit(f"Failed to resolve offline split '{split_key}': {exc}") from exc
+
+    seasonality_path = args.liquidity_seasonality
+    fees_path: str | None = None
+    adv_path: str | None = None
+    seasonality_hash: str | None = None
+    if offline_bundle is not None:
+        if offline_bundle.version:
+            print(
+                f"Resolved offline dataset split '{offline_bundle.name}' version {offline_bundle.version}"
+            )
+        else:
+            print(f"Resolved offline dataset split '{offline_bundle.name}'")
+        seasonality_art = offline_bundle.artifacts.get("seasonality")
+        if seasonality_art:
+            if seasonality_path is None:
+                seasonality_path = seasonality_art.path.as_posix()
+            raw_hash = seasonality_art.info.artifact.get("verification_hash")
+            if raw_hash:
+                seasonality_hash = str(raw_hash)
+        fees_art = offline_bundle.artifacts.get("fees")
+        if fees_art:
+            fees_path = fees_art.path.as_posix()
+        adv_art = offline_bundle.artifacts.get("adv")
+        if adv_art:
+            adv_path = adv_art.path.as_posix()
+
+    if seasonality_path is None:
+        seasonality_path = "configs/liquidity_seasonality.json"
+    args.liquidity_seasonality = seasonality_path
+
+    if not Path(seasonality_path).exists():
+        raise FileNotFoundError(
+            f"Liquidity seasonality file not found: {seasonality_path}. Run offline builders first."
+        )
 
     cfg = load_config(args.config)
 
@@ -912,8 +971,27 @@ def main():
             i += 1
 
     cfg_dict = cfg.dict()
+    if offline_bundle is not None:
+        data_block = cfg_dict.setdefault("data", {})
+        if offline_bundle.version:
+            data_block["split_version"] = offline_bundle.version
+        if adv_path:
+            adv_block = cfg_dict.setdefault("adv", {})
+            if not adv_block.get("path"):
+                adv_block["path"] = adv_path
+        if fees_path:
+            fees_block = cfg_dict.setdefault("fees", {})
+            if not fees_block.get("path"):
+                fees_block["path"] = fees_path
     for block, params in overrides.items():
         cfg_dict.setdefault(block, {}).update(params)
+    cfg_dict["liquidity_seasonality_path"] = args.liquidity_seasonality
+    cfg_dict["latency_seasonality_path"] = args.liquidity_seasonality
+    latency_block = cfg_dict.setdefault("latency", {})
+    if not latency_block.get("latency_seasonality_path"):
+        latency_block["latency_seasonality_path"] = args.liquidity_seasonality
+    if seasonality_hash:
+        cfg_dict["liquidity_seasonality_hash"] = seasonality_hash
     cfg = cfg.__class__.parse_obj(cfg_dict)
 
     timing_defaults, timing_profiles = load_timing_profiles()
