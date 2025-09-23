@@ -165,9 +165,6 @@ def _window_reasons(
     m_custom = _in_custom_window(ts_ms, cfg.custom_ms or [])
     m_calendar = _apply_calendar_windows(ts_ms, calendar, symbols)
 
-    m_daily = np.logical_or(m_daily, m_calendar)
-    m_custom = np.logical_or(m_custom, m_calendar)
-
     data = {
         "maintenance_daily": m_daily,
         "maintenance_funding": m_funding,
