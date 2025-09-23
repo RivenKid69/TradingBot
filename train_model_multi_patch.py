@@ -25,7 +25,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import shutil
-import random
 import math
 import argparse
 import yaml
@@ -156,6 +155,189 @@ def _file_sha256(path: str | None) -> str | None:
             return hashlib.sha256(f.read()).hexdigest()
     except FileNotFoundError:
         return None
+
+
+def _coerce_timestamp(value) -> int | None:
+    """Normalize timestamp representations to integer seconds."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        txt = value.strip()
+        if not txt or txt.lower() == "none":
+            return None
+        try:
+            value = int(txt)
+        except ValueError:
+            try:
+                ts = pd.Timestamp(txt)
+            except Exception as exc:  # pragma: no cover - defensive branch
+                raise ValueError(f"Unable to parse timestamp string '{value}'.") from exc
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            return int(ts.value // 10**9)
+    if isinstance(value, pd.Timestamp):
+        ts = value
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return int(ts.value // 10**9)
+    if isinstance(value, (np.integer, int)):
+        iv = int(value)
+        if abs(iv) > 10_000_000_000:  # heuristic: values in ms
+            return iv // 1000
+        return iv
+    if isinstance(value, (np.floating, float)):
+        if math.isnan(value):
+            return None
+        return _coerce_timestamp(int(value))
+    raise ValueError(f"Unsupported timestamp value: {value!r}")
+
+
+def _normalize_interval(item) -> tuple[int | None, int | None]:
+    if item is None:
+        return (None, None)
+    if isinstance(item, dict):
+        start = item.get("start_ts")
+        if start is None:
+            start = item.get("start") or item.get("from")
+        end = item.get("end_ts")
+        if end is None:
+            end = item.get("end") or item.get("to")
+    elif isinstance(item, (list, tuple)) and len(item) == 2:
+        start, end = item
+    else:
+        raise TypeError(f"Unsupported interval specification: {item!r}")
+    start_ts = _coerce_timestamp(start)
+    end_ts = _coerce_timestamp(end)
+    if start_ts is not None and end_ts is not None and end_ts < start_ts:
+        raise ValueError(f"Invalid interval with start {start_ts} after end {end_ts}")
+    return (start_ts, end_ts)
+
+
+def _load_time_splits(data_cfg) -> tuple[str | None, dict[str, list[tuple[int | None, int | None]]]]:
+    """Derive train/val/test time windows from config or an external manifest."""
+
+    splits: dict[str, list[tuple[int | None, int | None]]] = {"train": [], "val": [], "test": []}
+    version: str | None = getattr(data_cfg, "split_version", None)
+
+    split_path = getattr(data_cfg, "split_path", None)
+    if split_path:
+        manifest_path = Path(split_path)
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Split manifest not found: {split_path}")
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            if manifest_path.suffix.lower() in (".yaml", ".yml"):
+                raw = yaml.safe_load(fh) or {}
+            else:
+                raw = json.load(fh)
+        version = raw.get("version") or raw.get("name") or version or manifest_path.stem
+        raw_splits = raw.get("splits")
+        if raw_splits is None:
+            raw_splits = {k: raw.get(k) for k in ("train", "val", "test") if raw.get(k) is not None}
+        if raw_splits is None:
+            raise ValueError("Split manifest must contain 'splits' or per-phase keys (train/val/test).")
+        for phase in ("train", "val", "test"):
+            entries = raw_splits.get(phase)
+            if entries is None:
+                continue
+            if isinstance(entries, (list, tuple)):
+                iterable = entries
+            else:
+                iterable = [entries]
+            splits[phase].extend(_normalize_interval(item) for item in iterable)
+
+    for phase in ("train", "val", "test"):
+        start_attr = getattr(data_cfg, f"{phase}_start_ts", None)
+        end_attr = getattr(data_cfg, f"{phase}_end_ts", None)
+        if start_attr is not None or end_attr is not None:
+            splits[phase].append(_normalize_interval({"start_ts": start_attr, "end_ts": end_attr}))
+
+    if not splits["train"]:
+        fallback = _normalize_interval({"start_ts": getattr(data_cfg, "start_ts", None), "end_ts": getattr(data_cfg, "end_ts", None)})
+        if fallback != (None, None):
+            splits["train"].append(fallback)
+
+    for phase, items in splits.items():
+        cleaned = [item for item in items if not (item[0] is None and item[1] is None)]
+        cleaned.sort(key=lambda it: it[0] if it[0] is not None else -float("inf"))
+        splits[phase] = cleaned
+
+    if not splits["train"]:
+        raise ValueError("Training split is empty: provide train_start/train_end or a manifest")
+
+    return version, splits
+
+
+def _apply_role_column(
+    df: pd.DataFrame,
+    intervals: dict[str, list[tuple[int | None, int | None]]],
+    timestamp_column: str,
+    role_column: str,
+) -> tuple[pd.DataFrame, bool]:
+    """Annotate ``df`` with walk-forward roles using the provided intervals."""
+
+    if timestamp_column not in df.columns:
+        raise KeyError(f"DataFrame is missing timestamp column '{timestamp_column}'")
+    ts = pd.to_numeric(df[timestamp_column], errors="coerce")
+    roles = pd.Series(np.full(len(df), "none", dtype=object), index=df.index)
+
+    for phase in ("train", "val", "test"):
+        masks = []
+        for start, end in intervals.get(phase, []):
+            cur = pd.Series(True, index=df.index)
+            if start is not None:
+                cur &= ts >= start
+            if end is not None:
+                cur &= ts <= end
+            masks.append(cur)
+        if not masks:
+            continue
+        phase_mask = masks[0]
+        for extra in masks[1:]:
+            phase_mask |= extra
+        assignable = (roles == "none") & phase_mask
+        if assignable.any():
+            roles.loc[assignable] = phase
+
+    inferred_test = False
+    if not intervals.get("test"):
+        leftover = roles == "none"
+        if leftover.any():
+            roles.loc[leftover] = "test"
+            inferred_test = True
+
+    df_out = df.copy()
+    df_out[role_column] = roles.values
+    return df_out, inferred_test
+
+
+def _phase_bounds(mapping: dict[str, pd.DataFrame], ts_col: str) -> tuple[int | None, int | None]:
+    start: int | None = None
+    end: int | None = None
+    for df in mapping.values():
+        ts = pd.to_numeric(df[ts_col], errors="coerce").dropna()
+        if ts.empty:
+            continue
+        cur_start = int(ts.min())
+        cur_end = int(ts.max())
+        start = cur_start if start is None or cur_start < start else start
+        end = cur_end if end is None or cur_end > end else end
+    return start, end
+
+
+def _fmt_ts(ts: int | None) -> str:
+    if ts is None:
+        return "None"
+    return pd.to_datetime(int(ts), unit="s", utc=True).isoformat()
+
+
+def _format_interval(interval: tuple[int | None, int | None]) -> str:
+    start, end = interval
+    return f"[{_fmt_ts(start)} .. {_fmt_ts(end)}]"
 
 # === КОНФИГУРАЦИЯ ИНДИКАТОРОВ (ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ) ===
 MA5_WINDOW = 5
@@ -343,6 +525,8 @@ def objective(trial: optuna.Trial,
               train_obs_by_token: dict,
               val_data_by_token: dict,
               val_obs_by_token: dict,
+              test_data_by_token: dict,
+              test_obs_by_token: dict,
               norm_stats: dict,
               sim_config: dict,
               trials_dir: Path):
@@ -600,7 +784,12 @@ def objective(trial: optuna.Trial,
     
 
     print(f"<<< Trial {trial.number+1} finished training, starting unified final evaluation…")
-    _log_sha(val_paths, "test")
+
+    eval_phase_data = test_data_by_token if test_data_by_token else val_data_by_token
+    eval_phase_obs = test_obs_by_token if test_data_by_token else val_obs_by_token
+    eval_phase_name = "test" if test_data_by_token else "val"
+    if not eval_phase_data:
+        raise ValueError("No data available for validation/test evaluation. Check time split configuration.")
 
     # 1. Определяем все режимы для оценки
     regimes_to_evaluate = ['normal', 'choppy_flat', 'strong_trend']
@@ -611,12 +800,12 @@ def objective(trial: optuna.Trial,
     for regime in regimes_to_evaluate:
         def make_final_eval_env():
             final_env_params = {
-                "df_dict": val_data_by_token, "obs_dict": val_obs_by_token,
+                "df_dict": eval_phase_data, "obs_dict": eval_phase_obs,
                 "norm_stats": norm_stats, "window_size": params["window_size"],
                 "gamma": params["gamma"], "atr_multiplier": params["atr_multiplier"],
                 "trailing_atr_mult": params["trailing_atr_mult"], "tp_atr_mult": params["tp_atr_mult"],
                 "trade_frequency_penalty": params["trade_frequency_penalty"],
-                "turnover_penalty_coef": params["turnover_penalty_coef"], "mode": "val",
+                "turnover_penalty_coef": params["turnover_penalty_coef"], "mode": eval_phase_name,
                 "reward_shaping": False, "warmup_period": warmup_period,
                 "ma5_window": MA5_WINDOW, "ma20_window": MA20_WINDOW, "atr_window": ATR_WINDOW,
                 "rsi_window": RSI_WINDOW, "macd_fast": MACD_FAST, "macd_slow": MACD_SLOW,
@@ -642,12 +831,12 @@ def objective(trial: optuna.Trial,
         test_stats_path = trials_dir / f"vec_normalize_test_{trial.number}.pkl"
         if not test_stats_path.exists():
             final_eval_norm.save(str(test_stats_path))
-            save_sidecar_metadata(str(test_stats_path), extra={"kind": "vecnorm_stats", "phase": "test"})
+            save_sidecar_metadata(str(test_stats_path), extra={"kind": "vecnorm_stats", "phase": eval_phase_name})
 
         if regime != 'normal':
             final_eval_env.env_method("set_market_regime", regime=regime, duration=regime_duration)
 
-        num_episodes = len(val_data_by_token.keys())
+        num_episodes = len(eval_phase_data.keys())
         _rewards, equity_curves = evaluate_policy_custom_cython(model, final_eval_env, num_episodes=num_episodes)
 
         all_returns = [pd.Series(c).pct_change().dropna().to_numpy() for c in equity_curves if len(c) > 1]
@@ -768,21 +957,61 @@ def main():
             f"Run prepare_advanced_data.py (Fear&Greed), prepare_events.py (macro events), "
             f"incremental_klines.py (1h candles), then prepare_and_run.py (merge/export).",
         )
-    path_by_key = {Path(p).stem: p for p in all_feather_files}
-
     all_dfs_dict, all_obs_dict = load_all_data(all_feather_files, synthetic_fraction=0, seed=42)
+
+    split_version, time_splits = _load_time_splits(cfg.data)
+    if split_version:
+        print(f"Using split version: {split_version}")
+    timestamp_column = getattr(cfg.data, "timestamp_column", "timestamp")
+    role_column = getattr(cfg.data, "role_column", "wf_role")
+
+    dfs_with_roles: dict[str, pd.DataFrame] = {}
+    inferred_test_any = False
+    for symbol, df in all_dfs_dict.items():
+        annotated, inferred_flag = _apply_role_column(df, time_splits, timestamp_column, role_column)
+        dfs_with_roles[symbol] = annotated
+        inferred_test_any = inferred_test_any or inferred_flag
+
+    train_intervals = time_splits.get("train", [])
+    train_start_candidates = [start for start, _ in train_intervals if start is not None]
+    train_end_candidates = [end for _, end in train_intervals if end is not None]
+    train_start_ts = min(train_start_candidates) if train_start_candidates else None
+    train_end_ts = max(train_end_candidates) if train_end_candidates else None
 
     PREPROC_PATH = artifacts_root / "preproc_pipeline.json"
     pipe = FeaturePipeline()
-    pipe.fit(all_dfs_dict)
+    pipe.fit(
+        dfs_with_roles,
+        train_mask_column=role_column,
+        train_mask_values={"train"},
+        train_start_ts=train_start_ts,
+        train_end_ts=train_end_ts,
+        timestamp_column=timestamp_column,
+        split_version=split_version,
+        train_intervals=train_intervals,
+    )
     PREPROC_PATH.parent.mkdir(parents=True, exist_ok=True)
     pipe.save(str(PREPROC_PATH))
-    all_dfs_dict = pipe.transform_dict(all_dfs_dict, add_suffix="_z")
+    try:
+        save_sidecar_metadata(
+            str(PREPROC_PATH),
+            extra={
+                "kind": "feature_pipeline",
+                "split_version": split_version,
+                "train_start_ts": train_start_ts,
+                "train_end_ts": train_end_ts,
+            },
+        )
+    except Exception:
+        # Sidecar metadata helper may not be available in all environments.
+        pass
+    all_dfs_with_roles = pipe.transform_dict(dfs_with_roles, add_suffix="_z")
     print(f"Feature pipeline fitted and saved to {PREPROC_PATH}. Standardized columns *_z added.")
     print("To run inference over processed data, execute: python infer_signals.py")
+
     # --- Гейт качества данных: строгая валидация OHLCV перед сплитом ---
     _validator = DataValidator()
-    for _key, _df in all_dfs_dict.items():
+    for _key, _df in all_dfs_with_roles.items():
         try:
             # frequency=None -> автоопределение внутри валидатора
             _validator.validate(_df, frequency=None)
@@ -790,52 +1019,59 @@ def main():
             raise RuntimeError(f"Data validation failed for asset '{_key}': {e}")
     print("✓ Data validation passed for all assets.")
 
-    
-    
-    print("Splitting data into train/validation sets...")
+    def _extract_phase(phase: str) -> dict[str, pd.DataFrame]:
+        out: dict[str, pd.DataFrame] = {}
+        for sym, df in all_dfs_with_roles.items():
+            mask = df[role_column].astype(str) == phase
+            phase_df = df.loc[mask].copy()
+            if not phase_df.empty:
+                out[sym] = phase_df.reset_index(drop=True)
+        return out
 
-    full_train_data, full_val_data = {}, {}
-    full_train_obs, full_val_obs = {}, {}
+    train_data_by_token = _extract_phase("train")
+    val_data_by_token = _extract_phase("val")
+    test_data_by_token = _extract_phase("test")
 
-    rng = random.Random(42)
-    all_keys = list(all_dfs_dict.keys())
-    rng.shuffle(all_keys)
+    def _select_obs(mapping: dict[str, pd.DataFrame]) -> dict[str, np.ndarray]:
+        return {sym: all_obs_dict[sym] for sym in mapping if sym in all_obs_dict}
 
-    split_idx = int(0.8 * len(all_keys))
-    train_keys = all_keys[:split_idx]
-    val_keys   = all_keys[split_idx:]
+    train_obs_by_token = _select_obs(train_data_by_token)
+    val_obs_by_token = _select_obs(val_data_by_token)
+    test_obs_by_token = _select_obs(test_data_by_token)
 
-    for key in train_keys:
-        full_train_data[key] = all_dfs_dict[key]
-        if key in all_obs_dict:
-            full_train_obs[key] = all_obs_dict[key]
+    unused_rows = {
+        sym: int((df[role_column].astype(str) == "none").sum())
+        for sym, df in all_dfs_with_roles.items()
+        if (df[role_column].astype(str) == "none").any()
+    }
+    if unused_rows:
+        total_unused = sum(unused_rows.values())
+        print(
+            f"Warning: {total_unused} rows across {len(unused_rows)} symbols were not assigned to train/val/test and will be ignored."
+        )
 
-    for key in val_keys:
-        full_val_data[key] = all_dfs_dict[key]
-        if key in all_obs_dict:
-            full_val_obs[key] = all_obs_dict[key]
-
-    train_paths = {path_by_key[k] for k in train_keys}
-    val_paths = {path_by_key[k] for k in val_keys}
-    if train_paths & val_paths:
-        raise ValueError("Train and validation path sets overlap")
-
-    def _log_sha(paths, phase):
-        for p in sorted(paths):
-            with open(p, "rb") as fh:
-                sha = hashlib.sha256(fh.read()).hexdigest()
-            print(f"[DATA] phase={phase} file={os.path.basename(p)} sha256={sha}")
-
-    _log_sha(train_paths, "train")
-    _log_sha(val_paths, "val")
-
-    print(f"Data split: {len(full_train_data)} assets for training, {len(full_val_data)} for validation.")
+    print("Time-based split summary:")
+    for phase, mapping in (
+        ("train", train_data_by_token),
+        ("val", val_data_by_token),
+        ("test", test_data_by_token),
+    ):
+        intervals = time_splits.get(phase, [])
+        interval_desc = ", ".join(_format_interval(it) for it in intervals) if intervals else "(inferred remainder)"
+        total_rows = sum(len(df) for df in mapping.values())
+        observed_start, observed_end = _phase_bounds(mapping, timestamp_column)
+        print(
+            f"  {phase}: {len(mapping)} symbols, {total_rows} rows, intervals={interval_desc}, "
+            f"observed=[{_fmt_ts(observed_start)} .. {_fmt_ts(observed_end)}]"
+        )
+    if inferred_test_any and not time_splits.get("test"):
+        print("  Note: test split inferred from remaining rows (no explicit interval provided).")
 
     print("Calculating per-asset normalization stats from the training set...")
     norm_stats = {}
-    
+
     # Итерируем по каждому активу в ТРЕНИРОВОЧНОМ наборе данных
-    for asset_key, train_df in full_train_data.items():
+    for asset_key, train_df in train_data_by_token.items():
         
         # 1. Находим признаки для нормализации в ДАННОМ конкретном активе
         features_to_normalize = [
@@ -879,10 +1115,12 @@ def main():
         lambda t: objective(
             t,
             HPO_BUDGET_PER_TRIAL,
-            full_train_data,
-            full_train_obs,
-            full_val_data,
-            full_val_obs,
+            train_data_by_token,
+            train_obs_by_token,
+            val_data_by_token,
+            val_obs_by_token,
+            test_data_by_token,
+            test_obs_by_token,
             norm_stats,
             sim_config,
             trials_dir,
@@ -936,73 +1174,79 @@ def main():
         print("\nRunning validation on the best ensemble model...")
         best_trial = top_trials[0]
 
-        def _make_env_val():
-            params = best_trial.params
-            env_val_params = {
-                "df_dict": full_val_data,
-                "obs_dict": full_val_obs,
-                "norm_stats": norm_stats,
-                "window_size": params["window_size"],
-                "gamma": params["gamma"],
-                "atr_multiplier": params["atr_multiplier"],
-                "trailing_atr_mult": params["trailing_atr_mult"],
-                "tp_atr_mult": params["tp_atr_mult"],
-                "trade_frequency_penalty": params["trade_frequency_penalty"],
-                "turnover_penalty_coef": params["turnover_penalty_coef"],
-                "mode": "val",
-                "reward_shaping": False,
-                "warmup_period": warmup_period,
-                "ma5_window": MA5_WINDOW,
-                "ma20_window": MA20_WINDOW,
-                "atr_window": ATR_WINDOW,
-                "rsi_window": RSI_WINDOW,
-                "macd_fast": MACD_FAST,
-                "macd_slow": MACD_SLOW,
-                "macd_signal": MACD_SIGNAL,
-                "momentum_window": MOMENTUM_WINDOW,
-                "cci_window": CCI_WINDOW,
-                "bb_window": BB_WINDOW,
-                "obv_ma_window": OBV_MA_WINDOW,
-            }
-            env_val_params.update(sim_config)
-            env_val_params.update(timing_env_kwargs)
-            return TradingEnv(
-                **env_val_params,
-                leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs))
+        final_eval_data = test_data_by_token if test_data_by_token else val_data_by_token
+        final_eval_obs = test_obs_by_token if test_data_by_token else val_obs_by_token
+        final_eval_mode = "test" if test_data_by_token else "val"
+        if not final_eval_data:
+            print("⚠️ Skipping final validation: evaluation split is empty.")
+        else:
+            def _make_env_val():
+                params = best_trial.params
+                env_val_params = {
+                    "df_dict": final_eval_data,
+                    "obs_dict": final_eval_obs,
+                    "norm_stats": norm_stats,
+                    "window_size": params["window_size"],
+                    "gamma": params["gamma"],
+                    "atr_multiplier": params["atr_multiplier"],
+                    "trailing_atr_mult": params["trailing_atr_mult"],
+                    "tp_atr_mult": params["tp_atr_mult"],
+                    "trade_frequency_penalty": params["trade_frequency_penalty"],
+                    "turnover_penalty_coef": params["turnover_penalty_coef"],
+                    "mode": final_eval_mode,
+                    "reward_shaping": False,
+                    "warmup_period": warmup_period,
+                    "ma5_window": MA5_WINDOW,
+                    "ma20_window": MA20_WINDOW,
+                    "atr_window": ATR_WINDOW,
+                    "rsi_window": RSI_WINDOW,
+                    "macd_fast": MACD_FAST,
+                    "macd_slow": MACD_SLOW,
+                    "macd_signal": MACD_SIGNAL,
+                    "momentum_window": MOMENTUM_WINDOW,
+                    "cci_window": CCI_WINDOW,
+                    "bb_window": BB_WINDOW,
+                    "obv_ma_window": OBV_MA_WINDOW,
+                }
+                env_val_params.update(sim_config)
+                env_val_params.update(timing_env_kwargs)
+                return TradingEnv(
+                    **env_val_params,
+                    leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs))
+                )
+
+            monitored_eval_env = VecMonitor(DummyVecEnv([_make_env_val]))
+            check_model_compat(str(best_stats_path))
+            eval_env = VecNormalize.load(str(best_stats_path), monitored_eval_env)
+            eval_env.training = False
+            eval_env.norm_reward = False
+            eval_env.clip_reward = None
+
+            best_model = DistributionalPPO.load(str(best_model_path), env=eval_env)
+
+            rewards, equity_curves = evaluate_policy_custom_cython(
+                best_model, eval_env, num_episodes=max(1, len(final_eval_data))
             )
+            all_returns = [
+                pd.Series(curve).pct_change().dropna().to_numpy()
+                for curve in equity_curves if len(curve) > 1
+            ]
+            flat_returns = np.concatenate(all_returns) if all_returns else np.array([0.0])
+            sortino = sortino_ratio(flat_returns)
+            sharpe = sharpe_ratio(flat_returns)
 
-        monitored_eval_env = VecMonitor(DummyVecEnv([_make_env_val]))
-        check_model_compat(str(best_stats_path))
-        eval_env = VecNormalize.load(str(best_stats_path), monitored_eval_env)
-        eval_env.training = False
-        eval_env.norm_reward = False
-        eval_env.clip_reward = None
-
-        best_model = DistributionalPPO.load(str(best_model_path), env=eval_env)
-
-        rewards, equity_curves = evaluate_policy_custom_cython(
-            best_model, eval_env, num_episodes=5
-        )
-        all_returns = [
-            pd.Series(curve).pct_change().dropna().to_numpy()
-            for curve in equity_curves if len(curve) > 1
-        ]
-        flat_returns = np.concatenate(all_returns) if all_returns else np.array([0.0])
-        sortino = sortino_ratio(flat_returns)
-        sharpe = sharpe_ratio(flat_returns)
-
-        report = {
-            "mean_reward": float(np.mean(rewards)),
-            "std_reward": float(np.std(rewards)),
-            "sortino_ratio": float(sortino),
-            "sharpe_ratio": float(sharpe),
-        }
-        with open(ensemble_dir / "validation_report.json", "w") as f:
-            json.dump(report, f, indent=4)
-        print(
-            f"Validation metrics -> Sortino: {sortino:.4f}, Sharpe: {sharpe:.4f}. "
-            f"Report saved to '{ensemble_dir / 'validation_report.json'}'"
-        )
+            report = {
+                "mean_reward": float(np.mean(rewards)),
+                "std_reward": float(np.std(rewards)),
+                "sortino_ratio": float(sortino),
+                "sharpe_ratio": float(sharpe),
+            }
+            with open(ensemble_dir / "validation_report.json", "w") as f:
+                json.dump(report, f, indent=4)
+            print(
+                f"Validation metrics -> Sortino: {sortino:.4f}, Sharpe: {sharpe:.4f}. "
+                f"Report saved to '{ensemble_dir / 'validation_report.json'}'"
+            )
     else:
         print(
             "⚠️ Could not find best model or normalization stats for validation evaluation."
