@@ -144,7 +144,8 @@ class ADVStore:
                 candidate = os.path.join(base, dataset_name)
                 if os.path.exists(candidate):
                     return candidate
-            return base
+            if os.path.exists(base) and (not dataset_name or not os.path.isdir(base)):
+                return base
         return None
 
     def _ensure_loaded_locked(self) -> None:
