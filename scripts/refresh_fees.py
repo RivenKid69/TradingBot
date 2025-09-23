@@ -21,6 +21,13 @@ from binance_fee_refresh import (
     load_public_fee_snapshot,
     parse_timestamp,
 )
+from scripts.offline_utils import (
+    SplitArtifact,
+    apply_split_tag,
+    load_offline_payload,
+    ms_to_iso,
+    resolve_split_artifact,
+)
 
 
 DEFAULT_OUTPUT = Path("data/fees/fees_by_symbol.json")
@@ -35,7 +42,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--out",
-        default=str(DEFAULT_OUTPUT),
+        default=None,
         help="Destination JSON file. Defaults to data/fees/fees_by_symbol.json",
     )
     parser.add_argument(
@@ -111,6 +118,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Override the default public fee endpoint.",
     )
     parser.add_argument(
+        "--config",
+        default="configs/offline.yaml",
+        help="Offline configuration file providing dataset split metadata",
+    )
+    parser.add_argument(
+        "--split",
+        default=None,
+        help="Dataset split identifier used to derive paths and windows",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -171,7 +188,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    out_path = Path(args.out)
+    offline_payload: Mapping[str, Any] | None = None
+    if args.config:
+        try:
+            offline_payload = load_offline_payload(args.config)
+        except FileNotFoundError:
+            if args.split:
+                raise SystemExit(f"Offline config not found: {args.config}")
+            offline_payload = None
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    split_info: SplitArtifact | None = None
+    if args.split:
+        if offline_payload is None:
+            raise SystemExit("Offline config required when using --split")
+        try:
+            split_info = resolve_split_artifact(offline_payload, args.split, "fees")
+        except KeyError as exc:
+            raise SystemExit(f"Unknown split {args.split!r} in offline config") from exc
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    base_out = Path(args.out) if args.out else DEFAULT_OUTPUT
+    if split_info:
+        if split_info.output_path is not None and not args.out:
+            base_out = split_info.output_path
+        out_path = apply_split_tag(base_out, split_info.tag)
+    else:
+        out_path = base_out
+
     _check_refresh_frequency(out_path)
 
     logger.info("Fetching active spot symbols from Binance")
@@ -205,6 +251,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     payload = snapshot.payload
+    metadata_raw = payload.get("metadata") if isinstance(payload, Mapping) else None
+    metadata = dict(metadata_raw) if isinstance(metadata_raw, Mapping) else {}
+    payload["metadata"] = metadata
+
+    now_ms = int(ensure_aware(_dt.datetime.utcnow()).timestamp() * 1000)
+    actual_end_ms = now_ms
+    if split_info and split_info.config_end_ms is not None:
+        actual_end_ms = min(actual_end_ms, split_info.config_end_ms)
+    actual_start_ms = split_info.config_start_ms if split_info else None
+
+    data_window = {
+        "actual": {
+            "start_ms": actual_start_ms,
+            "end_ms": actual_end_ms,
+            "start": ms_to_iso(actual_start_ms),
+            "end": ms_to_iso(actual_end_ms),
+        }
+    }
+    if split_info:
+        data_window["config"] = split_info.configured_window
+        metadata["split"] = split_info.split_metadata
+    metadata["data_window"] = data_window
+    metadata.setdefault("output_path", str(out_path))
+
     logger.info("Received fee data for %d symbols", len(snapshot.records))
     if snapshot.maker_bps_default is not None or snapshot.taker_bps_default is not None:
         logger.info(

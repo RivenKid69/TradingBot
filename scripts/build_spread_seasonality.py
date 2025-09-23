@@ -32,6 +32,17 @@ import numpy as np
 import pandas as pd
 
 from utils.time import HOURS_IN_WEEK, DAY_MS, hour_of_week
+from scripts.offline_utils import (
+    SplitArtifact,
+    apply_split_tag,
+    load_offline_payload,
+    ms_to_iso,
+    resolve_split_artifact,
+    window_days as compute_window_days,
+)
+
+
+DEFAULT_OUTPUT = Path("data/slippage/hourly_profile.json")
 
 
 @dataclass(frozen=True)
@@ -40,6 +51,8 @@ class SpreadComputationResult:
     hourly_raw: np.ndarray
     counts: np.ndarray
     overall_mean: float
+    actual_start_ms: int | None
+    actual_end_ms: int | None
 
 
 def _load_table(path: Path) -> pd.DataFrame:
@@ -159,6 +172,8 @@ def compute_spread_multipliers(
     spread_column: Optional[str],
     window_days: int,
     symbol: Optional[str],
+    window_start_ms: int | None = None,
+    window_end_ms: int | None = None,
 ) -> SpreadComputationResult:
     if symbol is not None:
         if "symbol" not in df.columns:
@@ -174,12 +189,19 @@ def compute_spread_multipliers(
 
     mask = np.isfinite(ts_ms) & np.isfinite(spread_values)
     mask &= ts_ms > 0
+    if window_start_ms is not None:
+        mask &= ts_ms >= window_start_ms
+    if window_end_ms is not None:
+        mask &= ts_ms <= window_end_ms
     spread_values = spread_values[mask]
     ts_ms = ts_ms[mask]
 
     ts_ms, spread_values = _filter_window(ts_ms, spread_values, window_days)
     if ts_ms.size == 0:
         raise ValueError("No samples remain after applying filters")
+
+    actual_start_ms = int(ts_ms.min()) if ts_ms.size else None
+    actual_end_ms = int(ts_ms.max()) if ts_ms.size else None
 
     positive_mask = spread_values > 0
     spread_values = spread_values[positive_mask]
@@ -213,6 +235,8 @@ def compute_spread_multipliers(
         hourly_raw=filled,
         counts=counts,
         overall_mean=overall_mean,
+        actual_start_ms=actual_start_ms,
+        actual_end_ms=actual_end_ms,
     )
 
 
@@ -239,7 +263,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--out",
-        default="data/slippage/hourly_profile.json",
+        default=None,
         help="Output JSON file",
     )
     parser.add_argument(
@@ -274,7 +298,55 @@ def main() -> None:
         default=7,
         help="Emit a warning if the source file is older than this many days",
     )
+    parser.add_argument(
+        "--config",
+        default="configs/offline.yaml",
+        help="Offline configuration describing dataset splits",
+    )
+    parser.add_argument(
+        "--split",
+        default=None,
+        help="Dataset split identifier used for output naming and window bounds",
+    )
     args = parser.parse_args()
+
+    split_info: SplitArtifact | None = None
+    if args.split:
+        try:
+            payload = load_offline_payload(args.config)
+        except FileNotFoundError:
+            raise SystemExit(f"Offline config not found: {args.config}")
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        try:
+            split_info = resolve_split_artifact(payload, args.split, "seasonality")
+        except KeyError as exc:
+            raise SystemExit(f"Unknown split {args.split!r} in offline config") from exc
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        if (
+            split_info.config_start_ms is not None
+            and split_info.config_end_ms is not None
+            and split_info.config_end_ms < split_info.config_start_ms
+        ):
+            raise SystemExit(
+                f"Configured window for split {split_info.split_name!r} has end before start"
+            )
+
+    if split_info:
+        config_window_days = compute_window_days(
+            split_info.config_start_ms, split_info.config_end_ms
+        )
+    else:
+        config_window_days = None
+
+    base_out = Path(args.out) if args.out else DEFAULT_OUTPUT
+    if split_info:
+        if split_info.output_path is not None and not args.out:
+            base_out = split_info.output_path
+        out_path = apply_split_tag(base_out, split_info.tag)
+    else:
+        out_path = base_out
 
     data_path = Path(args.data)
     if not data_path.exists():
@@ -287,31 +359,60 @@ def main() -> None:
         raise ValueError("Input dataset is empty")
 
     ts_column = _infer_timestamp_column(df, args.ts_col)
+    window_days_arg = int(args.window_days)
     result = compute_spread_multipliers(
         df,
         ts_col=ts_column,
         spread_column=args.spread_column,
-        window_days=int(args.window_days),
+        window_days=window_days_arg,
         symbol=args.symbol,
+        window_start_ms=split_info.config_start_ms if split_info else None,
+        window_end_ms=split_info.config_end_ms if split_info else None,
     )
 
+    if window_days_arg > 0:
+        window_days_meta = window_days_arg
+    elif config_window_days:
+        window_days_meta = int(config_window_days)
+    else:
+        computed_window = compute_window_days(
+            result.actual_start_ms, result.actual_end_ms
+        )
+        window_days_meta = int(computed_window) if computed_window else 0
+
+    data_window_meta = {
+        "actual": {
+            "start_ms": result.actual_start_ms,
+            "end_ms": result.actual_end_ms,
+            "start": ms_to_iso(result.actual_start_ms),
+            "end": ms_to_iso(result.actual_end_ms),
+        }
+    }
+    if split_info:
+        data_window_meta["config"] = split_info.configured_window
+
+    metadata = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": str(data_path),
+        "profile_kind": args.profile_kind,
+        "window_days": window_days_meta,
+        "normalization": "mean = 1.0",
+        "symbol": args.symbol,
+        "samples": int(result.counts.sum()),
+        "overall_mean_spread": result.overall_mean,
+        "data_window": data_window_meta,
+    }
+    if split_info:
+        metadata["split"] = split_info.split_metadata
+    metadata.setdefault("output_path", str(out_path))
+
     payload = {
-        "metadata": {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "source": str(data_path),
-            "profile_kind": args.profile_kind,
-            "window_days": int(args.window_days),
-            "normalization": "mean = 1.0",
-            "symbol": args.symbol,
-            "samples": int(result.counts.sum()),
-            "overall_mean_spread": result.overall_mean,
-        },
+        "metadata": metadata,
         "profile": [float(x) for x in result.multipliers],
         "hourly_raw": [float(x) for x in result.hourly_raw],
         "counts": [int(x) for x in result.counts],
     }
 
-    out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
