@@ -36,6 +36,7 @@ class EvalConfig:
 
     trades_path: str | Dict[str, str]
     reports_path: str | Dict[str, str]
+    profile: Optional[str] = None
     out_json: str = "logs/metrics.json"
     out_md: str = "logs/metrics.md"
     equity_png: str = "logs/equity.png"
@@ -83,6 +84,28 @@ class ServiceEval:
             trades = {k: _normalize(v) for k, v in trades.items()}
         else:
             trades = _normalize(trades)
+
+        def _filter_profile(data: Any, prof: str) -> Any:
+            def _trim(df: Any) -> Any:
+                if not isinstance(df, pd.DataFrame):
+                    return df
+                if "execution_profile" in df.columns:
+                    mask = df["execution_profile"].astype(str) == prof
+                    df = df.loc[mask].drop(columns=["execution_profile"])
+                return df
+
+            if isinstance(data, dict):
+                if prof in data:
+                    return _trim(data[prof])
+                if data:
+                    first = next(iter(data.values()))
+                    return _trim(first)
+                return pd.DataFrame()
+            return _trim(data)
+
+        if self.cfg.profile:
+            trades = _filter_profile(trades, self.cfg.profile)
+            reports = _filter_profile(reports, self.cfg.profile)
 
         metrics = calculate_metrics(
             trades,
@@ -177,7 +200,8 @@ def from_config(
             except Exception:
                 pass
         root, ext = os.path.splitext(path)
-        return f"{root}_{prof}{ext}"
+        candidate = f"{root}_{prof}{ext}"
+        return candidate if os.path.exists(candidate) else path
 
     container = di_registry.build_graph(cfg.components, cfg)
 
@@ -196,6 +220,7 @@ def from_config(
             eval_cfg = EvalConfig(
                 trades_path=tp,
                 reports_path=rp,
+                profile=prof.value,
                 out_json=_apply_profile(f"{cfg.logs_dir}/metrics.json", prof.value),
                 out_md=_apply_profile(f"{cfg.logs_dir}/metrics.md", prof.value),
                 equity_png=_apply_profile(f"{cfg.logs_dir}/equity.png", prof.value),
@@ -211,12 +236,26 @@ def from_config(
     trades_path = cfg.input.trades_path
     reports_path = getattr(cfg.input, "equity_path", "")
 
+    effective_profile: Optional[str] = None
     if profile:
+        effective_profile = profile.value if isinstance(profile, ExecutionProfile) else str(profile)
+    elif not all_profiles:
+        cfg_prof = getattr(cfg, "execution_profile", None)
+        if isinstance(cfg_prof, ExecutionProfile):
+            effective_profile = cfg_prof.value
+        elif isinstance(cfg_prof, str) and cfg_prof:
+            effective_profile = cfg_prof
+
+    if effective_profile:
         trades_path = (
-            trades_path[profile] if isinstance(trades_path, dict) else _apply_profile(str(trades_path), profile)
+            trades_path[effective_profile]
+            if isinstance(trades_path, dict)
+            else _apply_profile(str(trades_path), effective_profile)
         )
         reports_path = (
-            reports_path.get(profile, "") if isinstance(reports_path, dict) else _apply_profile(str(reports_path), profile)
+            reports_path.get(effective_profile, "")
+            if isinstance(reports_path, dict)
+            else _apply_profile(str(reports_path), effective_profile)
         )
     elif isinstance(trades_path, dict):
         first = next(iter(trades_path))
@@ -226,6 +265,7 @@ def from_config(
     eval_cfg = EvalConfig(
         trades_path=trades_path,
         reports_path=reports_path,
+        profile=effective_profile,
         out_json=f"{cfg.logs_dir}/metrics.json",
         out_md=f"{cfg.logs_dir}/metrics.md",
         equity_png=f"{cfg.logs_dir}/equity.png",
