@@ -8,9 +8,9 @@ from typing import List, Optional
 
 import pandas as pd
 
-from data.asof_join import AsofMerger, AsofSpec
-from data.leakguard import LeakConfig, LeakGuard
-from data.labels import LabelConfig, LabelBuilder
+from asof_join import AsofMerger, AsofSpec
+from leakguard import LeakConfig, LeakGuard
+from labels import LabelConfig, LabelBuilder
 
 
 def _read_df(path: str) -> pd.DataFrame:
