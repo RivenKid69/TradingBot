@@ -59,8 +59,8 @@ def _agg(df: pd.DataFrame, interval: str, drop_partial: bool = False) -> pd.Data
             cleaned.append(g)
             continue
         # drop_partial=True: отбрасываем неполные окна
-        start_bound = _floor_ts(min_ts, step) + step
-        end_bound = _floor_ts(max_ts, step)
+        start_bound = _floor_ts(min_ts, step) + (0 if start_ok else step)
+        end_bound = _floor_ts(max_ts, step) + (step if end_ok else 0)
         g2 = g[(g["ts_ms"] >= start_bound) & (g["ts_ms"] < end_bound)]
         cleaned.append(g2)
     if problems:
