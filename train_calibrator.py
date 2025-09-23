@@ -9,7 +9,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from training.calibration import (
+from calibration import (
     BaseCalibrator,
     calibration_table,
     evaluate_before_after,

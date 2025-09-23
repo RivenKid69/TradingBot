@@ -7,7 +7,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from training.calibration import BaseCalibrator
+from calibration import BaseCalibrator
 
 
 def _read_table(path: str) -> pd.DataFrame:
