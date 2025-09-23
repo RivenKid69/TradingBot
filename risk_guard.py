@@ -81,8 +81,8 @@ class RiskGuard:
     def _get_max_position_from_state_or_cfg(state, cfg: RiskConfig) -> float:
         mp = float(getattr(state, "max_position", 0.0) or 0.0)
         if mp <= 0.0:
-            # если в стейте не задано — хеджируемся конфигом (не строже max_abs_position)
-            mp = min(1.0, cfg.max_abs_position)  # «1 контракт» как «минимум», но не выше hard-cap
+            # если в стейте не задано — используем положительный лимит из конфига либо fallback на 1 контракт
+            mp = float(cfg.max_abs_position) if cfg.max_abs_position > 0.0 else 1.0
         return float(mp)
 
     @staticmethod
