@@ -41,12 +41,15 @@ def _write_table(df: pd.DataFrame | Sequence[bool], path: str) -> None:
     raise ValueError(f"Неизвестный формат файла вывода: {ext}")
 
 
-def _blocked_durations(ts_ms: Sequence[int], mask: Sequence[bool]) -> np.ndarray:
+def _blocked_durations(
+    ts_ms: Sequence[int], mask: Sequence[bool], tf_ms: int | None = None
+) -> np.ndarray:
     """Return durations of consecutive blocked intervals in minutes."""
-    ts = pd.to_numeric(ts_ms, errors="coerce").to_numpy(dtype=np.int64)
+    ts = np.asarray(pd.to_numeric(ts_ms, errors="coerce"), dtype=np.int64)
     m = np.asarray(mask, dtype=bool)
     if ts.size == 0 or not m.any():
         return np.empty(0, dtype=float)
+
     diff = np.diff(m.astype(int))
     start_idx = np.where(diff == 1)[0] + 1
     end_idx = np.where(diff == -1)[0] + 1
@@ -54,8 +57,29 @@ def _blocked_durations(ts_ms: Sequence[int], mask: Sequence[bool]) -> np.ndarray
         start_idx = np.r_[0, start_idx]
     if m[-1]:
         end_idx = np.r_[end_idx, len(m)]
-    durations_ms = ts[end_idx - 1] - ts[start_idx]
-    return durations_ms / 60_000.0
+
+    inferred_tf_ms: int | None = None
+    if tf_ms is None and ts.size > 1:
+        deltas = np.diff(ts)
+        positive_deltas = deltas[deltas > 0]
+        if positive_deltas.size:
+            inferred_tf_ms = int(np.median(positive_deltas))
+
+    durations_ms = np.empty_like(start_idx, dtype=np.int64)
+    last_index = len(ts)
+    for i, (start, end) in enumerate(zip(start_idx, end_idx)):
+        start_ts = ts[start]
+        if end < last_index:
+            end_ts = ts[end]
+        else:
+            tf = tf_ms if tf_ms is not None else inferred_tf_ms
+            if tf is None:
+                end_ts = ts[end - 1]
+            else:
+                end_ts = ts[end - 1] + int(tf)
+        durations_ms[i] = max(0, end_ts - start_ts)
+
+    return durations_ms.astype(float) / 60_000.0
 
 
 def main():
@@ -210,7 +234,7 @@ def main():
     def _maybe_emit_histogram(mask: Sequence[bool]) -> None:
         if args.histogram is None:
             return
-        durations = _blocked_durations(df[args.ts_col], mask)
+        durations = _blocked_durations(df[args.ts_col], mask, tf_ms=tf_ms)
         if durations.size:
             hist, bin_edges = np.histogram(durations, bins="auto")
             lines = ["Гистограмма длительностей блоков (минуты):"]
