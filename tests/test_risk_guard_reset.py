@@ -28,6 +28,12 @@ class DummyStateNoMax:
         self.units = 0.0
 
 
+class DummyStateExposure:
+    def __init__(self, cash: float, units: float):
+        self.cash = cash
+        self.units = units
+
+
 def test_risk_guard_uses_cfg_limit_when_state_max_missing():
     cfg = RiskConfig(max_abs_position=5.0)
     rg = RiskGuard(cfg)
@@ -41,3 +47,16 @@ def test_risk_guard_uses_cfg_limit_when_state_max_missing():
     assert max_pos == cfg.max_abs_position
     proposed_units = st.units + proto.volume_frac * max_pos
     assert proposed_units == cfg.max_abs_position
+
+
+def test_notional_limit_based_on_position_exposure():
+    cfg = RiskConfig(max_notional=100.0)
+    rg = RiskGuard(cfg)
+    st = DummyStateExposure(cash=1_000_000.0, units=0.0)
+
+    event = rg.on_post_trade(st, 50.0)
+    assert event == RiskEvent.NONE
+
+    st.units = 5.0  # exposure = 250.0 > max_notional
+    event = rg.on_post_trade(st, 50.0)
+    assert event == RiskEvent.NOTIONAL_LIMIT

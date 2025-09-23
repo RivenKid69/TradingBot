@@ -90,9 +90,11 @@ class RiskGuard:
 
     @staticmethod
     def _notional(state, mid_price: float) -> float:
-        # Абсолютная величина net exposure (в денежных единицах)
-        # NW = cash + units * mid_price
-        return abs(float(state.cash) + float(state.units) * float(mid_price))
+        # Абсолютная экспозиция позиции (в денежных единицах)
+        price = float(mid_price)
+        if not math.isfinite(price) or price <= 0.0:
+            return 0.0
+        return abs(float(state.units)) * price
 
     def _update_equity_windows(self, ts: int, state, mid_price: float) -> Tuple[float, float, float]:
         # Возвращает (nw, peak, dd_pct)
