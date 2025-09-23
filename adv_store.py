@@ -136,15 +136,22 @@ class ADVStore:
             if dataset_name == "":
                 dataset_name = None
         for base in candidates:
-            if dataset_name and os.path.isdir(base):
-                candidate = os.path.join(base, dataset_name)
-                if os.path.exists(candidate):
-                    return candidate
-            if dataset_name and dataset_name not in os.path.basename(base):
-                candidate = os.path.join(base, dataset_name)
-                if os.path.exists(candidate):
-                    return candidate
-            return base
+            if dataset_name:
+                if os.path.isdir(base):
+                    candidate = os.path.join(base, dataset_name)
+                    if os.path.exists(candidate):
+                        return candidate
+                if dataset_name not in os.path.basename(base):
+                    candidate = os.path.join(base, dataset_name)
+                    if os.path.exists(candidate):
+                        return candidate
+                if os.path.exists(base) and (
+                    dataset_name in os.path.basename(base) or not os.path.isdir(base)
+                ):
+                    return base
+                continue
+            if os.path.exists(base):
+                return base
         return None
 
     def _ensure_loaded_locked(self) -> None:
