@@ -3550,7 +3550,7 @@ with tabs[18]:
     import json
     import numpy as np
     import pandas as pd
-    from training.calibration import (
+    from calibration import (
         fit_calibrator,
         BaseCalibrator,
         evaluate_before_after,
