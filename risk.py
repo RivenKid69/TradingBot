@@ -193,8 +193,8 @@ class RiskManager:
             if equity is not None and math.isfinite(float(equity)):
                 self._equity_day_start = float(equity)
             else:
-                # если equity неизвестен, старт примем за 0 до следующего обновления on_mark
-                self._equity_day_start = 0.0
+                # если equity неизвестен, базовое значение станет известным позже
+                self._equity_day_start = None
             self._entries_day_key = key
             self._entries_day_count = 0
 

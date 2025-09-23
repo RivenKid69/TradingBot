@@ -79,3 +79,21 @@ def test_daily_entry_limit_blocks_after_threshold():
         position_qty=0.0,
     )
     assert allowed_next_day == 1.0
+
+
+def test_daily_loss_limit_handles_none_initial_equity():
+    cfg = RiskConfig(enabled=True, daily_loss_limit=50.0, pause_seconds_on_violation=60)
+    rm = RiskManager(cfg)
+
+    rm.on_mark(ts_ms=0, equity=None)
+    assert rm._equity_day_start is None
+    assert rm.pop_events() == []
+
+    rm.on_mark(ts_ms=1, equity=1_000.0)
+    assert rm._equity_day_start == 1_000.0
+    assert rm.pop_events() == []
+
+    rm.on_mark(ts_ms=2, equity=940.0)
+    events = rm.pop_events()
+    assert any(ev.code == "DAILY_LOSS_PAUSE" for ev in events)
+    assert rm.paused_until_ms > 0
