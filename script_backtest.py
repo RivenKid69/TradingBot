@@ -10,6 +10,7 @@ from pathlib import Path
 
 from core_config import load_config
 from service_backtest import from_config
+from scripts.offline_utils import resolve_split_bundle
 
 
 def main() -> None:
@@ -32,9 +33,83 @@ def main() -> None:
         default="benchmarks/sim_kpi_thresholds.json",
         help="JSON с допустимыми диапазонами KPI",
     )
+    p.add_argument(
+        "--offline-config",
+        default="configs/offline.yaml",
+        help="Path to offline dataset configuration",
+    )
+    p.add_argument(
+        "--dataset-split",
+        default="val",
+        help="Dataset split identifier (use 'none' to disable offline bundle integration)",
+    )
     args = p.parse_args()
 
     cfg = load_config(args.config)
+    split_key = (args.dataset_split or "").strip()
+    seasonality_path: str | None = None
+    fees_path: str | None = None
+    adv_path: str | None = None
+    seasonality_hash: str | None = None
+    if split_key and split_key.lower() not in {"none", "null"}:
+        try:
+            offline_bundle = resolve_split_bundle(args.offline_config, split_key)
+        except FileNotFoundError as exc:
+            raise SystemExit(f"Offline config not found: {args.offline_config}") from exc
+        except KeyError as exc:
+            raise SystemExit(
+                f"Dataset split '{split_key}' not found in offline config {args.offline_config}"
+            ) from exc
+        except ValueError as exc:
+            raise SystemExit(f"Failed to resolve offline split '{split_key}': {exc}") from exc
+        if offline_bundle.version:
+            print(
+                f"Resolved offline dataset split '{offline_bundle.name}' version {offline_bundle.version}"
+            )
+        else:
+            print(f"Resolved offline dataset split '{offline_bundle.name}'")
+        seasonality_art = offline_bundle.artifacts.get("seasonality")
+        if seasonality_art:
+            seasonality_path = seasonality_art.path.as_posix()
+            raw_hash = seasonality_art.info.artifact.get("verification_hash")
+            if raw_hash:
+                seasonality_hash = str(raw_hash)
+        fees_art = offline_bundle.artifacts.get("fees")
+        if fees_art:
+            fees_path = fees_art.path.as_posix()
+        adv_art = offline_bundle.artifacts.get("adv")
+        if adv_art:
+            adv_path = adv_art.path.as_posix()
+
+    cfg_dict = cfg.dict()
+    if seasonality_path:
+        cfg_dict["liquidity_seasonality_path"] = seasonality_path
+        cfg_dict["latency_seasonality_path"] = seasonality_path
+        latency_block = cfg_dict.setdefault("latency", {})
+        if not latency_block.get("latency_seasonality_path"):
+            latency_block["latency_seasonality_path"] = seasonality_path
+        if seasonality_hash:
+            cfg_dict["liquidity_seasonality_hash"] = seasonality_hash
+    if fees_path:
+        fees_block = cfg_dict.setdefault("fees", {})
+        if not fees_block.get("path"):
+            fees_block["path"] = fees_path
+    if adv_path:
+        adv_block = cfg_dict.setdefault("adv", {})
+        if not adv_block.get("path"):
+            adv_block["path"] = adv_path
+        execution_block = cfg_dict.setdefault("execution", {})
+        if isinstance(execution_block, dict):
+            bar_block = execution_block.setdefault("bar_capacity_base", {})
+            if not bar_block.get("adv_base_path"):
+                bar_block["adv_base_path"] = adv_path
+    cfg = cfg.__class__.parse_obj(cfg_dict)
+
+    if seasonality_path and not Path(seasonality_path).exists():
+        raise FileNotFoundError(
+            f"Liquidity seasonality file not found: {seasonality_path}. Run offline builders first."
+        )
+
     reports = from_config(cfg, snapshot_config_path=args.config)
     print(f"Produced {len(reports)} reports")
 
