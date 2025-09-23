@@ -747,15 +747,22 @@ class FeesImpl:
                 self.account_fee_info = info
                 self.account_fee_overrides = info.to_fee_overrides()
 
-        maker_discount_mult = cfg.maker_discount_mult
-        if not cfg.maker_discount_overridden and cfg.auto_maker_discount_mult is not None:
-            maker_discount_mult = float(cfg.auto_maker_discount_mult)
-        taker_discount_mult = cfg.taker_discount_mult
-        if not cfg.taker_discount_overridden and cfg.auto_taker_discount_mult is not None:
-            taker_discount_mult = float(cfg.auto_taker_discount_mult)
         use_bnb_discount = cfg.use_bnb_discount
         if not cfg.use_bnb_discount_overridden and cfg.auto_use_bnb_discount is not None:
             use_bnb_discount = bool(cfg.auto_use_bnb_discount)
+
+        maker_discount_mult = cfg.maker_discount_mult
+        taker_discount_mult = cfg.taker_discount_mult
+        if use_bnb_discount:
+            if not cfg.maker_discount_overridden and cfg.auto_maker_discount_mult is not None:
+                maker_discount_mult = float(cfg.auto_maker_discount_mult)
+            if not cfg.taker_discount_overridden and cfg.auto_taker_discount_mult is not None:
+                taker_discount_mult = float(cfg.auto_taker_discount_mult)
+        else:
+            if not cfg.maker_discount_overridden:
+                maker_discount_mult = 1.0
+            if not cfg.taker_discount_overridden:
+                taker_discount_mult = 1.0
 
         self._maker_discount_mult = float(maker_discount_mult)
         self._taker_discount_mult = float(taker_discount_mult)
