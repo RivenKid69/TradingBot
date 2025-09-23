@@ -13,6 +13,7 @@ Mediator — координатор между средой, LOB/симулят�
 """
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Dict, List, Tuple, Optional, TYPE_CHECKING, Mapping
 
 if TYPE_CHECKING:
