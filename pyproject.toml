@@ -23,55 +23,5 @@ extra = [
     "uvicorn>=0.27.0",
 ]
 
-[tool.setuptools.extension-modules."core.core"]
-sources = ["core/core.pyx"]
-extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-
-[tool.setuptools.extension-modules."exec.lob_book"]
-sources = ["exec/lob_book.pyx"]
-language = "c++"
-extra-compile-args = ["-O3", "-std=c++17", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-
-[tool.setuptools.extension-modules."exec.engine"]
-sources = ["exec/engine.pyx"]
-language = "c++"
-extra-compile-args = ["-O3", "-std=c++17", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-
-[tool.setuptools.extension-modules."micro.generator"]
-sources = ["micro/generator.pyx"]
-extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-
-[tool.setuptools.extension-modules."market.market_simulator_wrapper"]
-sources = ["market/market_simulator_wrapper.pyx"]
-language = "c++"
-extra-compile-args = ["-O3", "-std=c++17", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-
-[tool.setuptools.extension-modules."risk.risk"]
-sources = ["risk/risk.pyx"]
-extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-
- [tool.setuptools.extension-modules."obs.builder"]
- sources = ["obs/builder.pyx"]
- extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
- # Include NumPy headers for this module
- include-dirs = ["numpy.get_include()"]
-
-[tool.setuptools.extension-modules."reward.reward"]
-sources = ["reward/reward.pyx"]
-extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-
-[tool.setuptools.extension-modules."metrics.metrics"]
-sources = ["metrics/metrics.pyx"]
-extra-compile-args = ["-O3", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
-
- [tool.setuptools.extension-modules."api.environment"]
- sources = ["api/environment.pyx"]
- language = "c++"
- extra-compile-args = ["-O3", "-std=c++17", "-DCYTHON_BOUND_CHECK=0", "-DCYTHON_WRAPAROUND=0"]
- # Include NumPy headers for this module
- include-dirs = ["numpy.get_include()"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
-[DONE]

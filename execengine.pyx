@@ -1,8 +1,9 @@
 # cython: language_level=3
-from exec import action_interpreter
-from exec.events import apply_agent_events
-from exec.lob_book cimport CythonLOB
-from core.workspace cimport SimulationWorkspace
+import execaction_interpreter as action_interpreter
+from execevents import apply_agent_events
+from execlob_book cimport CythonLOB
+from coreworkspace cimport SimulationWorkspace
+from execevents cimport EventType
 
 # Engine functions for full LOB execution and commit
 
@@ -34,6 +35,7 @@ cpdef commit_step(state, tracker, CythonLOB lob_clone, SimulationWorkspace ws):
     This applies position changes, cash flows, and updates open orders tracking.
     In this stage, we do not modify primary EnvState fields (defer to later integration).
     """
+    cdef int i
     # Update agent's open order tracker based on final LOB state
     if tracker is not None:
         try:
@@ -41,7 +43,6 @@ cpdef commit_step(state, tracker, CythonLOB lob_clone, SimulationWorkspace ws):
         except AttributeError:
             pass
         # Add all remaining agent orders from lob_clone to tracker
-        cdef int i
         for i in range(lob_clone.n_bids):
             if lob_clone.bid_orders[i].type == EventType.AGENT_LIMIT_ADD:
                 try:

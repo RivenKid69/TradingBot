@@ -1,7 +1,12 @@
 # cython: language_level=3
 import random
-from exec.events cimport EventType, Side, MarketEvent
-from core.constants cimport PRICE_SCALE
+
+cimport cython
+from libc.stdlib cimport malloc, free
+
+from execevents cimport EventType, Side, MarketEvent
+from execlob_book cimport CythonLOB
+from coreworkspace cimport SimulationWorkspace
 
 def build_agent_limit_add(double mid_price, int side, int qty, int next_order_id):
     """
@@ -74,16 +79,15 @@ def apply_agent_events(state, tracker, microgen, lob, ws, events_list):
     if events == NULL:
         raise MemoryError("Failed to allocate events array")
     cdef int i
+    cdef object evt
     for i in range(n):
         # Each event in list is expected as a tuple (type, side, price, qty, order_id)
-        cdef object evt = all_events[i]
+        evt = all_events[i]
         events[i].type = <EventType> evt[0]
         events[i].side = <Side> evt[1]
         events[i].price = <int> evt[2]
         events[i].qty = <int> evt[3]
         events[i].order_id = <int> evt[4]
-    # Apply events batch under nogil
-    with nogil:
-        lob.apply_events_batch_nogil(events, n, ws)
+    (<CythonLOB> lob).apply_events_batch_nogil(events, n, <SimulationWorkspace> ws)
     # Free allocated events array
     free(events)
