@@ -10,6 +10,7 @@ cdef enum ClosedReason:
     MAX_DRAWDOWN = 8
 
 from libc.math cimport floor, ceil
+from lob_state_cython cimport EnvState
 
 cdef double _ticks_to_price(long long ticks, long long price_scale):
     """Convert integer ticks to monetary price."""

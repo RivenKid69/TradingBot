@@ -62,6 +62,8 @@ cdef class SimulationWorkspace:
         cdef bytes b_makers = bytearray(capacity * sizeof(char))
         cdef bytes b_ts = bytearray(capacity * bytes_longlong)
         cdef bytes b_filled = bytearray(capacity * bytes_longlong)
+        cdef bytes b_maker_ids = bytearray(capacity * bytes_longlong)
+        cdef bytes b_taker_flags = bytearray(capacity * sizeof(char))
 
         # Cast byte buffers to typed memoryviews (C-contiguous arrays)
         self.trade_prices = memoryview(b_prices).cast('d')   # double -> 'd'
@@ -70,6 +72,16 @@ cdef class SimulationWorkspace:
         self.trade_is_agent_maker = memoryview(b_makers).cast('b')
         self.trade_ts = memoryview(b_ts).cast('q')           # long long -> 'q'
         self.filled_order_ids = memoryview(b_filled).cast('q')
+        self.maker_ids_all_arr = memoryview(b_maker_ids).cast('Q')
+        self.taker_is_agent_all_arr = memoryview(b_taker_flags).cast('b')
+
+        # Legacy aliases for backwards compatibility with lob_state_cython
+        self.prices_all_arr = self.trade_prices
+        self.volumes_all_arr = self.trade_qtys
+        self.is_buy_side_all_arr = self.trade_sides
+        self.maker_is_agent_all_arr = self.trade_is_agent_maker
+        self.timestamps_all_arr = self.trade_ts
+        self.fully_executed_ids_all_arr = self.filled_order_ids
 
         # Set the internal capacity and verify buffers are C-contiguous.
         self._capacity = capacity
@@ -79,6 +91,8 @@ cdef class SimulationWorkspace:
         assert self.trade_is_agent_maker.strides[0] == sizeof(char)
         assert self.trade_ts.strides[0] == sizeof(long long)
         assert self.filled_order_ids.strides[0] == sizeof(long long)
+        assert self.maker_ids_all_arr.strides[0] == sizeof(unsigned long long)
+        assert self.taker_is_agent_all_arr.strides[0] == sizeof(char)
         # Note: The above asserts ensure each memoryview has contiguous stride (1 element step).
         # They rely on the fact that memoryview.strides is accessible with GIL (we are in __init__).
 
@@ -117,6 +131,8 @@ cdef class SimulationWorkspace:
         cdef bytes b_makers_new = bytearray(new_capacity * sizeof(char))
         cdef bytes b_ts_new = bytearray(new_capacity * bytes_longlong)
         cdef bytes b_filled_new = bytearray(new_capacity * bytes_longlong)
+        cdef bytes b_maker_ids_new = bytearray(new_capacity * bytes_longlong)
+        cdef bytes b_taker_flags_new = bytearray(new_capacity * sizeof(char))
 
         cdef double[::1] new_prices = memoryview(b_prices_new).cast('d')
         cdef double[::1] new_qtys = memoryview(b_qtys_new).cast('d')
@@ -124,6 +140,8 @@ cdef class SimulationWorkspace:
         cdef char[::1] new_makers = memoryview(b_makers_new).cast('b')
         cdef long long[::1] new_ts = memoryview(b_ts_new).cast('q')
         cdef long long[::1] new_filled = memoryview(b_filled_new).cast('q')
+        cdef unsigned long long[::1] new_maker_ids = memoryview(b_maker_ids_new).cast('Q')
+        cdef char[::1] new_taker_flags = memoryview(b_taker_flags_new).cast('b')
 
         if self.trade_count > 0:
             new_prices[0:self.trade_count] = self.trade_prices[0:self.trade_count]
@@ -131,6 +149,8 @@ cdef class SimulationWorkspace:
             new_sides[0:self.trade_count] = self.trade_sides[0:self.trade_count]
             new_makers[0:self.trade_count] = self.trade_is_agent_maker[0:self.trade_count]
             new_ts[0:self.trade_count] = self.trade_ts[0:self.trade_count]
+            new_maker_ids[0:self.trade_count] = self.maker_ids_all_arr[0:self.trade_count]
+            new_taker_flags[0:self.trade_count] = self.taker_is_agent_all_arr[0:self.trade_count]
         if self.filled_count > 0:
             new_filled[0:self.filled_count] = self.filled_order_ids[0:self.filled_count]
 
@@ -140,6 +160,15 @@ cdef class SimulationWorkspace:
         self.trade_is_agent_maker = new_makers
         self.trade_ts = new_ts
         self.filled_order_ids = new_filled
+        self.maker_ids_all_arr = new_maker_ids
+        self.taker_is_agent_all_arr = new_taker_flags
+
+        self.prices_all_arr = self.trade_prices
+        self.volumes_all_arr = self.trade_qtys
+        self.is_buy_side_all_arr = self.trade_sides
+        self.maker_is_agent_all_arr = self.trade_is_agent_maker
+        self.timestamps_all_arr = self.trade_ts
+        self.fully_executed_ids_all_arr = self.filled_order_ids
 
         assert self.trade_prices.strides[0] == sizeof(double)
         assert self.trade_qtys.strides[0] == sizeof(double)
@@ -147,6 +176,8 @@ cdef class SimulationWorkspace:
         assert self.trade_is_agent_maker.strides[0] == sizeof(char)
         assert self.trade_ts.strides[0] == sizeof(long long)
         assert self.filled_order_ids.strides[0] == sizeof(long long)
+        assert self.maker_ids_all_arr.strides[0] == sizeof(unsigned long long)
+        assert self.taker_is_agent_all_arr.strides[0] == sizeof(char)
 
     cdef void clear_step(self) nogil:
         """Reset the workspace for a new simulation step.
