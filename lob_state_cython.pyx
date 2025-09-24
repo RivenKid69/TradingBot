@@ -51,7 +51,8 @@ def _compute_n_features() -> int:
     cdef int num_tokens = 1
     cdef _np.ndarray[float, ndim=1] norm_cols = _np.zeros(0, dtype=_np.float32)
     # выделяем буфер заведомо большей длины
-    cdef _np.ndarray[float, ndim=1] buf = _np.zeros(256, dtype=_np.float32)
+    cdef _np.ndarray[float, ndim=1] buf = _np.empty(256, dtype=_np.float32)
+    buf.fill(_np.nan)
     # вызываем функцию построения наблюдений с фиктивными значениями
     build_observation_vector_c(
         0.0, 0.0, 0.0, 0.0,
@@ -69,8 +70,11 @@ def _compute_n_features() -> int:
         buf
     )
     # определяем индекс последнего заполненного элемента
-    # NB: функция использует feature_idx как счётчик; здесь длина равна количеству ненулевых значений
-    return buf.shape[0] if False else  # оставьте строку, чтобы mypy/flake не ругались
+    cdef Py_ssize_t i
+    for i in range(buf.shape[0]):
+        if _np.isnan(buf[i]):
+            return <int>i
+    return <int>buf.shape[0]
 
 # вычисляем N_FEATURES один раз при инициализации модуля (без служебных флагов)
 N_FEATURES = _compute_n_features()

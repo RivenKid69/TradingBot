@@ -6,7 +6,6 @@ from libcpp.vector cimport vector      # (Not used, but available if needed for 
 
 # Import Python-level constants (ensuring no other project modules are used).
 import core_constants as constants
-from core_constants cimport PRICE_SCALE, MarketRegime
 
 cdef class SimulationWorkspace:
     """
@@ -31,8 +30,6 @@ cdef class SimulationWorkspace:
         trade_count (int): Current number of trades stored for this step.
         filled_count (int): Current number of filled order IDs stored for this step.
     """
-    cdef int _capacity  # internal capacity of each buffer (number of slots allocated)
-
     def __cinit__(self):
         # Initialize counters to zero and capacity to 0 (will allocate in __init__)
         self.trade_count = 0
@@ -88,9 +85,9 @@ cdef class SimulationWorkspace:
     cdef void ensure_capacity(self, int min_capacity) nogil:
         """Ensure the internal buffers have capacity for at least `min_capacity` elements.
 
-        If the current buffer capacity is less than min_capacity, new buffers twice the current 
-        size (or min_capacity, whichever is larger) are allocated and existing data is copied over. 
-        This operation may temporarily acquire the GIL for memory allocation and copying, but is 
+        If the current buffer capacity is less than min_capacity, new buffers twice the current
+        size (or min_capacity, whichever is larger) are allocated and existing data is copied over.
+        This operation may temporarily acquire the GIL for memory allocation and copying, but is
         designed to happen infrequently (only when buffers need to grow).
         """
         cdef int new_capacity, current_capacity
@@ -103,48 +100,47 @@ cdef class SimulationWorkspace:
         if new_capacity < min_capacity:
             new_capacity = min_capacity
 
-        # Perform allocation and copying with GIL, as this involves Python object management.
+        # Perform allocation and copying with the GIL held.
         with gil:
-            # Allocate new byte buffers for each array with the larger capacity.
-            cdef int bytes_double = sizeof(double)
-            cdef int bytes_longlong = sizeof(long long)
-            cdef bytes b_prices_new = bytearray(new_capacity * bytes_double)
-            cdef bytes b_qtys_new = bytearray(new_capacity * bytes_double)
-            cdef bytes b_sides_new = bytearray(new_capacity * sizeof(char))
-            cdef bytes b_makers_new = bytearray(new_capacity * sizeof(char))
-            cdef bytes b_ts_new = bytearray(new_capacity * bytes_longlong)
-            cdef bytes b_filled_new = bytearray(new_capacity * bytes_longlong)
-
-            # Create memoryviews for new buffers
-            cdef double[::1] new_prices = memoryview(b_prices_new).cast('d')
-            cdef double[::1] new_qtys = memoryview(b_qtys_new).cast('d')
-            cdef char[::1] new_sides = memoryview(b_sides_new).cast('b')
-            cdef char[::1] new_makers = memoryview(b_makers_new).cast('b')
-            cdef long long[::1] new_ts = memoryview(b_ts_new).cast('q')
-            cdef long long[::1] new_filled = memoryview(b_filled_new).cast('q')
-
-            # Copy old data into new buffers (up to current counts).
-            if self.trade_count > 0:
-                new_prices[0:self.trade_count] = self.trade_prices[0:self.trade_count]
-                new_qtys[0:self.trade_count] = self.trade_qtys[0:self.trade_count]
-                new_sides[0:self.trade_count] = self.trade_sides[0:self.trade_count]
-                new_makers[0:self.trade_count] = self.trade_is_agent_maker[0:self.trade_count]
-                new_ts[0:self.trade_count] = self.trade_ts[0:self.trade_count]
-            if self.filled_count > 0:
-                new_filled[0:self.filled_count] = self.filled_order_ids[0:self.filled_count]
-
-            # Assign new buffers to self (old buffers will be deallocated when their refs drop out of scope).
-            self.trade_prices = new_prices
-            self.trade_qtys = new_qtys
-            self.trade_sides = new_sides
-            self.trade_is_agent_maker = new_makers
-            self.trade_ts = new_ts
-            self.filled_order_ids = new_filled
+            self._resize_buffers(new_capacity)
 
         # Update internal capacity (no GIL needed here for plain C int).
         self._capacity = new_capacity
 
-        # Assert that new buffers are C-contiguous (for safety in debug mode). 
+    cdef void _resize_buffers(self, int new_capacity):
+        """Resize all workspace buffers to ``new_capacity`` while holding the GIL."""
+        cdef int bytes_double = sizeof(double)
+        cdef int bytes_longlong = sizeof(long long)
+        cdef bytes b_prices_new = bytearray(new_capacity * bytes_double)
+        cdef bytes b_qtys_new = bytearray(new_capacity * bytes_double)
+        cdef bytes b_sides_new = bytearray(new_capacity * sizeof(char))
+        cdef bytes b_makers_new = bytearray(new_capacity * sizeof(char))
+        cdef bytes b_ts_new = bytearray(new_capacity * bytes_longlong)
+        cdef bytes b_filled_new = bytearray(new_capacity * bytes_longlong)
+
+        cdef double[::1] new_prices = memoryview(b_prices_new).cast('d')
+        cdef double[::1] new_qtys = memoryview(b_qtys_new).cast('d')
+        cdef char[::1] new_sides = memoryview(b_sides_new).cast('b')
+        cdef char[::1] new_makers = memoryview(b_makers_new).cast('b')
+        cdef long long[::1] new_ts = memoryview(b_ts_new).cast('q')
+        cdef long long[::1] new_filled = memoryview(b_filled_new).cast('q')
+
+        if self.trade_count > 0:
+            new_prices[0:self.trade_count] = self.trade_prices[0:self.trade_count]
+            new_qtys[0:self.trade_count] = self.trade_qtys[0:self.trade_count]
+            new_sides[0:self.trade_count] = self.trade_sides[0:self.trade_count]
+            new_makers[0:self.trade_count] = self.trade_is_agent_maker[0:self.trade_count]
+            new_ts[0:self.trade_count] = self.trade_ts[0:self.trade_count]
+        if self.filled_count > 0:
+            new_filled[0:self.filled_count] = self.filled_order_ids[0:self.filled_count]
+
+        self.trade_prices = new_prices
+        self.trade_qtys = new_qtys
+        self.trade_sides = new_sides
+        self.trade_is_agent_maker = new_makers
+        self.trade_ts = new_ts
+        self.filled_order_ids = new_filled
+
         assert self.trade_prices.strides[0] == sizeof(double)
         assert self.trade_qtys.strides[0] == sizeof(double)
         assert self.trade_sides.strides[0] == sizeof(char)
