@@ -95,3 +95,48 @@ def test_bnb_fee_conversion_updates_equity(volume_frac):
         rel_tol=1e-9,
     )
 
+
+def test_bnb_fee_conversion_extreme_conversion_precision():
+    conversion_rate = 1e-8
+    taker_bps = 12.0
+    fees_config = {
+        "maker_bps": taker_bps,
+        "taker_bps": taker_bps,
+        "use_bnb_discount": True,
+        "maker_discount_mult": 0.75,
+        "taker_discount_mult": 0.75,
+        "settlement": {"mode": "bnb", "currency": "BNB"},
+        "bnb_conversion_rate": conversion_rate,
+    }
+
+    sim = ExecutionSimulator(filters_path=None, fees_config=fees_config)
+    sim.set_quantizer(DummyQuantizer())
+
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=1.0)
+
+    sim.run_step(
+        ts=1,
+        ref_price=150.0,
+        bid=149.5,
+        ask=150.5,
+        liquidity=1.0,
+        actions=[],
+    )
+    fees_before = sim.fees_cum
+
+    report = sim.run_step(
+        ts=2,
+        ref_price=150.0,
+        bid=149.5,
+        ask=150.5,
+        liquidity=1.0,
+        actions=[(ActionType.MARKET, proto)],
+    )
+
+    assert report.trades, "Expected trade execution"
+    trade = report.trades[0]
+    discount_mult = 0.75
+    expected_fee_quote = trade.price * trade.qty * (taker_bps * discount_mult) / 1e4
+    fees_delta = sim.fees_cum - fees_before
+    assert math.isclose(fees_delta, expected_fee_quote, rel_tol=1e-12)
+
