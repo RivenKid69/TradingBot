@@ -154,10 +154,18 @@ cdef class MicroSim:
         self.gen.copy_lambda_hat(&view[12])
         return arr
 
+
     cpdef ndarray lambda_hat(self):
         """
         Вектор λ̂ (shape=(LAMBDA_DIM,)) в порядке lambda_channel_names()
         """
+
+
+    cpdef np.ndarray lambda_hat(self):
+        """
+        Вектор λ̂ (shape=(LAMBDA_DIM,)) в порядке lambda_channel_names()
+        """
+
         cdef cnp.ndarray[cnp.float64_t, ndim=1] arr = np.zeros((LAMBDA_DIM,), dtype=np.float64)
         cdef double[::1] view = arr
         self.gen.copy_lambda_hat(&view[0])
