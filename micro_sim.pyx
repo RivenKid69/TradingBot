@@ -3,6 +3,7 @@
 # cython: boundscheck=False, wraparound=False, cdivision=True
 
 cimport cython
+from numpy cimport ndarray
 cimport numpy as cnp
 import numpy as np
 
@@ -10,6 +11,13 @@ import numpy as np
 cdef extern from "OrderBook.h":
     cdef cppclass OrderBook:
         pass
+
+cdef extern from "core_constants.h":
+    cdef enum MarketRegime:
+        NORMAL
+        CHOPPY_FLAT
+        STRONG_TREND
+        ILLIQUID
 
 cdef extern from "cpp_microstructure_generator.h":
     cdef enum MicroEventType:
@@ -40,7 +48,7 @@ cdef extern from "cpp_microstructure_generator.h":
     cdef cppclass MicrostructureGenerator:
         MicrostructureGenerator() except +
         void set_seed(unsigned long long seed)
-        void set_regime(int regime)
+        void set_regime(MarketRegime regime)
         void reset(long long mid0_ticks, long long best_bid_ticks, long long best_ask_ticks)
         int step(OrderBook& lob, int timestamp, MicroEvent* out_events, int cap)
         MicroFeatures current_features(const OrderBook& lob) const
@@ -120,7 +128,9 @@ cdef class MicroSim:
         self.gen.set_seed(seed)
 
     cpdef set_regime(self, int regime):
-        self.gen.set_regime(regime)
+        if regime < NORMAL or regime > ILLIQUID:
+            raise ValueError("regime out of range (expected 0..3)")
+        self.gen.set_regime(<MarketRegime>regime)
 
     cpdef reset(self, long long mid_ticks=10000, long long best_bid_ticks=0, long long best_ask_ticks=0):
         self.gen.reset(mid_ticks, best_bid_ticks, best_ask_ticks)
@@ -131,7 +141,7 @@ cdef class MicroSim:
         cdef OrderBook* ob = <OrderBook*> self._lob_ptr
         return self.gen.step(ob[0], timestamp, <MicroEvent*>NULL, 0)
 
-    cpdef np.ndarray features(self):
+    cpdef ndarray features(self):
         """
         Вернёт фичи (shape=(N_FEATURES,)). Хвост [12..17] — λ̂-каналы.
         """
@@ -144,10 +154,18 @@ cdef class MicroSim:
         self.gen.copy_lambda_hat(&view[12])
         return arr
 
+
+    cpdef ndarray lambda_hat(self):
+        """
+        Вектор λ̂ (shape=(LAMBDA_DIM,)) в порядке lambda_channel_names()
+        """
+
+
     cpdef np.ndarray lambda_hat(self):
         """
         Вектор λ̂ (shape=(LAMBDA_DIM,)) в порядке lambda_channel_names()
         """
+
         cdef cnp.ndarray[cnp.float64_t, ndim=1] arr = np.zeros((LAMBDA_DIM,), dtype=np.float64)
         cdef double[::1] view = arr
         self.gen.copy_lambda_hat(&view[0])

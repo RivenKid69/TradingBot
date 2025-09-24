@@ -195,6 +195,12 @@ public:
 
     // Доступ к λ̂ (после применения шоков/режимов)
     const std::array<double, CH_K>& lambda_hat() const { return m_lambda_hat; }
+    void copy_lambda_hat(double* out) const {
+        if (!out) return;
+        for (int k = 0; k < CH_K; ++k) {
+            out[k] = m_lambda_hat[k];
+        }
+    }
 
 private:
     // ----------------- внутреннее состояние -----------------
