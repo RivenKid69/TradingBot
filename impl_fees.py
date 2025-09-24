@@ -150,19 +150,19 @@ def _normalise_rounding_options(
     if decimals is not None:
         normalized["decimals"] = decimals
 
-    minimum = _safe_non_negative_float(
-        mapping.get("minimum")
-        or mapping.get("min_fee")
-        or mapping.get("minimum_fee")
-    )
+    minimum = _safe_non_negative_float(mapping.get("minimum"))
+    if minimum is None:
+        minimum = _safe_non_negative_float(mapping.get("min_fee"))
+    if minimum is None:
+        minimum = _safe_non_negative_float(mapping.get("minimum_fee"))
     if minimum is not None:
         normalized["minimum_fee"] = float(minimum)
 
-    maximum = _safe_non_negative_float(
-        mapping.get("maximum")
-        or mapping.get("max_fee")
-        or mapping.get("maximum_fee")
-    )
+    maximum = _safe_non_negative_float(mapping.get("maximum"))
+    if maximum is None:
+        maximum = _safe_non_negative_float(mapping.get("max_fee"))
+    if maximum is None:
+        maximum = _safe_non_negative_float(mapping.get("maximum_fee"))
     if maximum is not None:
         normalized["maximum_fee"] = float(maximum)
 
