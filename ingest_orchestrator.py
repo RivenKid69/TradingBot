@@ -5,6 +5,7 @@ import argparse
 import os
 import sys
 import subprocess
+from pathlib import Path
 from typing import List, Tuple
 
 from ingest_config import load_config, IngestConfig
@@ -42,6 +43,13 @@ def _pick_base_interval(intervals: List[str]) -> str:
 
 def _is_parquet(path: str) -> bool:
     return path.lower().endswith(".parquet")
+
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _script_path(name: str) -> str:
+    return os.fspath(_SCRIPT_DIR / name)
 
 
 def _run(cmd: List[str]) -> None:
@@ -89,7 +97,7 @@ def main():
             os.makedirs(klines_dir, exist_ok=True)
             cmd = [
                 sys.executable,
-                "scripts/ingest_klines.py",
+                _script_path("ingest_klines.py"),
                 "--market", market,
                 "--symbols", sym,
                 "--interval", interval,
@@ -113,7 +121,7 @@ def main():
             _ensure_dir(out_path)
             cmd = [
                 sys.executable,
-                "scripts/agg_klines.py",
+                _script_path("agg_klines.py"),
                 "--in-path", in_path,
                 "--interval", target,
                 "--out-path", out_path,
@@ -126,7 +134,7 @@ def main():
             os.makedirs(futures_dir, exist_ok=True)
             cmd = [
                 sys.executable,
-                "scripts/ingest_funding_mark.py",
+                _script_path("ingest_funding_mark.py"),
                 "--symbol", sym,
                 "--start", start,
                 "--end", end,
@@ -148,7 +156,7 @@ def main():
         _ensure_dir(prices_out)
         cmd = [
             sys.executable,
-            "scripts/make_prices_from_klines.py",
+            _script_path("make_prices_from_klines.py"),
             "--in-klines", in_path,
             "--symbol", sym,
             "--price-col", "close",
@@ -166,7 +174,7 @@ def main():
             _ensure_dir(out_sym)
             cmd = [
                 sys.executable,
-                "scripts/make_prices_from_klines.py",
+                _script_path("make_prices_from_klines.py"),
                 "--in-klines", in_path,
                 "--symbol", sym,
                 "--price-col", "close",
