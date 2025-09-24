@@ -1,4 +1,4 @@
-distutils: language = c++
+# distutils: language = c++
 cython: boundscheck=False, wraparound=False
 
 from libc.math cimport log, tanh
