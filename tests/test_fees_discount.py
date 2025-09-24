@@ -1,5 +1,6 @@
 import pytest
 
+from binance_fee_refresh import DEFAULT_BNB_DISCOUNT_RATE
 from impl_fees import FeesConfig, FeesImpl
 
 
@@ -17,10 +18,11 @@ def test_bnb_discount_applied_by_default():
     fee_disc_maker = disc.model.compute(side="BUY", price=price, qty=qty, liquidity="maker")
     fee_disc_taker = disc.model.compute(side="BUY", price=price, qty=qty, liquidity="taker")
 
-    assert disc.cfg.maker_discount_mult == 0.75
-    assert disc.cfg.taker_discount_mult == 0.75
-    assert fee_disc_maker == pytest.approx(fee_base_maker * 0.75)
-    assert fee_disc_taker == pytest.approx(fee_base_taker * 0.75)
+    expected_mult = 1.0 - float(DEFAULT_BNB_DISCOUNT_RATE)
+    assert disc.cfg.maker_discount_mult == pytest.approx(expected_mult)
+    assert disc.cfg.taker_discount_mult == pytest.approx(expected_mult)
+    assert fee_disc_maker == pytest.approx(fee_base_maker * expected_mult)
+    assert fee_disc_taker == pytest.approx(fee_base_taker * expected_mult)
 
 
 def test_bnb_discount_auto_data_ignored_when_disabled():
