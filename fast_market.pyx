@@ -1,8 +1,8 @@
 # cython: language_level=3
 # distutils: language = c++
 from libcpp.vector cimport vector
-cdef extern from "Python.h":
-    ctypedef void PyObject
+from cython cimport Py_ssize_t
+from cpython.object cimport PyObject
 
 cdef extern from "include/latency_queue.h":
     cdef cppclass LatencyQueuePy:
@@ -15,7 +15,10 @@ cdef extern from "include/latency_queue.h":
         size_t latency() const
         size_t slots() const
 
-from cpython.ref cimport Py_DECREF
+cdef extern from "Python.h":
+    PyObject* PyList_New(Py_ssize_t len)
+    void PyList_SET_ITEM(PyObject* list, Py_ssize_t i, PyObject* item)
+    void Py_DECREF(PyObject* o)
 
 cdef class LatencyQueue:
     cdef LatencyQueuePy* _q
@@ -24,7 +27,7 @@ cdef class LatencyQueue:
         self._q = new LatencyQueuePy(<size_t>max(delay, 0))
 
     def __dealloc__(self):
-        if self._q is not None:
+        if self._q is not NULL:
             del self._q
             self._q = NULL
 
@@ -33,13 +36,22 @@ cdef class LatencyQueue:
 
     cpdef list pop_ready(self):
         cdef vector[PyObject*] v = self._q.pop_ready()
+        cdef Py_ssize_t n = <Py_ssize_t>v.size()
+        cdef PyObject* list_obj = PyList_New(n)
         cdef PyObject* p
-        out = []
-        for i in range(v.size()):
+        cdef Py_ssize_t i
+
+        if list_obj == NULL:
+            for i in range(n):
+                p = v[i]
+                Py_DECREF(p)
+            raise MemoryError()
+
+        for i in range(n):
             p = v[i]
-            out.append(<object>p)  # превращаем в Python-объект (даёт INCREF)
-            Py_DECREF(p)           # балансируем INCREF, сделанный в C++
-        return out
+            PyList_SET_ITEM(list_obj, i, p)  # Steals reference
+
+        return <list>list_obj
 
     cpdef void tick(self):
         self._q.tick()
