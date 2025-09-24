@@ -1,4 +1,4 @@
-# # cython: language_level=3, c_string_type=str, c_string_encoding=utf-8, boundscheck=False, wraparound=False
+# cython: language_level=3, language=c++, c_string_type=str, c_string_encoding=utf-8, boundscheck=False, wraparound=False
 cdef extern from "cpp_microstructure_generator.h":
     cdef enum MarketEventType:
         NO_EVENT,
@@ -28,7 +28,7 @@ cdef extern from "cpp_microstructure_generator.h":
         )
 import uuid
 from cython cimport Py_ssize_t
-from libc.stdlib cimport rand, RAND_MAX, srand, time
+from libc.stdlib cimport rand, RAND_MAX, srand
 from libc.string cimport memset
 from libc.math cimport sin, sqrt, log, abs as c_abs, fmax as c_fmax
 import numpy as np
@@ -95,7 +95,16 @@ cdef extern from "AgentOrderTracker.h":
         long long price
         bint is_buy_side
     cdef cppclass AgentOrderTracker:
-        AgentOrderTracker() except +; void add(long long, long long, bint); void remove(long long); bint contains(long long); const AgentOrderInfo* get_info(long long); void clear(); bint is_empty(); vector[long long] get_all_ids(); const pair[const long long, AgentOrderInfo]* get_first_order_info(); pair[long long, long long] find_closest_order(long long);
+        AgentOrderTracker() except +
+        void add(long long order_id, long long price, bint is_buy)
+        void remove(long long order_id)
+        bint contains(long long order_id)
+        const AgentOrderInfo* get_info(long long order_id)
+        void clear()
+        bint is_empty()
+        vector[long long] get_all_ids()
+        const pair[const long long, AgentOrderInfo]* get_first_order_info()
+        pair[long long, long long] find_closest_order(long long price_ticks)
 
 # Инициализируем NumPy C-API
 np.import_array()
@@ -188,18 +197,15 @@ cdef class MarketSimulatorWrapper:
             raise MemoryError("Failed to allocate MarketSimulator")
 
     def __dealloc__(self):
-        # Освобождение C++ объекта требует GIL
-        with gil:
-            if self.thisptr:
-                del self.thisptr
-                self.thisptr = NULL
+        if self.thisptr is not NULL:
+            del self.thisptr
+            self.thisptr = NULL
 
-    def double step(self, int current_step_idx, double black_swan_probability, bint is_training_mode):
+    cpdef double step(self, int current_step_idx, double black_swan_probability, bint is_training_mode):
         """
         Вызывает C++ метод step для выполнения одного шага симуляции.
         """
-        with nogil:
-            self.thisptr.step(current_step_idx, black_swan_probability, is_training_mode)
+        return self.thisptr.step(current_step_idx, black_swan_probability, is_training_mode)
     cpdef double get_last_price(self):
         return self.thisptr.get_last_price()
     cpdef double get_ma5(self, size_t idx):
@@ -234,8 +240,7 @@ cdef class MarketSimulatorWrapper:
         else:
             regime = NORMAL
         
-        with nogil:
-            self.thisptr.force_market_regime(regime, start_idx, duration)
+        self.thisptr.force_market_regime(regime, start_idx, duration)
 
 
 
@@ -265,6 +270,7 @@ cpdef void build_observation_vector_c(
 
     cdef int feature_idx = 0
     cdef float feature_val # Временная переменная для вычислений
+    cdef int start_idx
 
     # --- Базовые признаки ---
     out_features[feature_idx] = <float>price; feature_idx += 1
@@ -359,7 +365,7 @@ cpdef void build_observation_vector_c(
 
     # --- One-Hot Encoding для токенов (с паддингом) ---
     if max_num_tokens > 1:
-        cdef int start_idx = feature_idx
+        start_idx = feature_idx
         # ПРАВИЛЬНО: Всегда проходим по МАКСИМАЛЬНОМУ числу токенов, заполняя нулями
         for i in range(max_num_tokens):
             out_features[start_idx + i] = 0.0
@@ -378,51 +384,7 @@ cdef class EnvState:
     Высокопроизводительный контейнер для всех переменных состояния торговой среды.
     Все поля объявлены явно для максимальной производительности и безопасности.
     """
-    # Состояние счета и позиции
-    cdef public float cash, units, net_worth, prev_net_worth, peak_value
-    cdef public double _position_value      # накопленная стоимость позиции (может быть <0)
-
-    # Состояние симуляции
-    cdef public int step_idx
-    cdef public bint is_bankrupt
-    cdef public AgentOrderTracker* agent_orders_ptr
-    cdef public unsigned long long next_order_id
-
-    # Параметры Stop-Loss / Take-Profit
-    cdef public bint use_atr_stop, use_trailing_stop, terminate_on_sl_tp, _trailing_active
-    cdef public double _entry_price, _atr_at_entry
-    cdef public double _initial_sl, _initial_tp
-    cdef public double _max_price_since_entry, _min_price_since_entry
-    cdef public double _high_extremum, _low_extremum
-    cdef public double atr_multiplier, trailing_atr_mult, tp_atr_mult
-    cdef public double last_pos
-
-    # Динамические показатели рынка и риска
-    cdef public double fear_greed_value
-    cdef public int trailing_stop_trigger_count
-    cdef public int atr_stop_trigger_count
-    cdef public int tp_trigger_count
-
-    # Метаданные последнего шага для построителя наблюдений
-    cdef public double last_agent_fill_ratio
-    cdef public double last_event_importance
-    cdef public double time_since_event
-    cdef public int last_event_step
-    cdef public int token_index
-    cdef public double last_realized_spread
-    cdef public object lob
-
-    # Параметры вознаграждения и комиссий
-    cdef public double profit_close_bonus, loss_close_penalty, taker_fee, maker_fee
-    cdef public double bankruptcy_threshold, bankruptcy_penalty, max_drawdown
-
-    # Параметры Shaping-а и риска
-    cdef public bint use_potential_shaping, use_dynamic_risk, use_legacy_log_reward
-    cdef public double gamma, last_potential, potential_shaping_coef
-    cdef public double risk_aversion_variance, risk_aversion_drawdown
-    cdef public double trade_frequency_penalty, turnover_penalty_coef, risk_off_level, risk_on_level
-    cdef public double max_position_risk_off, max_position_risk_on, market_impact_k
-    cdef public long long price_scale # <-- ДОБАВЛЕНО ПОЛЕ ДЛЯ МАСШТАБА
+    cdef AgentOrderTracker* agent_orders_ptr
 
     def __cinit__(self):
         # Этот метод вызывается для инициализации C/C++ полей ПЕРЕД __init__
@@ -452,10 +414,9 @@ cdef class EnvState:
             raise MemoryError("Failed to allocate AgentOrderTracker")
 
     def __dealloc__(self):
-        with gil:
-            if self.agent_orders_ptr is not NULL:
-                del self.agent_orders_ptr
-                self.agent_orders_ptr = NULL
+        if self.agent_orders_ptr is not NULL:
+            del self.agent_orders_ptr
+            self.agent_orders_ptr = NULL
 
     
 # ---------- Microstructure Generator (C++ Wrapper) ----------
@@ -480,10 +441,9 @@ cdef class CyMicrostructureGenerator:
             momentum_factor, mean_reversion_factor, adversarial_factor)
 
     def __dealloc__(self):
-        with gil:
-            if self.thisptr:
-                del self.thisptr
-                self.thisptr = NULL
+        if self.thisptr is not NULL:
+            del self.thisptr
+            self.thisptr = NULL
 
     cpdef long long generate_public_events_cy(self,
             vector[MarketEvent]& out_events,
@@ -575,20 +535,35 @@ cpdef tuple run_full_step_logic_cython(
     cdef dict info = {}
     
     cdef double current_max_pos, target_pos_ratio, order_type_signal, current_pos_ratio, delta_ratio, volume_to_trade, offset, price, avg_slippage, fear_greed, ratio, current_price, marketable_volume, remaining_volume, agent_net_taker_flow
-    cdef str side, order_id_str
+    cdef double base_offset, ideal_price, tick_size, price_threshold, tick_size_rand
+    cdef str side, order_id_str, reason_str
     cdef long long order_id
     cdef int trades_made, i
-    cdef double best_bid, best_ask
+    cdef int dynamic_hysteresis_ticks, dynamic_offset_range, offset_in_ticks
+    cdef double best_bid, best_ask, best_bid_scaled, best_ask_scaled
     # --- ИСПРАВЛЕНИЕ: Объявляем переменные здесь, чтобы они были доступны во всей функции ---
     cdef double final_price, volatility_factor, old_units_for_commit, prev_net_worth_before_step, step_pnl
-    cdef object order_id_to_remove, order_info_dict
+    cdef double temp_units, temp_pos_value, vol, fee, old_units, old_value, old_avg_price, realized_pnl, fee_total_event
+    cdef double final_cash, final_units, sl_to_check, tp_to_check, atr_for_trail
+    cdef double base_stop_loss_price, tick_size_sl, price_offset
+    cdef object order_id_to_remove, order_info_dict, reason_obj
     cdef tuple generated_events
     cdef np.ndarray limit_sides_bool, limit_prices, limit_sizes, cancel_sides, public_market_sides_bool, public_market_sizes
-    cdef bint is_buy
+    cdef bint is_buy, should_replace_order, is_buy_for_ideal_price, is_agent_taker
+    cdef bint is_taker, is_maker
     cdef int cancelled_order_count = 0
+    cdef int trades_start_idx, j, agent_trades_count, dynamic_sl_offset_range, random_ticks_offset, sl_range, trades_this_step
     # Новые переменные для событийной модели
     cdef vector[MarketEvent] all_events
-    cdef MarketEvent agent_event
+    cdef vector[long long] ids_to_cancel
+    cdef pair[long long, long long] closest_order
+    cdef MarketEvent agent_event, cancel_ev, current_event
+    cdef CythonLOB lob_clone
+    cdef long long closest_order_price
+    cdef unsigned long long agent_order_id
+    cdef const AgentOrderInfo* info_ptr
+    cdef int trades_made_this_event, executed_count_this_event
+    cdef AgentOrderInfo order_info
     
     
     
@@ -638,7 +613,7 @@ cpdef tuple run_full_step_logic_cython(
     prev_net_worth_before_step = state.prev_net_worth
 
     try:
-        cdef CythonLOB lob_clone = lob.clone()
+        lob_clone = lob.clone()
         # --- 1.1. Логика действий Агента ---
         current_price = bar_price
         volatility_factor = bar_atr / (current_price * 0.001 + 1e-9)
@@ -657,37 +632,36 @@ cpdef tuple run_full_step_logic_cython(
         delta_ratio = target_pos_ratio - current_pos_ratio
         
         if abs(delta_ratio) > 0.01:
-            cdef bint should_replace_order = True
+            should_replace_order = True
             if not state.agent_orders_ptr.is_empty():
                 is_buy_for_ideal_price = (delta_ratio > 0)
                 base_offset = current_price * 0.001
                 ideal_price = current_price - base_offset if is_buy_for_ideal_price else current_price + base_offset
-                cdef int dynamic_hysteresis_ticks = 3 + int(volatility_factor * 5)
-                cdef double tick_size = current_price * 0.0001
-                cdef double price_threshold = dynamic_hysteresis_ticks * tick_size
+                dynamic_hysteresis_ticks = 3 + int(volatility_factor * 5)
+                tick_size = current_price * 0.0001
+                price_threshold = dynamic_hysteresis_ticks * tick_size
                 # ИЗМЕНЕНО: Масштабируем ideal_price перед поиском ближайшего ордера
-                cdef pair[long long, long long] closest_order = state.agent_orders_ptr.find_closest_order(<long long>(ideal_price * 10000))
+                closest_order = state.agent_orders_ptr.find_closest_order(<long long>(ideal_price * 10000))
                 if closest_order.first != -1: # Проверяем, что ордер найден
-                    cdef long long closest_order_price = closest_order.second
+                    closest_order_price = closest_order.second
                     if abs(ideal_price - (closest_order_price / 10000.0)) <= price_threshold:
                         should_replace_order = False
             if should_replace_order:
-                
+
                 delta.clear_all_agent_orders = True # Сохраняем флаг для StateUpdateDelta
-                cdef vector[long long] ids_to_cancel = state.agent_orders_ptr.get_all_ids()
+                ids_to_cancel = state.agent_orders_ptr.get_all_ids()
                 cancelled_order_count = ids_to_cancel.size()
                 for i in range(cancelled_order_count):
-                    cdef MarketEvent cancel_ev
                     cancel_ev.type = AGENT_CANCEL_SPECIFIC
                     cancel_ev.order_id = ids_to_cancel[i]
                     all_events.push_back(cancel_ev)
-                
+
                 is_buy = (delta_ratio > 0)
                 volume_to_trade = abs(delta_ratio) * state.prev_net_worth / current_price
-                
+
                 if volume_to_trade * current_price >= 10:
                     # РЕЗЕРВИРУЕМ ID ДЛЯ ОРДЕРА АГЕНТА ЗАРАНЕЕ
-                    cdef unsigned long long agent_order_id = 0
+                    agent_order_id = 0
                     if order_type_signal > 0.5:
                         agent_order_id = state.next_order_id
                         state.next_order_id += 1
@@ -697,9 +671,9 @@ cpdef tuple run_full_step_logic_cython(
                         # Восстанавливаем вычисление цены для лимитного ордера
                         offset = current_price * 0.001
                         price = current_price - offset if is_buy else current_price + offset
-                        cdef int dynamic_offset_range = 2 + int(volatility_factor * 4)
-                        cdef double tick_size_rand = current_price * 0.0001
-                        cdef int offset_in_ticks = 0
+                        dynamic_offset_range = 2 + int(volatility_factor * 4)
+                        tick_size_rand = current_price * 0.0001
+                        offset_in_ticks = 0
                         if dynamic_offset_range > 0:
                             offset_in_ticks = -dynamic_offset_range + (rand() % (2 * dynamic_offset_range + 1))
                         price += offset_in_ticks * tick_size_rand
@@ -741,9 +715,6 @@ cpdef tuple run_full_step_logic_cython(
             random_shuffle(all_events.begin(), all_events.end())
 
         # --- 1.4. НОВЫЙ ЦИКЛ: Исполнение перемешанных событий ---
-        cdef MarketEvent current_event
-        cdef int trades_made_this_event, executed_count_this_event
-
         for i in range(all_events.size()):
             current_event = all_events[i]
             trades_made_this_event = 0
@@ -754,7 +725,7 @@ cpdef tuple run_full_step_logic_cython(
                 lob_clone.add_limit_order(current_event.is_buy, current_event.price, current_event.size, current_event.order_id, (current_event.type == AGENT_LIMIT_ADD), state.step_idx)
 
             elif current_event.type == AGENT_MARKET_MATCH or current_event.type == PUBLIC_MARKET_MATCH:
-                cdef bint is_agent_taker = (current_event.type == AGENT_MARKET_MATCH)
+                is_agent_taker = (current_event.type == AGENT_MARKET_MATCH)
                 trades_made_this_event, fee_total_event = lob_clone.match_market_order_cy(
                     current_event.is_buy, current_event.size, state.step_idx, is_agent_taker,
                     prices_all_arr, volumes_all_arr, maker_ids_all_arr,
@@ -767,7 +738,7 @@ cpdef tuple run_full_step_logic_cython(
                     taker_is_agent_all_arr[total_trades_count : total_trades_count + trades_made_this_event] = is_agent_taker
 
             elif current_event.type == AGENT_CANCEL_SPECIFIC:
-                cdef const AgentOrderInfo* info_ptr = state.agent_orders_ptr.get_info(current_event.order_id)
+                info_ptr = state.agent_orders_ptr.get_info(current_event.order_id)
                 if info_ptr is not NULL:
                     lob_clone.remove_order(info_ptr.is_buy_side, info_ptr.price, current_event.order_id)
 
@@ -779,9 +750,9 @@ cpdef tuple run_full_step_logic_cython(
 
             # --- КРИТИЧЕСКИ ВАЖНО: ОБРАБОТКА PNL ВНУТРИ ЦИКЛА ---
             if trades_made_this_event > 0:
-                cdef double temp_units = state.units + delta.units_delta
-                cdef double temp_pos_value = state._position_value + delta.position_value_delta
-                cdef int trades_start_idx = total_trades_count
+                temp_units = state.units + delta.units_delta
+                temp_pos_value = state._position_value + delta.position_value_delta
+                trades_start_idx = total_trades_count
 
                 for j in range(trades_start_idx, trades_start_idx + trades_made_this_event):
                     is_taker = taker_is_agent_all_arr[j]
@@ -801,7 +772,7 @@ cpdef tuple run_full_step_logic_cython(
                     old_units = temp_units
                     old_value = temp_pos_value
                     temp_units += d_units
-            
+
                     if old_units * temp_units >= 0.0:
                         if abs(temp_units) > abs(old_units):
                             temp_pos_value += d_units * price
@@ -832,10 +803,10 @@ cpdef tuple run_full_step_logic_cython(
         if best_bid_scaled > 0 and best_ask_scaled > 0:
             # ИСПРАВЛЕНО: Используем динамический state.price_scale
             final_price = (best_bid_scaled + best_ask_scaled) / (2.0 * state.price_scale)
-else:
+        else:
             final_price = current_price
         
-        cdef double units_after_trades = state.units + delta.units_delta
+        units_after_trades = state.units + delta.units_delta
 
         # SL/TP Logic - все записи идут в 'delta'
         if state.last_pos != 0 and abs(units_after_trades) < 1e-6: # Position closed
@@ -849,11 +820,9 @@ else:
             delta.atr_at_entry = max(bar_atr, long_term_atr)
             side = 'BUY' if units_after_trades > 0 else 'SELL'
             
-            cdef double base_stop_loss_price, tick_size_sl, price_offset
-            cdef int dynamic_sl_offset_range, random_ticks_offset
             tick_size_sl = current_price * 0.0001
             dynamic_sl_offset_range = 6 + int(volatility_factor * 10)
-            cdef int sl_range = max(1, dynamic_sl_offset_range - 1)
+            sl_range = max(1, dynamic_sl_offset_range - 1)
             random_ticks_offset = 1 + (rand() % sl_range)
             price_offset = random_ticks_offset * tick_size_sl
 
@@ -869,15 +838,15 @@ else:
                 if not state._trailing_active: delta.min_price_since_entry = delta.entry_price
 
         # Check for SL/TP triggers
-        cdef double sl_to_check = state._initial_sl
-        cdef double tp_to_check = state._initial_tp
+        sl_to_check = state._initial_sl
+        tp_to_check = state._initial_tp
 
         # Если позиция была только что открыта, используем новые уровни из delta
         if delta.new_pos_opened:
             sl_to_check = delta.initial_sl
             tp_to_check = delta.initial_tp
 
-        cdef double atr_for_trail = 0.0
+        atr_for_trail = 0.0
         if units_after_trades > 0: # Long position checks
             if state.use_trailing_stop:
                 if not state._trailing_active and state._entry_price > 0 and state._atr_at_entry > 0 and final_price >= state._entry_price + state._atr_at_entry * 1.5:
@@ -912,15 +881,15 @@ else:
             
 
         # Final state value calculations
-        cdef double final_cash = state.cash + delta.cash_delta
-        cdef double final_units = state.units + delta.units_delta
+        final_cash = state.cash + delta.cash_delta
+        final_units = state.units + delta.units_delta
         delta.final_net_worth = final_cash + final_units * final_price
-        
-        cdef int agent_trades_count = 0
+
+        agent_trades_count = 0
         for i in range(total_trades_count):
             if taker_is_agent_all_arr[i]: # char 1 (True) или 0 (False)
                 agent_trades_count += 1
-        
+
         trades_this_step = agent_trades_count + delta.agent_orders_to_remove.size() + cancelled_order_count
         
         
@@ -969,8 +938,8 @@ else:
     if not delta.new_agent_orders_to_add.empty():
         for i in range(delta.new_agent_orders_to_add.size()):
             order_id = delta.new_agent_orders_to_add[i].first
-            cdef AgentOrderInfo info = delta.new_agent_orders_to_add[i].second
-            state.agent_orders_ptr.add(order_id, info.price, info.is_buy_side)
+            order_info = delta.new_agent_orders_to_add[i].second
+            state.agent_orders_ptr.add(order_id, order_info.price, order_info.is_buy_side)
 
     # --- НАЧАЛО НОВОГО, ЕДИНОГО БЛОКА ОБНОВЛЕНИЯ ЦЕНЫ ВХОДА И SL/TP ---
 
@@ -999,12 +968,12 @@ else:
         state._atr_at_entry = max(bar_atr, long_term_atr)
         state._trailing_active = False # Трейлинг всегда выключен вначале.
 
-        cdef double volatility_factor = bar_atr / (bar_price * 0.001 + 1e-9)
-        cdef double tick_size_sl = bar_price * 0.0001
-        cdef int dynamic_sl_offset_range = 6 + int(volatility_factor * 10)
-        cdef int sl_range = max(1, dynamic_sl_offset_range - 1)
-        cdef int random_ticks_offset = 1 + (rand() % sl_range)
-        cdef double price_offset = random_ticks_offset * tick_size_sl
+        volatility_factor = bar_atr / (bar_price * 0.001 + 1e-9)
+        tick_size_sl = bar_price * 0.0001
+        dynamic_sl_offset_range = 6 + int(volatility_factor * 10)
+        sl_range = max(1, dynamic_sl_offset_range - 1)
+        random_ticks_offset = 1 + (rand() % sl_range)
+        price_offset = random_ticks_offset * tick_size_sl
         
         # Устанавливаем начальные SL/TP и экстремумы цены.
         if state.units > 0: # Long
@@ -1069,8 +1038,7 @@ else:
     state.fear_greed_value = bar_fear_greed
 
     if "closed" in info:
-        cdef object reason_obj = info["closed"]
-        cdef str reason_str
+        reason_obj = info["closed"]
         try:
             reason_str = <str>reason_obj
         except Exception:
@@ -1128,7 +1096,7 @@ else:
 # ==============================================================================
 # ====== ВОССТАНОВЛЕННАЯ И ОПТИМИЗИРОВАННАЯ ФУНКЦИЯ ВОЗНАГРАЖДЕНИЯ ===========
 # ==============================================================================
-cdef _compute_reward_cython(
+cdef inline tuple _compute_reward_cython(
     float net_worth, float prev_net_worth, float event_reward,
     bint use_legacy_log_reward, bint use_potential_shaping,
     float gamma, float last_potential, float potential_shaping_coef,
@@ -1137,19 +1105,18 @@ cdef _compute_reward_cython(
     int trades_this_step, float trade_frequency_penalty,
     double executed_notional, double turnover_penalty_coef
 ):
-    ""
-    Вознаграждение с базовым сигналом ΔPnL и опциональным наследуемым логарифмическим компонентом.
-    ""
+    # Вознаграждение с базовым сигналом ΔPnL и опциональным наследуемым логарифмическим компонентом.
     cdef double reward = net_worth - prev_net_worth
     cdef double current_potential = 0.0
+    cdef double clipped_ratio, risk_penalty, dd_penalty
 
     if use_legacy_log_reward:
-        cdef double clipped_ratio = fmax(0.1, fmin(net_worth / (prev_net_worth + 1e-9), 10.0))
+        clipped_ratio = fmax(0.1, fmin(net_worth / (prev_net_worth + 1e-9), 10.0))
         reward += log(clipped_ratio)
 
         if use_potential_shaping:
-            cdef double risk_penalty = 0.0
-            cdef double dd_penalty = 0.0
+            risk_penalty = 0.0
+            dd_penalty = 0.0
 
             if net_worth > 1e-9 and units != 0 and atr > 0:
                 risk_penalty = -risk_aversion_variance * abs(units) * atr / (abs(net_worth) + 1e-9)
