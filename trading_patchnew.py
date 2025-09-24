@@ -332,7 +332,14 @@ class TradingEnv(gym.Env):
         elif override:
             cfg_nt = NoTradeConfig(**override)
         else:
-            cfg_nt = get_no_trade_config(kwargs.get("sandbox_config", "configs/legacy_sandbox.yaml"))
+            sandbox_path = kwargs.get("sandbox_config", "configs/legacy_sandbox.yaml")
+            try:
+                cfg_nt = get_no_trade_config(sandbox_path)
+            except FileNotFoundError:
+                logger.warning(
+                    "Sandbox config %s not found; using default no-trade settings", sandbox_path
+                )
+                cfg_nt = NoTradeConfig()
         self._no_trade_cfg = cfg_nt
         if "ts_ms" in self.df.columns:
             ts = (
