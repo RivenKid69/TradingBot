@@ -11,6 +11,7 @@ import copy
 import difflib
 import shlex
 import tempfile
+from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -59,6 +60,12 @@ from service_signal_runner import (
     clear_dirty_restart,
 )
 from service_eval import ServiceEval, EvalConfig
+
+
+_ROOT_DIR = Path(__file__).resolve().parent
+_INGEST_SCRIPT = str(_ROOT_DIR / "ingest_orchestrator.py")
+_MAKE_FEATURES_SCRIPT = str(_ROOT_DIR / "make_features.py")
+_BUILD_TRAINING_TABLE_SCRIPT = str(_ROOT_DIR / "build_training_table.py")
 
 
 # --------------------------- Seasonality API ---------------------------
@@ -161,7 +168,7 @@ def build_all_pipeline(
     logs_dir: str,
 ) -> None:
     rc = run_cmd(
-        [py, "scripts/ingest_orchestrator.py", "--config", cfg_ingest],
+        [py, _INGEST_SCRIPT, "--config", cfg_ingest],
         log_path=os.path.join(logs_dir, "ingest.log"),
     )
     if rc != 0:
@@ -171,7 +178,7 @@ def build_all_pipeline(
     rc = run_cmd(
         [
             py,
-            "scripts/make_features.py",
+            _MAKE_FEATURES_SCRIPT,
             "--in",
             prices_in,
             "--out",
@@ -189,7 +196,7 @@ def build_all_pipeline(
 
     args = [
         py,
-        "scripts/build_training_table.py",
+        _BUILD_TRAINING_TABLE_SCRIPT,
         "--base",
         bt_base,
         "--prices",
@@ -788,7 +795,7 @@ with tabs[1]:
             rc = run_cmd(
                 [
                     sys.executable,
-                    "scripts/ingest_orchestrator.py",
+                    _INGEST_SCRIPT,
                     "--config",
                     cfg_ingest,
                 ],
@@ -823,7 +830,7 @@ with tabs[2]:
         rc = run_cmd(
             [
                 sys.executable,
-                "scripts/make_features.py",
+                _MAKE_FEATURES_SCRIPT,
                 "--in",
                 prices_in,
                 "--out",
@@ -845,7 +852,7 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Training table (сбор меток и merge asof)")
     st.caption(
-        "Вызов вашего scripts/build_training_table.py (аргументы подставьте под ваш проект)."
+        "Вызов вашего build_training_table.py (аргументы подставьте под ваш проект)."
     )
 
     bt_base = st.text_input("features base (--base)", value="data/features.parquet")
@@ -868,7 +875,7 @@ with tabs[3]:
     if st.button("Собрать training table", type="primary"):
         args = [
             sys.executable,
-            "scripts/build_training_table.py",
+            _BUILD_TRAINING_TABLE_SCRIPT,
             "--base",
             bt_base,
             "--prices",
