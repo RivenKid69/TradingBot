@@ -2,10 +2,10 @@
 from libc.stdlib cimport malloc, realloc, free, rand
 from libc.math cimport floor
 cimport cython
-from exec.lob_book cimport CythonLOB
-from exec.events cimport MarketEvent, EventType, Side
-from core.constants cimport PRICE_SCALE
-from core.workspace cimport SimulationWorkspace
+from execlob_book cimport CythonLOB
+from execevents cimport MarketEvent, EventType, Side
+from core_constants cimport PRICE_SCALE
+from coreworkspace cimport SimulationWorkspace
 
 @cython.cclass
 class CythonLOB:
