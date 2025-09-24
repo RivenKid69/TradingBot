@@ -17,6 +17,16 @@ cdef class SimulationWorkspace:
     cdef long long[::1] trade_ts        # Timestamps of trades
     cdef long long[::1] filled_order_ids# IDs of orders that were fully filled in the step
 
+    # Compatibility aliases for legacy lob_state_cython expectations
+    cdef double[::1] prices_all_arr
+    cdef double[::1] volumes_all_arr
+    cdef char[::1] is_buy_side_all_arr
+    cdef char[::1] maker_is_agent_all_arr
+    cdef char[::1] taker_is_agent_all_arr
+    cdef long long[::1] timestamps_all_arr
+    cdef unsigned long long[::1] maker_ids_all_arr
+    cdef long long[::1] fully_executed_ids_all_arr
+
     cdef int trade_count    # Number of trades recorded in the current step
     cdef int filled_count   # Number of order IDs recorded as fully filled in the current step
     cdef int _capacity      # Allocated slots for each buffer

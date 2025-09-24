@@ -38,6 +38,7 @@ cimport cython
 import random
 import pandas as pd
 from fast_lob cimport CythonLOB
+from coreworkspace cimport SimulationWorkspace
 # Инициализируем NumPy C-API
 np.import_array()
 # вычисляем число признаков для observation_space
@@ -103,39 +104,6 @@ np.import_array()
 # Используется для предварительного выделения памяти под NumPy массивы.
 DEF MAX_TRADES_PER_STEP = 10000
 DEF MAX_GENERATED_EVENTS_PER_TYPE = 5000
-cdef class SimulationWorkspace:
-    """
-    Контейнер для предварительно выделенных NumPy массивов,
-    чтобы избежать их пересоздания на каждом шаге симуляции.
-    """
-    # Объявляем публичные атрибуты для быстрого доступа из Cython
-    cdef public double[::1] prices_all_arr
-    cdef public double[::1] volumes_all_arr
-    cdef public unsigned long long[::1] maker_ids_all_arr
-    cdef public char[::1] maker_is_agent_all_arr
-    cdef public int[::1] timestamps_all_arr
-    cdef public char[::1] is_buy_side_all_arr
-    cdef public char[::1] taker_is_agent_all_arr
-    cdef public unsigned long long[::1] fully_executed_ids_all_arr
-
-    def __cinit__(self):
-        # Выделяем память один раз при создании объекта
-        self.prices_all_arr = np.empty(MAX_TRADES_PER_STEP, dtype=np.float64, order="C")
-        self.volumes_all_arr = np.empty(MAX_TRADES_PER_STEP, dtype=np.float64, order="C")
-        self.maker_ids_all_arr = np.empty(MAX_TRADES_PER_STEP, dtype=np.uint64, order="C")
-        self.maker_is_agent_all_arr = np.empty(MAX_TRADES_PER_STEP, dtype=np.int8, order="C")
-        self.timestamps_all_arr = np.empty(MAX_TRADES_PER_STEP, dtype=np.int32, order="C")
-        self.is_buy_side_all_arr = np.empty(MAX_TRADES_PER_STEP, dtype=np.int8, order="C")
-        self.taker_is_agent_all_arr = np.empty(MAX_TRADES_PER_STEP, dtype=np.int8, order="C")
-        self.fully_executed_ids_all_arr = np.empty(MAX_TRADES_PER_STEP, dtype=np.uint64, order="C")
-
-        # Закрепляем массивы, чтобы GC не освободил их
-        self._buf_refs = [
-            self.prices_all_arr, self.volumes_all_arr, self.maker_ids_all_arr,
-            self.maker_is_agent_all_arr, self.timestamps_all_arr,
-            self.is_buy_side_all_arr, self.taker_is_agent_all_arr,
-            self.fully_executed_ids_all_arr
-        ]
 
 # --- ИСПРАВЛЕННЫЕ C++ ДЕКЛАРАЦИИ ---
 # Объявляем, что мы будем использовать C++ класс MarketSimulator с полным набором указателей
@@ -422,10 +390,27 @@ cdef class EnvState:
 
     # Параметры Stop-Loss / Take-Profit
     cdef public bint use_atr_stop, use_trailing_stop, terminate_on_sl_tp, _trailing_active
-    cdef public double _entry_price, _atr_at_entry, _initial_sl_level, _initial_tp_level
+    cdef public double _entry_price, _atr_at_entry
+    cdef public double _initial_sl, _initial_tp
     cdef public double _max_price_since_entry, _min_price_since_entry
+    cdef public double _high_extremum, _low_extremum
     cdef public double atr_multiplier, trailing_atr_mult, tp_atr_mult
     cdef public double last_pos
+
+    # Динамические показатели рынка и риска
+    cdef public double fear_greed_value
+    cdef public int trailing_stop_trigger_count
+    cdef public int atr_stop_trigger_count
+    cdef public int tp_trigger_count
+
+    # Метаданные последнего шага для построителя наблюдений
+    cdef public double last_agent_fill_ratio
+    cdef public double last_event_importance
+    cdef public double time_since_event
+    cdef public int last_event_step
+    cdef public int token_index
+    cdef public double last_realized_spread
+    cdef public object lob
 
     # Параметры вознаграждения и комиссий
     cdef public double profit_close_bonus, loss_close_penalty, taker_fee, maker_fee
@@ -444,6 +429,25 @@ cdef class EnvState:
         self.agent_orders_ptr = new AgentOrderTracker()
         self._position_value = 0.0 # Инициализация нулём
         self.price_scale = PRICE_SCALE
+        self._entry_price = -1.0
+        self._atr_at_entry = -1.0
+        self._initial_sl = -1.0
+        self._initial_tp = -1.0
+        self._max_price_since_entry = -1.0
+        self._min_price_since_entry = -1.0
+        self._high_extremum = -1.0
+        self._low_extremum = -1.0
+        self.fear_greed_value = 0.0
+        self.trailing_stop_trigger_count = 0
+        self.atr_stop_trigger_count = 0
+        self.tp_trigger_count = 0
+        self.last_agent_fill_ratio = 0.0
+        self.last_event_importance = 0.0
+        self.time_since_event = 0.0
+        self.last_event_step = -1
+        self.token_index = 0
+        self.last_realized_spread = 0.0
+        self.lob = None
         if self.agent_orders_ptr is NULL:
             raise MemoryError("Failed to allocate AgentOrderTracker")
 
@@ -528,8 +532,8 @@ cdef struct StateUpdateDelta:
     # Изменения в состоянии отслеживания позиции (SL/TP)
     double entry_price
     double atr_at_entry
-    double initial_sl_level
-    double initial_tp_level
+    double initial_sl
+    double initial_tp
     double max_price_since_entry
     double min_price_since_entry
     bint trailing_active
@@ -596,9 +600,9 @@ cpdef tuple run_full_step_logic_cython(
     
     cdef double[::1] prices_all_arr = workspace.prices_all_arr
     cdef double[::1] volumes_all_arr = workspace.volumes_all_arr
-    cdef long long[::1] maker_ids_all_arr = workspace.maker_ids_all_arr
+    cdef unsigned long long[::1] maker_ids_all_arr = workspace.maker_ids_all_arr
     cdef char[::1] maker_is_agent_all_arr = workspace.maker_is_agent_all_arr
-    cdef int[::1] timestamps_all_arr = workspace.timestamps_all_arr
+    cdef long long[::1] timestamps_all_arr = workspace.timestamps_all_arr
     cdef char[::1] is_buy_side_all_arr = workspace.is_buy_side_all_arr
     cdef char[::1] taker_is_agent_all_arr = workspace.taker_is_agent_all_arr
     cdef long long[::1] fully_executed_ids_all_arr = workspace.fully_executed_ids_all_arr
@@ -855,23 +859,23 @@ else:
 
             if side == 'BUY':
                 base_stop_loss_price = delta.entry_price - state.atr_multiplier * delta.atr_at_entry
-                delta.initial_sl_level = base_stop_loss_price - price_offset
-                delta.initial_tp_level = delta.entry_price + state.tp_atr_mult * delta.atr_at_entry
+                delta.initial_sl = base_stop_loss_price - price_offset
+                delta.initial_tp = delta.entry_price + state.tp_atr_mult * delta.atr_at_entry
                 if not state._trailing_active: delta.max_price_since_entry = delta.entry_price
             else: # 'SELL'
                 base_stop_loss_price = delta.entry_price + state.atr_multiplier * delta.atr_at_entry
-                delta.initial_sl_level = base_stop_loss_price + price_offset
-                delta.initial_tp_level = delta.entry_price - state.tp_atr_mult * delta.atr_at_entry
+                delta.initial_sl = base_stop_loss_price + price_offset
+                delta.initial_tp = delta.entry_price - state.tp_atr_mult * delta.atr_at_entry
                 if not state._trailing_active: delta.min_price_since_entry = delta.entry_price
-        
+
         # Check for SL/TP triggers
-        cdef double sl_to_check = state._initial_sl_level
-        cdef double tp_to_check = state._initial_tp_level
+        cdef double sl_to_check = state._initial_sl
+        cdef double tp_to_check = state._initial_tp
 
         # Если позиция была только что открыта, используем новые уровни из delta
         if delta.new_pos_opened:
-            sl_to_check = delta.initial_sl_level
-            tp_to_check = delta.initial_tp_level
+            sl_to_check = delta.initial_sl
+            tp_to_check = delta.initial_tp
 
         cdef double atr_for_trail = 0.0
         if units_after_trades > 0: # Long position checks
@@ -981,10 +985,12 @@ else:
         state._entry_price = -1.0
         state._position_value = 0.0
         state._atr_at_entry = -1.0
-        state._initial_sl_level = -1.0
-        state._initial_tp_level = -1.0
+        state._initial_sl = -1.0
+        state._initial_tp = -1.0
         state._max_price_since_entry = -1.0
         state._min_price_since_entry = -1.0
+        state._high_extremum = -1.0
+        state._low_extremum = -1.0
         state._trailing_active = False
 
     # Шаг 2: Проверяем, не была ли только что открыта НОВАЯ позиция (переход с нуля).
@@ -1002,15 +1008,19 @@ else:
         
         # Устанавливаем начальные SL/TP и экстремумы цены.
         if state.units > 0: # Long
-            state._initial_sl_level = (state._entry_price - state.atr_multiplier * state._atr_at_entry) - price_offset
-            state._initial_tp_level = state._entry_price + state.tp_atr_mult * state._atr_at_entry
+            state._initial_sl = (state._entry_price - state.atr_multiplier * state._atr_at_entry) - price_offset
+            state._initial_tp = state._entry_price + state.tp_atr_mult * state._atr_at_entry
             state._max_price_since_entry = final_price # Начальный максимум = текущая цена
             state._min_price_since_entry = -1.0
+            state._high_extremum = final_price
+            state._low_extremum = final_price
         else: # Short
-            state._initial_sl_level = (state._entry_price + state.atr_multiplier * state._atr_at_entry) + price_offset
-            state._initial_tp_level = state._entry_price - state.tp_atr_mult * state._atr_at_entry
+            state._initial_sl = (state._entry_price + state.atr_multiplier * state._atr_at_entry) + price_offset
+            state._initial_tp = state._entry_price - state.tp_atr_mult * state._atr_at_entry
             state._min_price_since_entry = final_price # Начальный минимум = текущая цена
             state._max_price_since_entry = -1.0
+            state._high_extremum = final_price
+            state._low_extremum = final_price
 
     # Шаг 3: Обновляем состояние трейлинг-стопа.
     if delta.trailing_active and not state._trailing_active:
@@ -1021,8 +1031,34 @@ else:
     if state._trailing_active:
         if state.units > 0:
             state._max_price_since_entry = max(state._max_price_since_entry, final_price)
+            state._high_extremum = max(state._high_extremum, state._max_price_since_entry)
+            if state._low_extremum < 0:
+                state._low_extremum = final_price
+            else:
+                state._low_extremum = min(state._low_extremum, final_price)
         elif state.units < 0:
             state._min_price_since_entry = min(state._min_price_since_entry, final_price)
+            if state._low_extremum < 0:
+                state._low_extremum = state._min_price_since_entry
+            else:
+                state._low_extremum = min(state._low_extremum, state._min_price_since_entry)
+    elif abs(state.units) > 1e-8:
+        # Если трейлинг ещё не активен, экстремумы отслеживают текущую цену
+        if state.units > 0:
+            state._high_extremum = max(state._high_extremum, final_price)
+            if state._low_extremum < 0:
+                state._low_extremum = final_price
+            else:
+                state._low_extremum = min(state._low_extremum, final_price)
+        else:
+            if state._high_extremum < 0:
+                state._high_extremum = final_price
+            else:
+                state._high_extremum = max(state._high_extremum, final_price)
+            if state._low_extremum >= 0:
+                state._low_extremum = min(state._low_extremum, final_price)
+            else:
+                state._low_extremum = final_price
     
     state.last_pos = delta.final_last_pos
 
@@ -1030,7 +1066,22 @@ else:
     state.net_worth = delta.final_net_worth
     state.peak_value = delta.final_peak_value
     state.last_potential = delta.final_last_potential
-    
+    state.fear_greed_value = bar_fear_greed
+
+    if "closed" in info:
+        cdef object reason_obj = info["closed"]
+        cdef str reason_str
+        try:
+            reason_str = <str>reason_obj
+        except Exception:
+            reason_str = ""
+        if reason_str.startswith("trailing_sl"):
+            state.trailing_stop_trigger_count += 1
+        elif reason_str.startswith("atr_sl"):
+            state.atr_stop_trigger_count += 1
+        elif reason_str.startswith("static_tp"):
+            state.tp_trigger_count += 1
+
     # Обработка банкротства
     if delta.is_bankrupt:
         state.is_bankrupt = True

@@ -1,8 +1,7 @@
 # reward.pyx
 
 from libc.math cimport log, tanh, fabs  # use C math for performance (no Python)
-# Import definitions from reward.pxd
-cdef class EnvState  # (Ensure consistent with EnvState declared elsewhere)
+from lob_state_cython cimport EnvState
 cdef enum ClosedReason:
     NONE, ATR_SL_LONG, ATR_SL_SHORT, TRAILING_SL_LONG, TRAILING_SL_SHORT, STATIC_TP_LONG, STATIC_TP_SHORT, BANKRUPTCY, MAX_DRAWDOWN
 

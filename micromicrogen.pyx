@@ -93,6 +93,7 @@ cdef class CyMicrostructureGenerator:
             self.best_bid = 0
         self.best_ask = self.current_price + 1
 
+
 """Simple microstructure generator used by the Python simulation stack.
 
 The previous revision attempted to implement a fully ``nogil`` PCG based
@@ -128,6 +129,7 @@ cdef class CyMicrostructureGenerator:
         self._last_side = 0
 
 
+
     cpdef void set_regime(self,
                           double base_order_imbalance_ratio,
                           double base_cancel_ratio,
@@ -136,7 +138,9 @@ cdef class CyMicrostructureGenerator:
                           double adversarial_factor):
 
 
+
         """Configure the generator parameters used when producing events."""
+
 
         self.base_order_imbalance_ratio = base_order_imbalance_ratio
         self.base_cancel_ratio = base_cancel_ratio
@@ -434,6 +438,7 @@ cdef class CyMicrostructureGenerator:
             self.best_bid = 0
         self.best_ask = self.current_price + 1
 
+
     cpdef list generate_public_events(self,
                                       object state,
                                       object tracker,
@@ -541,4 +546,5 @@ cdef class CyMicrostructureGenerator:
 
     cdef int _sample_quantity(self):
         return 1 + self._rng.randint(0, 4 + int(abs(self.adversarial_factor) * 6))
+
 
