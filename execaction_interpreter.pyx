@@ -1,9 +1,13 @@
 # cython: language_level=3
 import math
-from exec.events import build_agent_limit_add, build_agent_market_match, build_agent_cancel_specific
-from exec.lob_book cimport CythonLOB
-from exec.events cimport EventType, Side
-from core.constants cimport PRICE_SCALE
+
+from execevents import (
+    build_agent_limit_add,
+    build_agent_market_match,
+    build_agent_cancel_specific,
+)
+from execevents cimport EventType, Side
+import core_constants as constants
 
 # For generating unique order IDs for agent orders (shim for environment's next_order_id)
 cdef int _next_order_id = 1  # NOTE: shim for integration; replace with state.next_order_id management later
@@ -13,6 +17,7 @@ def build_agent_event_set(state, tracker, params, action):
     Interpret the agent's action and generate a set of agent events for this step.
     Returns a list of event tuples (to be mixed with public events).
     """
+    global _next_order_id
     cdef double target_frac
     cdef double cur_units = 0.0
     cdef double net_worth = 0.0
@@ -20,11 +25,12 @@ def build_agent_event_set(state, tracker, params, action):
     cdef double price = 0.0
     cdef double position_value = 0.0
     cdef list events = []
+    cdef double style_param = 0.0
 
     # Extract action components
     if hasattr(action, "__len__") and len(action) > 1:
         target_frac = float(action[0])
-        cdef double style_param = float(action[1])
+        style_param = float(action[1])
     else:
         target_frac = float(action) if hasattr(action, "__float__") else 0.0
         style_param = 0.0  # default prefer limit
@@ -95,13 +101,13 @@ def build_agent_event_set(state, tracker, params, action):
         use_market = True
 
     # If agent has an existing open order from previous steps, handle cancellation if needed
+    cdef int existing_id = -1
     try:
-        cdef int existing_id = -1
         # Check buy side orders
         if tracker is not None:
-            existing_id = tracker.find_closest_order(price * PRICE_SCALE, Side.BUY)
+            existing_id = tracker.find_closest_order(price * constants.PRICE_SCALE, Side.BUY)
             if existing_id == -1:
-                existing_id = tracker.find_closest_order(price * PRICE_SCALE, Side.SELL)
+                existing_id = tracker.find_closest_order(price * constants.PRICE_SCALE, Side.SELL)
     except AttributeError:
         existing_id = -1
 
@@ -113,20 +119,22 @@ def build_agent_event_set(state, tracker, params, action):
             events.append(build_agent_cancel_specific(existing_id, 1 if side == 1 else -1))
 
     # Now build new order event if needed
+    cdef double mid
+    cdef int oid
     if volume_units > 0:
         if use_market:
             # Market order
             events.append(build_agent_market_match(side, volume_units))
         else:
             # Limit order
-            cdef double mid = 0.0
+            mid = 0.0
             try:
-                cdef CythonLOB lob = state.lob
-                if lob is not None:
-                    mid = lob.mid_price()
+                lob_obj = getattr(state, "lob", None)
+                if lob_obj is not None:
+                    mid = lob_obj.mid_price()
             except Exception:
-                mid = price * PRICE_SCALE
-            cdef int oid = _next_order_id
+                mid = price * constants.PRICE_SCALE
+            oid = _next_order_id
             _next_order_id += 1
             events.append(build_agent_limit_add(mid, side, volume_units, oid))
     return events
