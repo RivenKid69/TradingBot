@@ -82,7 +82,7 @@ cdef class EnvState:
     cdef public double _position_value
     cdef public int step_idx
     cdef public bint is_bankrupt
-    cdef public AgentOrderTracker* agent_orders_ptr
+    cdef AgentOrderTracker* agent_orders_ptr
     cdef public unsigned long long next_order_id
 
     cdef public bint use_atr_stop
