@@ -28,7 +28,9 @@ import shutil
 import math
 import argparse
 import yaml
+import sys
 import hashlib
+from functools import lru_cache
 from features_pipeline import FeaturePipeline
 from pathlib import Path
 
@@ -39,7 +41,6 @@ from core_config import (
     resolve_execution_timing,
 )
 
-from distributional_ppo import DistributionalPPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, DummyVecEnv, VecEnv
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.vec_env import VecNormalize
@@ -127,6 +128,13 @@ class AdversarialCallback(BaseCallback):
         """Возвращает словарь с результатами тестов."""
         return self.regime_metrics
 from shared_memory_vec_env import SharedMemoryVecEnv
+
+
+@lru_cache(maxsize=1)
+def _get_distributional_ppo():
+    from distributional_ppo import DistributionalPPO
+
+    return DistributionalPPO
 
 # --- ИЗМЕНЕНИЕ: Включаем оптимизации PyTorch ---
 # Если GPU и версия CUDA >= 11, включаем высокую точность
@@ -729,6 +737,7 @@ def objective(trial: optuna.Trial,
     
     # Оборачиваем ее в словарь для передачи в policy_kwargs
     policy_kwargs["lr_scheduler"] = scheduler_fn
+    DistributionalPPO = _get_distributional_ppo()
     model = DistributionalPPO(
         use_torch_compile=True,
         v_range_ema_alpha=params["v_range_ema_alpha"],
@@ -1300,6 +1309,7 @@ def main():
             eval_env.norm_reward = False
             eval_env.clip_reward = None
 
+            DistributionalPPO = _get_distributional_ppo()
             best_model = DistributionalPPO.load(str(best_model_path), env=eval_env)
 
             rewards, equity_curves = evaluate_policy_custom_cython(
@@ -1336,7 +1346,22 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
 
-    # --- gradient sanity check (включается флагом окружения) ---что 
+    def _extract_grad_sanity(argv: list[str]) -> str | None:
+        for idx, arg in enumerate(argv):
+            if arg == "--grad-sanity":
+                if idx + 1 < len(argv) and not argv[idx + 1].startswith("--"):
+                    return argv[idx + 1]
+                return "1"
+            if arg.startswith("--grad-sanity="):
+                value = arg.split("=", 1)[1]
+                return value if value else "1"
+        return None
+
+    flag_value = _extract_grad_sanity(sys.argv[1:])
+    if flag_value is not None:
+        os.environ["GRAD_SANITY"] = flag_value
+
+    # --- gradient sanity check (включается флагом окружения) ---что
     from runtime_flags import get_bool
     if get_bool("GRAD_SANITY", False):
         from tools.grad_sanity import run_check
