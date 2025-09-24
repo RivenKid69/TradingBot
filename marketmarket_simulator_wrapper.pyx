@@ -1,5 +1,7 @@
 import math
 
+from libc.stdint cimport uint64_t
+
 cdef class MarketSimulatorWrapper:
     """Cython wrapper for MarketSimulator, providing safe access to simulation and indicators."""
     cdef public bint _random_shocks_enabled

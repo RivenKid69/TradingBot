@@ -17,11 +17,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements_extra.txt
       - name: Verify pandas and numpy
-        run: python - <<'PY'
-import pandas, numpy
-print('pandas', pandas.__version__)
-print('numpy', numpy.__version__)
-PY
+        run: |
+          python - <<'PY'
+          import pandas, numpy
+          print('pandas', pandas.__version__)
+          print('numpy', numpy.__version__)
+          PY
       - name: Run lint checks
         run: |
           pip install black flake8

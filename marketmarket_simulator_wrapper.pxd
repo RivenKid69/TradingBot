@@ -3,6 +3,9 @@ cimport libc.stdint
 # Cython interface for the MarketSimulatorWrapper
 cdef class MarketSimulatorWrapper:
     """Cython wrapper for the C++ MarketSimulator (safe interface)."""
+    cdef public bint _random_shocks_enabled
+    cdef public bint _last_shock
+    cdef double _last_price
     cpdef void set_seed(self, libc.stdint.uint64_t seed)
     cpdef void enable_random_shocks(self, bint enable)
     cpdef void step(self, int step_index, double black_swan_probability, bint is_training_mode)
