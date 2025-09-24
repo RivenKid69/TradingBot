@@ -134,7 +134,7 @@ def now_ms() -> int:
 def next_bar_open_ms(close_ms: int, timeframe_ms: int) -> int:
     """Return the open timestamp of the bar following ``close_ms``."""
 
-    return bar_close_ms(close_ms, timeframe_ms)
+    return bar_start_ms(close_ms, timeframe_ms)
 
 
 def interpolate_daily_multipliers(days: Sequence[float]) -> np.ndarray:
