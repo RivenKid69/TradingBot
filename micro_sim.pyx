@@ -60,7 +60,7 @@ def lambda_channel_names():
 
 # --- упаковка признаков ---
 
-cdef inline np.ndarray _features_to_numpy(const MicroFeatures& f):
+cdef inline cnp.ndarray[cnp.float64_t, ndim=1] _features_to_numpy(const MicroFeatures& f):
     """
     ndarray[float64] длиной N_FEATURES:
       0: mid
@@ -77,21 +77,19 @@ cdef inline np.ndarray _features_to_numpy(const MicroFeatures& f):
      11: best_ask_ticks
      12..17: λ̂-каналы (см. lambda_channel_names)
     """
-    cdef cnp.npy_intp n = N_FEATURES
-    cdef np.ndarray arr = np.zeros((n,), dtype=np.float64)
-    cdef double* p = <double*> arr.data
-    p[0]  = f.mid
-    p[1]  = f.spread_ticks
-    p[2]  = f.depth_bid_top1
-    p[3]  = f.depth_ask_top1
-    p[4]  = f.depth_bid_top5
-    p[5]  = f.depth_ask_top5
-    p[6]  = f.imbalance_top1
-    p[7]  = f.imbalance_top5
-    p[8]  = <double>f.last_trade_sign
-    p[9]  = f.last_trade_size
-    p[10] = <double>f.best_bid
-    p[11] = <double>f.best_ask
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] arr = np.empty((N_FEATURES,), dtype=np.float64)
+    arr[0]  = f.mid
+    arr[1]  = f.spread_ticks
+    arr[2]  = f.depth_bid_top1
+    arr[3]  = f.depth_ask_top1
+    arr[4]  = f.depth_bid_top5
+    arr[5]  = f.depth_ask_top5
+    arr[6]  = f.imbalance_top1
+    arr[7]  = f.imbalance_top5
+    arr[8]  = <double>f.last_trade_sign
+    arr[9]  = f.last_trade_size
+    arr[10] = <double>f.best_bid
+    arr[11] = <double>f.best_ask
     return arr
 
 # --- основной класс ---
@@ -141,18 +139,18 @@ cdef class MicroSim:
             raise RuntimeError("MicroSim has no attached LOB (call attach_lob first)")
         cdef OrderBook* ob = <OrderBook*> self._lob_ptr
         cdef MicroFeatures f = self.gen.current_features(ob[0])
-        arr = _features_to_numpy(f)
-        cdef double* p = <double*> arr.data
-        self.gen.copy_lambda_hat(p + 12)
+        cdef cnp.ndarray[cnp.float64_t, ndim=1] arr = _features_to_numpy(f)
+        cdef double[::1] view = arr
+        self.gen.copy_lambda_hat(&view[12])
         return arr
 
     cpdef np.ndarray lambda_hat(self):
         """
         Вектор λ̂ (shape=(LAMBDA_DIM,)) в порядке lambda_channel_names()
         """
-        cdef np.ndarray arr = np.zeros((LAMBDA_DIM,), dtype=np.float64)
-        cdef double* p = <double*> arr.data
-        self.gen.copy_lambda_hat(p)
+        cdef cnp.ndarray[cnp.float64_t, ndim=1] arr = np.zeros((LAMBDA_DIM,), dtype=np.float64)
+        cdef double[::1] view = arr
+        self.gen.copy_lambda_hat(&view[0])
         return arr
 
     cpdef dict lambda_hat_dict(self):
