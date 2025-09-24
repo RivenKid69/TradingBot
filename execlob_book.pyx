@@ -381,3 +381,15 @@ class CythonLOB:
                             self.cancel_order(self.bid_orders[j].order_id)
                         else:
                             self.cancel_order(self.ask_orders[j - self.n_bids].order_id)
+
+    cpdef list iter_agent_orders(self):
+        """Return a Python list of the current agent limit orders."""
+        cdef list result = []
+        cdef int i
+        for i in range(self.n_bids):
+            if self.bid_orders[i].type == EventType.AGENT_LIMIT_ADD:
+                result.append((self.bid_orders[i].order_id, 1, self.bid_orders[i].price))
+        for i in range(self.n_asks):
+            if self.ask_orders[i].type == EventType.AGENT_LIMIT_ADD:
+                result.append((self.ask_orders[i].order_id, -1, self.ask_orders[i].price))
+        return result

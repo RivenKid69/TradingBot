@@ -1,18 +1,18 @@
 # cython: language_level=3
+"""Execution helpers for integrating the Cython order book."""
+
 import execaction_interpreter as action_interpreter
 from execevents import apply_agent_events
-from execlob_book cimport CythonLOB
-from coreworkspace cimport SimulationWorkspace
-from execevents cimport EventType
+from execlob_book import CythonLOB
 
 # Engine functions for full LOB execution and commit
 
-cpdef step_full_lob(state, tracker, params, microgen, SimulationWorkspace ws, action):
+cpdef step_full_lob(state, tracker, params, microgen, ws, action):
     """
     Execute one simulation step using the full order book (LOB) model.
     Generates and applies agent and public events to a cloned order book.
     """
-    cdef CythonLOB lob_clone
+    cdef object lob_clone
     # Obtain main order book from state (if available) and clone it
     try:
         lob_clone = state.lob.clone()
@@ -29,13 +29,14 @@ cpdef step_full_lob(state, tracker, params, microgen, SimulationWorkspace ws, ac
     apply_agent_events(state, tracker, microgen, lob_clone, ws, events_list)
     return lob_clone
 
-cpdef commit_step(state, tracker, CythonLOB lob_clone, SimulationWorkspace ws):
+cpdef commit_step(state, tracker, lob_clone, ws):
     """
     Commit the results of the step to the environment state.
     This applies position changes, cash flows, and updates open orders tracking.
     In this stage, we do not modify primary EnvState fields (defer to later integration).
     """
-    cdef int i
+    cdef int direction
+    cdef tuple order_info
     # Update agent's open order tracker based on final LOB state
     if tracker is not None:
         try:
@@ -43,18 +44,17 @@ cpdef commit_step(state, tracker, CythonLOB lob_clone, SimulationWorkspace ws):
         except AttributeError:
             pass
         # Add all remaining agent orders from lob_clone to tracker
-        for i in range(lob_clone.n_bids):
-            if lob_clone.bid_orders[i].type == EventType.AGENT_LIMIT_ADD:
+        try:
+            for order_info in lob_clone.iter_agent_orders():
+                # order_info = (order_id, side, price)
+                direction = 1 if order_info[1] > 0 else -1
                 try:
-                    tracker.add(lob_clone.bid_orders[i].order_id, 1, lob_clone.bid_orders[i].price)
+                    tracker.add(order_info[0], direction, order_info[2])
                 except AttributeError:
                     pass
-        for i in range(lob_clone.n_asks):
-            if lob_clone.ask_orders[i].type == EventType.AGENT_LIMIT_ADD:
-                try:
-                    tracker.add(lob_clone.ask_orders[i].order_id, -1, lob_clone.ask_orders[i].price)
-                except AttributeError:
-                    pass
+        except AttributeError:
+            # lob_clone may not expose the helper in some integration setups
+            pass
     # Optionally update EnvState's order book to the new cloned state (atomic commit)
     try:
         state.lob = lob_clone

@@ -27,3 +27,4 @@ cdef class CythonLOB:
     cdef void match_market(self, int side, int qty, SimulationWorkspace ws) nogil
     cpdef double mid_price(self)
     cdef void apply_events_batch_nogil(self, MarketEvent* events, int num_events, SimulationWorkspace ws) nogil
+    cpdef list iter_agent_orders(self)
