@@ -117,7 +117,6 @@ int timestamp)
                              static_cast<uint64_t>(order_id),
                              is_agent, timestamp, TIF_GTC);
 }
-}
 /* ------------------------------------------------------------------ */
 /*  clone (deep‑copy if !COW, shallow if COW)                         */
 /* ------------------------------------------------------------------ */
@@ -128,14 +127,20 @@ OrderBook* OrderBook::clone() const
     ob->_d = _d;               // shared reference
     return ob;
 #else
-    return new OrderBook(*this); // fallback – deleted copy ctor avoided
+    OrderBook* ob = new OrderBook();
+    ob->bids    = bids;
+    ob->asks    = asks;
+    ob->idx_map = idx_map;
+    ob->gen     = gen;
+    ob->fee_model = fee_model;
+    return ob;
 #endif
 }
 
 /* ------------------------------------------------------------------ */
 /*  swap                                                              */
 /* ------------------------------------------------------------------ */
-void OrderBook::swap(OrderBook& other)
+void OrderBook::swap(OrderBook& other) noexcept
 {
 #ifdef ORDERBOOK_COW
     _d.swap(other._d);
@@ -223,7 +228,7 @@ int OrderBook::decay_ttl_and_cancel(const std::function<void(const Order&)>& on_
     std::vector<Item> to_remove;
     int cancelled = 0;
 
-    auto scan_side = [&](bool is_buy, decltype(b)& book) {
+    auto scan_side = [&](bool is_buy, auto& book) {
         for (auto &kv : book) {
             long long price = kv.first;
             auto &dq = kv.second;
@@ -567,10 +572,16 @@ double OrderBook::get_volume_for_top_levels(bool is_buy_side, int levels) const
 {
 double vol = 0.0;
 int counted = 0;
-const auto& book = is_buy_side ? bids : asks;
-for (const auto& [px, dq] : book) {
-if (counted++ >= levels) break;
-for (const auto& o : dq) vol += o.volume;
+if (is_buy_side) {
+    for (const auto& [px, dq] : bids) {
+        if (counted++ >= levels) break;
+        for (const auto& o : dq) vol += o.volume;
+    }
+} else {
+    for (const auto& [px, dq] : asks) {
+        if (counted++ >= levels) break;
+        for (const auto& o : dq) vol += o.volume;
+    }
 }
 return vol;
 }
