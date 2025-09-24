@@ -242,3 +242,22 @@ def test_bnb_rounding_scales_with_conversion():
     assert details.rounding_step == pytest.approx(0.00005)
     assert details.commission_step == pytest.approx(0.00005)
 
+
+def test_decimal_rounding_uses_half_up():
+    model = FeesModel.from_dict(
+        {
+            "maker_bps": 0,
+            "taker_bps": 250,
+            "rounding": {"decimals": 2},
+        }
+    )
+
+    fee = model.compute(
+        side="SELL",
+        price=1.0,
+        qty=1.0,
+        liquidity="taker",
+    )
+
+    assert fee == pytest.approx(0.03)
+

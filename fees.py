@@ -140,13 +140,27 @@ def _round_value_to_decimals(value: float, decimals: int) -> float:
         return float(value)
     try:
         quant = Decimal(1).scaleb(-decimals)
-        rounded = Decimal(str(value)).quantize(quant)
+        rounded = Decimal(str(value)).quantize(quant, rounding=ROUND_HALF_UP)
         result = float(rounded)
         if math.isfinite(result):
             return result
     except (InvalidOperation, ValueError):
         pass
-    return float(round(value, decimals))
+
+    try:
+        factor = 10 ** decimals
+        scaled = float(value) * factor
+        if scaled >= 0.0:
+            adjusted = math.floor(scaled + 0.5)
+        else:
+            adjusted = math.ceil(scaled - 0.5)
+        result = adjusted / factor
+        if math.isfinite(result):
+            return float(result)
+    except Exception:
+        pass
+
+    return float(value)
 
 
 def _round_value_to_step(value: float, step: float, mode: str) -> float:
