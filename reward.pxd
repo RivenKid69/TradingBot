@@ -1,6 +1,6 @@
 # reward.pxd
 
-cdef class EnvState  # Forward declaration of EnvState (defined elsewhere)
+from lob_state_cython cimport EnvState
 
 cdef enum ClosedReason:  # Importing ClosedReason enum for closed position reasons
     NONE = 0
