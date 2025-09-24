@@ -14,7 +14,7 @@ exec_mod = importlib.util.module_from_spec(spec_exec)
 sys.modules["execution_sim"] = exec_mod
 spec_exec.loader.exec_module(exec_mod)
 
-spec_log = importlib.util.spec_from_file_location("sim_logging", BASE / "logging.py")
+spec_log = importlib.util.spec_from_file_location("sim_logging", BASE / "sim_logging.py")
 log_mod = importlib.util.module_from_spec(spec_log)
 sys.modules["sim_logging"] = log_mod
 spec_log.loader.exec_module(log_mod)

@@ -376,7 +376,7 @@ except Exception:
 
 # --- Импорт логгера ---
 try:
-    from sim.logging import LogWriter, LogConfig
+    from sim.sim_logging import LogWriter, LogConfig
 except Exception:
     LogWriter = None  # type: ignore
     LogConfig = None  # type: ignore

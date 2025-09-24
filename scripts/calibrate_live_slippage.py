@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Calibrate live slippage curves from execution logs.
 
-This utility scans trade fills produced by :class:`logging.LogWriter`,
+This utility scans trade fills produced by :class:`sim_logging.LogWriter`,
 aggregates empirical impact-vs-notional curves and derives seasonal
 adjustments that can be consumed by the runtime slippage model.  The
 workflow is fully offline – it only depends on historical log files and

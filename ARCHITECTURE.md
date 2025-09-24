@@ -233,7 +233,7 @@ from_config(cfg_run, trainer=trainer, train_cfg=cfg)
 ## Логи и отчёты
 
 Сервисы автоматически пишут журналы сделок и отчёты по эквити через
-класс `LogWriter` из модуля [`logging.py`](logging.py). По умолчанию
+класс `LogWriter` из модуля [`sim_logging.py`](sim_logging.py). По умолчанию
 создаются два файла.
 
 ### `logs/log_trades_<runid>.csv`
