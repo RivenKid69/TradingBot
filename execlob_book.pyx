@@ -7,30 +7,9 @@ from coreworkspace cimport SimulationWorkspace
 
 cdef class CythonLOB:
 
-from libc.stdlib cimport malloc, realloc, free, rand
-from libc.math cimport floor
-cimport cython
-from execlob_book cimport CythonLOB
-from execevents cimport MarketEvent, EventType, Side
-from core_constants cimport PRICE_SCALE
-from coreworkspace cimport SimulationWorkspace
-
-@cython.cclass
-class CythonLOB:
-
     """
     Cython implementation of a Limit Order Book (LOB) supporting basic operations.
     """
-    # Internal arrays and counters for bid and ask orders
-    cdef int capacity_bids
-    cdef int capacity_asks
-    cdef int n_bids
-    cdef int n_asks
-    cdef MarketEvent* bid_orders
-    cdef MarketEvent* ask_orders
-    cdef int best_bid_index
-    cdef int best_ask_index
-    cdef bint _pending_market_is_agent
 
     def __cinit__(self):
         # Initialize with default capacity
@@ -219,11 +198,11 @@ class CythonLOB:
         Cancel (remove) an order by its order_id if it exists.
         """
         cdef int idx
+        cdef int j
         # Try find in bids
         idx = self._find_order_index_by_id(order_id, True)
         if idx != -1:
             # Remove bid order at idx
-            cdef int j
             for j in range(idx + 1, self.n_bids):
                 self.bid_orders[j - 1] = self.bid_orders[j]
             self.n_bids -= 1
@@ -231,7 +210,6 @@ class CythonLOB:
         # Try find in asks
         idx = self._find_order_index_by_id(order_id, False)
         if idx != -1:
-            cdef int j
             for j in range(idx + 1, self.n_asks):
                 self.ask_orders[j - 1] = self.ask_orders[j]
             self.n_asks -= 1
@@ -257,6 +235,7 @@ class CythonLOB:
         cdef int remaining = qty
         cdef int trade_qty
         cdef int trade_price
+        cdef int j
         cdef bint is_agent_market = self._pending_market_is_agent
         if qty <= 0:
             return
@@ -275,7 +254,6 @@ class CythonLOB:
                     if self.ask_orders[0].type == EventType.AGENT_LIMIT_ADD:
                         ws.push_filled_order_id(self.ask_orders[0].order_id)
                     # Remove the ask order
-                    cdef int j
                     for j in range(1, self.n_asks):
                         self.ask_orders[j - 1] = self.ask_orders[j]
                     self.n_asks -= 1
@@ -381,3 +359,43 @@ class CythonLOB:
                             self.cancel_order(self.bid_orders[j].order_id)
                         else:
                             self.cancel_order(self.ask_orders[j - self.n_bids].order_id)
+
+    cpdef void apply_events_batch(self, list events, SimulationWorkspace ws):
+        """Apply a sequence of Python-level events to the book via the workspace."""
+        cdef Py_ssize_t n = len(events)
+        cdef MarketEvent* buffer
+        cdef Py_ssize_t i
+        cdef object evt
+
+        if n == 0:
+            return
+
+        buffer = <MarketEvent*> malloc(n * cython.sizeof(MarketEvent))
+        if buffer == <MarketEvent*> 0:
+            raise MemoryError("Failed to allocate temporary event buffer")
+
+        try:
+            for i in range(n):
+                evt = events[i]
+                buffer[i].type = <EventType> <int> evt[0]
+                buffer[i].side = <Side> <int> evt[1]
+                buffer[i].price = <int> evt[2]
+                buffer[i].qty = <int> evt[3]
+                buffer[i].order_id = <int> evt[4]
+
+            with nogil:
+                self.apply_events_batch_nogil(buffer, <int> n, ws)
+        finally:
+            free(buffer)
+
+    cpdef list iter_agent_orders(self):
+        """Return a Python list of the current agent limit orders."""
+        cdef list result = []
+        cdef int i
+        for i in range(self.n_bids):
+            if self.bid_orders[i].type == EventType.AGENT_LIMIT_ADD:
+                result.append((self.bid_orders[i].order_id, 1, self.bid_orders[i].price))
+        for i in range(self.n_asks):
+            if self.ask_orders[i].type == EventType.AGENT_LIMIT_ADD:
+                result.append((self.ask_orders[i].order_id, -1, self.ask_orders[i].price))
+        return result
