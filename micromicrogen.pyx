@@ -1,56 +1,36 @@
-# cython: language_level=3, boundscheck=False, wraparound=False
-from libc.stdint cimport uint32_t, uint64_t
-from libc.math cimport exp
+"""Simple microstructure generator used by the Python simulation stack.
 
-# Import PRICE_SCALE constant from core.constants (Python module)
-import core.constants as _const
-cdef int PRICE_SCALE = _const.PRICE_SCALE
+The previous revision attempted to implement a fully ``nogil`` PCG based
+event generator that wrote directly into a ``MarketEvent`` memory view.  The
+structure definition that code relied on no longer exists which caused Cython
+to emit multiple syntax and attribute errors (missing ``owner`` field,
+unmatched method signature used from Python, invalid ``cdef`` statements in a
+``with gil`` block, etc.).  For the high level simulator we only need a small
+Python friendly generator that returns tuples describing public events.  The
+rewritten implementation below keeps the configuration surface intact while
+removing the invalid low level constructs so the module can compile again.
+"""
+
+# cython: language_level=3
+from libc.stdint cimport uint64_t
+
+import random
+
+import core_constants as constants
+from execevents cimport EventType, Side
+
 
 cdef class CyMicrostructureGenerator:
-    """Cython class to generate public market microstructure events under nogil."""
-    cdef uint64_t _state        # PCG32 RNG state
-    cdef uint64_t _inc          # PCG32 RNG increment (stream id)
-    cdef double momentum_factor
-    cdef double mean_reversion_factor
-    cdef double base_order_imbalance_ratio
-    cdef double base_cancel_ratio
-    cdef double adversarial_factor
-    cdef int _last_side         # Last event side (1 for buy, -1 for sell, 0 if none)
-    cdef int current_price      # Approximate last trade price (in ticks)
-    cdef int best_bid           # Best bid price (tick)
-    cdef int best_ask           # Best ask price (tick)
+    """Generate lightweight public order flow for tests and Python sims."""
 
     def __cinit__(self):
-        # Initialize default parameters and RNG state
-        self._state = 0
-        self._inc = 0x14057B7EF767814F  # default stream (odd constant)
-        self.momentum_factor = 0.0
-        self.mean_reversion_factor = 0.0
-        self.base_order_imbalance_ratio = 1.0
-        self.base_cancel_ratio = 0.0
-        self.adversarial_factor = 0.0
-        self._last_side = 0
-        # Set a default initial price and spread (avoid negative prices)
-        self.current_price = 100 * PRICE_SCALE
-        if self.current_price < 0:
-            self.current_price = 0
-        self.best_bid = self.current_price - 1 if self.current_price > 0 else 0
-        self.best_ask = self.current_price + 1
+        self._rng = random.Random()
+        self._reset_defaults()
 
     cpdef void seed(self, uint64_t seed):
-        """Seed the internal PCG32 random number generator with a 64-bit seed."""
-        # NOTE: Using PCG32 seeding routine for reproducibility
-        self._state = 0
-        self._inc = (seed << 1) | 1  # ensure increment is odd
-        # Advance state with initial sequence selection and state injection
-        self._pcg32_random()        # discard first output, updates state
-        self._state += seed        # mix in the seed as initial state
-        self._pcg32_random()        # advance again to finalize state
-        self._last_side = 0        # reset momentum tracking
-        # Reset price and spread to default values (optional)
-        self.current_price = 100 * PRICE_SCALE
-        self.best_bid = self.current_price - 1 if self.current_price > 0 else 0
-        self.best_ask = self.current_price + 1
+        """Seed the internal RNG (``random.Random`` wrapper)."""
+        self._rng.seed(seed)
+        self._last_side = 0
 
     cpdef void set_regime(self,
                           double base_order_imbalance_ratio,
@@ -58,259 +38,117 @@ cdef class CyMicrostructureGenerator:
                           double momentum_factor,
                           double mean_reversion_factor,
                           double adversarial_factor):
-        """Set the microstructure regime parameters for event generation."""
+        """Configure the generator parameters used when producing events."""
         self.base_order_imbalance_ratio = base_order_imbalance_ratio
         self.base_cancel_ratio = base_cancel_ratio
         self.momentum_factor = momentum_factor
         self.mean_reversion_factor = mean_reversion_factor
         self.adversarial_factor = adversarial_factor
 
-    cpdef int generate_public_events(self, object out_events, int max_events):
-        """Generate public market events and fill the out_events buffer (owner=0).
-        
-        Returns the number of events generated. This function performs all 
-        event generation under nogil for performance. The output buffer out_events 
-        should be a contiguous memoryview of MarketEvent objects.
+    cpdef list generate_public_events(self,
+                                      object state,
+                                      object tracker,
+                                      object lob,
+                                      int max_events=16):
+        """Return a list of public events as tuples.
+
+        The tuples follow the same layout as agent events generated elsewhere in
+        the code base: ``(event_type, side, price_ticks, qty, order_id)``.
+        ``event_type`` and ``side`` are returned as plain integers compatible
+        with the ``EventType`` and ``Side`` enums defined in :mod:`execevents`.
         """
-        cdef int i, events_count
-        # Acquire a typed memoryview for output events (1D contiguous)
-        cdef MarketEvent[::1] ev_buf = out_events  # memoryview of MarketEvent
-        # Local copies of state for nogil operations
-        cdef uint64_t state = self._state
-        cdef uint64_t inc = self._inc
-        cdef int last_side = self._last_side
-        cdef int best_bid = self.best_bid
-        cdef int best_ask = self.best_ask
-        cdef int cur_price = self.current_price
 
-        # Calculate base probabilities
-        cdef double pb_base = 0.5
+        cdef list events = []
+        cdef int num_events = self._determine_event_count(max_events)
+        if num_events == 0:
+            return events
+
+        cdef double mid_price = self._resolve_mid_price(state, lob)
+        cdef int mid_ticks = <int> (mid_price * constants.PRICE_SCALE)
+        if mid_ticks < 1:
+            mid_ticks = constants.PRICE_SCALE  # fall back to one currency unit
+
+        cdef int i
+        for i in range(num_events):
+            events.append(self._build_single_event(mid_ticks))
+
+        return events
+
+    cdef void _reset_defaults(self):
+        self.momentum_factor = 0.0
+        self.mean_reversion_factor = 0.0
+        self.base_order_imbalance_ratio = 1.0
+        self.base_cancel_ratio = 0.1
+        self.adversarial_factor = 0.0
+        self._last_side = 0
+
+    cdef int _determine_event_count(self, int max_events):
+        if max_events <= 0:
+            return 0
+        # Use a simple geometric style distribution to keep things light weight.
+        cdef double intensity = 0.5 + max(0.0, self.adversarial_factor)
+        cdef int count = 0
+        while count < max_events and self._rng.random() < intensity:
+            count += 1
+            intensity *= 0.6  # diminishing probability of long bursts
+        return count
+
+    cdef double _resolve_mid_price(self, object state, object lob):
+        """Best effort mid price retrieval used for pricing new orders."""
+        try:
+            if lob is not None:
+                return float(lob.mid_price()) / constants.PRICE_SCALE
+        except Exception:
+            pass
+
+        try:
+            return float(getattr(state, "last_price"))
+        except Exception:
+            return 1.0  # final fallback prevents zero pricing
+
+    cdef tuple _build_single_event(self, int mid_ticks):
+        cdef int side = self._choose_side()
+        cdef double cancel_threshold = max(0.0, min(1.0, self.base_cancel_ratio))
+        cdef double draw = self._rng.random()
+
+        if draw < cancel_threshold:
+            return (<int> EventType.PUBLIC_CANCEL_RANDOM, side, 0, 0, 0)
+
+        cdef double market_bias = 0.5 + 0.5 * (self.momentum_factor - self.mean_reversion_factor)
+        market_bias = max(0.0, min(1.0, market_bias))
+
+        if self._rng.random() < market_bias:
+            price = max(1, mid_ticks + (constants.PRICE_SCALE if side == <int> Side.BUY else -constants.PRICE_SCALE))
+            qty = self._sample_quantity()
+            self._last_side = side
+            return (<int> EventType.PUBLIC_MARKET_MATCH, side, price, qty, 0)
+
+        price = self._sample_limit_price(mid_ticks, side)
+        qty = self._sample_quantity()
+        self._last_side = side
+        return (<int> EventType.PUBLIC_LIMIT_ADD, side, price, qty, 0)
+
+    cdef int _choose_side(self):
+        cdef double base_prob = 0.5
         if self.base_order_imbalance_ratio > 0.0:
-            pb_base = self.base_order_imbalance_ratio / (1.0 + self.base_order_imbalance_ratio)
-        elif self.base_order_imbalance_ratio == 0.0:
-            pb_base = 0.0  # extreme case: no buy flow if ratio is 0
+            base_prob = self.base_order_imbalance_ratio / (1.0 + self.base_order_imbalance_ratio)
 
-        # Compute expected events count (Poisson intensity = 1 + adversarial_factor)
-        cdef double lam = 1.0 + self.adversarial_factor
-        if lam < 0.0:
-            lam = 0.0
-        # Sample events_count ~ Poisson(lam) using inversion by multiplication
-        cdef double L = exp(-lam)
-        cdef double p = 1.0
-        events_count = 0
-        # Draw Poisson outcome
-        while True:
-            # Draw uniform [0,1) from PCG32
-            p *= (<double>(state >> 18 ^ state) * 2.3283064365386963e-10)  # Using PCG output as uniform
-            # The above uses an inline PCG step for efficiency (XSH RR output)
-            # Actually, ensure to advance state properly:
-            if p <= L:
-                break
-            events_count += 1
-            # Advance PCG state manually inside loop for subsequent randoms
-            state = state * 6364136223846793005ULL + (inc | 1ULL)
-            if events_count > max_events:
-                # Cap events at max_events to avoid overflow
-                events_count = max_events
-                break
+        if self._last_side == <int> Side.BUY:
+            base_prob += self.momentum_factor
+            base_prob -= self.mean_reversion_factor
+        elif self._last_side == <int> Side.SELL:
+            base_prob -= self.momentum_factor
+            base_prob += self.mean_reversion_factor
 
-        if events_count > max_events:
-            events_count = max_events
+        base_prob = max(0.0, min(1.0, base_prob))
+        return <int> Side.BUY if self._rng.random() < base_prob else <int> Side.SELL
 
-        # Generate each event
-        with nogil:
-            # Use the latest state/inc values for RNG under nogil
-            self._state = state
-            self._inc = inc
-            for i in range(events_count):
-                # Determine event type (cancel or order) based on base_cancel_ratio
-                cdef double u = self._rand_uniform()
-                cdef int event_type
-                if u < self.base_cancel_ratio and (best_bid > 0 or best_ask > 0):
-                    event_type = PUBLIC_CANCEL_RANDOM
-                else:
-                    # Determine if event is a market order or a limit add
-                    cdef double u_type = self._rand_uniform()
-                    # Base probability of market order (more with momentum, less with mean reversion)
-                    cdef double p_market = 0.5 + 0.5 * (self.momentum_factor - self.mean_reversion_factor)
-                    if p_market < 0.0:
-                        p_market = 0.0
-                    elif p_market > 1.0:
-                        p_market = 1.0
-                    if u_type < p_market:
-                        event_type = PUBLIC_MARKET_MATCH
-                    else:
-                        event_type = PUBLIC_LIMIT_ADD
-                # Determine side of event (buy or sell) with momentum/mean-reversion adjustments
-                cdef double pb = pb_base
-                if last_side == 1:
-                    # Last event was buy: momentum favors buy, reversion favors sell
-                    pb = pb_base + self.momentum_factor - self.mean_reversion_factor
-                elif last_side == -1:
-                    # Last event was sell: momentum favors sell (reducing buy prob), reversion favors buy
-                    pb = pb_base - self.momentum_factor + self.mean_reversion_factor
-                if pb < 0.0:
-                    pb = 0.0
-                elif pb > 1.0:
-                    pb = 1.0
-                cdef double u_side = self._rand_uniform()
-                cdef int side = 1 if u_side < pb else -1  # 1 for buy, -1 for sell
+    cdef int _sample_limit_price(self, int mid_ticks, int side):
+        cdef int tick_offset = 1 + self._rng.randint(0, 5 + int(abs(self.adversarial_factor) * 4))
+        if side == <int> Side.BUY:
+            return max(1, mid_ticks - tick_offset)
+        else:
+            return max(1, mid_ticks + tick_offset)
 
-                # Prepare event data
-                ev_buf[i].owner = 0
-                ev_buf[i].side = side
-                ev_buf[i].type = event_type
-                # Default price and qty
-                ev_buf[i].price = 0
-                ev_buf[i].qty = 1
-
-                if event_type == PUBLIC_LIMIT_ADD:
-                    # Generate a limit order (no immediate match)
-                    cdef int price = 0
-                    if side == 1:
-                        # Buy limit: place at or below best_ask - 1
-                        cdef int max_price = best_ask - 1 if best_ask > 0 else best_bid
-                        if max_price < 0:
-                            max_price = 0
-                        cdef int range = 5 + <int>(self.adversarial_factor * 5)
-                        if range < 0:
-                            range = 0
-                        # random offset within [0, range]
-                        cdef uint32_t rnd = self._pcg32_random_fast()
-                        cdef int offset = 0
-                        if range > 0:
-                            offset = rnd % (range + 1)
-                        price = best_bid
-                        if offset > 0:
-                            # Add offset but do not exceed max_price
-                            cdef long long cand_price = best_bid + offset
-                            price = cand_price if cand_price <= max_price else max_price
-                        # Update best_bid if improved
-                        if price > best_bid:
-                            best_bid = price
-                        # best_ask remains unchanged
-                    else:
-                        # Sell limit: place at or above best_bid + 1
-                        cdef int min_price = best_bid + 1
-                        if min_price < 0:
-                            min_price = 0
-                        cdef int range = 5 + <int>(self.adversarial_factor * 5)
-                        if range < 0:
-                            range = 0
-                        cdef uint32_t rnd = self._pcg32_random_fast()
-                        cdef int offset = 0
-                        if range > 0:
-                            offset = rnd % (range + 1)
-                        price = best_ask
-                        if offset > 0:
-                            # Subtract offset but ensure not below min_price
-                            cdef long long cand_price = best_ask - offset
-                            price = cand_price if cand_price >= min_price else min_price
-                        # Update best_ask if improved (lowered)
-                        if price < best_ask:
-                            best_ask = price
-                        # best_bid remains unchanged
-                    ev_buf[i].price = price if price >= 0 else 0
-                    # Quantity: at least 1, add adversarial factor influence
-                    cdef int base_max_qty = 5
-                    cdef int add_range = <int>(self.adversarial_factor * 10)
-                    if add_range < 0:
-                        add_range = 0
-                    cdef uint32_t rndq = self._pcg32_random_fast()
-                    cdef int qty = 1
-                    if base_max_qty + add_range > 1:
-                        qty = 1 + (rndq % (base_max_qty + add_range))
-                    if qty < 1:
-                        qty = 1
-                    ev_buf[i].qty = qty
-                    # current_price (last trade) remains unchanged (no trade occurred)
-                elif event_type == PUBLIC_MARKET_MATCH:
-                    # Generate a market order (immediate match with opposite side)
-                    if side == 1:
-                        # Buy market order: takes the best ask
-                        cdef int trade_price = best_ask
-                        ev_buf[i].price = trade_price if trade_price >= 0 else 0
-                        # Update current price to trade price
-                        cur_price = trade_price if trade_price >= 0 else 0
-                        # Remove best ask level (simulate fill)
-                        best_ask = trade_price + 1  # next ask is higher (spread widens)
-                        # Optionally narrow bid (simulate price up move)
-                        if best_bid < trade_price:
-                            best_bid += 1  # buyers chase price up by one tick
-                    else:
-                        # Sell market order: takes the best bid
-                        cdef int trade_price = best_bid
-                        ev_buf[i].price = trade_price if trade_price >= 0 else 0
-                        cur_price = trade_price if trade_price >= 0 else 0
-                        # Remove best bid level
-                        best_bid = trade_price - 1 if trade_price > 0 else 0  # next bid is lower
-                        # Optionally narrow ask (simulate price down move)
-                        if best_ask > trade_price:
-                            best_ask -= 1  # sellers push price down by one tick
-                    # Quantity for market order
-                    cdef int base_max_qty = 5
-                    cdef int add_range = <int>(self.adversarial_factor * 10)
-                    if add_range < 0:
-                        add_range = 0
-                    cdef uint32_t rndq = self._pcg32_random_fast()
-                    cdef int qty = 1
-                    if base_max_qty + add_range > 1:
-                        qty = 1 + (rndq % (base_max_qty + add_range))
-                    if qty < 1:
-                        qty = 1
-                    ev_buf[i].qty = qty
-                else:
-                    # PUBLIC_CANCEL_RANDOM event: cancel a random order on one side
-                    ev_buf[i].price = 0  # price not applicable
-                    ev_buf[i].qty = 0    # qty not applicable for cancel (not used)
-                    if side == 1:
-                        # Cancel a buy order: likely remove best bid
-                        if best_bid > 0:
-                            best_bid -= 1  # next lower bid becomes best
-                            if best_bid < 0:
-                                best_bid = 0
-                    else:
-                        # Cancel a sell order: remove best ask
-                        best_ask += 1  # next higher ask becomes best
-                    # current_price remains unchanged
-                # Update momentum tracking (last_side) after each event
-                last_side = side
-
-        # Re-acquire GIL here
-        # Save updated internal state and market state back to object
-        self._last_side = last_side
-        self.best_bid = best_bid
-        self.best_ask = best_ask
-        self.current_price = cur_price
-        return events_count
-
-    # Internal PCG32 functions (no GIL required)
-    cdef inline uint32_t _pcg32_random(self) nogil:
-        """Advance the RNG state and produce a 32-bit random output (PCG32)."""
-        cdef uint64_t oldstate = self._state
-        # Advance internal state (LCG step)
-        self._state = oldstate * 6364136223846793005ULL + (self._inc | 1ULL)
-        # Calculate output function (XSH RR)
-        cdef uint32_t xorshifted = <uint32_t>(((oldstate >> 18) ^ oldstate) >> 27)
-        cdef uint32_t rot = <uint32_t>(oldstate >> 59)
-        return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
-
-    cdef inline uint32_t _pcg32_random_fast(self) nogil:
-        """Fast PCG32 step without state update (use when state updated separately)."""
-        # This assumes state has been advanced externally. Use with caution.
-        cdef uint64_t oldstate = self._state
-        # We do not advance state here (state should be advanced prior to call)
-        cdef uint32_t xorshifted = <uint32_t>(((oldstate >> 18) ^ oldstate) >> 27)
-        cdef uint32_t rot = <uint32_t>(oldstate >> 59)
-        return (xorshifted >> rot) | (xorshifted << ((-rot) & 31))
-
-    cdef inline double _rand_uniform(self) nogil:
-        """Generate a uniform random number in [0.0, 1.0) using PCG32."""
-        cdef uint32_t r = self._pcg32_random()
-        # Convert to double in [0,1)
-        return r * (1.0 / 4294967296.0)
-
-# Define event type constants (assuming unique codes for public events)
-cdef int PUBLIC_LIMIT_ADD = 1
-cdef int PUBLIC_MARKET_MATCH = 2
-cdef int PUBLIC_CANCEL_RANDOM = 3
+    cdef int _sample_quantity(self):
+        return 1 + self._rng.randint(0, 4 + int(abs(self.adversarial_factor) * 6))

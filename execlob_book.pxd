@@ -1,8 +1,8 @@
 cimport cython
 from libcpp.vector cimport vector
 # cimport dependencies from other modules
-from exec.events cimport MarketEvent, EventType, Side
-from core.workspace cimport SimulationWorkspace
+from execevents cimport MarketEvent, EventType, Side
+from coreworkspace cimport SimulationWorkspace
 
 cdef class CythonLOB:
     """
