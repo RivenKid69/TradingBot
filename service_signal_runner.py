@@ -5415,7 +5415,13 @@ def from_config(
         timeframe_ms = 60_000
 
     cfg.timing.timeframe_ms = int(timeframe_ms)
-    cfg.timing.close_lag_ms = int(resolved_timing.decision_delay_ms)
+    timing_fields_set = getattr(cfg.timing, "model_fields_set", None)
+    if timing_fields_set is None:
+        timing_fields_set = getattr(cfg.timing, "__fields_set__", set())
+    if "close_lag_ms" not in timing_fields_set:
+        cfg.timing.close_lag_ms = int(resolved_timing.decision_delay_ms)
+    else:
+        cfg.timing.close_lag_ms = max(0, int(cfg.timing.close_lag_ms))
     cfg.execution.timeframe_ms = int(timeframe_ms)
     cfg.execution.latency_constant_ms = int(resolved_timing.decision_delay_ms)
     cfg.execution.latency_steps = int(resolved_timing.latency_steps)
