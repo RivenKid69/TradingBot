@@ -1,7 +1,28 @@
 import pytest
 
 from impl_fees import FeesImpl
-from fees import FeeComputation, FeesModel
+from fees import FeeComputation, FeesModel, _sanitize_rounding_config
+
+
+def test_rounding_config_allows_zero_minimum_and_maximum_fee():
+    config = _sanitize_rounding_config({"minimum_fee": 0.0, "maximum_fee": 0.0})
+
+    assert config.get("minimum_fee") == pytest.approx(0.0)
+    assert config.get("maximum_fee") == pytest.approx(0.0)
+
+
+def test_rounding_config_preserves_zero_fee_from_aliases():
+    config = _sanitize_rounding_config(
+        {
+            "minimum_fee": None,
+            "min_fee": 0.0,
+            "maximum_fee": None,
+            "max_fee": 0.0,
+        }
+    )
+
+    assert config.get("minimum_fee") == pytest.approx(0.0)
+    assert config.get("maximum_fee") == pytest.approx(0.0)
 
 
 def test_rounding_nested_options_normalized():

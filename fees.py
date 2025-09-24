@@ -313,19 +313,19 @@ def _sanitize_rounding_config(data: Any) -> Dict[str, Any]:
             if decimals_int >= 0:
                 normalized["decimals"] = decimals_int
 
-    minimum_fee = (
-        _sanitize_optional_non_negative(mapping.get("minimum_fee"))
-        or _sanitize_optional_non_negative(mapping.get("min_fee"))
-        or _sanitize_optional_non_negative(mapping.get("minimum"))
-    )
+    minimum_fee = _sanitize_optional_non_negative(mapping.get("minimum_fee"))
+    if minimum_fee is None:
+        minimum_fee = _sanitize_optional_non_negative(mapping.get("min_fee"))
+    if minimum_fee is None:
+        minimum_fee = _sanitize_optional_non_negative(mapping.get("minimum"))
     if minimum_fee is not None:
         normalized["minimum_fee"] = float(minimum_fee)
 
-    maximum_fee = (
-        _sanitize_optional_non_negative(mapping.get("maximum_fee"))
-        or _sanitize_optional_non_negative(mapping.get("max_fee"))
-        or _sanitize_optional_non_negative(mapping.get("maximum"))
-    )
+    maximum_fee = _sanitize_optional_non_negative(mapping.get("maximum_fee"))
+    if maximum_fee is None:
+        maximum_fee = _sanitize_optional_non_negative(mapping.get("max_fee"))
+    if maximum_fee is None:
+        maximum_fee = _sanitize_optional_non_negative(mapping.get("maximum"))
     if maximum_fee is not None:
         normalized["maximum_fee"] = float(maximum_fee)
 
