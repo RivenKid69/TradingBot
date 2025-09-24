@@ -42,10 +42,8 @@ inline uint64_t make_order_id() {
 
 
 /* -------------------------------------------------------------------------
-
-Basic order record
-
-/* --------------------------------------------------------------------- */
+ * Basic order record
+ * ------------------------------------------------------------------------- */
 struct Order {
     uint64_t id;       // 64-битный идентификатор
     double   volume;
@@ -55,43 +53,44 @@ struct Order {
 };
 
 /* -------------------------------------------------------------------------
-
-Fast queue‑index lookup (O(1))
-
---------------------------------------------------------------------- */
+ * Fast queue-index lookup (O(1))
+ * ------------------------------------------------------------------------- */
 struct PriceLevelIdx {
-uint64_t order_id;   // 64‑битный ID вместо long long
-uint32_t position; // 0‑based index inside deque
+    long long price_ticks;   // уровень цены (в тиках)
+    uint32_t  position;      // позиция в очереди (0-based)
+    bool      is_buy;        // true, если ордер в книге бидов
 };
 
+using BidsMap = std::map<long long, std::deque<Order>, std::greater<long long>>;
+using AsksMap = std::map<long long, std::deque<Order>>;
+
 /* -------------------------------------------------------------------------
-// модель комиссий и проскальзывания
+ * Модель комиссий и проскальзывания
+ * ------------------------------------------------------------------------- */
 struct FeeModel {
     double maker_fee {0.0};
     double taker_fee {0.0};
     double slip_k   {0.0};
 };
 
-OrderBook – value‑semantics, non‑copyable
+// OrderBook – value‑semantics, non‑copyable
 
-/* 
----------------------------------------------------------------------
- * Copy‑on‑Write toggle (Phase 13).
- * Build with  -DORDERBOOK_COW=ON  to enable shared_ptr‑based cloning.
- * 
-------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------
+ * Copy-on-Write toggle (Phase 13).
+ * Build with -DORDERBOOK_COW=ON to enable shared_ptr-based cloning.
+ * ------------------------------------------------------------------------- */
 #ifdef ORDERBOOK_COW
 #  include <memory>
 #endif
 // PATCH‑ID:P13_OB_toggle
 
---------------------------------------------------------------------- */
+// ---------------------------------------------------------------------
 class OrderBook {
 #ifdef ORDERBOOK_COW
 struct Impl {
     BidsMap bids;
     AsksMap asks;
-    std::unordered_map<uint64_t, PriceLevelIdx> idx_map;
+    std::unordered_map<long long, PriceLevelIdx> idx_map;
     std::mt19937 gen;
     Impl() { gen.seed(std::random_device{}()); }
 };
@@ -113,9 +112,28 @@ int add_limit_order_ex(bool is_buy_side,
                        int timestamp,
                        TimeInForce tif);
 
+void add_limit_order(bool is_buy_side,
+                     long long price_ticks,
+                     double volume,
+                     long long order_id,
+                     bool is_agent,
+                     int timestamp);
+
 void remove_order(bool is_buy_side,
-long long price_ticks,
-uint64_t order_id);
+                  long long price_ticks,
+                  long long order_id);
+
+int match_market_order(bool is_buy_side,
+                       double volume,
+                       int timestamp,
+                       bool taker_is_agent,
+                       double* out_prices,
+                       double* out_volumes,
+                       int*    out_is_buy,
+                       int*    out_is_self,
+                       long long* out_ids,
+                       int max_len,
+                       double* out_fee_total);
 
 // unified dense version – returns number of trades; also returns total agent fee (cash, >0)
 int match_limit_order(bool is_buy_side,
@@ -143,12 +161,12 @@ get_bids() const { return bids; }
 const std::map<long long, std::deque<Order>>&
 get_asks() const { return asks; }
 
-bool contains_order(uint64_t) order_id) const;
+bool contains_order(long long order_id) const;
 void cancel_random_public_orders(bool is_buy_side, int num_to_cancel);
 double get_volume_for_top_levels(bool is_buy_side, int levels) const;
 
 /* O(1) queue‑index lookup */
-uint32_t get_queue_position(uint64_t order_id) const;
+uint32_t get_queue_position(long long order_id) const;
 
 // Установить TTL конкретному ордеру (сканирует обе стороны книги), true если найден
 bool set_order_ttl(uint64_t order_id, int ttl_steps);
@@ -159,10 +177,12 @@ int decay_ttl_and_cancel(const std::function<void(const Order&)>& on_cancel = {}
 OrderBook* clone() const;
 void swap(OrderBook& other) noexcept;
 
-// модель комиссий и проскальзывания
-FeeModel fee;
+/* -------------------------------------------------------------------------
+ * Модель комиссий и проскальзывания для книги
+ * ------------------------------------------------------------------------- */
+FeeModel fee_model;
 // установить модель комиссий (копируется)
-void set_fee_model(const FeeModel& fm) { fee = fm; }
+void set_fee_model(const FeeModel& fm) { fee_model = fm; }
 
 private:
 #ifdef ORDERBOOK_COW
@@ -172,7 +192,7 @@ private:
 #else
     BidsMap bids;
     AsksMap asks;
-    std::unordered_map<uint64_t, PriceLevelIdx> idx_map;
+    std::unordered_map<long long, PriceLevelIdx> idx_map;
     std::mt19937 gen;
 #endif
 
