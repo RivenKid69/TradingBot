@@ -137,7 +137,7 @@ torch.backends.cudnn.benchmark = True
 
 
 from trading_patchnew import TradingEnv, DecisionTiming
-from custom_policy_patch import CustomActorCriticPolicy
+from custom_policy_patch1 import CustomActorCriticPolicy
 from fetch_all_data_patch import load_all_data
 # --- ИЗМЕНЕНИЕ: Импортируем быструю Cython-функцию оценки ---
 from evaluation_utils import evaluate_policy_custom_cython
