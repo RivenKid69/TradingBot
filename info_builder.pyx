@@ -1,6 +1,7 @@
 # metrics/info_builder.pyx
 
-from libc.math cimport fabs
+from lob_state_cython cimport EnvState
+from risk_manager cimport ClosedReason
 cdef inline double _safe_div(double a, double b) nogil:
     """Safe division: returns 0.0 if b is zero, otherwise a/b"""
     return a / b if b != 0.0 else 0.0
@@ -94,7 +95,14 @@ cpdef dict build_info_dict(EnvState* state,
     - "realized_spread"
     - "closed" (dict with reason or None):contentReference[oaicite:18]{index=18}
     """
-    cdef double slippage_bps, fill_ratio, trade_intens, vol_imb, realized_spread
+    cdef double slippage_bps = 0.0
+    cdef double fill_ratio = 0.0
+    cdef double trade_intens = 0.0
+    cdef double vol_imb = 0.0
+    cdef double realized_spread = 0.0
+    cdef dict info
+    cdef object closed_value = None
+    cdef str reason_str = "none"
     # Compute metrics in nogil (no Python operations)
     with nogil:
         vol_imb = compute_vol_imbalance_nogil(agent_net_taker_flow)
@@ -105,7 +113,7 @@ cpdef dict build_info_dict(EnvState* state,
                                                   final_best_bid, final_best_ask,
                                                   state.price_scale, agent_net_taker_flow)
     # Prepare the info dict (acquire GIL again for Python object creation)
-    cdef dict info = {
+    info = {
         "vol_imbalance": vol_imb,
         "trade_intensity": trade_intens,
         "realized_spread": realized_spread,
@@ -113,10 +121,8 @@ cpdef dict build_info_dict(EnvState* state,
         "slippage_bps": slippage_bps
     }
     # Determine closed position info
-    cdef dict closed_dict = None
     if closed_reason != ClosedReason.NONE:
         # Map ClosedReason to string labels:contentReference[oaicite:19]{index=19}
-        cdef str reason_str
         if closed_reason == ClosedReason.ATR_SL_LONG:
             reason_str = "atr_sl_long"
         elif closed_reason == ClosedReason.ATR_SL_SHORT:
@@ -135,7 +141,7 @@ cpdef dict build_info_dict(EnvState* state,
             reason_str = "max_drawdown"
         else:
             reason_str = "none"
-        closed_dict = {"reason": reason_str}
+        closed_value = {"reason": reason_str}
     # Include the 'closed' key in info (None if no closure):contentReference[oaicite:20]{index=20}
-    info["closed"] = closed_dict
+    info["closed"] = closed_value
     return info
