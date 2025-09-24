@@ -95,6 +95,7 @@ cdef class CyMicrostructureGenerator:
 
 
 
+
 """Simple microstructure generator used by the Python simulation stack.
 
 The previous revision attempted to implement a fully ``nogil`` PCG based
@@ -132,6 +133,7 @@ cdef class CyMicrostructureGenerator:
 
 
 
+
     cpdef void set_regime(self,
                           double base_order_imbalance_ratio,
                           double base_cancel_ratio,
@@ -143,6 +145,7 @@ cdef class CyMicrostructureGenerator:
 
 
         """Configure the generator parameters used when producing events."""
+
 
 
 
@@ -441,6 +444,7 @@ cdef class CyMicrostructureGenerator:
         if self.best_bid < 0:
             self.best_bid = 0
         self.best_ask = self.current_price + 1
+
 
 
 

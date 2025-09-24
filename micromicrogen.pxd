@@ -13,11 +13,11 @@ cdef class CyMicrostructureGenerator:
 
 
 
+
 # Cython declarations for the microstructure event generator
 cdef class CyMicrostructureGenerator:
     """Simple microstructure generator used from Python code."""
     cdef object _rng
-
 
 
     cdef double momentum_factor
@@ -45,6 +45,7 @@ cdef class CyMicrostructureGenerator:
 
 
 
+
     cdef int _last_side
     cpdef void seed(self, unsigned long long seed)
     cpdef void set_regime(self, double base_order_imbalance_ratio,
@@ -61,5 +62,6 @@ cdef class CyMicrostructureGenerator:
     cdef int _choose_side(self)
     cdef int _sample_limit_price(self, int mid_ticks, int side)
     cdef int _sample_quantity(self)
+
 
 

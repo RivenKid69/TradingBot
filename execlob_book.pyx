@@ -1,4 +1,12 @@
 # cython: language_level=3
+
+from libc.stdlib cimport malloc, realloc, free, rand
+cimport cython
+from execevents cimport MarketEvent, EventType, Side
+from coreworkspace cimport SimulationWorkspace
+
+cdef class CythonLOB:
+
 from libc.stdlib cimport malloc, realloc, free, rand
 from libc.math cimport floor
 cimport cython
@@ -9,6 +17,7 @@ from coreworkspace cimport SimulationWorkspace
 
 @cython.cclass
 class CythonLOB:
+
     """
     Cython implementation of a Limit Order Book (LOB) supporting basic operations.
     """
@@ -21,6 +30,7 @@ class CythonLOB:
     cdef MarketEvent* ask_orders
     cdef int best_bid_index
     cdef int best_ask_index
+    cdef bint _pending_market_is_agent
 
     def __cinit__(self):
         # Initialize with default capacity
@@ -32,6 +42,7 @@ class CythonLOB:
         self.ask_orders = <MarketEvent*> malloc(self.capacity_asks * cython.sizeof(MarketEvent))
         self.best_bid_index = -1
         self.best_ask_index = -1
+        self._pending_market_is_agent = False
 
     def __dealloc__(self):
         # Free allocated memory
@@ -111,10 +122,6 @@ class CythonLOB:
         is_agent: whether this order belongs to the agent.
         order_id: unique identifier for the order.
         """
-        cdef MarketEvent* book_side
-        cdef MarketEvent* opp_side
-        cdef int* side_count
-        cdef int* opp_count
         cdef int i, insert_idx
 
         if qty <= 0:
@@ -216,17 +223,30 @@ class CythonLOB:
         idx = self._find_order_index_by_id(order_id, True)
         if idx != -1:
             # Remove bid order at idx
-            for int j from idx+1 <= j < self.n_bids:
-                self.bid_orders[j-1] = self.bid_orders[j]
+            cdef int j
+            for j in range(idx + 1, self.n_bids):
+                self.bid_orders[j - 1] = self.bid_orders[j]
             self.n_bids -= 1
             return
         # Try find in asks
         idx = self._find_order_index_by_id(order_id, False)
         if idx != -1:
-            for int j from idx+1 <= j < self.n_asks:
-                self.ask_orders[j-1] = self.ask_orders[j]
+            cdef int j
+            for j in range(idx + 1, self.n_asks):
+                self.ask_orders[j - 1] = self.ask_orders[j]
             self.n_asks -= 1
             return
+
+    cdef void _record_trade(self, SimulationWorkspace ws, int price, int qty, int side,
+                            bint agent_maker, bint agent_taker, int maker_order_id) nogil:
+        cdef int idx = ws.trade_count
+        ws.push_trade(<double> price, <double> qty, <char> side,
+                      <char> (1 if agent_maker else 0), 0)
+        ws.taker_is_agent_all_arr[idx] = <char> (1 if agent_taker else 0)
+        if agent_maker:
+            ws.maker_ids_all_arr[idx] = <unsigned long long> maker_order_id
+        else:
+            ws.maker_ids_all_arr[idx] = <unsigned long long> 0
 
     cdef void match_market(self, int side, int qty, SimulationWorkspace ws) nogil:
         """
@@ -237,6 +257,7 @@ class CythonLOB:
         cdef int remaining = qty
         cdef int trade_qty
         cdef int trade_price
+        cdef bint is_agent_market = self._pending_market_is_agent
         if qty <= 0:
             return
         if side == Side.BUY:
@@ -248,42 +269,26 @@ class CythonLOB:
                     trade_qty = self.ask_orders[0].qty
                     remaining -= trade_qty
                     # Record trade in SimulationWorkspace
-                    ws.ensure_capacity(ws.trade_count + 1)
-                    ws.trade_price[ws.trade_count] = trade_price
-                    ws.trade_volume[ws.trade_count] = trade_qty
-                    ws.trade_side[ws.trade_count] = 1  # agent buys (taker)
-                    ws.trade_agent_marker[ws.trade_count] = 2  # agent is taker
-                    ws.trade_timestamp[ws.trade_count] = ws.step_index  # use step index as timestamp
-                    ws.trade_count += 1
-                    # Check if the ask order is from agent (agent maker) for tracking
+                    self._record_trade(ws, trade_price, trade_qty, 1,
+                                       self.ask_orders[0].type == EventType.AGENT_LIMIT_ADD,
+                                       is_agent_market, self.ask_orders[0].order_id)
                     if self.ask_orders[0].type == EventType.AGENT_LIMIT_ADD:
-                        # Agent's resting sell order was taken -> mark agent maker trade
-                        ws.trade_agent_marker[ws.trade_count-1] = 1  # agent was maker
-                        # Mark this order as fully executed
-                        ws.completed_order_ids[ws.completed_count] = self.ask_orders[0].order_id
-                        ws.completed_count += 1
+                        ws.push_filled_order_id(self.ask_orders[0].order_id)
                     # Remove the ask order
-                    for int j from 1 <= j < self.n_asks:
-                        self.ask_orders[j-1] = self.ask_orders[j]
+                    cdef int j
+                    for j in range(1, self.n_asks):
+                        self.ask_orders[j - 1] = self.ask_orders[j]
                     self.n_asks -= 1
                 else:
                     # Partial fill of the ask order
                     trade_qty = remaining
                     self.ask_orders[0].qty -= trade_qty
                     remaining = 0
-                    ws.ensure_capacity(ws.trade_count + 1)
-                    ws.trade_price[ws.trade_count] = trade_price
-                    ws.trade_volume[ws.trade_count] = trade_qty
-                    ws.trade_side[ws.trade_count] = 1  # agent buys
-                    ws.trade_agent_marker[ws.trade_count] = 2  # agent taker
-                    ws.trade_timestamp[ws.trade_count] = ws.step_index
-                    ws.trade_count += 1
-                    if self.ask_orders[0].type == EventType.AGENT_LIMIT_ADD:
-                        ws.trade_agent_marker[ws.trade_count-1] = 1  # agent maker
-                        # If ask now has 0 qty (just filled exactly, though partial branch suggests not)
-                        if self.ask_orders[0].qty == 0:
-                            ws.completed_order_ids[ws.completed_count] = self.ask_orders[0].order_id
-                            ws.completed_count += 1
+                    self._record_trade(ws, trade_price, trade_qty, 1,
+                                       self.ask_orders[0].type == EventType.AGENT_LIMIT_ADD,
+                                       is_agent_market, self.ask_orders[0].order_id)
+                    if self.ask_orders[0].type == EventType.AGENT_LIMIT_ADD and self.ask_orders[0].qty == 0:
+                        ws.push_filled_order_id(self.ask_orders[0].order_id)
                     # remaining = 0 will break loop
             # Note: any remaining unmatched volume is discarded (market order not fully filled)
         else:
@@ -295,35 +300,22 @@ class CythonLOB:
                 if self.bid_orders[self.best_bid_index].qty <= remaining:
                     trade_qty = self.bid_orders[self.best_bid_index].qty
                     remaining -= trade_qty
-                    ws.ensure_capacity(ws.trade_count + 1)
-                    ws.trade_price[ws.trade_count] = trade_price
-                    ws.trade_volume[ws.trade_count] = trade_qty
-                    ws.trade_side[ws.trade_count] = -1  # agent sells (taker)
-                    ws.trade_agent_marker[ws.trade_count] = 2  # agent taker
-                    ws.trade_timestamp[ws.trade_count] = ws.step_index
-                    ws.trade_count += 1
+                    self._record_trade(ws, trade_price, trade_qty, -1,
+                                       self.bid_orders[self.best_bid_index].type == EventType.AGENT_LIMIT_ADD,
+                                       is_agent_market, self.bid_orders[self.best_bid_index].order_id)
                     if self.bid_orders[self.best_bid_index].type == EventType.AGENT_LIMIT_ADD:
-                        ws.trade_agent_marker[ws.trade_count-1] = 1  # agent maker (agent's buy order was hit)
-                        ws.completed_order_ids[ws.completed_count] = self.bid_orders[self.best_bid_index].order_id
-                        ws.completed_count += 1
+                        ws.push_filled_order_id(self.bid_orders[self.best_bid_index].order_id)
                     # Remove this bid
                     self.n_bids -= 1
                 else:
                     trade_qty = remaining
                     self.bid_orders[self.best_bid_index].qty -= trade_qty
                     remaining = 0
-                    ws.ensure_capacity(ws.trade_count + 1)
-                    ws.trade_price[ws.trade_count] = trade_price
-                    ws.trade_volume[ws.trade_count] = trade_qty
-                    ws.trade_side[ws.trade_count] = -1  # agent sells
-                    ws.trade_agent_marker[ws.trade_count] = 2  # agent taker
-                    ws.trade_timestamp[ws.trade_count] = ws.step_index
-                    ws.trade_count += 1
-                    if self.bid_orders[self.best_bid_index].type == EventType.AGENT_LIMIT_ADD:
-                        ws.trade_agent_marker[ws.trade_count-1] = 1  # agent maker
-                        if self.bid_orders[self.best_bid_index].qty == 0:
-                            ws.completed_order_ids[ws.completed_count] = self.bid_orders[self.best_bid_index].order_id
-                            ws.completed_count += 1
+                    self._record_trade(ws, trade_price, trade_qty, -1,
+                                       self.bid_orders[self.best_bid_index].type == EventType.AGENT_LIMIT_ADD,
+                                       is_agent_market, self.bid_orders[self.best_bid_index].order_id)
+                    if self.bid_orders[self.best_bid_index].type == EventType.AGENT_LIMIT_ADD and self.bid_orders[self.best_bid_index].qty == 0:
+                        ws.push_filled_order_id(self.bid_orders[self.best_bid_index].order_id)
 
     cpdef double mid_price(self):
         """
@@ -351,6 +343,8 @@ class CythonLOB:
         This enforces atomic step processing.
         """
         cdef int i
+        cdef int j
+        self._pending_market_is_agent = False
         # Process limit add events first
         for i in range(num_events):
             if events[i].type == EventType.AGENT_LIMIT_ADD or events[i].type == EventType.PUBLIC_LIMIT_ADD:
@@ -359,7 +353,9 @@ class CythonLOB:
         # Process market match events
         for i in range(num_events):
             if events[i].type == EventType.AGENT_MARKET_MATCH or events[i].type == EventType.PUBLIC_MARKET_MATCH:
+                self._pending_market_is_agent = events[i].type == EventType.AGENT_MARKET_MATCH
                 self.match_market(events[i].side, events[i].qty, ws)
+        self._pending_market_is_agent = False
         # Process cancel events
         for i in range(num_events):
             if events[i].type == EventType.AGENT_CANCEL_SPECIFIC or events[i].type == EventType.PUBLIC_CANCEL_RANDOM:
