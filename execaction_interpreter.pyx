@@ -12,6 +12,10 @@ import core_constants as constants
 # For generating unique order IDs for agent orders (shim for environment's next_order_id)
 cdef int _next_order_id = 1  # NOTE: shim for integration; replace with state.next_order_id management later
 
+# Expose enum values as Python integers to avoid attribute lookups on the cdef enum.
+SIDE_BUY = <int> Side.BUY
+SIDE_SELL = <int> Side.SELL
+
 def build_agent_event_set(state, tracker, params, action):
     """
     Interpret the agent's action and generate a set of agent events for this step.
@@ -105,9 +109,9 @@ def build_agent_event_set(state, tracker, params, action):
     try:
         # Check buy side orders
         if tracker is not None:
-            existing_id = tracker.find_closest_order(price * constants.PRICE_SCALE, Side.BUY)
+            existing_id = tracker.find_closest_order(price * constants.PRICE_SCALE, SIDE_BUY)
             if existing_id == -1:
-                existing_id = tracker.find_closest_order(price * constants.PRICE_SCALE, Side.SELL)
+                existing_id = tracker.find_closest_order(price * constants.PRICE_SCALE, SIDE_SELL)
     except AttributeError:
         existing_id = -1
 
