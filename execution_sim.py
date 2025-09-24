@@ -4271,11 +4271,11 @@ class ExecutionSimulator:
                     exc_info=True,
                 )
                 multiplier = None
-        if multiplier is None or not math.isfinite(multiplier) or multiplier <= 0.0:
+        if multiplier is None or not math.isfinite(multiplier) or multiplier < 0.0:
             fallback = self._fallback_discount_multiplier(symbol, is_maker)
             if fallback is not None:
                 multiplier = fallback
-        if multiplier is None or not math.isfinite(multiplier) or multiplier <= 0.0:
+        if multiplier is None or not math.isfinite(multiplier) or multiplier < 0.0:
             multiplier = 1.0
         return float(multiplier)
 
@@ -4302,7 +4302,7 @@ class ExecutionSimulator:
                 sources.append(account_overrides.get(key))
         for candidate in sources:
             value = ExecutionSimulator._trade_cost_float(candidate)
-            if value is None or value <= 0.0:
+            if value is None or value < 0.0:
                 continue
             return float(value)
         return None
