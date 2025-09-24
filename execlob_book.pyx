@@ -360,6 +360,7 @@ cdef class CythonLOB:
                         else:
                             self.cancel_order(self.ask_orders[j - self.n_bids].order_id)
 
+
     cpdef void apply_events_batch(self, list events, SimulationWorkspace ws):
         """Apply a sequence of Python-level events to the book via the workspace."""
         cdef Py_ssize_t n = len(events)
@@ -387,6 +388,8 @@ cdef class CythonLOB:
                 self.apply_events_batch_nogil(buffer, <int> n, ws)
         finally:
             free(buffer)
+
+
 
     cpdef list iter_agent_orders(self):
         """Return a Python list of the current agent limit orders."""
