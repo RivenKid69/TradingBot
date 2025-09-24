@@ -1473,6 +1473,7 @@ class ExecutionSimulator:
         self.fees_conversion_rates: Dict[str, float] = {}
         self._fees_quote_currency_cache: Dict[str, Optional[str]] = {}
         self._fees_conversion_requests: Dict[str, float] = {}
+        self._fees_last_quote_equivalent: Optional[float] = None
         self._maker_taker_share_cfg: Optional[Dict[str, Any]] = None
         self._maker_taker_share_enabled: bool = False
         self._maker_taker_share_mode: Optional[str] = None
@@ -2748,7 +2749,7 @@ class ExecutionSimulator:
                 liquidity="taker",
             )
             fee_total += float(fee)
-            self.fees_cum += float(fee)
+            self._fees_apply_to_cumulative(fee)
             _ = self._apply_trade_inventory(side=state.side, price=filled_price, qty=qty_total)
             tif = str(getattr(state.proto, "tif", "GTC")).upper()
             ttl_steps = int(getattr(state.proto, "ttl_steps", 0))
@@ -4533,6 +4534,17 @@ class ExecutionSimulator:
                 settlement_currency or "BNB",
             )
 
+    def _fees_apply_to_cumulative(self, fee: Any) -> None:
+        quote_equivalent = ExecutionSimulator._trade_cost_float(
+            getattr(self, "_fees_last_quote_equivalent", None)
+        )
+        fee_value = ExecutionSimulator._trade_cost_float(fee)
+        if quote_equivalent is not None and quote_equivalent > 0.0:
+            self.fees_cum += float(quote_equivalent)
+        elif fee_value is not None and fee_value > 0.0:
+            self.fees_cum += float(fee_value)
+        self._fees_last_quote_equivalent = None
+
     def _refresh_slippage_share_info(self) -> None:
         getter = getattr(self, "_slippage_get_maker_taker_share_info", None)
         if not callable(getter):
@@ -4874,6 +4886,7 @@ class ExecutionSimulator:
         qty: float,
         liquidity: str,
     ) -> float:
+        self._fees_last_quote_equivalent = None
         side_key = str(side).upper()
         liquidity_key = str(liquidity).lower()
         if liquidity_key not in ("maker", "taker") and logger.isEnabledFor(logging.DEBUG):
@@ -5064,9 +5077,9 @@ class ExecutionSimulator:
                             settlement_amount = fee_out
                             fee_quote_equivalent = float(settlement_amount * conversion_rate)
                             if math.isfinite(fee_quote_equivalent):
-                                adjustment = fee_quote_equivalent - settlement_amount
-                                if math.isfinite(adjustment) and adjustment != 0.0:
-                                    self.fees_cum += float(adjustment)
+                                self._fees_last_quote_equivalent = float(
+                                    fee_quote_equivalent
+                                )
                                 fee_out = float(settlement_amount)
                                 needs_conversion = False
                             else:
@@ -8911,7 +8924,7 @@ class ExecutionSimulator:
                         liquidity="taker",
                     )
                     fee_total += float(fee)
-                    self.fees_cum += float(fee)
+                    self._fees_apply_to_cumulative(fee)
 
                     # обновить позицию с расчётом реализованного PnL
                     _ = self._apply_trade_inventory(
@@ -9032,7 +9045,7 @@ class ExecutionSimulator:
                 side=side, price=filled_price, qty=qty, liquidity="taker"
             )
             fee_total += float(fee)
-            self.fees_cum += float(fee)
+            self._fees_apply_to_cumulative(fee)
 
             # обновить позицию с расчётом реализованного PnL
             _ = self._apply_trade_inventory(side=side, price=filled_price, qty=qty)
@@ -10262,7 +10275,7 @@ class ExecutionSimulator:
                         liquidity="taker",
                     )
                     fee_total += float(fee)
-                    self.fees_cum += float(fee)
+                    self._fees_apply_to_cumulative(fee)
 
                     # инвентарь + реализованный PnL
                     _ = self._apply_trade_inventory(
