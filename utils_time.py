@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 import numpy as np
 import clock
-from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK
+from utils.time import hour_of_week, HOUR_MS, HOURS_IN_WEEK, DAY_MS
 
 __all__ = [
     "bar_start_ms",
@@ -394,7 +394,9 @@ def get_hourly_multiplier(
     If ``interpolate`` is ``False`` (default) the multiplier of the nearest
     hour is returned.  When ``True``, the result is linearly interpolated
     between the current hour and the next using the minute offset within the
-    hour.  Missing or short arrays gracefully default to ``1.0``.
+    hour.  When ``multipliers`` contains one value per day (length ``7``), the
+    interpolation spans the whole day instead of just the current hour. Missing
+    or short arrays gracefully default to ``1.0``.
     """
 
     if multipliers is None:
@@ -411,7 +413,11 @@ def get_hourly_multiplier(
         if not interpolate:
             return base
         nxt = float(multipliers[(idx + 1) % length])
-        frac = (ts_ms % HOUR_MS) / float(HOUR_MS)
+        ts_val = int(ts_ms)
+        if length == 7:
+            frac = (ts_val % DAY_MS) / float(DAY_MS)
+        else:
+            frac = (ts_val % HOUR_MS) / float(HOUR_MS)
         return base + (nxt - base) * frac
     except Exception:
         return 1.0
