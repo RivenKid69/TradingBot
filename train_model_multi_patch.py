@@ -140,7 +140,7 @@ from trading_patchnew import TradingEnv, DecisionTiming
 from custom_policy_patch1 import CustomActorCriticPolicy
 from fetch_all_data_patch import load_all_data
 # --- ИЗМЕНЕНИЕ: Импортируем быструю Cython-функцию оценки ---
-from evaluation_utils import evaluate_policy_custom_cython
+from evaluate_policy_custom_cython import evaluate_policy_custom_cython
 from scripts.validate_regime_distributions import compare_regime_distributions
 from data_validation import DataValidator
 from utils.model_io import save_sidecar_metadata, check_model_compat
