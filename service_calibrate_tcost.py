@@ -34,9 +34,8 @@ from legacy_sandbox_config import load_config as load_sandbox_config
 
 
 def _ensure_dir(path: str) -> None:
-    d = os.path.dirname(path) if os.path.splitext(path)[1] else path
-    if d:
-        os.makedirs(d, exist_ok=True)
+    directory = os.path.dirname(os.fspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
 
 
 def _safe_abs_log_ret(df: pd.DataFrame, sym_col: str, ts_col: str, price_col: str) -> pd.Series:

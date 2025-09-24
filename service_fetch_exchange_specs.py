@@ -60,9 +60,8 @@ def _estimate_kline_tokens(limit: int) -> float:
 
 
 def _ensure_dir(path: str) -> None:
-    d = os.path.dirname(path) if os.path.splitext(path)[1] else path
-    if d:
-        os.makedirs(d, exist_ok=True)
+    directory = os.path.dirname(os.fspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
 
 
 def _write_json_atomic(path: str, payload: Mapping[str, Any] | Sequence[Any]) -> None:
