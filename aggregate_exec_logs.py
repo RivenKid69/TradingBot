@@ -261,10 +261,20 @@ def recompute_pnl(trades: pd.DataFrame, reports: pd.DataFrame) -> pd.Series:
     recomputed PnL (realized + unrealized) at each report timestamp.
     """
 
-    if trades is None or trades.empty or reports is None or reports.empty:
+    if reports is None or reports.empty:
         return pd.Series(dtype=float)
 
-    t = trades.sort_values("ts").copy()
+    if trades is None or trades.empty:
+        t_ts: list[float] = []
+        t_side: list[str] = []
+        t_price: list[float] = []
+        t_qty: list[float] = []
+    else:
+        t = trades.sort_values("ts").copy()
+        t_ts = t["ts"].values.tolist()
+        t_side = t["side"].astype(str).str.upper().values.tolist()
+        t_price = t["price"].astype(float).values.tolist()
+        t_qty = t["quantity"].astype(float).abs().values.tolist()
     r = reports.sort_values("ts_ms").copy()
 
     pos = 0.0
@@ -272,10 +282,6 @@ def recompute_pnl(trades: pd.DataFrame, reports: pd.DataFrame) -> pd.Series:
     realized = 0.0
     i = 0
     out: list[float] = []
-    t_ts = t["ts"].values.tolist()
-    t_side = t["side"].astype(str).str.upper().values.tolist()
-    t_price = t["price"].astype(float).values.tolist()
-    t_qty = t["quantity"].astype(float).abs().values.tolist()
 
     for _, rep in r.iterrows():
         ts = float(rep["ts_ms"]) if pd.notna(rep["ts_ms"]) else float("inf")
