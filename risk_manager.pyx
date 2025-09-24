@@ -1,3 +1,4 @@
+
 from risk_manager cimport ClosedReason
 from libc.math cimport fmax, fmin, fabs
 from lob_state_cython cimport EnvState
@@ -9,6 +10,25 @@ cdef inline double _current_fill_price(EnvState* state) nogil:
     if state.units == 0:
         return 0.0
     return state._position_value / state.units
+
+cdef enum ClosedReason:
+    NONE = 0
+    ATR_SL_LONG = 1
+    ATR_SL_SHORT = 2
+    TRAILING_SL_LONG = 3
+    TRAILING_SL_SHORT = 4
+    STATIC_TP_LONG = 5
+    STATIC_TP_SHORT = 6
+    BANKRUPTCY = 7
+    MAX_DRAWDOWN = 8
+
+from libc.math cimport floor, ceil
+from lob_state_cython cimport EnvState
+
+cdef double _ticks_to_price(long long ticks, long long price_scale):
+    """Convert integer ticks to monetary price."""
+    return ticks / <double>price_scale
+
 
 cdef double compute_max_position_frac(EnvState* state) nogil:
     """Compute maximum allowed position fraction of equity based on dynamic risk profile."""
