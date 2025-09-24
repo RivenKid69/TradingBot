@@ -1,10 +1,23 @@
 # cython: language_level=3
+
 from libc.stdlib cimport malloc, realloc, free, rand
 cimport cython
 from execevents cimport MarketEvent, EventType, Side
 from coreworkspace cimport SimulationWorkspace
 
 cdef class CythonLOB:
+
+from libc.stdlib cimport malloc, realloc, free, rand
+from libc.math cimport floor
+cimport cython
+from execlob_book cimport CythonLOB
+from execevents cimport MarketEvent, EventType, Side
+from core_constants cimport PRICE_SCALE
+from coreworkspace cimport SimulationWorkspace
+
+@cython.cclass
+class CythonLOB:
+
     """
     Cython implementation of a Limit Order Book (LOB) supporting basic operations.
     """
