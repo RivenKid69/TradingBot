@@ -15,9 +15,8 @@ import pandas as pd
 
 
 def ensure_dir(path: str) -> None:
-    d = os.path.dirname(path) if os.path.splitext(path)[1] else path
-    if d:
-        os.makedirs(d, exist_ok=True)
+    directory = os.path.dirname(os.fspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
 
 
 # ------------------------------------------------------------------

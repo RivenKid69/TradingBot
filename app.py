@@ -446,7 +446,8 @@ with st.sidebar:
     )
 
     logs_dir = st.text_input("Каталог логов", value="logs")
-    _ensure_dir(logs_dir)
+    if logs_dir:
+        os.makedirs(logs_dir, exist_ok=True)
 
     trades_path = st.text_input(
         "Путь к трейдам (для evaluate)",

@@ -27,9 +27,8 @@ _INTERVAL_MS = {
 
 
 def _ensure_dir(path: str) -> None:
-    d = os.path.dirname(path) if os.path.splitext(path)[1] else path
-    if d:
-        os.makedirs(d, exist_ok=True)
+    directory = os.path.dirname(os.fspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
 
 
 def _pick_base_interval(intervals: List[str]) -> str:
@@ -87,7 +86,7 @@ def main():
     # 1) Ingest klines для всех символов и всех указанных интервалов
     for sym in symbols:
         for interval in intervals:
-            _ensure_dir(klines_dir)
+            os.makedirs(klines_dir, exist_ok=True)
             cmd = [
                 sys.executable,
                 "scripts/ingest_klines.py",
@@ -124,7 +123,7 @@ def main():
     # 3) Для фьючей: funding + mark-price
     if market == "futures":
         for sym in symbols:
-            _ensure_dir(futures_dir)
+            os.makedirs(futures_dir, exist_ok=True)
             cmd = [
                 sys.executable,
                 "scripts/ingest_funding_mark.py",
