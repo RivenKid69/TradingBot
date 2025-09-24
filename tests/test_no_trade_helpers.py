@@ -25,7 +25,7 @@ def test_in_funding_buffer_with_midnight_and_day_marks():
     ], dtype=np.int64)
     ts_ms = ts_minutes * 60_000
     mask = _in_funding_buffer(ts_ms, 10)
-    expected = np.array([True, True, True, False, True, False, False])
+    expected = np.array([True, True, True, False, True, False, True])
     np.testing.assert_array_equal(mask, expected)
 
 

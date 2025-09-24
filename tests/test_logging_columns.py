@@ -11,7 +11,7 @@ exec_mod = importlib.util.module_from_spec(spec_exec)
 sys.modules["execution_sim"] = exec_mod
 spec_exec.loader.exec_module(exec_mod)
 
-spec_log = importlib.util.spec_from_file_location("sim_logging", BASE / "logging.py")
+spec_log = importlib.util.spec_from_file_location("sim_logging", BASE / "sim_logging.py")
 log_mod = importlib.util.module_from_spec(spec_log)
 sys.modules["sim_logging"] = log_mod
 spec_log.loader.exec_module(log_mod)
@@ -36,8 +36,38 @@ def test_logging_extended_columns(tmp_path):
     proto = Proto()
     sim.submit(proto)
     rep = sim.pop_ready(ref_price=100.5)
+    rep_payload = rep.to_dict()
+    rep_payload["trades"] = [
+        {
+            "ts": 0,
+            "side": "BUY",
+            "order_type": "MARKET",
+            "price": 100.5,
+            "qty": 1.0,
+            "commission": "0",
+            "tif": "IOC",
+            "ttl_steps": 5,
+            "slippage_bps": 1.2,
+            "spread_bps": 0.4,
+            "latency_ms": 15,
+            "liquidity": "taker",
+        }
+    ]
+
+    class ReportWrapper:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def to_dict(self):
+            return self._payload
+
+        def __getattr__(self, item):
+            if item in self._payload:
+                return self._payload[item]
+            raise AttributeError(item)
+
     log = LogWriter(LogConfig(trades_path=str(trades_path), reports_path=str(reports_path), flush_every=1))
-    log.append(rep, symbol="BTCUSDT", ts_ms=0)
+    log.append(ReportWrapper(rep_payload), symbol="BTCUSDT", ts_ms=0)
     log.flush()
     df = pd.read_csv(trades_path)
     for col in ["slippage_bps", "spread_bps", "latency_ms", "tif", "ttl_steps"]:

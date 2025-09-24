@@ -59,7 +59,9 @@ def _in_funding_buffer(ts_ms: np.ndarray, buf_min: int) -> np.ndarray:
     # |sec_day - mark| <= buf*60
     mask = np.zeros_like(sec_day, dtype=bool)
     for m in marks:
-        mask |= (np.abs(sec_day - m) <= buf_min * 60)
+        diff = np.abs(sec_day - m)
+        wrapped = 86400 - diff
+        mask |= np.minimum(diff, wrapped) <= buf_min * 60
     return mask
 
 

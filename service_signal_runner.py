@@ -3321,7 +3321,7 @@ class ServiceSignalRunner:
                 "reports_path": os.path.join(logs_dir, f"report_equity_{run_id}.csv"),
             }
             try:
-                from logging import LogWriter, LogConfig  # type: ignore
+                from sim_logging import LogWriter, LogConfig  # type: ignore
 
                 sim._logger = LogWriter(
                     LogConfig.from_dict(logging_config), run_id=run_id

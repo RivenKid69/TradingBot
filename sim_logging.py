@@ -1,4 +1,4 @@
-# sim/logging.py
+# sim/sim_logging.py
 from __future__ import annotations
 
 import os

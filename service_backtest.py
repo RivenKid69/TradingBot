@@ -877,7 +877,7 @@ class ServiceBacktest:
             "reports_path": os.path.join(logs_dir, f"report_equity_{run_id}.csv"),
         }
         try:  # переподключаем логгер симулятора с нужными путями
-            from logging import LogWriter, LogConfig  # type: ignore
+            from sim_logging import LogWriter, LogConfig  # type: ignore
 
             self.sim._logger = LogWriter(
                 LogConfig.from_dict(logging_config), run_id=run_id
