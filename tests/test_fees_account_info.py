@@ -38,6 +38,41 @@ def test_account_info_overrides_base_rates(monkeypatch):
     assert applied.get("vip_tier") is True
 
 
+def test_account_info_rates_not_discounted_twice(monkeypatch):
+    def _fake_fetch(**kwargs):
+        return AccountFeeInfo(vip_tier=3, maker_bps=7.5, taker_bps=9.1)
+
+    monkeypatch.setattr("impl_fees.fetch_account_fee_info", _fake_fetch)
+
+    fees = FeesImpl.from_dict(
+        {
+            "maker_bps": 1.0,
+            "taker_bps": 5.0,
+            "use_bnb_discount": True,
+            "account_info": {
+                "enabled": True,
+                "api_key": "key",
+                "api_secret": "secret",
+            },
+        }
+    )
+
+    model = fees.model
+    assert model is not None
+
+    price = 100.0
+    qty = 2.0
+
+    maker_fee = model.compute(side="BUY", price=price, qty=qty, liquidity="maker")
+    taker_fee = model.compute(side="BUY", price=price, qty=qty, liquidity="taker")
+
+    expected_maker = price * qty * 7.5 / 10_000.0
+    expected_taker = price * qty * 9.1 / 10_000.0
+
+    assert maker_fee == pytest.approx(expected_maker)
+    assert taker_fee == pytest.approx(expected_taker)
+
+
 def test_account_info_missing_credentials(monkeypatch):
     def _fail_fetch(**kwargs):  # pragma: no cover - should not be triggered
         raise AssertionError("fetch_account_fee_info should not be called")

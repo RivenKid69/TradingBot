@@ -850,13 +850,20 @@ class FeesImpl:
         if not cfg.taker_bps_overridden and cfg.auto_taker_bps is not None:
             taker_bps = float(cfg.auto_taker_bps)
         account_maker_bps = _safe_float(self.account_fee_overrides.get("maker_bps"))
-        if account_maker_bps is not None:
+        account_maker_override = account_maker_bps is not None
+        if account_maker_override:
             maker_bps = account_maker_bps
             self._account_fee_applied["maker_bps"] = True
         account_taker_bps = _safe_float(self.account_fee_overrides.get("taker_bps"))
-        if account_taker_bps is not None:
+        account_taker_override = account_taker_bps is not None
+        if account_taker_override:
             taker_bps = account_taker_bps
             self._account_fee_applied["taker_bps"] = True
+
+        if account_maker_override:
+            self._maker_discount_mult = 1.0
+        if account_taker_override:
+            self._taker_discount_mult = 1.0
 
         self.base_fee_bps: Dict[str, float] = {
             "maker_fee_bps": maker_bps * self._maker_discount_mult,
