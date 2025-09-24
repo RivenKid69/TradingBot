@@ -7,6 +7,7 @@ import copy
 import datetime as _dt
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -417,15 +418,22 @@ class FeesConfig:
         maker_mult_input = self.maker_discount_mult
         self.maker_discount_overridden = maker_mult_input is not None
         maker_mult = _safe_float(maker_mult_input)
+        try:
+            default_discount_mult = 1.0 - float(DEFAULT_BNB_DISCOUNT_RATE)
+        except (TypeError, ValueError):
+            default_discount_mult = 1.0
+        if not math.isfinite(default_discount_mult):
+            default_discount_mult = 1.0
+        default_discount_mult = max(0.0, min(default_discount_mult, 1.0))
         if maker_mult is None:
-            maker_mult = 0.75 if self.use_bnb_discount else 1.0
+            maker_mult = default_discount_mult if self.use_bnb_discount else 1.0
         self.maker_discount_mult = maker_mult
 
         taker_mult_input = self.taker_discount_mult
         self.taker_discount_overridden = taker_mult_input is not None
         taker_mult = _safe_float(taker_mult_input)
         if taker_mult is None:
-            taker_mult = 0.75 if self.use_bnb_discount else 1.0
+            taker_mult = default_discount_mult if self.use_bnb_discount else 1.0
         self.taker_discount_mult = taker_mult
 
         vip_input = self.vip_tier
