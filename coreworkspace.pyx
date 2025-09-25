@@ -96,29 +96,19 @@ cdef class SimulationWorkspace:
         # Note: The above asserts ensure each memoryview has contiguous stride (1 element step).
         # They rely on the fact that memoryview.strides is accessible with GIL (we are in __init__).
 
-    cdef void ensure_capacity(self, int min_capacity) nogil:
-        """Ensure the internal buffers have capacity for at least `min_capacity` elements.
-
-        If the current buffer capacity is less than min_capacity, new buffers twice the current
-        size (or min_capacity, whichever is larger) are allocated and existing data is copied over.
-        This operation may temporarily acquire the GIL for memory allocation and copying, but is
-        designed to happen infrequently (only when buffers need to grow).
-        """
+    cdef void ensure_capacity(self, int min_capacity):
+        """Ensure the internal buffers have capacity for at least ``min_capacity`` elements."""
         cdef int new_capacity, current_capacity
+
         current_capacity = self._capacity
         if min_capacity <= current_capacity:
-            return  # Sufficient capacity already available.
+            return
 
-        # Determine new capacity (grow by factor of 2, or to min_capacity if larger).
         new_capacity = current_capacity * 2
         if new_capacity < min_capacity:
             new_capacity = min_capacity
 
-        # Perform allocation and copying with the GIL held.
-        with gil:
-            self._resize_buffers(new_capacity)
-
-        # Update internal capacity (no GIL needed here for plain C int).
+        self._resize_buffers(new_capacity)
         self._capacity = new_capacity
 
     cdef void _resize_buffers(self, int new_capacity):
@@ -209,13 +199,16 @@ cdef class SimulationWorkspace:
         cdef int idx = self.trade_count
         if idx >= self._capacity:
             # Need to grow the buffers to fit at least one more trade.
-            self.ensure_capacity(idx + 1)
+            with gil:
+                self.ensure_capacity(idx + 1)
         # After ensure_capacity, it's safe to write the new trade at index idx.
         self.trade_prices[idx] = price
         self.trade_qtys[idx] = qty
         self.trade_sides[idx] = side
         self.trade_is_agent_maker[idx] = is_agent_maker
         self.trade_ts[idx] = ts
+        self.taker_is_agent_all_arr[idx] = <char>0
+        self.maker_ids_all_arr[idx] = <unsigned long long>0
         self.trade_count += 1
 
     cdef void push_filled_order_id(self, long long order_id) nogil:
@@ -230,6 +223,7 @@ cdef class SimulationWorkspace:
         cdef int idx = self.filled_count
         if idx >= self._capacity:
             # Ensure there is space for the new filled order ID.
-            self.ensure_capacity(idx + 1)
+            with gil:
+                self.ensure_capacity(idx + 1)
         self.filled_order_ids[idx] = order_id
         self.filled_count += 1

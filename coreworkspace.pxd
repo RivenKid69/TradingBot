@@ -32,7 +32,7 @@ cdef class SimulationWorkspace:
     cdef int _capacity      # Allocated slots for each buffer
 
     # Methods for managing the workspace buffers.
-    cdef void ensure_capacity(self, int min_capacity) nogil
+    cdef void ensure_capacity(self, int min_capacity)
     cdef void _resize_buffers(self, int new_capacity)
     cdef void clear_step(self) nogil
     cdef void push_trade(self, double price, double qty, char side, char is_agent_maker, long long ts) nogil
