@@ -55,15 +55,17 @@ cdef class SimulationWorkspace:
         cdef int bytes_double = sizeof(double)
         cdef int bytes_longlong = sizeof(long long)
 
-        # Allocate byte buffers for each array
-        cdef bytes b_prices = bytearray(capacity * bytes_double)
-        cdef bytes b_qtys = bytearray(capacity * bytes_double)
-        cdef bytes b_sides = bytearray(capacity * sizeof(char))
-        cdef bytes b_makers = bytearray(capacity * sizeof(char))
-        cdef bytes b_ts = bytearray(capacity * bytes_longlong)
-        cdef bytes b_filled = bytearray(capacity * bytes_longlong)
-        cdef bytes b_maker_ids = bytearray(capacity * bytes_longlong)
-        cdef bytes b_taker_flags = bytearray(capacity * sizeof(char))
+        # Allocate byte buffers for each array. Using bytearray ensures the
+        # underlying storage is writable and remains alive while referenced by
+        # typed memoryviews.
+        cdef bytearray b_prices = bytearray(capacity * bytes_double)
+        cdef bytearray b_qtys = bytearray(capacity * bytes_double)
+        cdef bytearray b_sides = bytearray(capacity * sizeof(char))
+        cdef bytearray b_makers = bytearray(capacity * sizeof(char))
+        cdef bytearray b_ts = bytearray(capacity * bytes_longlong)
+        cdef bytearray b_filled = bytearray(capacity * bytes_longlong)
+        cdef bytearray b_maker_ids = bytearray(capacity * bytes_longlong)
+        cdef bytearray b_taker_flags = bytearray(capacity * sizeof(char))
 
         # Cast byte buffers to typed memoryviews (C-contiguous arrays)
         self.trade_prices = memoryview(b_prices).cast('d')   # double -> 'd'
@@ -74,6 +76,16 @@ cdef class SimulationWorkspace:
         self.filled_order_ids = memoryview(b_filled).cast('q')
         self.maker_ids_all_arr = memoryview(b_maker_ids).cast('Q')
         self.taker_is_agent_all_arr = memoryview(b_taker_flags).cast('b')
+
+        # Retain references to the Python buffers for the lifetime of the workspace.
+        self._buf_trade_prices = b_prices
+        self._buf_trade_qtys = b_qtys
+        self._buf_trade_sides = b_sides
+        self._buf_trade_is_agent_maker = b_makers
+        self._buf_trade_ts = b_ts
+        self._buf_filled_order_ids = b_filled
+        self._buf_maker_ids = b_maker_ids
+        self._buf_taker_flags = b_taker_flags
 
         # Legacy aliases for backwards compatibility with lob_state_cython
         self.prices_all_arr = self.trade_prices
@@ -115,14 +127,24 @@ cdef class SimulationWorkspace:
         """Resize all workspace buffers to ``new_capacity`` while holding the GIL."""
         cdef int bytes_double = sizeof(double)
         cdef int bytes_longlong = sizeof(long long)
-        cdef bytes b_prices_new = bytearray(new_capacity * bytes_double)
-        cdef bytes b_qtys_new = bytearray(new_capacity * bytes_double)
-        cdef bytes b_sides_new = bytearray(new_capacity * sizeof(char))
-        cdef bytes b_makers_new = bytearray(new_capacity * sizeof(char))
-        cdef bytes b_ts_new = bytearray(new_capacity * bytes_longlong)
-        cdef bytes b_filled_new = bytearray(new_capacity * bytes_longlong)
-        cdef bytes b_maker_ids_new = bytearray(new_capacity * bytes_longlong)
-        cdef bytes b_taker_flags_new = bytearray(new_capacity * sizeof(char))
+
+        cdef double[::1] old_prices = self.trade_prices
+        cdef double[::1] old_qtys = self.trade_qtys
+        cdef char[::1] old_sides = self.trade_sides
+        cdef char[::1] old_makers = self.trade_is_agent_maker
+        cdef long long[::1] old_ts = self.trade_ts
+        cdef long long[::1] old_filled = self.filled_order_ids
+        cdef unsigned long long[::1] old_maker_ids = self.maker_ids_all_arr
+        cdef char[::1] old_taker_flags = self.taker_is_agent_all_arr
+
+        cdef bytearray b_prices_new = bytearray(new_capacity * bytes_double)
+        cdef bytearray b_qtys_new = bytearray(new_capacity * bytes_double)
+        cdef bytearray b_sides_new = bytearray(new_capacity * sizeof(char))
+        cdef bytearray b_makers_new = bytearray(new_capacity * sizeof(char))
+        cdef bytearray b_ts_new = bytearray(new_capacity * bytes_longlong)
+        cdef bytearray b_filled_new = bytearray(new_capacity * bytes_longlong)
+        cdef bytearray b_maker_ids_new = bytearray(new_capacity * bytes_longlong)
+        cdef bytearray b_taker_flags_new = bytearray(new_capacity * sizeof(char))
 
         cdef double[::1] new_prices = memoryview(b_prices_new).cast('d')
         cdef double[::1] new_qtys = memoryview(b_qtys_new).cast('d')
@@ -134,15 +156,15 @@ cdef class SimulationWorkspace:
         cdef char[::1] new_taker_flags = memoryview(b_taker_flags_new).cast('b')
 
         if self.trade_count > 0:
-            new_prices[0:self.trade_count] = self.trade_prices[0:self.trade_count]
-            new_qtys[0:self.trade_count] = self.trade_qtys[0:self.trade_count]
-            new_sides[0:self.trade_count] = self.trade_sides[0:self.trade_count]
-            new_makers[0:self.trade_count] = self.trade_is_agent_maker[0:self.trade_count]
-            new_ts[0:self.trade_count] = self.trade_ts[0:self.trade_count]
-            new_maker_ids[0:self.trade_count] = self.maker_ids_all_arr[0:self.trade_count]
-            new_taker_flags[0:self.trade_count] = self.taker_is_agent_all_arr[0:self.trade_count]
+            new_prices[0:self.trade_count] = old_prices[0:self.trade_count]
+            new_qtys[0:self.trade_count] = old_qtys[0:self.trade_count]
+            new_sides[0:self.trade_count] = old_sides[0:self.trade_count]
+            new_makers[0:self.trade_count] = old_makers[0:self.trade_count]
+            new_ts[0:self.trade_count] = old_ts[0:self.trade_count]
+            new_maker_ids[0:self.trade_count] = old_maker_ids[0:self.trade_count]
+            new_taker_flags[0:self.trade_count] = old_taker_flags[0:self.trade_count]
         if self.filled_count > 0:
-            new_filled[0:self.filled_count] = self.filled_order_ids[0:self.filled_count]
+            new_filled[0:self.filled_count] = old_filled[0:self.filled_count]
 
         self.trade_prices = new_prices
         self.trade_qtys = new_qtys
@@ -152,6 +174,15 @@ cdef class SimulationWorkspace:
         self.filled_order_ids = new_filled
         self.maker_ids_all_arr = new_maker_ids
         self.taker_is_agent_all_arr = new_taker_flags
+
+        self._buf_trade_prices = b_prices_new
+        self._buf_trade_qtys = b_qtys_new
+        self._buf_trade_sides = b_sides_new
+        self._buf_trade_is_agent_maker = b_makers_new
+        self._buf_trade_ts = b_ts_new
+        self._buf_filled_order_ids = b_filled_new
+        self._buf_maker_ids = b_maker_ids_new
+        self._buf_taker_flags = b_taker_flags_new
 
         self.prices_all_arr = self.trade_prices
         self.volumes_all_arr = self.trade_qtys

@@ -17,6 +17,16 @@ cdef class SimulationWorkspace:
     cdef long long[::1] trade_ts        # Timestamps of trades
     cdef long long[::1] filled_order_ids# IDs of orders that were fully filled in the step
 
+    # Backing Python objects that own the writable memory for the typed memoryviews.
+    cdef object _buf_trade_prices
+    cdef object _buf_trade_qtys
+    cdef object _buf_trade_sides
+    cdef object _buf_trade_is_agent_maker
+    cdef object _buf_trade_ts
+    cdef object _buf_filled_order_ids
+    cdef object _buf_maker_ids
+    cdef object _buf_taker_flags
+
     # Compatibility aliases for legacy lob_state_cython expectations
     cdef double[::1] prices_all_arr
     cdef double[::1] volumes_all_arr
