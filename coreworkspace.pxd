@@ -40,10 +40,14 @@ cdef class SimulationWorkspace:
     cdef int trade_count    # Number of trades recorded in the current step
     cdef int filled_count   # Number of order IDs recorded as fully filled in the current step
     cdef int _capacity      # Allocated slots for each buffer
+    cdef bint _has_error
+    cdef object _pending_exception
 
     # Methods for managing the workspace buffers.
     cdef void ensure_capacity(self, int min_capacity)
     cdef void _resize_buffers(self, int new_capacity)
     cdef void clear_step(self) nogil
-    cdef void push_trade(self, double price, double qty, char side, char is_agent_maker, long long ts) nogil
-    cdef void push_filled_order_id(self, long long order_id) nogil
+    cdef bint push_trade(self, double price, double qty, char side, char is_agent_maker, long long ts) noexcept nogil
+    cdef bint push_filled_order_id(self, long long order_id) noexcept nogil
+    cdef bint has_error(self) noexcept nogil
+    cpdef void raise_pending_error(self)

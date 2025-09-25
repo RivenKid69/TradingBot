@@ -2,7 +2,6 @@
 # The above directives (if present) disable certain Python checks for performance.
 
 from libc.stdlib cimport malloc, free  # (Optional: if using C memory allocation, but here we use Python memory)
-from libcpp.vector cimport vector      # (Not used, but available if needed for C++ structures)
 
 # Import Python-level constants (ensuring no other project modules are used).
 import core_constants as constants
@@ -35,6 +34,8 @@ cdef class SimulationWorkspace:
         self.trade_count = 0
         self.filled_count = 0
         self._capacity = 0
+        self._has_error = False
+        self._pending_exception = None
 
     def __init__(self, int initial_capacity=0):
         """Initialize the SimulationWorkspace with given initial capacity (number of trades).
@@ -203,21 +204,24 @@ cdef class SimulationWorkspace:
     cdef void clear_step(self) nogil:
         """Reset the workspace for a new simulation step.
 
-        This clears the counters for trades and filled orders, allowing reuse of the existing buffers 
-        without resizing. The data in the buffers remains allocated (and may still hold old values), 
-        but new writes will simply overwrite old data. This method should be called at the beginning 
+        This clears the counters for trades and filled orders, allowing reuse of the existing buffers
+        without resizing. The data in the buffers remains allocated (and may still hold old values),
+        but new writes will simply overwrite old data. This method should be called at the beginning
         of each new simulation step to start fresh.
         """
         self.trade_count = 0
         self.filled_count = 0
+        self._has_error = False
+        with gil:
+            self._pending_exception = None
         # Note: We do not clear the buffer contents for performance reasons. The trade_count and 
         # filled_count define the active range of data, and old data beyond these counts is ignored.
 
-    cdef void push_trade(self, double price, double qty, char side, char is_agent_maker, long long ts) nogil:
+    cdef bint push_trade(self, double price, double qty, char side, char is_agent_maker, long long ts) noexcept nogil:
         """Append a trade record to the workspace buffers.
 
         This records a new trade with the given price, quantity, side, agent maker flag, and timestamp.
-        If necessary, the internal buffers are expanded to accommodate the new trade (which may involve 
+        If necessary, the internal buffers are expanded to accommodate the new trade (which may involve
         acquiring the GIL briefly).
 
         Args:
@@ -227,11 +231,25 @@ cdef class SimulationWorkspace:
             is_agent_maker (char): Flag indicating if the agent was the maker (1) or taker (0) in this trade.
             ts (long long): The timestamp of the trade (in nanoseconds or appropriate unit).
         """
-        cdef int idx = self.trade_count
+        cdef int idx
+        if self._has_error:
+            return False
+
+        idx = self.trade_count
         if idx >= self._capacity:
             # Need to grow the buffers to fit at least one more trade.
             with gil:
-                self.ensure_capacity(idx + 1)
+                if not self._has_error:
+                    try:
+                        self.ensure_capacity(idx + 1)
+                    except Exception as exc:
+                        self._has_error = True
+                        self._pending_exception = exc
+                        return False
+                else:
+                    return False
+        if self._has_error:
+            return False
         # After ensure_capacity, it's safe to write the new trade at index idx.
         self.trade_prices[idx] = price
         self.trade_qtys[idx] = qty
@@ -241,8 +259,9 @@ cdef class SimulationWorkspace:
         self.taker_is_agent_all_arr[idx] = <char>0
         self.maker_ids_all_arr[idx] = <unsigned long long>0
         self.trade_count += 1
+        return True
 
-    cdef void push_filled_order_id(self, long long order_id) nogil:
+    cdef bint push_filled_order_id(self, long long order_id) noexcept nogil:
         """Append a filled order ID to the workspace buffer.
 
         This records the ID of an order that was completely filled during the step.
@@ -251,10 +270,37 @@ cdef class SimulationWorkspace:
         Args:
             order_id (long long): The identifier of the order that has been fully filled.
         """
-        cdef int idx = self.filled_count
+        cdef int idx
+        if self._has_error:
+            return False
+
+        idx = self.filled_count
         if idx >= self._capacity:
             # Ensure there is space for the new filled order ID.
             with gil:
-                self.ensure_capacity(idx + 1)
+                if not self._has_error:
+                    try:
+                        self.ensure_capacity(idx + 1)
+                    except Exception as exc:
+                        self._has_error = True
+                        self._pending_exception = exc
+                        return False
+                else:
+                    return False
+        if self._has_error:
+            return False
         self.filled_order_ids[idx] = order_id
         self.filled_count += 1
+        return True
+
+    cdef bint has_error(self) noexcept nogil:
+        return self._has_error
+
+    cpdef void raise_pending_error(self):
+        if self._has_error:
+            exc = self._pending_exception
+            self._pending_exception = None
+            self._has_error = False
+            if exc is None:
+                raise MemoryError("SimulationWorkspace encountered an unknown error")
+            raise exc
