@@ -31,7 +31,7 @@ def execute_market_fast(state, tracker, params, SimulationWorkspace ws, int side
         return
     cdef double exec_price = price
     cdef long long ts = _resolve_timestamp(state, ws)
-    ws.push_trade(exec_price * constants.PRICE_SCALE, qty, <char> side, <char> 2, ts)
+    ws.push_trade(exec_price, qty, <char> side, <char> 2, ts)
     # Note: No order remains open in fast execution (market order fully executed immediately).
 
 def execute_limit_fast(state, tracker, params, SimulationWorkspace ws, int side, int qty, double price):
@@ -50,6 +50,6 @@ def execute_limit_fast(state, tracker, params, SimulationWorkspace ws, int side,
     if filled:
         exec_price = price
         ts = _resolve_timestamp(state, ws)
-        ws.push_trade(exec_price * constants.PRICE_SCALE, qty, <char> side, <char> 1, ts)
+        ws.push_trade(exec_price, qty, <char> side, <char> 1, ts)
         # No open order to carry since it was filled
     return filled
