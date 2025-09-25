@@ -7,6 +7,8 @@ from numpy cimport ndarray
 cimport numpy as cnp
 import numpy as np
 
+cnp.import_array()
+
 # ---- C++ интерфейсы ----
 cdef extern from "OrderBook.h":
     cdef cppclass OrderBook:
@@ -156,12 +158,6 @@ cdef class MicroSim:
 
 
     cpdef ndarray lambda_hat(self):
-        """
-        Вектор λ̂ (shape=(LAMBDA_DIM,)) в порядке lambda_channel_names()
-        """
-
-
-    cpdef np.ndarray lambda_hat(self):
         """
         Вектор λ̂ (shape=(LAMBDA_DIM,)) в порядке lambda_channel_names()
         """
