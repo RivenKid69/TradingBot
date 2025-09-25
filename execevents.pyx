@@ -1,7 +1,25 @@
 # cython: language_level=3
 import random
+from enum import IntEnum
 
 from execevents cimport EventType, Side
+
+
+class EventTypeEnum(IntEnum):
+    """Python-facing view of the execution event types."""
+    AGENT_LIMIT_ADD = <int> EventType.AGENT_LIMIT_ADD
+    AGENT_MARKET_MATCH = <int> EventType.AGENT_MARKET_MATCH
+    AGENT_CANCEL_SPECIFIC = <int> EventType.AGENT_CANCEL_SPECIFIC
+    PUBLIC_LIMIT_ADD = <int> EventType.PUBLIC_LIMIT_ADD
+    PUBLIC_MARKET_MATCH = <int> EventType.PUBLIC_MARKET_MATCH
+    PUBLIC_CANCEL_RANDOM = <int> EventType.PUBLIC_CANCEL_RANDOM
+
+
+class SideEnum(IntEnum):
+    """Python-facing view of the order sides."""
+    BUY = <int> Side.BUY
+    SELL = <int> Side.SELL
+
 
 # Export frequently used enum values as Python-level constants for convenience.
 SIDE_BUY: int = <int> Side.BUY
@@ -9,6 +27,39 @@ SIDE_SELL: int = <int> Side.SELL
 EVENT_AGENT_LIMIT_ADD: int = <int> EventType.AGENT_LIMIT_ADD
 EVENT_AGENT_MARKET_MATCH: int = <int> EventType.AGENT_MARKET_MATCH
 EVENT_AGENT_CANCEL_SPECIFIC: int = <int> EventType.AGENT_CANCEL_SPECIFIC
+
+# Backwards-compatible aliases exposed through the module globals without shadowing ctypedefs.
+EventTypePy = EventTypeEnum
+SidePy = SideEnum
+
+__all__ = [
+    "EventTypeEnum",
+    "SideEnum",
+    "EventTypePy",
+    "SidePy",
+    "EventType",
+    "Side",
+    "SIDE_BUY",
+    "SIDE_SELL",
+    "EVENT_AGENT_LIMIT_ADD",
+    "EVENT_AGENT_MARKET_MATCH",
+    "EVENT_AGENT_CANCEL_SPECIFIC",
+    "build_agent_limit_add",
+    "build_agent_market_match",
+    "build_agent_cancel_specific",
+    "apply_agent_events",
+]
+
+
+def _register_python_enums():
+    """Expose Python enum views under the historical attribute names."""
+    globals()["EventType"] = EventTypeEnum
+    globals()["Side"] = SideEnum
+
+
+_register_python_enums()
+del _register_python_enums
+
 
 cpdef tuple build_agent_limit_add(double mid_price, Side side, int qty, int next_order_id):
     """
@@ -41,6 +92,7 @@ cpdef tuple build_agent_limit_add(double mid_price, Side side, int qty, int next
             price = 1
     return (EVENT_AGENT_LIMIT_ADD, <int> side, price, qty, next_order_id)
 
+
 cpdef tuple build_agent_market_match(Side side, int qty):
     """
     Build an agent market match event.
@@ -49,12 +101,14 @@ cpdef tuple build_agent_market_match(Side side, int qty):
     """
     return (EVENT_AGENT_MARKET_MATCH, <int> side, 0, qty, 0)
 
+
 cpdef tuple build_agent_cancel_specific(int order_id, Side side):
     """
     Build an agent cancel specific event for the given order id.
     side: side of the order to cancel (1 for buy side order, -1 for sell side order).
     """
     return (EVENT_AGENT_CANCEL_SPECIFIC, <int> side, 0, 0, order_id)
+
 
 def apply_agent_events(state, tracker, microgen, lob, ws, events_list):
     """
