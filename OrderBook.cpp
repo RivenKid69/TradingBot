@@ -3,10 +3,11 @@
 #include <random>
 #include <iterator>
 #include <tuple>
+#include <limits>
 
-/* ------------------------------------------------------------------ /
-/ ctor /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// ctor
+/* ------------------------------------------------------------------ */
 OrderBook::OrderBook()
 {
 #ifdef ORDERBOOK_COW
@@ -17,13 +18,13 @@ OrderBook::OrderBook()
 }
 // PATCH‑ID:P13_OB_ctor
 
-/* ------------------------------------------------------------------ /
-/ add_limit_order /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// add_limit_order
+/* ------------------------------------------------------------------ */
 static inline void reserve_if_empty(std::deque<Order>& dq)
 {
 #if defined(__cpp_lib_containers_reserve) || (__cplusplus >= 202302L)
-if (dq.empty()) dq.reserve(64);
+    if (dq.empty()) dq.reserve(64);
 #endif
 }
 
@@ -151,9 +152,9 @@ void OrderBook::swap(OrderBook& other) noexcept
 #endif
 }
 // PATCH‑ID:P13_OB_clone_swap
-/* ------------------------------------------------------------------ /
-/ remove_order /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// remove_order
+/* ------------------------------------------------------------------ */
 template <typename MapT>
 static void erase_and_reindex(
     MapT& book,
@@ -161,6 +162,13 @@ static void erase_and_reindex(
     long long oid,
     std::unordered_map<long long, PriceLevelIdx>& idx)
 {
+    if (oid < 0) {
+        return;
+    }
+    const auto target_id = static_cast<uint64_t>(oid);
+    if (target_id > static_cast<uint64_t>(std::numeric_limits<long long>::max())) {
+        return;
+    }
     auto it = book.find(price);
     if (it == book.end()) {
         return;
@@ -168,9 +176,9 @@ static void erase_and_reindex(
 
     auto& dq = it->second;
     for (std::size_t i = 0; i < dq.size(); ++i) {
-        if (dq[i].id == oid) {
+        if (dq[i].id == target_id) {
             dq.erase(dq.begin() + static_cast<long long>(i));
-            idx.erase(oid);
+            idx.erase(static_cast<long long>(target_id));
             for (std::size_t j = i; j < dq.size(); ++j) {
                 idx[dq[j].id].position = static_cast<uint32_t>(j);
             }
@@ -257,9 +265,9 @@ int OrderBook::decay_ttl_and_cancel(const std::function<void(const Order&)>& on_
 }
 
 
-/* ------------------------------------------------------------------ /
-/ internal matcher /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// internal matcher
+/* ------------------------------------------------------------------ */
 /* =================================================================
 *  Commission & slippage (Phase 14)
 * ================================================================= */
@@ -275,7 +283,6 @@ const std::function<void(long long,double,const Order&)>& cb)
     int trades = 0, full_exec = 0;
 
     auto process = [&](auto& book, bool taker_is_buy) {
-        const double mid = _mid_price(*this);
         while (remain > EPS && !book.empty()) {
             auto lvl_it = book.begin();
             long long price_ticks = lvl_it->first;
@@ -342,9 +349,9 @@ const std::function<void(long long,double,const Order&)>& cb)
     return {trades, full_exec};
 }
 
-/* ------------------------------------------------------------------ /
-/ match_market_order – dense‑array variant /
-/ ------------------------------------------------------------------ / 
+/* ------------------------------------------------------------------ */
+// match_market_order – dense-array variant
+/* ------------------------------------------------------------------ */ 
 int OrderBook::match_market_order(
     bool is_buy,
     double volume,
@@ -497,103 +504,105 @@ int OrderBook::match_limit_order(
     return t_written;
 }
 
-/* ------------------------------------------------------------------ /
-/ best bid / ask /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// best bid / ask
+/* ------------------------------------------------------------------ */
 long long OrderBook::get_best_bid() const { return bids.empty() ? -1 : bids.begin()->first; }
 long long OrderBook::get_best_ask() const { return asks.empty() ? -1 : asks.begin()->first; }
 
-/* ------------------------------------------------------------------ /
-/ prune stale /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// prune stale
+/* ------------------------------------------------------------------ */
 void OrderBook::prune_stale_orders(int current_step, int max_age)
 {
-auto prune = [&](auto& book)
-{
-for (auto it = book.begin(); it != book.end();) {
-auto& dq = it->second;
-dq.erase(std::remove_if(dq.begin(), dq.end(),
-[&](const Order& o){ return current_step - o.timestamp >= max_age; }),
-dq.end());
-if (dq.empty()) it = book.erase(it);
-else ++it;
-}
-};
-prune(bids);
-prune(asks);
+    auto prune = [&](auto& book) {
+        for (auto it = book.begin(); it != book.end();) {
+            auto& dq = it->second;
+            dq.erase(std::remove_if(dq.begin(), dq.end(),
+                                    [&](const Order& o){ return current_step - o.timestamp >= max_age; }),
+                     dq.end());
+            if (dq.empty()) it = book.erase(it);
+            else ++it;
+        }
+    };
+    prune(bids);
+    prune(asks);
 }
 
-/* ------------------------------------------------------------------ /
-/ contains_order /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// contains_order
+/* ------------------------------------------------------------------ */
 bool OrderBook::contains_order(long long oid) const
 {
-return idx_map.find(oid) != idx_map.end();
+    return idx_map.find(oid) != idx_map.end();
 }
 
-/* ------------------------------------------------------------------ /
-/ cancel_random_public_orders /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// cancel_random_public_orders
+/* ------------------------------------------------------------------ */
 void OrderBook::cancel_random_public_orders(bool is_buy_side, int n)
 {
-if (n <= 0) return;
-std::vector<std::pair<long long,long long>> sample;
-sample.reserve(n);
-long long seen = 0;
+    if (n <= 0) return;
+    std::vector<std::pair<long long,long long>> sample;
+    sample.reserve(n);
+    long long seen = 0;
 
-
-auto sample_book = [&](auto& book)
-{
-    for (auto& [px, dq] : book) {
-        for (auto& ord : dq) {
-            if (ord.is_agent) continue;
-            if (sample.size() < static_cast<std::size_t>(n)) {
-                sample.emplace_back(px, ord.id);
-            } else {
-                std::uniform_int_distribution<long long> d(0, ++seen);
-                long long j = d(gen);
-                if (j < n) sample[j] = {px, ord.id};
+    auto sample_book = [&](auto& book) {
+        for (auto& [px, dq] : book) {
+            for (auto& ord : dq) {
+                if (ord.is_agent) continue;
+                if (sample.size() < static_cast<std::size_t>(n)) {
+                    sample.emplace_back(px, ord.id);
+                } else {
+                    std::uniform_int_distribution<long long> d(0, ++seen);
+                    long long j = d(gen);
+                    if (j < n) sample[j] = {px, ord.id};
+                }
+                ++seen;
             }
-            ++seen;
         }
+    };
+
+    if (is_buy_side) {
+        sample_book(bids);
+    } else {
+        sample_book(asks);
     }
-};
 
-if (is_buy_side) sample_book(bids); else sample_book(asks);
-
-for (auto& p : sample)
-    remove_order(is_buy_side, p.first, p.second);
+    for (auto& p : sample) {
+        remove_order(is_buy_side, p.first, p.second);
+    }
 }
 
-/* ------------------------------------------------------------------ /
-/ volume for top levels /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// volume for top levels
+/* ------------------------------------------------------------------ */
 double OrderBook::get_volume_for_top_levels(bool is_buy_side, int levels) const
 {
-double vol = 0.0;
-int counted = 0;
-if (is_buy_side) {
-    for (const auto& [px, dq] : bids) {
-        if (counted++ >= levels) break;
-        for (const auto& o : dq) vol += o.volume;
+    double vol = 0.0;
+    int counted = 0;
+    if (is_buy_side) {
+        for (const auto& [px, dq] : bids) {
+            if (counted++ >= levels) break;
+            for (const auto& o : dq) vol += o.volume;
+        }
+    } else {
+        for (const auto& [px, dq] : asks) {
+            if (counted++ >= levels) break;
+            for (const auto& o : dq) vol += o.volume;
+        }
     }
-} else {
-    for (const auto& [px, dq] : asks) {
-        if (counted++ >= levels) break;
-        for (const auto& o : dq) vol += o.volume;
-    }
-}
-return vol;
+    return vol;
 }
 
-/* ------------------------------------------------------------------ /
-/ get_queue_position /
-/ ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+// get_queue_position
+/* ------------------------------------------------------------------ */
 uint32_t OrderBook::get_queue_position(long long oid) const
 {
-auto it = idx_map.find(oid);
-return (it == idx_map.end()) ? std::numeric_limits<uint32_t>::max()
-: it->second.position;
+    auto it = idx_map.find(oid);
+    return (it == idx_map.end()) ? std::numeric_limits<uint32_t>::max()
+                                 : it->second.position;
 }
 
 void OrderBook::set_seed(uint64_t seed) {

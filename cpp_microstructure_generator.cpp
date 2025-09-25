@@ -153,7 +153,7 @@ void MicrostructureGenerator::reset(long long mid0_ticks, long long best_bid_tic
     // buy уровни: ... <= bid
     for (int i = 0; i < 10; ++i) {
         long long px = best_bid_ticks - i;
-        double sz = _sample_size(m_sz_limit);
+        (void)_sample_size(m_sz_limit); // прогрев распределения размеров
         std::uint64_t oid = m_next_order_id++;
         // add_limit_order(bool is_buy, price_ticks, volume, order_id, is_agent, ts)
         // НЕЛЬЗЯ в nogil — мы в C++.
@@ -176,7 +176,7 @@ void MicrostructureGenerator::reset(long long mid0_ticks, long long best_bid_tic
     // sell уровни: ... >= ask
     for (int i = 0; i < 10; ++i) {
         long long px = best_ask_ticks + i;
-        double sz = _sample_size(m_sz_limit);
+        (void)_sample_size(m_sz_limit);
         std::uint64_t oid = m_next_order_id++;
         _track_new_order(false, oid, px);
         OrderBook& lob_dummy2 = *(OrderBook*)nullptr; (void)lob_dummy2;
@@ -362,10 +362,8 @@ int MicrostructureGenerator::step(OrderBook& lob, int timestamp, MicroEvent* out
     _update_lambdas();
 
     // 2) Flash-шок (на один шаг) — масштабируем все λ̂
-    bool flash_applied = false;
     if (m_sp.enabled && m_unif(m_rng) < clampd(m_sp.prob_per_step, 0.0, 1.0)) {
         for (int k = 0; k < CH_K; ++k) m_lambda_hat[k] *= std::max(1.0, m_sp.intensity_scale);
-        flash_applied = true;
     }
 
     // 3) Black Swan (редко, с охлаждением) — усиливаем λ̂ на период
