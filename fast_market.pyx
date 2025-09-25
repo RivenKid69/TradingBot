@@ -4,7 +4,7 @@ from libcpp.vector cimport vector
 from cython cimport Py_ssize_t
 from cpython.object cimport PyObject
 
-cdef extern from "include/latency_queue.h":
+cdef extern from "include/latency_queue_py.h":
     cdef cppclass LatencyQueuePy:
         LatencyQueuePy(size_t delay=0) except +
         void push(PyObject* o)
