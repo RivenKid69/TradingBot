@@ -3,7 +3,14 @@ import random
 
 from execevents cimport EventType, Side
 
-def build_agent_limit_add(double mid_price, int side, int qty, int next_order_id):
+# Export frequently used enum values as Python-level constants for convenience.
+SIDE_BUY: int = <int> Side.BUY
+SIDE_SELL: int = <int> Side.SELL
+EVENT_AGENT_LIMIT_ADD: int = <int> EventType.AGENT_LIMIT_ADD
+EVENT_AGENT_MARKET_MATCH: int = <int> EventType.AGENT_MARKET_MATCH
+EVENT_AGENT_CANCEL_SPECIFIC: int = <int> EventType.AGENT_CANCEL_SPECIFIC
+
+cpdef tuple build_agent_limit_add(double mid_price, Side side, int qty, int next_order_id):
     """
     Build an agent limit add event. mid_price is in ticks (as float if fractional mid).
     side: 1 for buy, -1 for sell.
@@ -32,22 +39,22 @@ def build_agent_limit_add(double mid_price, int side, int qty, int next_order_id
         price = mid_ticks + offset
         if price < 1:
             price = 1
-    return (<int>EventType.AGENT_LIMIT_ADD, <int>side, price, qty, next_order_id)
+    return (EVENT_AGENT_LIMIT_ADD, <int> side, price, qty, next_order_id)
 
-def build_agent_market_match(int side, int qty):
+cpdef tuple build_agent_market_match(Side side, int qty):
     """
     Build an agent market match event.
     side: 1 for buy (market buy), -1 for sell (market sell).
     qty: volume to match at market.
     """
-    return (<int>EventType.AGENT_MARKET_MATCH, <int>side, 0, qty, 0)
+    return (EVENT_AGENT_MARKET_MATCH, <int> side, 0, qty, 0)
 
-def build_agent_cancel_specific(int order_id, int side):
+cpdef tuple build_agent_cancel_specific(int order_id, Side side):
     """
     Build an agent cancel specific event for the given order id.
     side: side of the order to cancel (1 for buy side order, -1 for sell side order).
     """
-    return (<int>EventType.AGENT_CANCEL_SPECIFIC, <int>side, 0, 0, order_id)
+    return (EVENT_AGENT_CANCEL_SPECIFIC, <int> side, 0, 0, order_id)
 
 def apply_agent_events(state, tracker, microgen, lob, ws, events_list):
     """
