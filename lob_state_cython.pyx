@@ -409,6 +409,8 @@ cdef class EnvState:
         self.last_event_step = -1
         self.token_index = 0
         self.last_realized_spread = 0.0
+        self.last_executed_notional = 0.0
+        self.last_bar_atr = 0.0
         self.lob = None
         if self.agent_orders_ptr is NULL:
             raise MemoryError("Failed to allocate AgentOrderTracker")
@@ -1030,6 +1032,8 @@ cpdef tuple run_full_step_logic_cython(
                 state._low_extremum = final_price
     
     state.last_pos = delta.final_last_pos
+    state.last_executed_notional = delta.executed_notional
+    state.last_bar_atr = bar_atr
 
     # Применяем финальные вычисленные значения
     state.net_worth = delta.final_net_worth

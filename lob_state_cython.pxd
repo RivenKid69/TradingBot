@@ -122,6 +122,8 @@ cdef class EnvState:
     cdef public double risk_aversion_drawdown
     cdef public double trade_frequency_penalty
     cdef public double turnover_penalty_coef
+    cdef public double last_executed_notional
+    cdef public double last_bar_atr
     cdef public double risk_off_level
     cdef public double risk_on_level
     cdef public double max_position_risk_off
