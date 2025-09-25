@@ -7,19 +7,14 @@ from numpy cimport ndarray
 cimport numpy as cnp
 import numpy as np
 
+from core_constants cimport MarketRegime, NORMAL, CHOPPY_FLAT, STRONG_TREND, ILLIQUID
+
 cnp.import_array()
 
 # ---- C++ интерфейсы ----
 cdef extern from "OrderBook.h":
     cdef cppclass OrderBook:
         pass
-
-cdef extern from "core_constants.h":
-    cdef enum MarketRegime:
-        NORMAL
-        CHOPPY_FLAT
-        STRONG_TREND
-        ILLIQUID
 
 cdef extern from "cpp_microstructure_generator.h":
     cdef enum MicroEventType:
