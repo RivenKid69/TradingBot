@@ -159,6 +159,8 @@ cdef class TradingEnv:
         cdef double realized_spread = 0.0
         cdef double tick = 0.0
 
+        self.state.last_executed_notional = 0.0
+
         if isinstance(action, (list, tuple, np.ndarray)):
             if len(action) >= 2:
                 target_fraction = <double> action[0]
@@ -314,6 +316,7 @@ cdef class TradingEnv:
         reward = base_reward
         if self.config.reward.use_potential_shaping:
             current_atr = self.config.market.initial_atr
+            self.state.last_bar_atr = current_atr
             open_risk = 0.0
             if self.state.net_worth > 1e-9:
                 open_risk = (abs(self.state.units) * current_atr) / self.state.net_worth
