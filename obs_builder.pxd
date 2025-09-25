@@ -1,2 +1,37 @@
+# cython: language_level=3
+
 cdef int compute_n_features(list layout)
-cdef void build_observation_vector_c(const EnvState* state, MarketSimulatorWrapper* market, float[::1] ext_norm_cols, float[::1] out_vec) nogil
+
+cpdef void build_observation_vector_c(
+    float price,
+    float prev_price,
+    float log_volume_norm,
+    float rel_volume,
+    float ma5,
+    float ma20,
+    float rsi14,
+    float macd,
+    float macd_signal,
+    float momentum,
+    float atr,
+    float cci,
+    float obv,
+    float bb_lower,
+    float bb_upper,
+    float is_high_importance,
+    float time_since_event,
+    float fear_greed_value,
+    bint has_fear_greed,
+    bint risk_off_flag,
+    float cash,
+    float units,
+    float last_vol_imbalance,
+    float last_trade_intensity,
+    float last_realized_spread,
+    float last_agent_fill_ratio,
+    int token_id,
+    int max_num_tokens,
+    int num_tokens,
+    float[::1] norm_cols_values,
+    float[::1] out_features
+) noexcept nogil
