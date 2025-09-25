@@ -1,4 +1,4 @@
-cdef enum EventType:
+cpdef enum EventType:
     AGENT_LIMIT_ADD = 0
     AGENT_MARKET_MATCH = 1
     AGENT_CANCEL_SPECIFIC = 2
@@ -6,7 +6,7 @@ cdef enum EventType:
     PUBLIC_MARKET_MATCH = 4
     PUBLIC_CANCEL_RANDOM = 5
 
-cdef enum Side:
+cpdef enum Side:
     BUY = 1
     SELL = -1
 

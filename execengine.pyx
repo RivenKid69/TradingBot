@@ -3,6 +3,7 @@
 
 import execaction_interpreter as action_interpreter
 from execevents import apply_agent_events
+from execevents cimport Side
 from execlob_book import CythonLOB
 
 # Engine functions for full LOB execution and commit
@@ -35,7 +36,7 @@ cpdef commit_step(state, tracker, lob_clone, ws):
     This applies position changes, cash flows, and updates open orders tracking.
     In this stage, we do not modify primary EnvState fields (defer to later integration).
     """
-    cdef int direction
+    cdef Side order_side
     cdef tuple order_info
     # Update agent's open order tracker based on final LOB state
     if tracker is not None:
@@ -47,9 +48,14 @@ cpdef commit_step(state, tracker, lob_clone, ws):
         try:
             for order_info in lob_clone.iter_agent_orders():
                 # order_info = (order_id, side, price)
-                direction = 1 if order_info[1] > 0 else -1
+                order_side = Side.BUY if int(order_info[1]) > 0 else Side.SELL
                 try:
-                    tracker.add(order_info[0], direction, order_info[2])
+                    tracker.add(order_info[0], order_side, order_info[2])
+                except TypeError:
+                    try:
+                        tracker.add(order_info[0], <int> order_side, order_info[2])
+                    except Exception:
+                        pass
                 except AttributeError:
                     pass
         except AttributeError:
