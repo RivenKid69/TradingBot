@@ -81,6 +81,16 @@ ext_modules = [
         extra_link_args=link_args,
     ),
     Extension(
+        name="fast_market",
+        sources=["fast_market.pyx"],
+        include_dirs=include_dirs,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        language="c++",
+        extra_compile_args=cxx_args,
+        extra_link_args=link_args,
+    ),
+    Extension(
         name="micro_sim",
         sources=["micro_sim.pyx", orderbook_cpp, micro_cpp],
         include_dirs=include_dirs,
