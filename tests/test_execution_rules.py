@@ -194,6 +194,21 @@ def test_ttl_two_steps_sim():
     assert rep3.cancelled_ids == []
 
 
+def test_limit_maker_price_enqueues_without_trade():
+    sim = ExecutionSimulator(filters_path=None)
+    sim.set_market_snapshot(bid=100.0, ask=101.0)
+
+    proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=0.1, abs_price=100.5)
+    oid = sim.submit(proto)
+
+    report = sim.pop_ready(ref_price=100.0)
+
+    assert report.trades == []
+    assert report.cancelled_ids == []
+    assert report.new_order_ids == [oid]
+    assert report.new_order_pos == [0]
+
+
 def test_latency_sample_slightly_above_step_waits_full_delay():
     sim = ExecutionSimulator(filters_path=None)
     sim.step_ms = 100
