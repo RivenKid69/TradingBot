@@ -5518,8 +5518,8 @@ class ExecutionSimulator:
                 continue
             expected_fee_out = float(value)
             break
-        if not share_enabled:
-            expected_fee_out = 0.0 if expected_fee_out is not None else 0.0
+        # Preserve the blended expected fee even when maker/taker sharing is disabled so
+        # downstream consumers (reports, metrics) can still surface the latest estimate.
 
         spread_maker_val: Optional[float] = None
         spread_taker_val: Optional[float] = None
@@ -5566,10 +5566,10 @@ class ExecutionSimulator:
             expected_spread_out = None
 
         components: Dict[str, Optional[float]] = {}
-        if share_enabled and expected_fee_out is not None:
+        if expected_fee_out is not None:
             components["fee_bps"] = float(expected_fee_out)
         else:
-            components["fee_bps"] = 0.0 if share_enabled else 0.0
+            components["fee_bps"] = 0.0
         if expected_spread_out is not None:
             components["spread_bps"] = float(expected_spread_out)
         if maker_fee_val is not None:
