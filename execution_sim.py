@@ -7504,6 +7504,28 @@ class ExecutionSimulator:
             for event in self.risk.pop_events():
                 if isinstance(event, RiskEvent):  # type: ignore[name-defined]
                     risk_events_local.append(event)
+            if qty_total <= 0.0:
+                self._next_open_cancelled.append(cid)
+                self._next_open_cancelled_reasons[cid] = "RISK"
+                return cid
+
+            qty_validated, post_risk_rejection = self._apply_filters_market(
+                side, qty_total, ref_market
+            )
+            if post_risk_rejection is not None or qty_validated <= 0.0:
+                self._log_filter_rejection(post_risk_rejection)
+                if post_risk_rejection is not None:
+                    self._record_filter_rejection(post_risk_rejection, "MARKET")
+                reason_code = (
+                    post_risk_rejection.code
+                    if post_risk_rejection is not None
+                    else "FILTER"
+                )
+                self._next_open_cancelled.append(cid)
+                self._next_open_cancelled_reasons[cid] = str(reason_code)
+                return cid
+
+            qty_total = float(qty_validated)
         if qty_total <= 0.0:
             self._next_open_cancelled.append(cid)
             self._next_open_cancelled_reasons[cid] = "RISK"
@@ -8688,6 +8710,33 @@ class ExecutionSimulator:
                     # накопим события риска
                     # (дальше они будут добавлены к отчёту)
                     continue
+
+                if self.risk is not None:
+                    qty_validated, post_risk_rejection = self._apply_filters_market(
+                        side, qty_total, ref_market
+                    )
+                    if post_risk_rejection is not None or qty_validated <= 0.0:
+                        self._log_filter_rejection(post_risk_rejection)
+                        if post_risk_rejection is not None:
+                            filter_rejections_step.append(
+                                self._make_filter_rejection_entry(
+                                    post_risk_rejection,
+                                    client_order_id=p.client_order_id,
+                                    order_type="MARKET",
+                                )
+                            )
+                            self._record_filter_rejection(
+                                post_risk_rejection, "MARKET"
+                            )
+                        reason_code = (
+                            post_risk_rejection.code
+                            if post_risk_rejection is not None
+                            else "FILTER"
+                        )
+                        _cancel(p.client_order_id, reason_code)
+                        continue
+
+                    qty_total = float(qty_validated)
 
                 cap_base_per_bar = self._reset_bar_capacity_if_needed(ts)
                 cap_enforced = bool(
@@ -10134,6 +10183,32 @@ class ExecutionSimulator:
                     if qty_total <= 0.0:
                         _cancel(cli_id)
                         continue
+
+                    qty_validated, post_risk_rejection = self._apply_filters_market(
+                        side, qty_total, ref_market
+                    )
+                    if post_risk_rejection is not None or qty_validated <= 0.0:
+                        self._log_filter_rejection(post_risk_rejection)
+                        if post_risk_rejection is not None:
+                            filter_rejections_step.append(
+                                self._make_filter_rejection_entry(
+                                    post_risk_rejection,
+                                    client_order_id=cli_id,
+                                    order_type="MARKET",
+                                )
+                            )
+                            self._record_filter_rejection(
+                                post_risk_rejection, "MARKET"
+                            )
+                        reason_code = (
+                            post_risk_rejection.code
+                            if post_risk_rejection is not None
+                            else "FILTER"
+                        )
+                        _cancel(cli_id, reason_code)
+                        continue
+
+                    qty_total = float(qty_validated)
 
                 cap_base_per_bar = self._reset_bar_capacity_if_needed(ts)
                 cap_enforced = bool(
