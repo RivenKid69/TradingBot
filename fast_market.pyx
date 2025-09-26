@@ -1,12 +1,15 @@
 # cython: language_level=3
+# cython: language=c++
 # distutils: language = c++
 from libcpp.vector cimport vector
 from cython cimport Py_ssize_t
 from cpython.object cimport PyObject
+from libc.stddef cimport size_t
 
 cdef extern from "include/latency_queue_py.h":
     cdef cppclass LatencyQueuePy:
-        LatencyQueuePy(size_t delay=0) except +
+        LatencyQueuePy() except +
+        LatencyQueuePy(size_t delay) except +
         void push(PyObject* o)
         void tick()
         vector[PyObject*] pop_ready()

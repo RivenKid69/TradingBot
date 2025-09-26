@@ -1,4 +1,5 @@
 # cython: language_level=3
+# cython: language=c++
 # distutils: language = c++
 # cython: c_string_type=unicode, c_string_encoding=utf8, boundscheck=False, wraparound=False
 
@@ -7,6 +8,7 @@ cimport numpy as cnp
 import numpy as np
 from libcpp cimport bool as cpp_bool
 from libcpp.vector cimport vector
+from libc.stddef cimport size_t
 
 ctypedef unsigned long long uint64_t
 ctypedef unsigned int uint32_t
