@@ -8501,7 +8501,7 @@ class ExecutionSimulator:
                 return price_quantized, 0.0, reason
             qty_quantized = qty_for_notional
 
-        if self.enforce_ppbs:
+        if enforce_ppbs:
             if ref_ppbs is not None and ref_ppbs > 0.0:
                 ppbs_ok = True
                 if quantizer is not None:
