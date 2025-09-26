@@ -310,6 +310,46 @@ def test_limit_near_minimum_passes_after_quantization():
     assert qty == pytest.approx(0.1)
 
 
+def test_limit_tick_alignment_with_offset_min_price():
+    local_filters = {
+        "OFFSETPAIR": {
+            "PRICE_FILTER": {
+                "minPrice": "0.35",
+                "maxPrice": "1000",
+                "tickSize": "0.2",
+            },
+            "LOT_SIZE": {"minQty": "1", "maxQty": "1000", "stepSize": "1"},
+            "MIN_NOTIONAL": {"minNotional": "0"},
+        }
+    }
+
+    sim = ExecutionSimulator(symbol="OFFSETPAIR", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.quantizer = None
+    sim.filters = local_filters
+
+    price_ok, qty_ok, rejection_ok = sim._apply_filters_limit_legacy(
+        "BUY", price=0.35, qty=10.0, ref_price=0.4
+    )
+
+    assert rejection_ok is None
+    assert price_ok == pytest.approx(0.35)
+    assert qty_ok == pytest.approx(10.0)
+
+    price_bad, qty_bad, rejection_bad = sim._apply_filters_limit_legacy(
+        "BUY", price=0.45, qty=10.0, ref_price=0.4
+    )
+
+    assert rejection_bad is not None
+    assert rejection_bad.code == "PRICE_FILTER"
+    assert rejection_bad.message == "Price not aligned to tick"
+    assert rejection_bad.constraint is not None
+    assert rejection_bad.constraint.get("min_price") == pytest.approx(0.35)
+    snapped = rejection_bad.constraint.get("snapped_price")
+    assert snapped == pytest.approx(0.35) or snapped == pytest.approx(0.55)
+
+
 def test_attach_quantizer_sets_metadata(tmp_path: pathlib.Path):
     filters_path = tmp_path / "filters.json"
     filters_path.write_text(json.dumps({"filters": filters}), encoding="utf-8")

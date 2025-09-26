@@ -8324,8 +8324,36 @@ class ExecutionSimulator:
                 return 0.0, 0.0, reason
 
         if filters.price_tick > 0.0:
-            snapped = math.floor(price_quantized / filters.price_tick) * filters.price_tick
-            if abs(price_quantized - snapped) > tolerance:
+            origin = filters.price_min
+            if not math.isfinite(origin) or origin <= 0.0:
+                origin = 0.0
+            offset = price_quantized - origin
+            if offset < 0.0 and abs(offset) <= tolerance:
+                offset = 0.0
+            step_size = filters.price_tick
+            if step_size <= 0.0 or not math.isfinite(step_size):
+                step_size = 0.0
+            if step_size > 0.0:
+                steps = math.floor((offset + tolerance) / step_size)
+                if steps < 0:
+                    steps = 0
+                snapped = origin + steps * step_size
+                snapped_next = snapped + step_size
+                diff_primary = abs(price_quantized - snapped)
+                diff_next = abs(price_quantized - snapped_next)
+                if diff_primary <= tolerance:
+                    aligned = True
+                    snap_target = snapped
+                elif diff_next <= tolerance:
+                    aligned = True
+                    snap_target = snapped_next
+                else:
+                    aligned = False
+                    snap_target = snapped if diff_primary <= diff_next else snapped_next
+            else:
+                aligned = True
+                snap_target = price_quantized
+            if not aligned:
                 reason = FilterRejectionReason(
                     code="PRICE_FILTER",
                     message="Price not aligned to tick",
@@ -8333,6 +8361,8 @@ class ExecutionSimulator:
                         "tick": filters.price_tick,
                         "price": price_quantized,
                         "raw_price": price_raw,
+                        "min_price": filters.price_min,
+                        "snapped_price": snap_target,
                     },
                 )
                 return 0.0, 0.0, reason
