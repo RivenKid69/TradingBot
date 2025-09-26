@@ -152,6 +152,38 @@ def test_ttl_two_steps_sim():
     assert rep3.cancelled_ids == []
 
 
+def test_latency_sample_slightly_above_step_waits_full_delay():
+    sim = ExecutionSimulator(filters_path=None)
+    sim.step_ms = 100
+    sim.set_market_snapshot(bid=100.0, ask=101.0)
+
+    class _LatencyModel:
+        def sample(self, ts=None):
+            return {"total_ms": sim.step_ms + 1}
+
+    sim.latency = _LatencyModel()
+
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=0.5)
+    oid = sim.submit(proto, now_ts=0)
+
+    assert len(sim._q._q) == 1
+    assert sim._q._q[0].client_order_id == oid
+    assert sim._q._q[0].remaining_lat == 2
+
+    report_first = sim.pop_ready(now_ts=sim.step_ms, ref_price=100.5)
+    assert report_first.trades == []
+    assert len(sim._q._q) == 1
+    assert sim._q._q[0].remaining_lat == 1
+
+    report_second = sim.pop_ready(now_ts=2 * sim.step_ms, ref_price=100.5)
+    assert report_second.trades == []
+    assert len(sim._q._q) == 1
+    assert sim._q._q[0].remaining_lat == 0
+
+    report_third = sim.pop_ready(now_ts=3 * sim.step_ms, ref_price=100.5)
+    assert [t.client_order_id for t in report_third.trades] == [oid]
+
+
 # --- C++ LOB tests (using stub) ---
 
 def test_unquantized_limit_rejected_lob():
