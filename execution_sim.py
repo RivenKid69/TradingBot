@@ -9538,6 +9538,7 @@ class ExecutionSimulator:
                         liquidity=liquidity_role,
                     )
                     fee_total += float(fee)
+                    self._fees_apply_to_cumulative(fee)
                     _ = self._apply_trade_inventory(
                         side=side, price=filled_price, qty=exec_qty
                     )
@@ -9599,6 +9600,7 @@ class ExecutionSimulator:
                         liquidity=liquidity_role,
                     )
                     fee_total += float(fee)
+                    self._fees_apply_to_cumulative(fee)
                     _ = self._apply_trade_inventory(
                         side=side, price=filled_price, qty=qty_q
                     )
