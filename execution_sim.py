@@ -7982,28 +7982,32 @@ class ExecutionSimulator:
         if not validations_enabled or filters is None:
             return qty_quantized, None
 
-        if qty_raw <= 0.0:
+        if qty_quantized <= 0.0:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity is not positive",
-                constraint={"quantity": qty_raw},
+                constraint={"quantity": qty_quantized},
             )
             return 0.0, reason
 
         min_qty = filters.min_qty_threshold
-        if min_qty > 0.0 and qty_raw + tolerance < min_qty:
+        if min_qty > 0.0 and qty_quantized + tolerance < min_qty:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity below minimum",
-                constraint={"min_qty": min_qty, "step": filters.qty_step, "quantity": qty_raw},
+                constraint={
+                    "min_qty": min_qty,
+                    "step": filters.qty_step,
+                    "quantity": qty_quantized,
+                },
             )
             return 0.0, reason
 
-        if filters.qty_max < float("inf") and qty_raw - tolerance > filters.qty_max:
+        if filters.qty_max < float("inf") and qty_quantized - tolerance > filters.qty_max:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity above maximum",
-                constraint={"max_qty": filters.qty_max, "quantity": qty_raw},
+                constraint={"max_qty": filters.qty_max, "quantity": qty_quantized},
             )
             return 0.0, reason
 
