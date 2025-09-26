@@ -15,6 +15,7 @@ import core_constants as consts
 from core_constants cimport MarketRegime, NORMAL, CHOPPY_FLAT, STRONG_TREND
 from coreworkspace cimport SimulationWorkspace
 from fast_lob cimport CythonLOB
+from obs_builder cimport build_observation_vector_c
 
 # Инициализируем NumPy C-API
 np.import_array()
@@ -208,136 +209,6 @@ cdef class MarketSimulatorWrapper:
         self.thisptr.force_market_regime(regime, start_idx, duration)
 
 
-
-# НОВАЯ И ЕДИНСТВЕННАЯ ВЕРСИЯ ФУНКЦИИ ПОСТРОЕНИЯ НАБЛЮДЕНИЙ
-cpdef void build_observation_vector_c(
-    
-    # Аргументы-признаки (все остаются как есть)
-    float price, float  prev_price, float  log_volume_norm, float  rel_volume,
-    float ma5, float  ma20, float  rsi14, float  macd, float  macd_signal,
-    float momentum, float  atr, float  cci, float  obv,
-    float bb_lower, float  bb_upper,
-    float is_high_importance, float  time_since_event,
-    float fear_greed_value, bint has_fear_greed, bint risk_off_flag,
-    # Аргументы состояния агента
-    float cash, float  units,
-    float last_vol_imbalance, float  last_trade_intensity,
-    float last_realized_spread, float  last_agent_fill_ratio,
-    # Аргументы для нормализованных колонок
-    int token_id,  int max_num_tokens,
-    int num_tokens,
-    float[::1] norm_cols_values,
-    # ВЫХОДНОЙ ПАРАМЕТР: Указатель на заранее выделенный массив
-    float[::1] out_features
-) noexcept nogil:
-    # `nogil` здесь возможен, так как мы убрали все Python-операции,
-    # кроме чтения из `norm_cols_values`, что безопасно.
-
-    cdef int feature_idx = 0
-    cdef float feature_val # Временная переменная для вычислений
-    cdef int start_idx
-
-    # --- Базовые признаки ---
-    out_features[feature_idx] = <float>price; feature_idx += 1
-    out_features[feature_idx] = <float>log_volume_norm; feature_idx += 1
-    out_features[feature_idx] = <float>rel_volume; feature_idx += 1
-    cdef bint ma5_valid = not isnan(ma5)
-    out_features[feature_idx] = <float>ma5 if ma5_valid else 0.0; feature_idx += 1
-    out_features[feature_idx] = <float>ma5_valid; feature_idx += 1
-    cdef bint ma20_valid = not isnan(ma20)
-    out_features[feature_idx] = <float>ma20 if ma20_valid else 0.0; feature_idx += 1
-    out_features[feature_idx] = <float>ma20_valid; feature_idx += 1
-    out_features[feature_idx] = <float>rsi14; feature_idx += 1
-    out_features[feature_idx] = <float>macd; feature_idx += 1
-    out_features[feature_idx] = <float>macd_signal; feature_idx += 1
-    out_features[feature_idx] = <float>momentum; feature_idx += 1
-    out_features[feature_idx] = <float>atr; feature_idx += 1
-    out_features[feature_idx] = <float>cci; feature_idx += 1
-    out_features[feature_idx] = <float>obv; feature_idx += 1
-    
-
-    # --- Производные признаки (с заменой np.* на libc.math.*) ---
-    cdef double ret_1h = tanh((price - prev_price) / (prev_price + 1e-8))
-    out_features[feature_idx] = <float>ret_1h; feature_idx += 1
-
-    # Используем log1p для большей точности при малых значениях x в log(1+x)
-    cdef double vol_24h = tanh(log1p(atr / (price + 1e-8)))
-    out_features[feature_idx] = <float>vol_24h; feature_idx += 1
-
-    # --- Признаки состояния агента ---
-    cdef double position_value = units * price
-    cdef double total_worth = cash + position_value
-    
-    feature_val = 1.0 if total_worth <= 1e-8 else cash / total_worth
-    out_features[feature_idx] = <float>fmax(0.0, fmin(feature_val, 1.0)); feature_idx += 1 # clip(liquidity, 0, 1)
-
-    feature_val = 0.0 if total_worth <= 1e-8 else position_value / total_worth
-    out_features[feature_idx] = <float>tanh(feature_val); feature_idx += 1 # tanh(position_ratio)
-    
-    out_features[feature_idx] = <float>tanh(last_vol_imbalance); feature_idx += 1
-    out_features[feature_idx] = <float>tanh(last_trade_intensity); feature_idx += 1
-
-    feature_val = fmax(-0.1, fmin(last_realized_spread, 0.1)) # clip(spread, -0.1, 0.1)
-    out_features[feature_idx] = <float>feature_val; feature_idx += 1
-    out_features[feature_idx] = <float>last_agent_fill_ratio; feature_idx += 1
-    # --- Microstructure: OFI / QueueImbalance / Microprice (proxies) ---
-
-    # OFI-проxi: знак изменения mid * интенсивность объёма
-    cdef double mid_ret     = tanh((price - prev_price) / (prev_price + 1e-8))
-    cdef double vol_int     = tanh(rel_volume)
-    cdef double ofi_proxy   = mid_ret * vol_int
-    out_features[feature_idx] = <float>ofi_proxy; feature_idx += 1
-
-    # Queue-imbalance: уже передан last_vol_imbalance → нормализуем tanh
-    cdef double qimb = tanh(last_vol_imbalance)
-    out_features[feature_idx] = <float>qimb; feature_idx += 1
-
-    # Microprice proxy: смещение от mid пропорционально половине спрэда и дисбалансу
-    cdef double micro_dev = 0.5 * last_realized_spread * qimb
-    out_features[feature_idx] = <float>micro_dev; feature_idx += 1
-
-    # --- Признаки Bollinger Bands ---
-    cdef double bb_width = bb_upper - bb_lower
-    cdef bint bb_valid = not isnan(bb_lower) # Проверки одного достаточно
-    cdef double min_bb_width = price * 0.0001
-    feature_val = 0.5 if not bb_valid or bb_width <= min_bb_width else (price - bb_lower) / (bb_width + 1e-9)
-    out_features[feature_idx] = <float>fmax(-1.0, fmin(feature_val, 2.0)); feature_idx += 1 # clip(bb_pos, -1, 2)
-    
-    feature_val = 0.0 if not bb_valid else (bb_width / (price + 1e-8))
-    out_features[feature_idx] = <float>bb_valid; feature_idx += 1
-
-    # --- Прочие признаки ---
-    out_features[feature_idx] = <float>is_high_importance; feature_idx += 1
-    out_features[feature_idx] = <float>tanh(time_since_event / 24.0); feature_idx += 1
-
-    # --- Нормализованные колонки ---
-    # Этот цикл все еще работает с Python-списком, но без создания новых объектов.
-    # Это компромисс, чтобы не менять сигнатуру для `norm_cols_values`.
-    cdef Py_ssize_t i
-    for i in range(norm_cols_values.shape[0]):
-        feature_val = fmax(-3.0, fmin(norm_cols_values[i], 3.0)) # clip
-        out_features[feature_idx] = feature_val
-        feature_idx += 1
-
-    # --- Индекс страха и жадности ---
-    if has_fear_greed:
-        feature_val = fmax(-3.0, fmin(fear_greed_value / 100.0, 3.0)) # clip
-        out_features[feature_idx] = <float>feature_val
-        feature_idx += 1
-
-    # --- One-Hot Encoding для токенов (с паддингом) ---
-    if max_num_tokens > 1:
-        start_idx = feature_idx
-        # ПРАВИЛЬНО: Всегда проходим по МАКСИМАЛЬНОМУ числу токенов, заполняя нулями
-        for i in range(max_num_tokens):
-            out_features[start_idx + i] = 0.0
-    
-        # ПРАВИЛЬНО: Ставим единицу только если токен валиден для ТЕКУЩЕГО ассета
-        if 0 <= token_id < max_num_tokens:
-            out_features[start_idx + token_id] = 1.0
-        
-        # ПРАВИЛЬНО: Сдвигаем индекс всегда на МАКСИМАЛЬНОЕ число токенов
-        feature_idx += max_num_tokens
 
 
 # ---------- Состояние Среды (НОВЫЙ КЛАСС) ----------
