@@ -146,6 +146,33 @@ def test_unquantized_limit_rejected_strict():
     assert trade.price == pytest.approx(100.0)
 
 
+def test_cancel_all_cancels_open_limits():
+    sim = ExecutionSimulator(filters_path=None)
+    limit_proto = ActionProto(
+        action_type=ActionType.LIMIT,
+        volume_frac=0.5,
+        abs_price=100.0,
+        ttl_steps=2,
+    )
+    limit_id = sim.submit(limit_proto)
+
+    first_report = sim.pop_ready(ref_price=100.0)
+    assert first_report.trades == []
+    assert limit_id in first_report.new_order_ids
+    assert (limit_id, 2) in sim._ttl_orders
+
+    cancel_proto = ActionProto(action_type=ActionType.CANCEL_ALL, volume_frac=0.0)
+    cancel_id = sim.submit(cancel_proto)
+    cancel_report = sim.pop_ready(ref_price=100.0)
+
+    assert cancel_report.trades == []
+    assert limit_id in cancel_report.cancelled_ids
+    assert cancel_id in cancel_report.cancelled_ids
+    assert cancel_report.new_order_ids == []
+    assert sim._ttl_orders == []
+    assert cancel_report.cancelled_reasons[limit_id] == "CANCEL_ALL"
+
+
 def test_market_quantity_rounded_up_passes_filters():
     sim = ExecutionSimulator(filters_path=None)
     sim.set_quantizer(Quantizer(filters, strict=True))

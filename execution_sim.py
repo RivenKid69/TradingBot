@@ -9660,6 +9660,46 @@ class ExecutionSimulator:
                         )
                 continue
 
+            if atype == ActionType.CANCEL_ALL:
+                _cancel(p.client_order_id, "CANCEL_ALL")
+                seen_cancelled: set[int] = {int(p.client_order_id)}
+                ttl_cancel_ids = [int(oid) for oid, _ in self._ttl_orders]
+                for oid in ttl_cancel_ids:
+                    if oid not in seen_cancelled:
+                        _cancel(oid, "CANCEL_ALL")
+                        seen_cancelled.add(oid)
+                    if self.lob and hasattr(self.lob, "remove_order"):
+                        try:
+                            self.lob.remove_order(int(oid))
+                        except TypeError:
+                            removed = False
+                            for args in ((True, 0, int(oid)), (False, 0, int(oid))):
+                                try:
+                                    if bool(self.lob.remove_order(*args)):
+                                        removed = True
+                                        break
+                                except Exception:
+                                    continue
+                            if not removed:
+                                continue
+                        except Exception:
+                            pass
+                self._ttl_orders = []
+                if self.lob:
+                    for helper in (
+                        "cancel_all",
+                        "cancel_all_orders",
+                        "clear_orders",
+                        "clear",
+                        "reset",
+                    ):
+                        if hasattr(self.lob, helper):
+                            try:
+                                getattr(self.lob, helper)()
+                            except Exception:
+                                continue
+                continue
+
             # Определение направления и базовой цены для прочих типов
             is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
             side = "BUY" if is_buy else "SELL"
@@ -9767,9 +9807,6 @@ class ExecutionSimulator:
             trades.append(trade)
             self._trade_log.append(trade)
             continue
-
-            # прочее — no-op
-            _cancel(p.client_order_id)
 
         # funding: начислить по текущей позиции и актуальной рыночной цене (используем ref как mark)
         funding_cashflow = 0.0
