@@ -72,6 +72,33 @@ def make_sim(strict: bool) -> ExecutionSimulator:
     return sim
 
 
+class _FakeRisk:
+    def __init__(self, adjusted_qty: float):
+        self.qty = float(adjusted_qty)
+        self._events: list = []
+        self.paused_until_ms = 0
+
+    def pre_trade_adjust(self, **_kwargs):
+        return self.qty
+
+    def pop_events(self):
+        events = list(self._events)
+        self._events.clear()
+        return events
+
+    def can_send_order(self, *_args, **_kwargs) -> bool:
+        return True
+
+    def on_new_order(self, *_args, **_kwargs) -> None:
+        return None
+
+    def _emit(self, *_args, **_kwargs) -> None:
+        return None
+
+    def on_mark(self, **_kwargs) -> None:
+        return None
+
+
 def add_limit_with_filters(lob: CythonLOB, is_buy: bool, price: float, qty: float, q: Quantizer):
     p_abs = q.quantize_price("BTCUSDT", price)
     q_qty = q.quantize_qty("BTCUSDT", qty)
@@ -120,6 +147,73 @@ def test_market_quantity_rounded_up_passes_filters():
 
     assert qty_total == pytest.approx(0.1)
     assert rejection is None
+
+
+def test_next_open_risk_adjustment_revalidated_by_filters():
+    sim = make_sim(strict=True)
+    sim._last_ref_price = 100.0
+    sim.risk = _FakeRisk(0.105)
+
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=0.1)
+    cid = sim._submit_next_open(proto, now_ts=123456)
+
+    state = sim._pending_next_open.get("BUY")
+    assert state is not None
+    assert state.qty == pytest.approx(0.1)
+    assert cid not in sim._next_open_cancelled
+
+
+def test_next_open_risk_adjustment_rejected_when_off_filters():
+    sim = ExecutionSimulator(filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.quantizer = None
+    sim.filters = json.loads(json.dumps(filters))
+    sim._last_ref_price = 100.0
+    sim.risk = _FakeRisk(0.05)
+
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=0.1)
+    cid = sim._submit_next_open(proto, now_ts=123456)
+
+    assert cid in sim._next_open_cancelled
+    assert sim._next_open_cancelled_reasons[cid] == "LOT_SIZE"
+    assert not sim._pending_next_open
+
+
+def test_market_pop_ready_requantizes_post_risk_quantity():
+    sim = make_sim(strict=True)
+    sim._last_ref_price = 100.0
+    sim.risk = _FakeRisk(0.105)
+
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=0.1)
+    oid = sim.submit(proto)
+    report = sim.pop_ready(ref_price=100.0)
+
+    assert report.cancelled_ids == []
+    assert len(report.trades) == 1
+    trade = report.trades[0]
+    assert trade.client_order_id == oid
+    assert trade.qty == pytest.approx(0.1)
+
+
+def test_market_pop_ready_rejects_post_risk_filter_violation():
+    sim = ExecutionSimulator(filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.quantizer = None
+    sim.filters = json.loads(json.dumps(filters))
+    sim._last_ref_price = 100.0
+    sim.risk = _FakeRisk(0.05)
+
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=0.1)
+    oid = sim.submit(proto)
+    report = sim.pop_ready(ref_price=100.0)
+
+    assert report.trades == []
+    assert report.cancelled_ids == [oid]
+    assert report.cancelled_reasons[oid] == "LOT_SIZE"
+    assert report.status == "REJECTED_BY_FILTER"
+    assert report.reason and report.reason.get("primary") == "FILTER_REJECTION"
 
 
 def test_limit_near_minimum_passes_after_quantization():
