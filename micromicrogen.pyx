@@ -130,25 +130,44 @@ cdef class CyMicrostructureGenerator:
         if max_events > <int>buf_len:
             max_events = <int>buf_len
 
-        cdef double lam = 1.0 + self.adversarial_factor
+        cdef uint64_t state
+        cdef uint64_t inc
+        cdef int last_side
+        cdef int best_bid
+        cdef int best_ask
+        cdef int current_price
+        cdef uint32_t order_seq
+        cdef double cancel_ratio
+        cdef double imbalance_ratio
+        cdef double momentum
+        cdef double mean_reversion
+        cdef double adversarial
+
+        with gil:
+            state = self._state
+            inc = self._inc
+            last_side = self._last_side
+            best_bid = self.best_bid
+            best_ask = self.best_ask
+            current_price = self.current_price
+            order_seq = self._order_seq
+            cancel_ratio = self.base_cancel_ratio
+            imbalance_ratio = self.base_order_imbalance_ratio
+            momentum = self.momentum_factor
+            mean_reversion = self.mean_reversion_factor
+            adversarial = self.adversarial_factor
+
+        inc |= 1
+
+        cdef double lam = 1.0 + adversarial
         if lam < 0.0:
             lam = 0.0
 
-        cdef uint64_t state = self._state
-        cdef uint64_t inc = self._inc | 1
-        cdef int last_side = self._last_side
-        cdef int best_bid = self.best_bid
-        cdef int best_ask = self.best_ask
-        cdef int current_price = self.current_price
-        cdef uint32_t order_seq = self._order_seq
-
-        cdef double cancel_ratio = self.base_cancel_ratio
         if cancel_ratio < 0.0:
             cancel_ratio = 0.0
         elif cancel_ratio > 1.0:
             cancel_ratio = 1.0
 
-        cdef double imbalance_ratio = self.base_order_imbalance_ratio
         cdef double pb_base
         if imbalance_ratio > 0.0:
             pb_base = imbalance_ratio / (1.0 + imbalance_ratio)
@@ -156,10 +175,6 @@ cdef class CyMicrostructureGenerator:
             pb_base = 0.0
         else:
             pb_base = 0.5
-
-        cdef double momentum = self.momentum_factor
-        cdef double mean_reversion = self.mean_reversion_factor
-        cdef double adversarial = self.adversarial_factor
 
         cdef int events_count = _sample_poisson(&state, inc, lam, max_events)
 
