@@ -116,6 +116,20 @@ def add_limit_with_filters(lob: CythonLOB, is_buy: bool, price: float, qty: floa
     return lob.add_limit_order(is_buy, p_ticks, q_qty, 0, True)
 
 
+class _ClampNotionalQuantizer:
+    def __init__(self, forced_qty: float):
+        self._forced_qty = float(forced_qty)
+
+    def quantize_price(self, _symbol: str, price: float) -> float:
+        return float(price)
+
+    def quantize_qty(self, _symbol: str, qty: float) -> float:
+        return float(qty)
+
+    def clamp_notional(self, _symbol: str, _ref_price: float, qty: float) -> float:
+        return max(float(qty), self._forced_qty)
+
+
 # --- Python ExecutionSimulator tests ---
 
 def test_unquantized_limit_executes_permissive():
@@ -181,6 +195,31 @@ def test_market_quantity_rounded_up_passes_filters():
 
     assert qty_total == pytest.approx(0.1)
     assert rejection is None
+
+
+def test_market_clamp_notional_growth_rejected_by_qty_limits():
+    ref_price = 50.0
+    local_filters = {
+        "TESTUSDT": {
+            "PRICE_FILTER": {"minPrice": "0", "maxPrice": "100000", "tickSize": "0.1"},
+            "LOT_SIZE": {"minQty": "0.1", "maxQty": "5", "stepSize": "0.1"},
+            "MIN_NOTIONAL": {"minNotional": "400"},
+        }
+    }
+    forced_qty = float(local_filters["TESTUSDT"]["MIN_NOTIONAL"]["minNotional"]) / ref_price
+
+    sim = ExecutionSimulator(symbol="TESTUSDT", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.filters = local_filters
+    sim.quantizer = _ClampNotionalQuantizer(forced_qty)
+
+    qty_total, rejection = sim._apply_filters_market("BUY", 1.0, ref_price=ref_price)
+
+    assert qty_total == 0.0
+    assert rejection is not None
+    assert rejection.code == "LOT_SIZE"
+    assert rejection.message == "Quantity above maximum"
 
 
 def test_next_open_risk_adjustment_revalidated_by_filters():
@@ -373,6 +412,34 @@ def test_limit_near_minimum_passes_after_quantization():
     assert rejection is None
     assert price == pytest.approx(10.0)
     assert qty == pytest.approx(0.1)
+
+
+def test_limit_clamp_notional_growth_rejected_by_qty_limits():
+    price = 50.0
+    local_filters = {
+        "TESTUSDT": {
+            "PRICE_FILTER": {"minPrice": "10", "maxPrice": "100000", "tickSize": "0.1"},
+            "LOT_SIZE": {"minQty": "0.1", "maxQty": "5", "stepSize": "0.1"},
+            "MIN_NOTIONAL": {"minNotional": "400"},
+        }
+    }
+    forced_qty = float(local_filters["TESTUSDT"]["MIN_NOTIONAL"]["minNotional"]) / price
+
+    sim = ExecutionSimulator(symbol="TESTUSDT", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.filters = local_filters
+    sim.quantizer = _ClampNotionalQuantizer(forced_qty)
+
+    price_adj, qty_adj, rejection = sim._apply_filters_limit(
+        "BUY", price=price, qty=1.0, ref_price=price
+    )
+
+    assert price_adj == pytest.approx(price)
+    assert qty_adj == 0.0
+    assert rejection is not None
+    assert rejection.code == "LOT_SIZE"
+    assert rejection.message == "Quantity above maximum"
 
 
 def test_limit_tick_alignment_with_offset_min_price():

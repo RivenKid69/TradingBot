@@ -8140,6 +8140,58 @@ class ExecutionSimulator:
                 )
                 return 0.0, reason
 
+        # ``clamp_notional`` may increase the size to satisfy the notional constraint;
+        # rerun the standard LOT_SIZE validations on the adjusted quantity.
+        if validations_enabled and filters is not None:
+            if qty_for_notional <= 0.0:
+                reason = FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message="Quantity is not positive",
+                    constraint={"quantity": qty_for_notional},
+                )
+                return 0.0, reason
+
+            if min_qty > 0.0 and qty_for_notional + tolerance < min_qty:
+                reason = FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message="Quantity below minimum",
+                    constraint={
+                        "min_qty": min_qty,
+                        "step": filters.qty_step,
+                        "quantity": qty_for_notional,
+                    },
+                )
+                return 0.0, reason
+
+            if (
+                filters.qty_max < float("inf")
+                and qty_for_notional - tolerance > filters.qty_max
+            ):
+                reason = FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message="Quantity above maximum",
+                    constraint={
+                        "max_qty": filters.qty_max,
+                        "quantity": qty_for_notional,
+                    },
+                )
+                return 0.0, reason
+
+            if filters.qty_step > 0.0:
+                snapped_qty = (
+                    math.floor(qty_for_notional / filters.qty_step) * filters.qty_step
+                )
+                if abs(qty_for_notional - snapped_qty) > tolerance:
+                    reason = FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Quantity not aligned to step",
+                        constraint={
+                            "step": filters.qty_step,
+                            "quantity": qty_for_notional,
+                        },
+                    )
+                    return 0.0, reason
+
         notional = abs(ref_val * qty_for_notional)
         if not math.isfinite(notional) or notional + tolerance < filters.min_notional:
             reason = FilterRejectionReason(
@@ -8481,6 +8533,62 @@ class ExecutionSimulator:
                             "min_notional": filters.min_notional,
                             "price": price_for_notional,
                             "raw_price": price_raw,
+                        },
+                    )
+                    return price_quantized, 0.0, reason
+            # ``clamp_notional`` may bump the size upward to meet the min notional,
+            # so the adjusted quantity must also satisfy LOT_SIZE filters.
+            if qty_for_notional <= 0.0:
+                reason = FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message="Quantity is not positive",
+                    constraint={
+                        "quantity": qty_for_notional,
+                        "raw_quantity": qty_raw,
+                    },
+                )
+                return price_quantized, 0.0, reason
+
+            if min_qty > 0.0 and qty_for_notional + tolerance < min_qty:
+                reason = FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message="Quantity below minimum",
+                    constraint={
+                        "min_qty": min_qty,
+                        "step": filters.qty_step,
+                        "quantity": qty_for_notional,
+                        "raw_quantity": qty_raw,
+                    },
+                )
+                return price_quantized, 0.0, reason
+
+            if (
+                filters.qty_max < float("inf")
+                and qty_for_notional - tolerance > filters.qty_max
+            ):
+                reason = FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message="Quantity above maximum",
+                    constraint={
+                        "max_qty": filters.qty_max,
+                        "quantity": qty_for_notional,
+                        "raw_quantity": qty_raw,
+                    },
+                )
+                return price_quantized, 0.0, reason
+
+            if filters.qty_step > 0.0:
+                snapped_qty = (
+                    math.floor(qty_for_notional / filters.qty_step) * filters.qty_step
+                )
+                if abs(qty_for_notional - snapped_qty) > tolerance:
+                    reason = FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Quantity not aligned to step",
+                        constraint={
+                            "step": filters.qty_step,
+                            "quantity": qty_for_notional,
+                            "raw_quantity": qty_raw,
                         },
                     )
                     return price_quantized, 0.0, reason
