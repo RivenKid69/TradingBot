@@ -205,6 +205,51 @@ class ExecAction:
     client_tag: Optional[str] = None
 
 
+def _normalize_ttl_steps(
+    ttl_steps: Any, ttl_ms: Any, step_ms: Optional[int]
+) -> int:
+    """Convert raw TTL payload into simulator steps."""
+
+    ttl_steps_val: Optional[float]
+    if ttl_steps is None:
+        ttl_steps_val = None
+    else:
+        try:
+            ttl_steps_val = float(ttl_steps)
+        except (TypeError, ValueError):
+            ttl_steps_val = None
+        else:
+            if not math.isfinite(ttl_steps_val):
+                ttl_steps_val = None
+
+    ttl_from_ms: Optional[int] = None
+    if ttl_steps_val is None and ttl_ms is not None:
+        try:
+            ttl_ms_val = float(ttl_ms)
+        except (TypeError, ValueError):
+            ttl_ms_val = None
+        else:
+            if math.isfinite(ttl_ms_val) and ttl_ms_val > 0.0:
+                base = int(step_ms) if step_ms is not None else 0
+                if base <= 0:
+                    base = 1
+                ttl_from_ms = int(math.ceil(ttl_ms_val / base))
+            else:
+                ttl_from_ms = 0
+
+    if ttl_steps_val is not None:
+        ttl_final = int(ttl_steps_val)
+    elif ttl_from_ms is not None:
+        ttl_final = int(ttl_from_ms)
+    else:
+        ttl_final = 0
+
+    if ttl_final < 0:
+        ttl_final = 0
+
+    return int(ttl_final)
+
+
 def as_exec_action(proto: Any, step_ms: int) -> ExecAction:
     """Normalize arbitrary action-like payload into :class:`ExecAction`."""
 
@@ -217,30 +262,11 @@ def as_exec_action(proto: Any, step_ms: int) -> ExecAction:
     if isinstance(proto, Mapping):
         proto = SimpleNamespace(**proto)  # type: ignore[arg-type]
 
-    ttl_steps = getattr(proto, "ttl_steps", None)
-    ttl_ms = getattr(proto, "ttl_ms", None)
-
-    if ttl_steps is None:
-        ttl_steps_val: Optional[float] = None
-    else:
-        try:
-            ttl_steps_val = float(ttl_steps)
-        except (TypeError, ValueError):
-            ttl_steps_val = None
-
-    if (ttl_steps is None or ttl_steps_val is None) and ttl_ms is not None:
-        try:
-            ttl_ms_val = float(ttl_ms)
-        except (TypeError, ValueError):
-            ttl_steps_converted = 0
-        else:
-            base = max(1, int(step_ms) if step_ms is not None else 0)
-            ttl_steps_converted = int(math.ceil(ttl_ms_val / base)) if base > 0 else 0
-        ttl_steps_final = ttl_steps_converted
-    elif ttl_steps_val is not None:
-        ttl_steps_final = int(ttl_steps_val)
-    else:
-        ttl_steps_final = 0
+    ttl_steps_final = _normalize_ttl_steps(
+        getattr(proto, "ttl_steps", None),
+        getattr(proto, "ttl_ms", None),
+        step_ms,
+    )
 
     abs_price_raw = getattr(proto, "abs_price", None)
     abs_price_val: Optional[float]
@@ -1791,6 +1817,12 @@ class ExecutionSimulator:
             str(execution_profile) if execution_profile is not None else ""
         )
         self.execution_params: dict = dict(execution_params or {})
+        ttl_normalized = _normalize_ttl_steps(
+            self.execution_params.get("ttl_steps"),
+            self.execution_params.get("ttl_ms"),
+            self.step_ms,
+        )
+        self.execution_params["ttl_steps"] = ttl_normalized
         limit_cfg = self.execution_params.get("trade_cost_debug_max_logs")
         if limit_cfg is not None:
             try:
@@ -2405,6 +2437,12 @@ class ExecutionSimulator:
         """Установить профиль исполнения и параметры."""
         self.execution_profile = str(profile).upper()
         self.execution_params = dict(params or {})
+        ttl_normalized = _normalize_ttl_steps(
+            self.execution_params.get("ttl_steps"),
+            self.execution_params.get("ttl_ms"),
+            self.step_ms,
+        )
+        self.execution_params["ttl_steps"] = ttl_normalized
         params_map = dict(self.execution_params)
         entry_mode_param = params_map.get("entry_mode")
         if entry_mode_param is None and self.execution_profile == "MKT_OPEN_NEXT_H1":
