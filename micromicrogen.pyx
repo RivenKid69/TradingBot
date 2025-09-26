@@ -175,42 +175,10 @@ cdef class CyMicrostructureGenerator:
         cdef uint32_t rnd
         cdef double abs_adv = fabs(adversarial)
 
-        with nogil:
-            for i in range(events_count):
-                u = _rand_uniform(&state, inc)
-                if u < cancel_ratio and (best_bid > 0 or best_ask > 0):
-                    events[i].type = EventType.PUBLIC_CANCEL_RANDOM
-                    pb = pb_base
-                    if last_side == 1:
-                        pb = pb + momentum - mean_reversion
-                    elif last_side == -1:
-                        pb = pb - momentum + mean_reversion
-                    if pb < 0.0:
-                        pb = 0.0
-                    elif pb > 1.0:
-                        pb = 1.0
-                    side = 1 if _rand_uniform(&state, inc) < pb else -1
-                    events[i].side = <Side>side
-                    events[i].price = 0
-                    events[i].qty = 0
-                    events[i].order_id = <int>(_rand_uint(&state, inc) & 0x7FFFFFFF)
-                    if side == 1 and best_bid > 0:
-                        best_bid -= 1
-                        if best_bid < 0:
-                            best_bid = 0
-                    elif side == -1:
-                        best_ask += 1
-                    if best_ask <= best_bid:
-                        best_ask = best_bid + 1
-                    last_side = side
-                    continue
-
-                p_market = 0.5 + 0.5 * (momentum - mean_reversion)
-                if p_market < 0.0:
-                    p_market = 0.0
-                elif p_market > 1.0:
-                    p_market = 1.0
-
+        for i in range(events_count):
+            u = _rand_uniform(&state, inc)
+            if u < cancel_ratio and (best_bid > 0 or best_ask > 0):
+                events[i].type = EventType.PUBLIC_CANCEL_RANDOM
                 pb = pb_base
                 if last_side == 1:
                     pb = pb + momentum - mean_reversion
@@ -220,96 +188,128 @@ cdef class CyMicrostructureGenerator:
                     pb = 0.0
                 elif pb > 1.0:
                     pb = 1.0
-
                 side = 1 if _rand_uniform(&state, inc) < pb else -1
                 events[i].side = <Side>side
-
-                if _rand_uniform(&state, inc) < p_market:
-                    events[i].type = EventType.PUBLIC_MARKET_MATCH
-                    if side == 1:
-                        price = best_ask
-                        if price <= 0:
-                            price = current_price + 1
-                        current_price = price
-                        if best_bid < price:
-                            best_bid = price
-                        best_ask = price + 1
-                    else:
-                        price = best_bid
-                        if price <= 0:
-                            price = current_price - 1
-                            if price < 0:
-                                price = 0
-                        current_price = price
-                        if best_ask > price:
-                            best_ask = price
-                        if price > 0:
-                            best_bid = price - 1
-                        else:
-                            best_bid = 0
-                    if best_ask <= best_bid:
-                        best_ask = best_bid + 1
-                    range_extra = 4 + <int>(abs_adv * 10.0)
-                    if range_extra < 1:
-                        range_extra = 1
-                    qty = 1 + <int>(_rand_uint(&state, inc) % <uint32_t>(range_extra))
-                    if qty < 1:
-                        qty = 1
-                    events[i].price = price
-                    events[i].qty = qty
-                    events[i].order_id = 0
-                else:
-                    events[i].type = EventType.PUBLIC_LIMIT_ADD
-                    range_extra = 5 + <int>(abs_adv * 5.0)
-                    if range_extra < 0:
-                        range_extra = 0
-                    rnd = _rand_uint(&state, inc)
-                    if side == 1:
-                        price = best_bid
-                        if range_extra > 0:
-                            price += <int>(rnd % <uint32_t>(range_extra + 1))
-                        if best_ask > best_bid + 1 and price >= best_ask:
-                            price = best_ask - 1
-                        if price < 0:
-                            price = 0
-                        if price > best_bid:
-                            best_bid = price
-                    else:
-                        price = best_ask
-                        if range_extra > 0:
-                            price -= <int>(rnd % <uint32_t>(range_extra + 1))
-                        if price <= best_bid:
-                            price = best_bid + 1
-                        if price < 0:
-                            price = 0
-                        if price < best_ask:
-                            best_ask = price
-
-                    range_extra = 5 + <int>(abs_adv * 10.0)
-                    if range_extra < 1:
-                        range_extra = 1
-                    qty = 1 + <int>(_rand_uint(&state, inc) % <uint32_t>(range_extra))
-                    if qty < 1:
-                        qty = 1
-                    events[i].price = price
-                    events[i].qty = qty
-                    events[i].order_id = <int>order_seq
-                    order_seq += 1
+                events[i].price = 0
+                events[i].qty = 0
+                events[i].order_id = <int>(_rand_uint(&state, inc) & 0x7FFFFFFF)
+                if side == 1 and best_bid > 0:
+                    best_bid -= 1
+                    if best_bid < 0:
+                        best_bid = 0
+                elif side == -1:
+                    best_ask += 1
+                if best_ask <= best_bid:
+                    best_ask = best_bid + 1
                 last_side = side
+                continue
 
-        self._state = state
-        self._inc = inc
-        self._last_side = last_side
-        if best_bid < 0:
-            best_bid = 0
-        if best_ask <= best_bid:
-            best_ask = best_bid + 1
-        if current_price < 0:
-            current_price = 0
-        self.best_bid = best_bid
-        self.best_ask = best_ask
-        self.current_price = current_price
-        self._order_seq = order_seq
+            p_market = 0.5 + 0.5 * (momentum - mean_reversion)
+            if p_market < 0.0:
+                p_market = 0.0
+            elif p_market > 1.0:
+                p_market = 1.0
+
+            pb = pb_base
+            if last_side == 1:
+                pb = pb + momentum - mean_reversion
+            elif last_side == -1:
+                pb = pb - momentum + mean_reversion
+            if pb < 0.0:
+                pb = 0.0
+            elif pb > 1.0:
+                pb = 1.0
+
+            side = 1 if _rand_uniform(&state, inc) < pb else -1
+            events[i].side = <Side>side
+
+            if _rand_uniform(&state, inc) < p_market:
+                events[i].type = EventType.PUBLIC_MARKET_MATCH
+                if side == 1:
+                    price = best_ask
+                    if price <= 0:
+                        price = current_price + 1
+                    current_price = price
+                    if best_bid < price:
+                        best_bid = price
+                    best_ask = price + 1
+                else:
+                    price = best_bid
+                    if price <= 0:
+                        price = current_price - 1
+                        if price < 0:
+                            price = 0
+                    current_price = price
+                    if best_ask > price:
+                        best_ask = price
+                    if price > 0:
+                        best_bid = price - 1
+                    else:
+                        best_bid = 0
+                if best_ask <= best_bid:
+                    best_ask = best_bid + 1
+                range_extra = 4 + <int>(abs_adv * 10.0)
+                if range_extra < 1:
+                    range_extra = 1
+                qty = 1 + <int>(_rand_uint(&state, inc) % <uint32_t>(range_extra))
+                if qty < 1:
+                    qty = 1
+                events[i].price = price
+                events[i].qty = qty
+                events[i].order_id = 0
+            else:
+                events[i].type = EventType.PUBLIC_LIMIT_ADD
+                range_extra = 5 + <int>(abs_adv * 5.0)
+                if range_extra < 0:
+                    range_extra = 0
+                rnd = _rand_uint(&state, inc)
+                if side == 1:
+                    price = best_bid
+                    if range_extra > 0:
+                        price += <int>(rnd % <uint32_t>(range_extra + 1))
+                    if best_ask > best_bid + 1 and price >= best_ask:
+                        price = best_ask - 1
+                    if price < 0:
+                        price = 0
+                    if price > best_bid:
+                        best_bid = price
+                else:
+                    price = best_ask
+                    if range_extra > 0:
+                        price -= <int>(rnd % <uint32_t>(range_extra + 1))
+                    if price <= best_bid:
+                        price = best_bid + 1
+                    if price < 0:
+                        price = 0
+                    if price < best_ask:
+                        best_ask = price
+
+                range_extra = 5 + <int>(abs_adv * 10.0)
+                if range_extra < 1:
+                    range_extra = 1
+                qty = 1 + <int>(_rand_uint(&state, inc) % <uint32_t>(range_extra))
+                if qty < 1:
+                    qty = 1
+                events[i].price = price
+                events[i].qty = qty
+                events[i].order_id = <int>order_seq
+                order_seq += 1
+            last_side = side
+
+        with gil:
+            self._state = state
+            self._inc = inc
+            self._last_side = last_side
+            if best_bid < 0:
+                best_bid = 0
+            if best_ask <= best_bid:
+                best_ask = best_bid + 1
+            if current_price < 0:
+                current_price = 0
+            self.best_bid = best_bid
+            self.best_ask = best_ask
+            self.current_price = current_price
+            self._order_seq = order_seq
 
         return events_count
 
