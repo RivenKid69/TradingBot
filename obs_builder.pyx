@@ -1,5 +1,6 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 
+from cython cimport Py_ssize_t
 from libc.math cimport tanh, log1p, isnan
 
 
@@ -11,7 +12,7 @@ cdef inline float _clipf(double value, double lower, double upper) nogil:
     return <float>value
 
 
-cdef int compute_n_features(list layout):
+cpdef int compute_n_features(list layout):
     """Utility used by legacy Python code to count feature slots."""
     cdef int total = 0
     cdef dict block
@@ -20,7 +21,7 @@ cdef int compute_n_features(list layout):
     return total
 
 
-cpdef void build_observation_vector_c(
+cdef void build_observation_vector_c(
     float price,
     float prev_price,
     float log_volume_norm,
@@ -57,6 +58,7 @@ cpdef void build_observation_vector_c(
 
     cdef int feature_idx = 0
     cdef float feature_val
+    cdef float indicator
     cdef double price_d = price
     cdef double prev_price_d = prev_price
     cdef double position_value
@@ -74,7 +76,7 @@ cpdef void build_observation_vector_c(
     cdef bint bb_valid
     cdef double min_bb_width
     cdef int padded_tokens
-    cdef int i
+    cdef Py_ssize_t i
 
     # --- Bar level block ---------------------------------------------------
     out_features[feature_idx] = price
@@ -193,28 +195,113 @@ cpdef void build_observation_vector_c(
     out_features[feature_idx] = 1.0 if risk_off_flag else 0.0
     feature_idx += 1
 
+    # --- Fear & Greed ------------------------------------------------------
+    if has_fear_greed:
+        feature_val = _clipf(fear_greed_value / 100.0, -3.0, 3.0)
+        indicator = 1.0
+    else:
+        feature_val = 0.0
+        indicator = 0.0
+    out_features[feature_idx] = feature_val
+    feature_idx += 1
+    out_features[feature_idx] = indicator
+    feature_idx += 1
+
     # --- External normalised columns --------------------------------------
     for i in range(norm_cols_values.shape[0]):
         feature_val = _clipf(norm_cols_values[i], -3.0, 3.0)
         out_features[feature_idx] = feature_val
         feature_idx += 1
 
-    # --- Fear & greed (optional) ------------------------------------------
-    if has_fear_greed:
-        feature_val = _clipf(fear_greed_value / 100.0, -3.0, 3.0)
+    # --- Token metadata ----------------------------------------------------
+    if max_num_tokens > 0:
+        # Normalised statistics to keep vector length fixed
+        feature_val = _clipf(num_tokens / (<double>max_num_tokens), 0.0, 1.0)
         out_features[feature_idx] = feature_val
         feature_idx += 1
 
-    # --- Token one-hot -----------------------------------------------------
-    padded_tokens = max_num_tokens
-    if padded_tokens <= 0:
-        padded_tokens = num_tokens
-    elif padded_tokens < num_tokens:
-        padded_tokens = num_tokens
+        if 0 <= token_id < max_num_tokens:
+            feature_val = _clipf(token_id / (<double>max_num_tokens), 0.0, 1.0)
+        else:
+            feature_val = 0.0
+        out_features[feature_idx] = feature_val
+        feature_idx += 1
 
-    if padded_tokens > 0:
+        padded_tokens = max_num_tokens
         for i in range(padded_tokens):
             out_features[feature_idx + i] = 0.0
-        if 0 <= token_id < num_tokens and token_id < padded_tokens:
+
+        if 0 <= token_id < num_tokens and token_id < max_num_tokens:
             out_features[feature_idx + token_id] = 1.0
+
         feature_idx += padded_tokens
+
+
+cpdef void build_observation_vector(
+    float price,
+    float prev_price,
+    float log_volume_norm,
+    float rel_volume,
+    float ma5,
+    float ma20,
+    float rsi14,
+    float macd,
+    float macd_signal,
+    float momentum,
+    float atr,
+    float cci,
+    float obv,
+    float bb_lower,
+    float bb_upper,
+    float is_high_importance,
+    float time_since_event,
+    float fear_greed_value,
+    bint has_fear_greed,
+    bint risk_off_flag,
+    float cash,
+    float units,
+    float last_vol_imbalance,
+    float last_trade_intensity,
+    float last_realized_spread,
+    float last_agent_fill_ratio,
+    int token_id,
+    int max_num_tokens,
+    int num_tokens,
+    float[::1] norm_cols_values,
+    float[::1] out_features
+) noexcept:
+    """Python-callable wrapper that forwards to the ``nogil`` implementation."""
+
+    build_observation_vector_c(
+        price,
+        prev_price,
+        log_volume_norm,
+        rel_volume,
+        ma5,
+        ma20,
+        rsi14,
+        macd,
+        macd_signal,
+        momentum,
+        atr,
+        cci,
+        obv,
+        bb_lower,
+        bb_upper,
+        is_high_importance,
+        time_since_event,
+        fear_greed_value,
+        has_fear_greed,
+        risk_off_flag,
+        cash,
+        units,
+        last_vol_imbalance,
+        last_trade_intensity,
+        last_realized_spread,
+        last_agent_fill_ratio,
+        token_id,
+        max_num_tokens,
+        num_tokens,
+        norm_cols_values,
+        out_features,
+    )

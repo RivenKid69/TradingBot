@@ -44,6 +44,15 @@ micro_cpp = "cpp_microstructure_generator.cpp"
 
 ext_modules = [
     Extension(
+        name="obs_builder",
+        sources=["obs_builder.pyx"],
+        include_dirs=include_dirs,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        language="c",
+        extra_compile_args=c_args,
+    ),
+    Extension(
         name="execlob_book",
         sources=["execlob_book.pyx"],
         include_dirs=include_dirs,
