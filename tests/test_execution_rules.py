@@ -112,6 +112,16 @@ def test_unquantized_limit_rejected_strict():
     assert trade.price == pytest.approx(100.0)
 
 
+def test_market_quantity_rounded_up_passes_filters():
+    sim = ExecutionSimulator(filters_path=None)
+    sim.set_quantizer(Quantizer(filters, strict=True))
+
+    qty_total, rejection = sim._apply_filters_market("BUY", 0.099, ref_price=100.0)
+
+    assert qty_total == pytest.approx(0.1)
+    assert rejection is None
+
+
 def test_attach_quantizer_sets_metadata(tmp_path: pathlib.Path):
     filters_path = tmp_path / "filters.json"
     filters_path.write_text(json.dumps({"filters": filters}), encoding="utf-8")
