@@ -727,28 +727,19 @@ class SymbolFilterSnapshot:
     def percent_price_bounds(self, side: str) -> Tuple[Optional[float], Optional[float]]:
         """Return (upper, lower) multipliers for the provided side."""
         side_norm = str(side).upper()
+
         if side_norm == "BUY":
-            up = (
-                self.bid_multiplier_up
-                if self.bid_multiplier_up is not None
-                else self.multiplier_up
-            )
-            down = (
-                self.bid_multiplier_down
-                if self.bid_multiplier_down is not None
-                else self.multiplier_down
-            )
+            preferred_up = self.ask_multiplier_up
+            preferred_down = self.ask_multiplier_down
+        elif side_norm == "SELL":
+            preferred_up = self.bid_multiplier_up
+            preferred_down = self.bid_multiplier_down
         else:
-            up = (
-                self.ask_multiplier_up
-                if self.ask_multiplier_up is not None
-                else self.multiplier_up
-            )
-            down = (
-                self.ask_multiplier_down
-                if self.ask_multiplier_down is not None
-                else self.multiplier_down
-            )
+            preferred_up = None
+            preferred_down = None
+
+        up = preferred_up if preferred_up is not None else self.multiplier_up
+        down = preferred_down if preferred_down is not None else self.multiplier_down
         return up, down
 
     @property
