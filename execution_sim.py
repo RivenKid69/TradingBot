@@ -1446,7 +1446,10 @@ class ExecutionSimulator:
         if data_degradation is None:
             data_degradation = DataDegradationConfig.default()
         self.data_degradation = data_degradation
-        self._rng_dd = random.Random(self.data_degradation.seed or self.seed)
+        dd_seed = self.data_degradation.seed
+        if dd_seed is None:
+            dd_seed = self.seed
+        self._rng_dd = random.Random(dd_seed)
         max_delay_steps = 0
         if self.step_ms > 0:
             max_delay_steps = self.data_degradation.max_delay_ms // self.step_ms

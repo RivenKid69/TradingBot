@@ -1,5 +1,6 @@
 import importlib.util
 import pathlib
+import random
 import sys
 
 import pytest
@@ -17,6 +18,7 @@ ExecutionSimulator = exec_mod.ExecutionSimulator
 TWAPExecutor = exec_mod.TWAPExecutor
 POVExecutor = exec_mod.POVExecutor
 VWAPExecutor = exec_mod.VWAPExecutor
+DataDegradationConfig = exec_mod.DataDegradationConfig
 
 
 latency_cfg = {"base_ms": 0, "jitter_ms": 0, "spike_p": 0.0, "timeout_ms": 1000, "retries": 0}
@@ -154,3 +156,18 @@ def test_vwap_fallback_plan():
     assert plan[-1].ts_offset_ms == 300
     qty_total = sum(child.qty for child in plan)
     assert qty_total == pytest.approx(40.0)
+
+
+def test_data_degradation_seed_zero_is_distinct_from_none():
+    dd_zero = DataDegradationConfig.default()
+    dd_zero.seed = 0
+    sim_zero = ExecutionSimulator(seed=123, data_degradation=dd_zero)
+    zero_val = sim_zero._rng_dd.random()
+
+    dd_none = DataDegradationConfig.default()
+    dd_none.seed = None
+    sim_none = ExecutionSimulator(seed=123, data_degradation=dd_none)
+    none_val = sim_none._rng_dd.random()
+
+    assert zero_val == random.Random(0).random()
+    assert none_val == random.Random(123).random()
