@@ -1,9 +1,11 @@
-# cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
+# cython: language_level=3, language=c++, boundscheck=False, wraparound=False, cdivision=True
+# distutils: language = c++
 """Reward shaping utilities shared between Python and Cython environments."""
 
 from libc.math cimport fabs, log, tanh
 
 from lob_state_cython cimport EnvState
+from risk_manager cimport ClosedReason
 
 
 cdef inline double _clamp(double value, double lower, double upper) noexcept nogil:
