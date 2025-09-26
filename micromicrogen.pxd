@@ -31,7 +31,7 @@ cdef class CyMicrostructureGenerator:
                                          size_t buf_len,
                                          int max_events) nogil
     cpdef list generate_public_events(self, object state, object tracker,
-                                      object lob, int max_events=*)
+                                      object lob, int max_events=?)
     cdef void _reset_parameters(self)
 
 
