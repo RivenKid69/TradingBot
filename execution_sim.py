@@ -615,11 +615,28 @@ class SymbolFilterSnapshot:
 
     @property
     def min_qty_threshold(self) -> float:
-        candidates = [self.qty_min, self.qty_step]
-        positives = [float(x) for x in candidates if x and float(x) > 0.0]
-        if not positives:
-            return 0.0
-        return max(positives)
+        qty_min = float(self.qty_min or 0.0)
+        qty_step = float(self.qty_step or 0.0)
+
+        if qty_step > 0.0:
+            # Align the minimum quantity with the exchange step by rounding up to
+            # the nearest multiple. Using ``math.ceil`` ensures we respect the
+            # minimum while keeping the result a multiple of ``qty_step``.
+            if qty_min > 0.0:
+                ratio = qty_min / qty_step
+                # Subtracting a tiny epsilon compensates for floating-point
+                # rounding errors when ``qty_min`` is already an exact multiple
+                # of ``qty_step``.
+                steps = math.ceil(ratio - 1e-12)
+                steps = max(steps, 1)
+            else:
+                steps = 0
+            return steps * qty_step
+
+        if qty_min > 0.0:
+            return qty_min
+
+        return 0.0
 
 
 @dataclass
