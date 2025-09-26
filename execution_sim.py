@@ -26,6 +26,7 @@ import collections
 import copy
 from collections import deque
 from dataclasses import dataclass, field
+from enum import IntEnum
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Any, Dict, Sequence, Mapping, Callable, Deque
 import hashlib
@@ -181,27 +182,115 @@ except Exception:  # минимальная замена на случай от�
 
 
 # --- Совместимость с ActionProto/ActionType ---
-try:
-    from action_proto import ActionType, ActionProto  # type: ignore
+try:  # предпочитаем реальные числовые коды действий, если модуль доступен
+    from action_proto import ActionType as _ExternalActionType  # type: ignore
 except Exception:
-    from enum import IntEnum
-
-    @dataclass
-    class ActionProto:  # минимально необходимый набор полей
-        action_type: int  # 0=HOLD,1=MARKET,2=LIMIT
-        volume_frac: float = 0.0
-        price_offset_ticks: int = 0
-        ttl_steps: int = 0
-        abs_price: Optional[float] = (
-            None  # опционально, если доступна абсолютная цена лимитки
-        )
-        tif: str = "GTC"
-        client_tag: Optional[str] = None
-
     class ActionType(IntEnum):
         HOLD = 0
         MARKET = 1
         LIMIT = 2
+        CANCEL_ALL = 3
+else:
+    ActionType = _ExternalActionType  # type: ignore
+
+
+@dataclass
+class ExecAction:
+    action_type: int
+    volume_frac: float = 0.0
+    price_offset_ticks: int = 0
+    abs_price: Optional[float] = None
+    tif: str = "GTC"
+    ttl_steps: int = 0
+    client_tag: Optional[str] = None
+
+
+def as_exec_action(proto: Any, step_ms: int) -> ExecAction:
+    """Normalize arbitrary action-like payload into :class:`ExecAction`."""
+
+    if isinstance(proto, ExecAction):
+        return proto
+
+    if proto is None:
+        raise ValueError("action proto must not be None")
+
+    if isinstance(proto, Mapping):
+        proto = SimpleNamespace(**proto)  # type: ignore[arg-type]
+
+    ttl_steps = getattr(proto, "ttl_steps", None)
+    ttl_ms = getattr(proto, "ttl_ms", None)
+
+    if ttl_steps is None:
+        ttl_steps_val: Optional[float] = None
+    else:
+        try:
+            ttl_steps_val = float(ttl_steps)
+        except (TypeError, ValueError):
+            ttl_steps_val = None
+
+    if (ttl_steps is None or ttl_steps_val is None) and ttl_ms is not None:
+        try:
+            ttl_ms_val = float(ttl_ms)
+        except (TypeError, ValueError):
+            ttl_steps_converted = 0
+        else:
+            base = max(1, int(step_ms) if step_ms is not None else 0)
+            ttl_steps_converted = int(math.ceil(ttl_ms_val / base)) if base > 0 else 0
+        ttl_steps_final = ttl_steps_converted
+    elif ttl_steps_val is not None:
+        ttl_steps_final = int(ttl_steps_val)
+    else:
+        ttl_steps_final = 0
+
+    abs_price_raw = getattr(proto, "abs_price", None)
+    abs_price_val: Optional[float]
+    if abs_price_raw is None:
+        abs_price_val = None
+    else:
+        try:
+            abs_price_val = float(abs_price_raw)
+        except (TypeError, ValueError):
+            abs_price_val = None
+
+    action_type_raw = getattr(proto, "action_type")
+    if action_type_raw is None:
+        raise ValueError("action proto missing action_type")
+
+    try:
+        action_type_val = int(action_type_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("action proto has invalid action_type") from exc
+
+    volume_raw = getattr(proto, "volume_frac", 0.0)
+    try:
+        volume_val = float(volume_raw)
+    except (TypeError, ValueError):
+        volume_val = 0.0
+
+    price_offset_raw = getattr(proto, "price_offset_ticks", 0)
+    try:
+        price_offset_val = int(price_offset_raw)
+    except (TypeError, ValueError):
+        price_offset_val = 0
+
+    tif_raw = getattr(proto, "tif", "GTC")
+    tif_val = str(tif_raw).upper() if tif_raw is not None else "GTC"
+
+    client_tag_val = getattr(proto, "client_tag", None)
+
+    return ExecAction(
+        action_type=action_type_val,
+        volume_frac=volume_val,
+        price_offset_ticks=price_offset_val,
+        abs_price=abs_price_val,
+        tif=tif_val,
+        ttl_steps=max(int(ttl_steps_final), 0),
+        client_tag=client_tag_val,
+    )
+
+
+# Backward compatibility for legacy imports
+ActionProto = ExecAction
 
 
 # --- Импорт квантизатора, комиссий/funding и слиппеджа ---
@@ -701,7 +790,7 @@ ExecReport = SimStepReport
 
 @dataclass
 class Pending:
-    proto: ActionProto
+    proto: ExecAction
     client_order_id: int
     remaining_lat: int
     timestamp: int
@@ -714,7 +803,7 @@ class Pending:
 
 @dataclass
 class PendingOrderState:
-    proto: ActionProto
+    proto: ExecAction
     client_order_id: int
     side: str
     qty: float
@@ -3399,16 +3488,16 @@ class ExecutionSimulator:
         timeframe_ms: Optional[int],
     ) -> Optional[float]:
         if not self._bar_cap_base_enabled:
-            return 0.0
+            return None
         path_val = self._bar_cap_base_path
         if not path_val:
-            return 0.0
+            return None
         try:
             path_key = str(path_val).strip()
         except Exception:
-            return 0.0
+            return None
         if not path_key:
-            return 0.0
+            return None
 
         now_ts = now_ms()
         cache_path = self._bar_cap_base_cache_path
@@ -3486,7 +3575,7 @@ class ExecutionSimulator:
         except Exception:
             sym_key = ""
         if not sym_key:
-            return 0.0
+            return None
 
         raw_value = dataset_map.get(sym_key)
         base_daily_val: Optional[float]
@@ -3521,7 +3610,7 @@ class ExecutionSimulator:
                         sym_key,
                     )
                     self._bar_cap_base_warned_symbols.add(sym_key)
-                return 0.0
+                return None
             base_daily_val = fallback_val
             if sym_key and sym_key not in self._bar_cap_base_warned_symbols:
                 logger.warning(
@@ -3574,18 +3663,18 @@ class ExecutionSimulator:
         if timeframe_candidate is None or timeframe_candidate <= 0:
             timeframe_candidate = self._resolve_intrabar_timeframe(None)
         if timeframe_candidate is None or timeframe_candidate <= 0:
-            return 0.0
+            return None
         try:
             bars_per_day = 86_400_000.0 / float(timeframe_candidate)
         except (TypeError, ValueError):
-            return 0.0
+            return None
         if not math.isfinite(bars_per_day) or bars_per_day <= 0.0:
-            return 0.0
+            return None
 
         daily_capacity = base_daily_val * frac_float
         capacity_per_bar = daily_capacity / bars_per_day
         if not math.isfinite(capacity_per_bar):
-            return 0.0
+            return None
         if capacity_per_bar < 0.0:
             capacity_per_bar = 0.0
         return capacity_per_bar
@@ -7229,7 +7318,7 @@ class ExecutionSimulator:
 
     # ---- очередь ----
     def _submit_next_open(
-        self, proto: ActionProto, now_ts: Optional[int] = None
+        self, proto: ExecAction, now_ts: Optional[int] = None
     ) -> int:
         cid = self._next_cli_id
         self._next_cli_id += 1
@@ -7306,7 +7395,8 @@ class ExecutionSimulator:
         self._next_open_new_orders.append(cid)
         return cid
 
-    def submit(self, proto: ActionProto, now_ts: Optional[int] = None) -> int:
+    def submit(self, proto: ExecAction, now_ts: Optional[int] = None) -> int:
+        proto = as_exec_action(proto, self.step_ms)
         if getattr(self, "_entry_mode", "default") == "next_bar_open":
             return self._submit_next_open(proto, now_ts=now_ts)
         cid = self._next_cli_id
@@ -8207,8 +8297,8 @@ class ExecutionSimulator:
 
         return new_qty, None
 
-    def _build_limit_action(self, side: str, qty: float) -> Optional[ActionProto]:
-        """Build a LIMIT ActionProto around the mid price."""
+    def _build_limit_action(self, side: str, qty: float) -> Optional[ExecAction]:
+        """Build a LIMIT ExecAction around the mid price."""
         if MidOffsetLimitExecutor is None:
             return None
         try:
@@ -8228,17 +8318,15 @@ class ExecutionSimulator:
             built = execu.build_action(side=str(side), qty=float(qty), snapshot=snap)
             if built is None:
                 return None
-            if isinstance(built, ActionProto):
-                ap = built
+            if isinstance(built, Mapping):
+                built_payload = dict(built)
+                built_payload.setdefault("action_type", int(ActionType.LIMIT))
+                candidate = as_exec_action(SimpleNamespace(**built_payload), self.step_ms)
             else:
-                ap = ActionProto(
-                    action_type=ActionType.LIMIT,
-                    volume_frac=float(built.get("volume_frac", 0.0)),
-                    tif=str(built.get("tif", "GTC")),
-                )
-                object.__setattr__(ap, "ttl_steps", int(built.get("ttl_steps", 0)))
-                object.__setattr__(ap, "abs_price", built.get("abs_price"))
-            return ap
+                candidate = as_exec_action(built, self.step_ms)
+            if int(candidate.action_type) != int(ActionType.LIMIT):
+                candidate.action_type = int(ActionType.LIMIT)
+            return candidate
         except Exception:
             return None
 
@@ -8963,115 +9051,6 @@ class ExecutionSimulator:
                             fill_ratio=float(fill_ratio),
                         )
                 continue
-            # Определение направления и базовой цены для прочих типов
-            is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
-            side = "BUY" if is_buy else "SELL"
-            qty = abs(float(getattr(proto, "volume_frac", 0.0)))
-            last_liq_cap = self._effective_liquidity_cap()
-            if last_liq_cap is not None:
-                try:
-                    cap_val = float(last_liq_cap)
-                except (TypeError, ValueError):
-                    cap_val = None
-                else:
-                    if math.isfinite(cap_val):
-                        if cap_val < 0.0:
-                            cap_val = 0.0
-                        qty = min(qty, cap_val)
-                        if qty <= 0.0:
-                            _cancel(p.client_order_id)
-                            continue
-            if side == "BUY":
-                base_price = self._last_ask if self._last_ask is not None else ref
-            else:
-                base_price = self._last_bid if self._last_bid is not None else ref
-            filled_price = float(base_price) if base_price is not None else float(ref)
-
-            # слиппедж
-            slip_bps = 0.0
-            sbps = self._last_spread_bps
-            vf = self._last_vol_factor
-            liq = self._limit_optional_by_intrabar_volume(self._last_liquidity)
-            pre_slip_price = float(filled_price)
-            trade_cost: Optional[_TradeCostResult] = None
-            fallback_slip: Optional[float] = None
-            if self.slippage_cfg is not None:
-                trade_cost = self._compute_dynamic_trade_cost_bps(
-                    side=side,
-                    qty=qty,
-                    spread_bps=sbps,
-                    base_price=pre_slip_price,
-                    liquidity=liq,
-                    vol_factor=vf,
-                    order_seq=None,
-                    bar_close_ts=getattr(self, "_last_bar_close_ts", None),
-                )
-                if trade_cost is None and estimate_slippage_bps is not None:
-                    fallback_slip = estimate_slippage_bps(
-                        spread_bps=sbps,
-                        size=qty,
-                        liquidity=liq,
-                        vol_factor=vf,
-                        cfg=self.slippage_cfg,
-                    )
-            if trade_cost is not None:
-                slip_bps = self._trade_cost_expected_bps(trade_cost)
-                filled_price = self._apply_trade_cost_price(
-                    side=side,
-                    pre_slip_price=pre_slip_price,
-                    trade_cost=trade_cost,
-                )
-                self._log_trade_cost_debug(
-                    context="market",
-                    side=side,
-                    qty=qty,
-                    pre_price=pre_slip_price,
-                    final_price=filled_price,
-                    trade_cost=trade_cost,
-                )
-            elif fallback_slip is not None:
-                blended = self._blend_expected_spread(taker_bps=fallback_slip)
-                if blended is None:
-                    slip_bps = 0.0
-                else:
-                    slip_bps = float(blended)
-                if apply_slippage_price is not None:
-                    filled_price = apply_slippage_price(
-                        side=side, quote_price=pre_slip_price, slippage_bps=slip_bps
-                    )
-
-            # комиссия
-            fee = self._compute_trade_fee(
-                side=side, price=filled_price, qty=qty, liquidity="taker"
-            )
-            fee_total += float(fee)
-            self._fees_apply_to_cumulative(fee)
-
-            # обновить позицию с расчётом реализованного PnL
-            _ = self._apply_trade_inventory(side=side, price=filled_price, qty=qty)
-
-            trade = ExecTrade(
-                ts=self._trade_timestamp_with_close_lag(ts),
-                side=side,
-                price=filled_price,
-                qty=qty,
-                notional=filled_price * qty,
-                liquidity="taker",
-                proto_type=atype,
-                client_order_id=p.client_order_id,
-                fee=float(fee),
-                slippage_bps=float(slip_bps),
-                spread_bps=self._report_spread_bps(sbps),
-                latency_ms=int(p.lat_ms),
-                latency_spike=bool(p.spike),
-                tif=tif,
-                ttl_steps=ttl_steps,
-            )
-            trades.append(trade)
-            self._trade_log.append(trade)
-            continue
-
-            # LIMIT
             if atype == ActionType.LIMIT:
                 is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
                 side = "BUY" if is_buy else "SELL"
@@ -9087,14 +9066,16 @@ class ExecutionSimulator:
                     limit_latency, limit_timeframe
                 )
                 order_seq = self._next_order_seq()
-                limit_intrabar_price, limit_intrabar_clipped, limit_intrabar_frac = (
-                    self._compute_intrabar_price(
-                        side=side,
-                        time_fraction=limit_fraction,
-                        fallback_price=ref,
-                        bar_ts=self._last_bar_close_ts,
-                        order_seq=order_seq,
-                    )
+                (
+                    limit_intrabar_price,
+                    limit_intrabar_clipped,
+                    limit_intrabar_frac,
+                ) = self._compute_intrabar_price(
+                    side=side,
+                    time_fraction=limit_fraction,
+                    fallback_price=ref,
+                    bar_ts=self._last_bar_close_ts,
+                    order_seq=order_seq,
                 )
                 ref_limit: Optional[float] = None
                 if limit_intrabar_price is not None and math.isfinite(
@@ -9113,16 +9094,12 @@ class ExecutionSimulator:
                     except (TypeError, ValueError):
                         intrabar_base_price = None
 
-                # Определяем лимитную цену
                 abs_price = getattr(proto, "abs_price", None)
                 if abs_price is None:
-                    # нет абсолютной цены в proto — попробуем использовать ref_price как базу
                     if ref_limit is None:
-                        # ничего не можем сделать — считаем, что заявка размещена (эмуляция)
                         new_order_ids.append(int(p.client_order_id))
                         new_order_pos.append(0)
                         continue
-                    # без знания tickSize в тиках используем abs_price=ref (реальную оффсет-логику добавим позже)
                     abs_price = float(ref_limit)
 
                 price_q, qty_q, rejection = self._apply_filters_limit(
@@ -9324,6 +9301,114 @@ class ExecutionSimulator:
                             (int(p.client_order_id), int(ttl_steps))
                         )
                 continue
+
+            # Определение направления и базовой цены для прочих типов
+            is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
+            side = "BUY" if is_buy else "SELL"
+            qty = abs(float(getattr(proto, "volume_frac", 0.0)))
+            last_liq_cap = self._effective_liquidity_cap()
+            if last_liq_cap is not None:
+                try:
+                    cap_val = float(last_liq_cap)
+                except (TypeError, ValueError):
+                    cap_val = None
+                else:
+                    if math.isfinite(cap_val):
+                        if cap_val < 0.0:
+                            cap_val = 0.0
+                        qty = min(qty, cap_val)
+                        if qty <= 0.0:
+                            _cancel(p.client_order_id)
+                            continue
+            if side == "BUY":
+                base_price = self._last_ask if self._last_ask is not None else ref
+            else:
+                base_price = self._last_bid if self._last_bid is not None else ref
+            filled_price = float(base_price) if base_price is not None else float(ref)
+
+            # слиппедж
+            slip_bps = 0.0
+            sbps = self._last_spread_bps
+            vf = self._last_vol_factor
+            liq = self._limit_optional_by_intrabar_volume(self._last_liquidity)
+            pre_slip_price = float(filled_price)
+            trade_cost: Optional[_TradeCostResult] = None
+            fallback_slip: Optional[float] = None
+            if self.slippage_cfg is not None:
+                trade_cost = self._compute_dynamic_trade_cost_bps(
+                    side=side,
+                    qty=qty,
+                    spread_bps=sbps,
+                    base_price=pre_slip_price,
+                    liquidity=liq,
+                    vol_factor=vf,
+                    order_seq=None,
+                    bar_close_ts=getattr(self, "_last_bar_close_ts", None),
+                )
+                if trade_cost is None and estimate_slippage_bps is not None:
+                    fallback_slip = estimate_slippage_bps(
+                        spread_bps=sbps,
+                        size=qty,
+                        liquidity=liq,
+                        vol_factor=vf,
+                        cfg=self.slippage_cfg,
+                    )
+            if trade_cost is not None:
+                slip_bps = self._trade_cost_expected_bps(trade_cost)
+                filled_price = self._apply_trade_cost_price(
+                    side=side,
+                    pre_slip_price=pre_slip_price,
+                    trade_cost=trade_cost,
+                )
+                self._log_trade_cost_debug(
+                    context="market",
+                    side=side,
+                    qty=qty,
+                    pre_price=pre_slip_price,
+                    final_price=filled_price,
+                    trade_cost=trade_cost,
+                )
+            elif fallback_slip is not None:
+                blended = self._blend_expected_spread(taker_bps=fallback_slip)
+                if blended is None:
+                    slip_bps = 0.0
+                else:
+                    slip_bps = float(blended)
+                if apply_slippage_price is not None:
+                    filled_price = apply_slippage_price(
+                        side=side, quote_price=pre_slip_price, slippage_bps=slip_bps
+                    )
+
+            # комиссия
+            fee = self._compute_trade_fee(
+                side=side, price=filled_price, qty=qty, liquidity="taker"
+            )
+            fee_total += float(fee)
+            self._fees_apply_to_cumulative(fee)
+
+            # обновить позицию с расчётом реализованного PnL
+            _ = self._apply_trade_inventory(side=side, price=filled_price, qty=qty)
+
+            trade = ExecTrade(
+                ts=self._trade_timestamp_with_close_lag(ts),
+                side=side,
+                price=filled_price,
+                qty=qty,
+                notional=filled_price * qty,
+                liquidity="taker",
+                proto_type=atype,
+                client_order_id=p.client_order_id,
+                fee=float(fee),
+                slippage_bps=float(slip_bps),
+                spread_bps=self._report_spread_bps(sbps),
+                latency_ms=int(p.lat_ms),
+                latency_spike=bool(p.spike),
+                tif=tif,
+                ttl_steps=ttl_steps,
+            )
+            trades.append(trade)
+            self._trade_log.append(trade)
+            continue
 
             # прочее — no-op
             _cancel(p.client_order_id)
@@ -9699,7 +9784,7 @@ class ExecutionSimulator:
                 if str(
                     getattr(atype, "name", getattr(atype, "__class__", type(atype)))
                 ).upper().endswith("MARKET") or str(atype).upper().endswith("MARKET"):
-                    self._submit_next_open(proto, now_ts=ts)
+                    self._submit_next_open(as_exec_action(proto, self.step_ms), now_ts=ts)
             report_next = self._pop_ready_next_open(
                 now_ts=ts,
                 ref_price=ref_price,

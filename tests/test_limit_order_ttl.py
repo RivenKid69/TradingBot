@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import sys
+from types import SimpleNamespace
 
 base = pathlib.Path(__file__).resolve().parents[1]
 spec_exec = importlib.util.spec_from_file_location("execution_sim", base / "execution_sim.py")
@@ -37,6 +38,25 @@ def test_limit_order_ttl_survives():
     report4 = sim.pop_ready(ref_price=100.0)
     assert report4.cancelled_ids == [oid]
     assert report4.cancelled_reasons == {oid: "TTL"}
+
+
+def test_limit_order_ttl_ms_rounds_up():
+    sim = ExecutionSimulator()
+    sim.step_ms = 200
+    proto = SimpleNamespace(
+        action_type=ActionType.LIMIT,
+        volume_frac=1.0,
+        abs_price=100.0,
+        ttl_ms=350,
+    )
+    oid = sim.submit(proto)
+    report1 = sim.pop_ready(ref_price=100.0)
+    assert report1.new_order_ids == [oid]
+    report2 = sim.pop_ready(ref_price=100.0)
+    assert report2.cancelled_ids == []
+    report3 = sim.pop_ready(ref_price=100.0)
+    assert report3.cancelled_ids == [oid]
+    assert report3.cancelled_reasons == {oid: "TTL"}
 
 
 from fast_lob import CythonLOB
