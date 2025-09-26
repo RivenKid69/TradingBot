@@ -8440,7 +8440,7 @@ class ExecutionSimulator:
         self._vwap_on_tick(ts, ref, self._last_liquidity)
 
         for p in ready:
-            proto = p.proto
+            proto = as_exec_action(p.proto, self.step_ms)
             atype = int(getattr(proto, "action_type", ActionType.HOLD))
             ttl_steps = int(getattr(proto, "ttl_steps", 0))
             tif = str(getattr(proto, "tif", "GTC")).upper()
@@ -9132,13 +9132,46 @@ class ExecutionSimulator:
                     except (TypeError, ValueError):
                         intrabar_base_price = None
 
-                abs_price = getattr(proto, "abs_price", None)
+                abs_price_raw = getattr(proto, "abs_price", None)
+                abs_price = None
+                explicit_price = False
+                if abs_price_raw is not None:
+                    try:
+                        abs_price_val = float(abs_price_raw)
+                    except (TypeError, ValueError):
+                        abs_price_val = None
+                    else:
+                        if math.isfinite(abs_price_val):
+                            abs_price = float(abs_price_val)
+                            explicit_price = True
+                if abs_price is None and limit_intrabar_price is not None:
+                    try:
+                        candidate_price = float(limit_intrabar_price)
+                    except (TypeError, ValueError):
+                        candidate_price = None
+                    else:
+                        if math.isfinite(candidate_price):
+                            abs_price = float(candidate_price)
+
+                def _register_unfilled_limit() -> None:
+                    new_order_ids.append(int(p.client_order_id))
+                    new_order_pos.append(0)
+                    if ttl_steps > 0:
+                        self._ttl_orders.append(
+                            (int(p.client_order_id), int(ttl_steps))
+                        )
+
                 if abs_price is None:
-                    if ref_limit is None:
-                        new_order_ids.append(int(p.client_order_id))
-                        new_order_pos.append(0)
+                    _register_unfilled_limit()
+                    continue
+
+                if not explicit_price:
+                    side_best = (
+                        self._last_ask if side == "BUY" else self._last_bid
+                    )
+                    if side_best is None:
+                        _register_unfilled_limit()
                         continue
-                    abs_price = float(ref_limit)
 
                 price_q, qty_q, rejection = self._apply_filters_limit(
                     side, float(abs_price), qty_raw, ref_limit
