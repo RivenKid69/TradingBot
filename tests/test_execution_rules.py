@@ -122,6 +122,38 @@ def test_market_quantity_rounded_up_passes_filters():
     assert rejection is None
 
 
+def test_limit_near_minimum_passes_after_quantization():
+    local_filters = {
+        "TESTUSDT": {
+            "PRICE_FILTER": {
+                "minPrice": "10",
+                "maxPrice": "100000",
+                "tickSize": "0.5",
+            },
+            "LOT_SIZE": {
+                "minQty": "0.1",
+                "maxQty": "1000",
+                "stepSize": "0.1",
+            },
+            "MIN_NOTIONAL": {"minNotional": "1"},
+        }
+    }
+
+    sim = ExecutionSimulator(symbol="TESTUSDT", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.filters = local_filters
+    sim.quantizer = Quantizer(local_filters, strict=True)
+
+    price, qty, rejection = sim._apply_filters_limit_legacy(
+        "BUY", price=9.999, qty=0.099, ref_price=10.0
+    )
+
+    assert rejection is None
+    assert price == pytest.approx(10.0)
+    assert qty == pytest.approx(0.1)
+
+
 def test_attach_quantizer_sets_metadata(tmp_path: pathlib.Path):
     filters_path = tmp_path / "filters.json"
     filters_path.write_text(json.dumps({"filters": filters}), encoding="utf-8")
