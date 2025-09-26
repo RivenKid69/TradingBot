@@ -47,9 +47,10 @@ cdef class MarketSimulatorWrapper:
         self._low_ref = low
         self._volume_ref = volume
         self._n_steps = <size_t>price.shape[0]
+        self._price_data = &price[0]
 
         self._sim = new MarketSimulator(&price[0], &open_[0], &high[0], &low[0], &volume[0], self._n_steps, seed)
-        if self._sim is NULL:
+        if self._sim == NULL:
             raise MemoryError("Failed to allocate MarketSimulator")
 
         self._random_shocks_enabled = False
@@ -77,78 +78,86 @@ cdef class MarketSimulatorWrapper:
         self.set_regime_distribution(probs)
 
     def __dealloc__(self):
-        if self._sim is not NULL:
+        if self._sim != NULL:
             del self._sim
-            self._sim = NULL
+            self._sim = <MarketSimulator*>NULL
+        self._price_data = <double*>NULL
 
-    cpdef void set_seed(self, uint64_t seed):
-        self._sim.set_seed(seed)
+    def set_seed(self, seed):
+        cdef uint64_t c_seed = <uint64_t>seed
+        self._sim.set_seed(c_seed)
         self._last_price = 0.0
         self._last_shock = False
         self._last_step = 0
 
-    cpdef void enable_random_shocks(self, bint enable, double probability=0.01):
-        if probability < 0.0:
-            probability = 0.0
-        self._sim.enable_random_shocks(enable, probability)
-        self._random_shocks_enabled = enable
-        self._flash_probability = probability
+    def enable_random_shocks(self, enable, probability=0.01):
+        cdef bint c_enable = <bint>enable
+        cdef double c_probability = float(probability)
+        if c_probability < 0.0:
+            c_probability = 0.0
+        self._sim.enable_random_shocks(c_enable, c_probability)
+        self._random_shocks_enabled = c_enable
+        self._flash_probability = c_probability
 
-    cpdef double step(self, int step_index, double black_swan_probability, bint is_training_mode):
-        if step_index < 0:
+    def step(self, step_index, black_swan_probability, is_training_mode):
+        cdef int c_step_index = int(step_index)
+        if c_step_index < 0:
             raise ValueError("step_index must be non-negative")
-        self._last_step = <size_t>step_index
-        self._last_price = self._sim.step(self._last_step, black_swan_probability, is_training_mode)
+        cdef double c_prob = float(black_swan_probability)
+        cdef bint c_training = <bint>is_training_mode
+        self._last_step = <size_t>c_step_index
+        self._last_price = self._sim.step(self._last_step, c_prob, c_training)
         self._last_shock = self._sim.shock_triggered(self._last_step) != 0
         return self._last_price
 
-    cpdef int shock_triggered(self, long step_idx=-1):
+    def shock_triggered(self, step_idx=-1):
         cdef size_t idx
-        if step_idx < 0:
+        cdef long c_step_idx = <long>step_idx
+        if c_step_idx < 0:
             idx = self._last_step
         else:
-            idx = <size_t>step_idx
+            idx = <size_t>c_step_idx
         return self._sim.shock_triggered(idx)
 
-    cpdef double get_last_price(self):
-        if self._last_step < self._n_steps:
-            return (<np.ndarray[np.float64_t, ndim=1]>self._price_ref)[self._last_step]
+    def get_last_price(self):
+        if self._last_step < self._n_steps and self._price_data != NULL:
+            return self._price_data[self._last_step]
         return self._last_price
 
-    cpdef double get_ma5(self):
+    def get_ma5(self):
         return self._sim.get_ma5(self._last_step)
 
-    cpdef double get_ma20(self):
+    def get_ma20(self):
         return self._sim.get_ma20(self._last_step)
 
-    cpdef double get_atr(self):
+    def get_atr(self):
         return self._sim.get_atr(self._last_step)
 
-    cpdef double get_rsi(self):
+    def get_rsi(self):
         return self._sim.get_rsi(self._last_step)
 
-    cpdef double get_macd(self):
+    def get_macd(self):
         return self._sim.get_macd(self._last_step)
 
-    cpdef double get_macd_signal(self):
+    def get_macd_signal(self):
         return self._sim.get_macd_signal(self._last_step)
 
-    cpdef double get_momentum(self):
+    def get_momentum(self):
         return self._sim.get_momentum(self._last_step)
 
-    cpdef double get_cci(self):
+    def get_cci(self):
         return self._sim.get_cci(self._last_step)
 
-    cpdef double get_obv(self):
+    def get_obv(self):
         return self._sim.get_obv(self._last_step)
 
-    cpdef double get_bb_lower(self):
+    def get_bb_lower(self):
         return self._sim.get_bb_lower(self._last_step)
 
-    cpdef double get_bb_upper(self):
+    def get_bb_upper(self):
         return self._sim.get_bb_upper(self._last_step)
 
-    cpdef void set_regime_distribution(self, object probabilities):
+    def set_regime_distribution(self, probabilities):
         cdef np.ndarray[np.float64_t, ndim=1] probs = np.ascontiguousarray(probabilities, dtype=np.float64)
         if probs.size != 4:
             raise ValueError("regime distribution must contain exactly four values")
@@ -160,39 +169,47 @@ cdef class MarketSimulatorWrapper:
             total += probs[i]
         if total <= 0.0:
             raise ValueError("regime probabilities must sum to a positive value")
+        cdef ArrayDouble4 c_probs = ArrayDouble4()
+        cdef double* probs_ptr = <double*>c_probs.data()
         for i in range(4):
             self._regime_probs[i] = probs[i] / total
-        self._sim.set_regime_distribution(self._regime_probs)
+            probs_ptr[i] = self._regime_probs[i]
+        self._sim.set_regime_distribution(c_probs)
 
-    cpdef object get_regime_distribution(self):
+    def get_regime_distribution(self):
         cdef np.ndarray[np.float64_t, ndim=1] out = np.empty(4, dtype=np.float64)
         cdef int i
         for i in range(4):
             out[i] = self._regime_probs[i]
         return out
 
-    cpdef void set_liquidity_seasonality(self, object multipliers):
+    def set_liquidity_seasonality(self, multipliers):
         cdef np.ndarray[np.float64_t, ndim=1] mult = np.ascontiguousarray(multipliers, dtype=np.float64)
         if mult.size != 168:
             raise ValueError("liquidity seasonality must contain 168 hourly multipliers")
         cdef int i
+        cdef ArrayDouble168 c_mult = ArrayDouble168()
+        cdef double* mult_ptr = <double*>c_mult.data()
         for i in range(168):
             self._liquidity_multipliers[i] = _clamp_non_negative(mult[i])
-        self._sim.set_liquidity_seasonality(self._liquidity_multipliers)
+            mult_ptr[i] = self._liquidity_multipliers[i]
+        self._sim.set_liquidity_seasonality(c_mult)
 
-    cpdef object get_liquidity_seasonality(self):
+    def get_liquidity_seasonality(self):
         cdef np.ndarray[np.float64_t, ndim=1] out = np.empty(168, dtype=np.float64)
         cdef int i
         for i in range(168):
             out[i] = self._liquidity_multipliers[i]
         return out
 
-    cpdef void force_market_regime(self, object regime, int start=0, int duration=0):
+    def force_market_regime(self, regime, start=0, duration=0):
         cdef MarketRegime regime_code
         try:
             regime_code = <MarketRegime><int>regime
         except Exception:
             raise ValueError("regime must be convertible to MarketRegime enum")
-        if start < 0 or duration < 0:
+        cdef int c_start = int(start)
+        cdef int c_duration = int(duration)
+        if c_start < 0 or c_duration < 0:
             raise ValueError("start and duration must be non-negative")
-        self._sim.force_market_regime(regime_code, <size_t>start, <size_t>duration)
+        self._sim.force_market_regime(regime_code, <size_t>c_start, <size_t>c_duration)

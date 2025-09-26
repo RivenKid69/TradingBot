@@ -100,6 +100,16 @@ ext_modules = [
         extra_compile_args=cxx_args,
         extra_link_args=link_args,
     ),
+    Extension(
+        name="marketmarket_simulator_wrapper",
+        sources=["marketmarket_simulator_wrapper.pyx", "MarketSimulator.cpp"],
+        include_dirs=include_dirs,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        language="c++",
+        extra_compile_args=cxx_args,
+        extra_link_args=link_args,
+    ),
 ]
 
 setup(

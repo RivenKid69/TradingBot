@@ -71,15 +71,19 @@ void MarketSimulator::initialize_defaults() {
     if (in.good()) {
         std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         auto parse_regime = [&](const std::string& name, RegimeParams& out) {
-            std::regex re("\"" + name + "\"\\s*:\\s*\{[^}]*\"mu\"\\s*:\\s*([-0-9.eE]+)[^}]*\"sigma\"\\s*:\\s*([-0-9.eE]+)[^}]*\"kappa\"\\s*:\\s*([-0-9.eE]+)[^}]*\"avg_volume\"\\s*:\\s*([-0-9.eE]+)[^}]*\"avg_spread\"\\s*:\\s*([-0-9.eE]+)");
-            std::smatch m;
-            if (std::regex_search(s, m, re)) {
-                out.mu = std::stod(m[1]);
-                out.sigma = std::stod(m[2]);
-                out.kappa = std::stod(m[3]);
-                out.avg_volume = std::stod(m[4]);
-                out.avg_spread = std::stod(m[5]);
-                return true;
+            try {
+                std::regex re("\"" + name + "\"\\s*:\\s*\{[^}]*\"mu\"\\s*:\\s*([-0-9.eE]+)[^}]*\"sigma\"\\s*:\\s*([-0-9.eE]+)[^}]*\"kappa\"\\s*:\\s*([-0-9.eE]+)[^}]*\"avg_volume\"\\s*:\\s*([-0-9.eE]+)[^}]*\"avg_spread\"\\s*:\\s*([-0-9.eE]+)");
+                std::smatch m;
+                if (std::regex_search(s, m, re)) {
+                    out.mu = std::stod(m[1]);
+                    out.sigma = std::stod(m[2]);
+                    out.kappa = std::stod(m[3]);
+                    out.avg_volume = std::stod(m[4]);
+                    out.avg_spread = std::stod(m[5]);
+                    return true;
+                }
+            } catch (const std::regex_error&) {
+                // ignore malformed patterns and fall back to defaults
             }
             return false;
         };
@@ -88,36 +92,40 @@ void MarketSimulator::initialize_defaults() {
         loaded = parse_regime("STRONG_TREND", m_params[(int)MarketRegime::STRONG_TREND]) || loaded;
         loaded = parse_regime("ILLIQUID",     m_params[(int)MarketRegime::ILLIQUID]) || loaded;
         // распределение режимов
-        std::regex re_probs("\"regime_probs\"\\s*:\\s*\[([^\]]+)\]");
-        std::smatch mp;
-        if (std::regex_search(s, mp, re_probs)) {
-            std::string arr = mp[1];
-            std::stringstream ss(arr);
-            for (int i = 0; i < 4; ++i) {
+        try {
+            std::regex re_probs(R"("regime_probs"\s*:\s*\[([^\]]+)\])");
+            std::smatch mp;
+            if (std::regex_search(s, mp, re_probs)) {
+                std::string arr = mp[1];
+                std::stringstream ss(arr);
+                for (int i = 0; i < 4; ++i) {
+                    std::string token;
+                    if (!std::getline(ss, token, ',')) break;
+                    try { m_regime_probs[i] = std::max(0.0, std::stod(token)); }
+                    catch (...) { m_regime_probs[i] = 0.0; }
+                }
+                double sum = 0.0; for (double p: m_regime_probs) sum += p; if (sum>0) for (double& p: m_regime_probs) p/=sum;
+            } else {
+                m_regime_probs = {0.25,0.25,0.25,0.25};
+            }
+            // flash shock
+            std::regex re_fp(R"("flash_shock"[^}]*"probability"\s*:\s*([-0-9.eE]+))");
+            if (std::regex_search(s, mp, re_fp)) {
+                m_shock_p = clampd(std::stod(mp[1]),0.0,1.0);
+                m_shocks_enabled = m_shock_p > 0.0;
+            }
+            std::regex re_mags(R"("flash_shock"[^}]*"magnitudes"\s*:\s*\[([^\]]+)\])");
+            if (std::regex_search(s, mp, re_mags)) {
+                std::string arr = mp[1];
+                std::stringstream ss(arr);
                 std::string token;
-                if (!std::getline(ss, token, ',')) break;
-                try { m_regime_probs[i] = std::max(0.0, std::stod(token)); }
-                catch (...) { m_regime_probs[i] = 0.0; }
+                m_shock_mags.clear();
+                while (std::getline(ss, token, ',')) {
+                    try { m_shock_mags.push_back(std::stod(token)); } catch (...) {}
+                }
             }
-            double sum = 0.0; for (double p: m_regime_probs) sum += p; if (sum>0) for (double& p: m_regime_probs) p/=sum;
-        } else {
+        } catch (const std::regex_error&) {
             m_regime_probs = {0.25,0.25,0.25,0.25};
-        }
-        // flash shock
-        std::regex re_fp("\"flash_shock\"[^}]*\"probability\"\\s*:\\s*([-0-9.eE]+)");
-        if (std::regex_search(s, mp, re_fp)) {
-            m_shock_p = clampd(std::stod(mp[1]),0.0,1.0);
-            m_shocks_enabled = m_shock_p > 0.0;
-        }
-        std::regex re_mags("\"flash_shock\"[^}]*\"magnitudes\"\\s*:\\s*\[([^\]]+)\]");
-        if (std::regex_search(s, mp, re_mags)) {
-            std::string arr = mp[1];
-            std::stringstream ss(arr);
-            std::string token;
-            m_shock_mags.clear();
-            while (std::getline(ss, token, ',')) {
-                try { m_shock_mags.push_back(std::stod(token)); } catch (...) {}
-            }
         }
     }
     if (!loaded) {
