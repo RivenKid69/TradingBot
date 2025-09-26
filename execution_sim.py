@@ -8033,6 +8033,16 @@ class ExecutionSimulator:
             )
             return 0.0, reason
 
+        if filters.qty_step > 0.0:
+            snapped_qty = math.floor(qty_quantized / filters.qty_step) * filters.qty_step
+            if abs(qty_quantized - snapped_qty) > tolerance:
+                reason = FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message="Quantity not aligned to step",
+                    constraint={"step": filters.qty_step, "quantity": qty_quantized},
+                )
+                return 0.0, reason
+
         if quant_result is not None:
             reason_code = getattr(quant_result, "reason_code", None)
             if reason_code:

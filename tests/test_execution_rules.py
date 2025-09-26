@@ -180,6 +180,21 @@ def test_next_open_risk_adjustment_rejected_when_off_filters():
     assert not sim._pending_next_open
 
 
+def test_market_step_violation_rejected_without_quantizer():
+    sim = ExecutionSimulator(filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.quantizer = None
+    sim.filters = json.loads(json.dumps(filters))
+
+    qty_total, rejection = sim._apply_filters_market("BUY", 0.105, ref_price=100.0)
+
+    assert qty_total == pytest.approx(0.0)
+    assert rejection is not None
+    assert rejection.code == "LOT_SIZE"
+    assert rejection.message == "Quantity not aligned to step"
+
+
 def test_market_pop_ready_requantizes_post_risk_quantity():
     sim = make_sim(strict=True)
     sim._last_ref_price = 100.0
