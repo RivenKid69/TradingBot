@@ -653,6 +653,10 @@ class SymbolFilterSnapshot:
     min_notional: float = 0.0
     multiplier_up: Optional[float] = None
     multiplier_down: Optional[float] = None
+    bid_multiplier_up: Optional[float] = None
+    bid_multiplier_down: Optional[float] = None
+    ask_multiplier_up: Optional[float] = None
+    ask_multiplier_down: Optional[float] = None
 
     @classmethod
     def from_raw(cls, data: Mapping[str, Any]) -> "SymbolFilterSnapshot":
@@ -682,6 +686,10 @@ class SymbolFilterSnapshot:
 
         up = _flt(pp, "multiplierUp", float("nan")) if pp else float("nan")
         down = _flt(pp, "multiplierDown", float("nan")) if pp else float("nan")
+        bid_up = _flt(pp, "bidMultiplierUp", float("nan")) if pp else float("nan")
+        bid_down = _flt(pp, "bidMultiplierDown", float("nan")) if pp else float("nan")
+        ask_up = _flt(pp, "askMultiplierUp", float("nan")) if pp else float("nan")
+        ask_down = _flt(pp, "askMultiplierDown", float("nan")) if pp else float("nan")
         return cls(
             price_tick=_flt(pf, "tickSize", 0.0),
             price_min=_flt(pf, "minPrice", 0.0),
@@ -692,6 +700,10 @@ class SymbolFilterSnapshot:
             min_notional=_flt(mn, "minNotional", 0.0),
             multiplier_up=up if math.isfinite(up) else None,
             multiplier_down=down if math.isfinite(down) else None,
+            bid_multiplier_up=bid_up if math.isfinite(bid_up) else None,
+            bid_multiplier_down=bid_down if math.isfinite(bid_down) else None,
+            ask_multiplier_up=ask_up if math.isfinite(ask_up) else None,
+            ask_multiplier_down=ask_down if math.isfinite(ask_down) else None,
         )
 
     @classmethod
@@ -706,7 +718,38 @@ class SymbolFilterSnapshot:
             min_notional=float(getattr(obj, "min_notional", 0.0) or 0.0),
             multiplier_up=getattr(obj, "multiplier_up", None),
             multiplier_down=getattr(obj, "multiplier_down", None),
+            bid_multiplier_up=getattr(obj, "bid_multiplier_up", None),
+            bid_multiplier_down=getattr(obj, "bid_multiplier_down", None),
+            ask_multiplier_up=getattr(obj, "ask_multiplier_up", None),
+            ask_multiplier_down=getattr(obj, "ask_multiplier_down", None),
         )
+
+    def percent_price_bounds(self, side: str) -> Tuple[Optional[float], Optional[float]]:
+        """Return (upper, lower) multipliers for the provided side."""
+        side_norm = str(side).upper()
+        if side_norm == "BUY":
+            up = (
+                self.bid_multiplier_up
+                if self.bid_multiplier_up is not None
+                else self.multiplier_up
+            )
+            down = (
+                self.bid_multiplier_down
+                if self.bid_multiplier_down is not None
+                else self.multiplier_down
+            )
+        else:
+            up = (
+                self.ask_multiplier_up
+                if self.ask_multiplier_up is not None
+                else self.multiplier_up
+            )
+            down = (
+                self.ask_multiplier_down
+                if self.ask_multiplier_down is not None
+                else self.multiplier_down
+            )
+        return up, down
 
     @property
     def min_qty_threshold(self) -> float:
@@ -8450,16 +8493,17 @@ class ExecutionSimulator:
                     except Exception as exc:
                         logger.debug("PPBS check failed via quantizer: %s", exc)
                         ppbs_ok = True
-                elif (
-                    filters.multiplier_up is not None
-                    and filters.multiplier_down is not None
-                ):
-                    if str(side).upper() == "BUY":
-                        allowed = ref_ppbs * float(filters.multiplier_up)
-                        ppbs_ok = price_quantized <= allowed + tolerance
-                    else:
-                        allowed = ref_ppbs * float(filters.multiplier_down)
-                        ppbs_ok = price_quantized + tolerance >= allowed
+                else:
+                    mult_up, mult_down = filters.percent_price_bounds(side)
+                    ppbs_ok = True
+                    if mult_up is not None:
+                        allowed_up = ref_ppbs * float(mult_up)
+                        if price_quantized - tolerance > allowed_up:
+                            ppbs_ok = False
+                    if ppbs_ok and mult_down is not None:
+                        allowed_down = ref_ppbs * float(mult_down)
+                        if price_quantized + tolerance < allowed_down:
+                            ppbs_ok = False
                 if not ppbs_ok:
                     reason = FilterRejectionReason(
                         code="PPBS",
@@ -8470,6 +8514,10 @@ class ExecutionSimulator:
                             "side": side,
                             "multiplier_up": filters.multiplier_up,
                             "multiplier_down": filters.multiplier_down,
+                            "bid_multiplier_up": filters.bid_multiplier_up,
+                            "bid_multiplier_down": filters.bid_multiplier_down,
+                            "ask_multiplier_up": filters.ask_multiplier_up,
+                            "ask_multiplier_down": filters.ask_multiplier_down,
                         },
                     )
                     return price_quantized, 0.0, reason

@@ -45,7 +45,14 @@ filters = {
         "PRICE_FILTER": {"minPrice": "0", "maxPrice": "1000000", "tickSize": "0.5"},
         "LOT_SIZE": {"minQty": "0.1", "maxQty": "1000", "stepSize": "0.1"},
         "MIN_NOTIONAL": {"minNotional": "5"},
-        "PERCENT_PRICE_BY_SIDE": {"multiplierUp": "1000", "multiplierDown": "0"},
+        "PERCENT_PRICE_BY_SIDE": {
+            "multiplierUp": "1000",
+            "multiplierDown": "0",
+            "bidMultiplierUp": "1000",
+            "bidMultiplierDown": "0",
+            "askMultiplierUp": "1000",
+            "askMultiplierDown": "0",
+        },
     }
 }
 
@@ -193,6 +200,46 @@ def test_market_step_violation_rejected_without_quantizer():
     assert rejection is not None
     assert rejection.code == "LOT_SIZE"
     assert rejection.message == "Quantity not aligned to step"
+
+
+def test_limit_ppbs_violation_without_quantizer():
+    sim = ExecutionSimulator(filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = True
+    sim.quantizer = None
+    sim.filters = {
+        "BTCUSDT": {
+            "PRICE_FILTER": {
+                "minPrice": "0",
+                "maxPrice": "200",
+                "tickSize": "0.1",
+            },
+            "LOT_SIZE": {
+                "minQty": "0.1",
+                "maxQty": "100",
+                "stepSize": "0.1",
+            },
+            "MIN_NOTIONAL": {"minNotional": "5"},
+            "PERCENT_PRICE_BY_SIDE": {
+                "multiplierUp": "1.5",
+                "multiplierDown": "0.5",
+                "bidMultiplierUp": "1.01",
+                "bidMultiplierDown": "0.99",
+                "askMultiplierUp": "1.5",
+                "askMultiplierDown": "0.5",
+            },
+        }
+    }
+
+    price_adj, qty_adj, rejection = sim._apply_filters_limit(
+        "BUY", 101.2, 0.5, ref_price=100.0
+    )
+
+    assert price_adj == pytest.approx(101.2)
+    assert qty_adj == pytest.approx(0.0)
+    assert rejection is not None
+    assert rejection.code == "PPBS"
+    assert rejection.message == "PERCENT_PRICE_BY_SIDE violation"
 
 
 def test_market_pop_ready_requantizes_post_risk_quantity():
