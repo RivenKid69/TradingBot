@@ -100,17 +100,11 @@ cdef inline cnp.ndarray[cnp.float64_t, ndim=1] _features_to_numpy(const MicroFea
 # --- основной класс ---
 
 cdef class MicroSim:
-    cdef MicrostructureGenerator* gen
+    cdef MicrostructureGenerator gen
     cdef size_t _lob_ptr  # OrderBook*
 
     def __cinit__(self):
-        self.gen = new MicrostructureGenerator()
         self._lob_ptr = 0
-
-    def __dealloc__(self):
-        if self.gen is not NULL:
-            del self.gen
-            self.gen = NULL
 
     cpdef attach_lob(self, fast_lob):
         """
