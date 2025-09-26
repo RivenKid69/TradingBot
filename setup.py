@@ -24,10 +24,12 @@ class BuildExtWithNumpy(build_ext):
 
 # --- common flags ---
 if sys.platform.startswith("win"):
+    c_args = ["/O2"]
     cxx_args = ["/O2", "/std:c++17"]
     link_args = []
 else:
     # gnu++17 for <algorithm>, <random>, etc.
+    c_args = ["-O3", "-fvisibility=hidden"]
     cxx_args = ["-O3", "-std=gnu++17", "-fvisibility=hidden"]
     link_args = ["-std=gnu++17"]
 
@@ -41,6 +43,33 @@ orderbook_cpp = "OrderBook.cpp"  # your LOB implementation
 micro_cpp = "cpp_microstructure_generator.cpp"
 
 ext_modules = [
+    Extension(
+        name="execlob_book",
+        sources=["execlob_book.pyx"],
+        include_dirs=include_dirs,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        language="c",
+        extra_compile_args=c_args,
+    ),
+    Extension(
+        name="coreworkspace",
+        sources=["coreworkspace.pyx"],
+        include_dirs=include_dirs,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        language="c",
+        extra_compile_args=c_args,
+    ),
+    Extension(
+        name="execevents",
+        sources=["execevents.pyx"],
+        include_dirs=include_dirs,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        language="c",
+        extra_compile_args=c_args,
+    ),
     Extension(
         name="fast_lob",
         sources=["fast_lob.pyx", orderbook_cpp],

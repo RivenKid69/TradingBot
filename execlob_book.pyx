@@ -2,6 +2,7 @@
 
 from libc.stdlib cimport malloc, realloc, free, rand
 from libc.stddef cimport size_t
+from libc.string cimport memcpy, memmove
 cimport cython
 from execevents cimport MarketEvent, EventType, Side
 from coreworkspace cimport SimulationWorkspace
@@ -44,11 +45,13 @@ cdef class CythonLOB:
         newlob._ensure_capacity(True, self.n_bids)
         newlob._ensure_capacity(False, self.n_asks)
         # Copy bid orders
-        for i in range(self.n_bids):
-            newlob.bid_orders[i] = self.bid_orders[i]
+        if self.n_bids > 0:
+            memcpy(<void*> newlob.bid_orders, <void*> self.bid_orders,
+                   <size_t> self.n_bids * cython.sizeof(MarketEvent))
         # Copy ask orders
-        for i in range(self.n_asks):
-            newlob.ask_orders[i] = self.ask_orders[i]
+        if self.n_asks > 0:
+            memcpy(<void*> newlob.ask_orders, <void*> self.ask_orders,
+                   <size_t> self.n_asks * cython.sizeof(MarketEvent))
         newlob.n_bids = self.n_bids
         newlob.n_asks = self.n_asks
         # Update best indices in clone
@@ -109,11 +112,10 @@ cdef class CythonLOB:
         self._has_error = False
         self._pending_exception = None
 
-    cdef void _set_error(self, object exc) noexcept nogil:
-        with gil:
-            if self._pending_exception is None:
-                self._pending_exception = exc
-            self._has_error = True
+    cdef void _set_error(self, object exc) noexcept:
+        if self._pending_exception is None:
+            self._pending_exception = exc
+        self._has_error = True
 
     cdef void _raise_pending_error(self):
         if self._has_error:
@@ -142,7 +144,7 @@ cdef class CythonLOB:
 
     cdef bint add_limit(self, int side, int price, int qty, bint is_agent, int order_id) noexcept nogil:
         """Add a limit order to the book, optionally matching against resting liquidity."""
-        cdef int i, insert_idx
+        cdef int insert_idx
 
         if qty <= 0:
             return True
@@ -155,9 +157,17 @@ cdef class CythonLOB:
                 if self.ask_orders[0].price <= price:
                     if self.ask_orders[0].qty <= qty:
                         qty -= self.ask_orders[0].qty
-                        for i in range(1, self.n_asks):
-                            self.ask_orders[i - 1] = self.ask_orders[i]
+                        if self.n_asks > 1:
+                            memmove(
+                                <void*> self.ask_orders,
+                                <void*> (self.ask_orders + 1),
+                                <size_t> (self.n_asks - 1) * cython.sizeof(MarketEvent),
+                            )
                         self.n_asks -= 1
+                        if self.n_asks == 0:
+                            self.best_ask_index = -1
+                        else:
+                            self.best_ask_index = 0
                     else:
                         self.ask_orders[0].qty -= qty
                         qty = 0
@@ -170,8 +180,12 @@ cdef class CythonLOB:
             insert_idx = 0
             while insert_idx < self.n_bids and self.bid_orders[insert_idx].price < price:
                 insert_idx += 1
-            for i in range(self.n_bids, insert_idx, -1):
-                self.bid_orders[i] = self.bid_orders[i - 1]
+            if self.n_bids > insert_idx:
+                memmove(
+                    <void*> (self.bid_orders + insert_idx + 1),
+                    <void*> (self.bid_orders + insert_idx),
+                    <size_t> (self.n_bids - insert_idx) * cython.sizeof(MarketEvent),
+                )
             self.bid_orders[insert_idx].type = EventType.PUBLIC_LIMIT_ADD
             self.bid_orders[insert_idx].side = Side.BUY
             self.bid_orders[insert_idx].price = price
@@ -188,6 +202,10 @@ cdef class CythonLOB:
                     if self.bid_orders[self.best_bid_index].qty <= qty:
                         qty -= self.bid_orders[self.best_bid_index].qty
                         self.n_bids -= 1
+                        if self.n_bids == 0:
+                            self.best_bid_index = -1
+                        else:
+                            self.best_bid_index = self.n_bids - 1
                     else:
                         self.bid_orders[self.best_bid_index].qty -= qty
                         qty = 0
@@ -200,8 +218,12 @@ cdef class CythonLOB:
             insert_idx = 0
             while insert_idx < self.n_asks and self.ask_orders[insert_idx].price < price:
                 insert_idx += 1
-            for i in range(self.n_asks, insert_idx, -1):
-                self.ask_orders[i] = self.ask_orders[i - 1]
+            if self.n_asks > insert_idx:
+                memmove(
+                    <void*> (self.ask_orders + insert_idx + 1),
+                    <void*> (self.ask_orders + insert_idx),
+                    <size_t> (self.n_asks - insert_idx) * cython.sizeof(MarketEvent),
+                )
             self.ask_orders[insert_idx].type = EventType.PUBLIC_LIMIT_ADD
             self.ask_orders[insert_idx].side = Side.SELL
             self.ask_orders[insert_idx].price = price
@@ -217,23 +239,38 @@ cdef class CythonLOB:
     cdef bint cancel_order(self, int order_id) noexcept nogil:
         """Cancel (remove) an order by its ``order_id`` if it exists."""
         cdef int idx
-        cdef int j
 
         if self._has_error:
             return False
 
         idx = self._find_order_index_by_id(order_id, True)
         if idx != -1:
-            for j in range(idx + 1, self.n_bids):
-                self.bid_orders[j - 1] = self.bid_orders[j]
+            if idx + 1 < self.n_bids:
+                memmove(
+                    <void*> (self.bid_orders + idx),
+                    <void*> (self.bid_orders + idx + 1),
+                    <size_t> (self.n_bids - idx - 1) * cython.sizeof(MarketEvent),
+                )
             self.n_bids -= 1
+            if self.n_bids == 0:
+                self.best_bid_index = -1
+            else:
+                self.best_bid_index = self.n_bids - 1
             return True
 
         idx = self._find_order_index_by_id(order_id, False)
         if idx != -1:
-            for j in range(idx + 1, self.n_asks):
-                self.ask_orders[j - 1] = self.ask_orders[j]
+            if idx + 1 < self.n_asks:
+                memmove(
+                    <void*> (self.ask_orders + idx),
+                    <void*> (self.ask_orders + idx + 1),
+                    <size_t> (self.n_asks - idx - 1) * cython.sizeof(MarketEvent),
+                )
             self.n_asks -= 1
+            if self.n_asks == 0:
+                self.best_ask_index = -1
+            else:
+                self.best_ask_index = 0
         return True
 
     cdef bint _record_trade(self, SimulationWorkspace ws, int price, int qty, int side,
@@ -246,8 +283,12 @@ cdef class CythonLOB:
         idx = ws.trade_count
         if not ws.push_trade(<double> price, <double> qty, <char> side,
                              <char> (1 if agent_maker else 0), 0):
+            with gil:
+                self._set_error(RuntimeError("SimulationWorkspace.push_trade failed"))
             return False
         if ws.has_error():
+            with gil:
+                self._set_error(RuntimeError("SimulationWorkspace reported an error"))
             return False
 
         ws.taker_is_agent_all_arr[idx] = <char> (1 if agent_taker else 0)
@@ -284,12 +325,22 @@ cdef class CythonLOB:
                         return False
                     if maker_is_agent:
                         if not ws.push_filled_order_id(self.ask_orders[0].order_id):
+                            with gil:
+                                self._set_error(RuntimeError("Failed to push filled order id"))
                             return False
                         if ws.has_error():
                             return False
-                    for j in range(1, self.n_asks):
-                        self.ask_orders[j - 1] = self.ask_orders[j]
+                    if self.n_asks > 1:
+                        memmove(
+                            <void*> self.ask_orders,
+                            <void*> (self.ask_orders + 1),
+                            <size_t> (self.n_asks - 1) * cython.sizeof(MarketEvent),
+                        )
                     self.n_asks -= 1
+                    if self.n_asks == 0:
+                        self.best_ask_index = -1
+                    else:
+                        self.best_ask_index = 0
                 else:
                     trade_qty = remaining
                     self.ask_orders[0].qty -= trade_qty
@@ -299,6 +350,8 @@ cdef class CythonLOB:
                         return False
                     if maker_is_agent and self.ask_orders[0].qty == 0:
                         if not ws.push_filled_order_id(self.ask_orders[0].order_id):
+                            with gil:
+                                self._set_error(RuntimeError("Failed to push filled order id"))
                             return False
                         if ws.has_error():
                             return False
@@ -315,10 +368,16 @@ cdef class CythonLOB:
                         return False
                     if maker_is_agent:
                         if not ws.push_filled_order_id(self.bid_orders[self.best_bid_index].order_id):
+                            with gil:
+                                self._set_error(RuntimeError("Failed to push filled order id"))
                             return False
                         if ws.has_error():
                             return False
                     self.n_bids -= 1
+                    if self.n_bids == 0:
+                        self.best_bid_index = -1
+                    else:
+                        self.best_bid_index = self.n_bids - 1
                 else:
                     trade_qty = remaining
                     self.bid_orders[self.best_bid_index].qty -= trade_qty
@@ -328,6 +387,8 @@ cdef class CythonLOB:
                         return False
                     if maker_is_agent and self.bid_orders[self.best_bid_index].qty == 0:
                         if not ws.push_filled_order_id(self.bid_orders[self.best_bid_index].order_id):
+                            with gil:
+                                self._set_error(RuntimeError("Failed to push filled order id"))
                             return False
                         if ws.has_error():
                             return False

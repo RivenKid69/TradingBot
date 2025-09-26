@@ -41,7 +41,7 @@ cdef class CythonLOB:
         int maker_order_id,
     ) noexcept nogil
     cdef void _reset_error_state(self)
-    cdef void _set_error(self, object exc) noexcept nogil
+    cdef void _set_error(self, object exc) noexcept
     cdef void _raise_pending_error(self)
     cpdef double mid_price(self)
     cdef bint apply_events_batch_nogil(self, MarketEvent* events, int num_events, SimulationWorkspace ws) noexcept nogil
