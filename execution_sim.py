@@ -333,7 +333,10 @@ def _normalize_ttl_steps(
                 ttl_from_ms = 0
 
     if ttl_steps_val is not None:
-        ttl_final = int(ttl_steps_val)
+        if ttl_steps_val > 0:
+            ttl_final = int(math.ceil(ttl_steps_val))
+        else:
+            ttl_final = int(ttl_steps_val)
     elif ttl_from_ms is not None:
         ttl_final = int(ttl_from_ms)
     else:
