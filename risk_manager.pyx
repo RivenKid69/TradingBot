@@ -2,9 +2,14 @@
 # distutils: language = c++
 from libc.math cimport fmax, fmin, fabs
 
-from risk_manager cimport ClosedReason
+from risk_enums cimport ClosedReason
+from risk_enums import ClosedReason as PyClosedReason
 from lob_state_cython cimport EnvState
 from lob_state_cython import EnvState as PyEnvState
+
+# Re-export the Python enumeration for convenient access from Python code.
+ClosedReasonEnum = PyClosedReason
+ClosedReasonPy = PyClosedReason
 
 
 cdef inline double _current_fill_price(EnvState state):
@@ -262,8 +267,8 @@ def _py_check_bankruptcy(object state):
     net_worth = float(getattr(state, "net_worth", 0.0))
     threshold = float(getattr(state, "bankruptcy_threshold", 0.0))
     if net_worth <= threshold:
-        return ClosedReason.BANKRUPTCY
-    return ClosedReason.NONE
+        return PyClosedReason.BANKRUPTCY
+    return PyClosedReason.NONE
 
 
 def _py_check_max_drawdown(object state):
@@ -274,8 +279,8 @@ def _py_check_max_drawdown(object state):
         peak_value = net_worth
     max_dd = float(getattr(state, "max_drawdown", 0.0))
     if max_dd > 0.0 and net_worth <= peak_value * (1.0 - max_dd):
-        return ClosedReason.MAX_DRAWDOWN
-    return ClosedReason.NONE
+        return PyClosedReason.MAX_DRAWDOWN
+    return PyClosedReason.NONE
 
 
 def _py_update_trailing_extrema(object state):
@@ -330,84 +335,84 @@ def _py_update_trailing_extrema(object state):
 
 def _py_check_static_atr_stop(object state):
     if not getattr(state, "use_atr_stop", False):
-        return ClosedReason.NONE
+        return PyClosedReason.NONE
     if bool(getattr(state, "_trailing_active", False)):
-        return ClosedReason.NONE
+        return PyClosedReason.NONE
     units = float(getattr(state, "units", 0.0))
     if units == 0.0:
-        return ClosedReason.NONE
+        return PyClosedReason.NONE
     last_price = _py_current_fill_price(state)
     initial_sl = float(getattr(state, "_initial_sl", -1.0))
     if units > 0.0:
         if initial_sl > 0.0 and last_price <= initial_sl:
-            return ClosedReason.ATR_SL_LONG
+            return PyClosedReason.ATR_SL_LONG
     else:
         if initial_sl > 0.0 and last_price >= initial_sl:
-            return ClosedReason.ATR_SL_SHORT
-    return ClosedReason.NONE
+            return PyClosedReason.ATR_SL_SHORT
+    return PyClosedReason.NONE
 
 
 def _py_check_trailing_stop(object state):
     if not getattr(state, "use_trailing_stop", False):
-        return ClosedReason.NONE
+        return PyClosedReason.NONE
     if not bool(getattr(state, "_trailing_active", False)):
-        return ClosedReason.NONE
+        return PyClosedReason.NONE
     units = float(getattr(state, "units", 0.0))
     if units == 0.0:
-        return ClosedReason.NONE
+        return PyClosedReason.NONE
     last_price = _py_current_fill_price(state)
     initial_sl = float(getattr(state, "_initial_sl", -1.0))
     if units > 0.0:
         if initial_sl > 0.0 and last_price <= initial_sl:
-            return ClosedReason.TRAILING_SL_LONG
+            return PyClosedReason.TRAILING_SL_LONG
     else:
         if initial_sl > 0.0 and last_price >= initial_sl:
-            return ClosedReason.TRAILING_SL_SHORT
-    return ClosedReason.NONE
+            return PyClosedReason.TRAILING_SL_SHORT
+    return PyClosedReason.NONE
 
 
 def _py_check_take_profit(object state):
     units = float(getattr(state, "units", 0.0))
     if units == 0.0:
-        return ClosedReason.NONE
+        return PyClosedReason.NONE
     tp_mult = float(getattr(state, "tp_atr_mult", 0.0))
     if tp_mult <= 0.0:
-        return ClosedReason.NONE
+        return PyClosedReason.NONE
     last_price = _py_current_fill_price(state)
     initial_tp = float(getattr(state, "_initial_tp", -1.0))
     if units > 0.0:
         if initial_tp > 0.0 and last_price >= initial_tp:
-            return ClosedReason.STATIC_TP_LONG
+            return PyClosedReason.STATIC_TP_LONG
     else:
         if initial_tp > 0.0 and last_price <= initial_tp:
-            return ClosedReason.STATIC_TP_SHORT
-    return ClosedReason.NONE
+            return PyClosedReason.STATIC_TP_SHORT
+    return PyClosedReason.NONE
 
 
 def _apply_close_if_needed_py(object state):
     reason = _py_check_bankruptcy(state)
-    if reason == ClosedReason.NONE:
+    if reason == PyClosedReason.NONE:
         reason = _py_check_max_drawdown(state)
     units = float(getattr(state, "units", 0.0))
-    if reason == ClosedReason.NONE and units != 0.0:
+    if reason == PyClosedReason.NONE and units != 0.0:
         if getattr(state, "use_trailing_stop", False):
             _py_update_trailing_extrema(state)
         reason = _py_check_static_atr_stop(state)
-        if reason == ClosedReason.NONE:
+        if reason == PyClosedReason.NONE:
             reason = _py_check_trailing_stop(state)
-            if reason == ClosedReason.NONE:
+            if reason == PyClosedReason.NONE:
                 reason = _py_check_take_profit(state)
-    if reason != ClosedReason.NONE:
+    if reason != PyClosedReason.NONE:
         atr_count = int(getattr(state, "atr_stop_trigger_count", 0))
         trailing_count = int(getattr(state, "trailing_stop_trigger_count", 0))
         tp_count = int(getattr(state, "tp_trigger_count", 0))
-        if reason in (ClosedReason.ATR_SL_LONG, ClosedReason.ATR_SL_SHORT):
+        if reason in (PyClosedReason.ATR_SL_LONG, PyClosedReason.ATR_SL_SHORT):
             atr_count += 1
             setattr(state, "atr_stop_trigger_count", atr_count)
-        elif reason in (ClosedReason.TRAILING_SL_LONG, ClosedReason.TRAILING_SL_SHORT):
+        elif reason in (PyClosedReason.TRAILING_SL_LONG, PyClosedReason.TRAILING_SL_SHORT):
             trailing_count += 1
             setattr(state, "trailing_stop_trigger_count", trailing_count)
-        elif reason in (ClosedReason.STATIC_TP_LONG, ClosedReason.STATIC_TP_SHORT):
+        elif reason in (PyClosedReason.STATIC_TP_LONG, PyClosedReason.STATIC_TP_SHORT):
             tp_count += 1
             setattr(state, "tp_trigger_count", tp_count)
         position_value = float(getattr(state, "_position_value", 0.0))
@@ -422,7 +427,7 @@ def _apply_close_if_needed_py(object state):
         setattr(state, "net_worth", cash)
         setattr(state, "units", 0.0)
         setattr(state, "_position_value", 0.0)
-        if reason == ClosedReason.BANKRUPTCY:
+        if reason == PyClosedReason.BANKRUPTCY:
             setattr(state, "cash", 0.0)
             setattr(state, "net_worth", 0.0)
             setattr(state, "is_bankrupt", True)
@@ -441,7 +446,8 @@ def _apply_close_if_needed_py(object state):
 def apply_close_if_needed(object state, bint readonly=False):
     """Python wrapper that accepts either EnvState or a duck-typed object."""
     if isinstance(state, PyEnvState):
-        return _apply_close_if_needed_impl(state, readonly)
+        cdef ClosedReason reason = _apply_close_if_needed_impl(state, readonly)
+        return PyClosedReason(reason)
     if readonly:
         import copy
         working = copy.deepcopy(state)

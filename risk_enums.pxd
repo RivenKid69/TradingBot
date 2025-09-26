@@ -1,0 +1,11 @@
+# cython: language_level=3
+cdef enum ClosedReason:
+    NONE = 0
+    ATR_SL_LONG = 1
+    ATR_SL_SHORT = 2
+    TRAILING_SL_LONG = 3
+    TRAILING_SL_SHORT = 4
+    STATIC_TP_LONG = 5
+    STATIC_TP_SHORT = 6
+    BANKRUPTCY = 7
+    MAX_DRAWDOWN = 8
