@@ -1,3 +1,5 @@
+# cython: language=c++
+
 from libc.stddef cimport size_t
 from libc.stdint cimport uint64_t
 from core_constants cimport MarketRegime
