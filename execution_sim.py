@@ -8195,7 +8195,11 @@ class ExecutionSimulator:
                     reason = FilterRejectionReason(
                         code="PRICE_FILTER",
                         message="quantize_price failed",
-                        constraint={"error": str(exc), "price": price_raw},
+                        constraint={
+                            "error": str(exc),
+                            "price": price_quantized,
+                            "raw_price": price_raw,
+                        },
                     )
                     return 0.0, 0.0, reason
                 try:
@@ -8206,80 +8210,115 @@ class ExecutionSimulator:
                     reason = FilterRejectionReason(
                         code="LOT_SIZE",
                         message="quantize_qty failed",
-                        constraint={"error": str(exc), "quantity": qty_raw},
+                        constraint={
+                            "error": str(exc),
+                            "quantity": qty_quantized,
+                            "raw_quantity": qty_raw,
+                        },
                     )
                     return price_quantized, 0.0, reason
 
         if not validations_enabled or filters is None:
             return price_quantized, qty_quantized, None
 
-        if price_raw <= 0.0 or not math.isfinite(price_raw):
+        if price_quantized <= 0.0 or not math.isfinite(price_quantized):
             reason = FilterRejectionReason(
                 code="PRICE_FILTER",
                 message="Price is not positive",
-                constraint={"price": price_raw},
+                constraint={
+                    "price": price_quantized,
+                    "raw_price": price_raw,
+                },
             )
             return 0.0, 0.0, reason
 
-        if filters.price_min > 0.0 and price_raw + tolerance < filters.price_min:
+        if filters.price_min > 0.0 and price_quantized + tolerance < filters.price_min:
             reason = FilterRejectionReason(
                 code="PRICE_FILTER",
                 message="Price below minimum",
-                constraint={"min_price": filters.price_min, "price": price_raw},
+                constraint={
+                    "min_price": filters.price_min,
+                    "price": price_quantized,
+                    "raw_price": price_raw,
+                },
             )
             return 0.0, 0.0, reason
 
         if math.isfinite(filters.price_max) and filters.price_max > 0.0:
-            if price_raw - tolerance > filters.price_max:
+            if price_quantized - tolerance > filters.price_max:
                 reason = FilterRejectionReason(
                     code="PRICE_FILTER",
                     message="Price above maximum",
-                    constraint={"max_price": filters.price_max, "price": price_raw},
+                    constraint={
+                        "max_price": filters.price_max,
+                        "price": price_quantized,
+                        "raw_price": price_raw,
+                    },
                 )
                 return 0.0, 0.0, reason
 
         if filters.price_tick > 0.0:
-            snapped = math.floor(price_raw / filters.price_tick) * filters.price_tick
-            if abs(price_raw - snapped) > tolerance:
+            snapped = math.floor(price_quantized / filters.price_tick) * filters.price_tick
+            if abs(price_quantized - snapped) > tolerance:
                 reason = FilterRejectionReason(
                     code="PRICE_FILTER",
                     message="Price not aligned to tick",
-                    constraint={"tick": filters.price_tick, "price": price_raw},
+                    constraint={
+                        "tick": filters.price_tick,
+                        "price": price_quantized,
+                        "raw_price": price_raw,
+                    },
                 )
                 return 0.0, 0.0, reason
 
-        if qty_raw <= 0.0:
+        if qty_quantized <= 0.0:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity is not positive",
-                constraint={"quantity": qty_raw},
+                constraint={
+                    "quantity": qty_quantized,
+                    "raw_quantity": qty_raw,
+                },
             )
             return price_quantized, 0.0, reason
 
         min_qty = filters.min_qty_threshold
-        if min_qty > 0.0 and qty_raw + tolerance < min_qty:
+        if min_qty > 0.0 and qty_quantized + tolerance < min_qty:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity below minimum",
-                constraint={"min_qty": min_qty, "step": filters.qty_step, "quantity": qty_raw},
+                constraint={
+                    "min_qty": min_qty,
+                    "step": filters.qty_step,
+                    "quantity": qty_quantized,
+                    "raw_quantity": qty_raw,
+                },
             )
             return price_quantized, 0.0, reason
 
-        if filters.qty_max < float("inf") and qty_raw - tolerance > filters.qty_max:
+        if filters.qty_max < float("inf") and qty_quantized - tolerance > filters.qty_max:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity above maximum",
-                constraint={"max_qty": filters.qty_max, "quantity": qty_raw},
+                constraint={
+                    "max_qty": filters.qty_max,
+                    "quantity": qty_quantized,
+                    "raw_quantity": qty_raw,
+                },
             )
             return price_quantized, 0.0, reason
 
         if filters.qty_step > 0.0:
-            snapped_qty = math.floor(qty_raw / filters.qty_step) * filters.qty_step
-            if abs(qty_raw - snapped_qty) > tolerance:
+            snapped_qty = math.floor(qty_quantized / filters.qty_step) * filters.qty_step
+            if abs(qty_quantized - snapped_qty) > tolerance:
                 reason = FilterRejectionReason(
                     code="LOT_SIZE",
                     message="Quantity not aligned to step",
-                    constraint={"step": filters.qty_step, "quantity": qty_raw},
+                    constraint={
+                        "step": filters.qty_step,
+                        "quantity": qty_quantized,
+                        "raw_quantity": qty_raw,
+                    },
                 )
                 return price_quantized, 0.0, reason
 
@@ -8308,7 +8347,10 @@ class ExecutionSimulator:
             reason = FilterRejectionReason(
                 code="PRICE_FILTER",
                 message="Effective price is invalid",
-                constraint={"price": price_for_notional},
+                constraint={
+                    "price": price_for_notional,
+                    "raw_price": price_raw,
+                },
             )
             return 0.0, 0.0, reason
 
@@ -8329,6 +8371,8 @@ class ExecutionSimulator:
                             "min_notional": filters.min_notional,
                             "price": price_for_notional,
                             "quantity": qty_quantized,
+                            "raw_price": price_raw,
+                            "raw_quantity": qty_raw,
                         },
                     )
                     return price_quantized, 0.0, reason
@@ -8340,6 +8384,7 @@ class ExecutionSimulator:
                             "error": str(exc),
                             "min_notional": filters.min_notional,
                             "price": price_for_notional,
+                            "raw_price": price_raw,
                         },
                     )
                     return price_quantized, 0.0, reason
@@ -8353,6 +8398,8 @@ class ExecutionSimulator:
                         "price": price_for_notional,
                         "quantity": qty_for_notional,
                         "notional": notional,
+                        "raw_price": price_raw,
+                        "raw_quantity": qty_raw,
                     },
                 )
                 return price_quantized, 0.0, reason
