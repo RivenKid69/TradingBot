@@ -1,4 +1,4 @@
-# cython: language_level=3
+# cython: language_level=3, language=c++
 from libcpp.vector cimport vector
 from libcpp.utility cimport pair
 
@@ -58,6 +58,8 @@ cdef extern from "AgentOrderTracker.h":
 
 cdef class CyMicrostructureGenerator:
     cdef CppMicrostructureGenerator* thisptr
+    cdef public double base_order_imbalance_ratio
+    cdef public double base_cancel_ratio
     cpdef long long generate_public_events_cy(
         self,
         vector[MarketEvent]& out_events,

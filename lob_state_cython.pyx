@@ -1,71 +1,65 @@
 # cython: language_level=3, language=c++, c_string_type=str, c_string_encoding=utf-8, boundscheck=False, wraparound=False
-cdef extern from "cpp_microstructure_generator.h":
-    cdef enum MarketEventType:
-        NO_EVENT,
-        PUBLIC_LIMIT_ADD,
-        PUBLIC_MARKET_MATCH,
-        PUBLIC_CANCEL_RANDOM,
-        AGENT_LIMIT_ADD,
-        AGENT_MARKET_MATCH,
-        AGENT_CANCEL_SPECIFIC
+from libcpp.vector cimport vector
+from libcpp.utility cimport pair
 
-    cdef struct MarketEvent:
-        MarketEventType type
-        bint is_buy
-        long long price
-        double size
-        unsigned long long order_id
-        int buy_cancel_count
-        int sell_cancel_count
-
-    cdef cppclass CppMicrostructureGenerator:
-        CppMicrostructureGenerator(double, double, double) except +
-        void generate_public_events(
-            double, double, double, int, double, double, double, double,
-            double, double, int,
-            vector[MarketEvent]&,
-            long long&
-        )
-import uuid
 from cython cimport Py_ssize_t
-from libc.stdlib cimport rand, RAND_MAX, srand
-from libc.string cimport memset
-from libc.math cimport sin, sqrt, log, abs as c_abs, fmax as c_fmax
-import numpy as np
-cimport numpy as np
 from libc.stddef cimport size_t
+from libc.stdlib cimport rand
+from libc.math cimport log, tanh, fmax, fmin, log1p, fabs, isnan
+
 cimport cython
-import random
-import pandas as pd
-from fast_lob cimport CythonLOB
+cimport numpy as np
+import numpy as np
+
+import core_constants as consts
+from core_constants cimport MarketRegime, NORMAL, CHOPPY_FLAT, STRONG_TREND
 from coreworkspace cimport SimulationWorkspace
+from fast_lob cimport CythonLOB
+
 # Инициализируем NumPy C-API
 np.import_array()
+
 # вычисляем число признаков для observation_space
 # создаём временный буфер достаточной длины
-import numpy as _np
 cdef public int N_FEATURES
+@cython.cfunc
+cdef void _shuffle_events(vector[MarketEvent]& events):
+    cdef size_t n = events.size()
+    cdef size_t i
+    cdef size_t j
+    cdef MarketEvent tmp
+
+    if n <= 1:
+        return
+
+    i = n
+    while i > 1:
+        i -= 1
+        j = <size_t>(rand() % (<int>i + 1))
+        tmp = events[i]
+        events[i] = events[j]
+        events[j] = tmp
 
 def _compute_n_features() -> int:
     """Вспомогательная функция для подсчёта длины вектора признаков."""
     cdef int max_tokens = 1      # максимальное число токенов (подгоните при необходимости)
     cdef int num_tokens = 1
-    cdef _np.ndarray[float, ndim=1] norm_cols = _np.zeros(0, dtype=_np.float32)
+    norm_cols = np.zeros(0, dtype=np.float32)
     # выделяем буфер заведомо большей длины
-    cdef _np.ndarray[float, ndim=1] buf = _np.empty(256, dtype=_np.float32)
-    buf.fill(_np.nan)
+    buf = np.empty(256, dtype=np.float32)
+    buf.fill(np.nan)
     # вызываем функцию построения наблюдений с фиктивными значениями
     build_observation_vector_c(
-        0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0,
-        0.0, False,
-        False,       # risk_off_flag
-        0.0, 0.0,
-        0.0, 0.0,
-        0.0, 0.0,
-        0, max_tokens,
+        0.0, 0.0, 0.0, 0.0,  # price, prev_price, log_volume_norm, rel_volume
+        0.0, 0.0, 0.0, 0.0, 0.0,  # ma5, ma20, rsi14, macd, macd_signal
+        0.0, 0.0, 0.0, 0.0,  # momentum, atr, cci, obv
+        0.0, 0.0,  # bb_lower, bb_upper
+        0.0, 0.0,  # is_high_importance, time_since_event
+        0.0, False, False,  # fear_greed_value, has_fear_greed, risk_off_flag
+        0.0, 0.0,  # cash, units
+        0.0, 0.0,  # last_vol_imbalance, last_trade_intensity
+        0.0, 0.0,  # last_realized_spread, last_agent_fill_ratio
+        0, max_tokens,  # token_id, max_num_tokens
         num_tokens,
         norm_cols,
         buf
@@ -73,41 +67,12 @@ def _compute_n_features() -> int:
     # определяем индекс последнего заполненного элемента
     cdef Py_ssize_t i
     for i in range(buf.shape[0]):
-        if _np.isnan(buf[i]):
+        if np.isnan(buf[i]):
             return <int>i
     return <int>buf.shape[0]
 
 # вычисляем N_FEATURES один раз при инициализации модуля (без служебных флагов)
 N_FEATURES = _compute_n_features()
-from libcpp.algorithm cimport random_shuffle
-
-from core_constants cimport PRICE_SCALE, MarketRegime
-
-# Импортируем нашу новую Cython-обертку вместо старых классов
-from fast_lob cimport CythonLOB
-from libcpp.vector cimport vector
-from libcpp.utility cimport pair
-from libc.math cimport isnan
-from libc.math cimport log, tanh, fmax, fmin, log1p
-
-cdef extern from "AgentOrderTracker.h":
-    cdef struct AgentOrderInfo:
-        long long price
-        bint is_buy_side
-    cdef cppclass AgentOrderTracker:
-        AgentOrderTracker() except +
-        void add(long long order_id, long long price, bint is_buy)
-        void remove(long long order_id)
-        bint contains(long long order_id)
-        const AgentOrderInfo* get_info(long long order_id)
-        void clear()
-        bint is_empty()
-        vector[long long] get_all_ids()
-        const pair[const long long, AgentOrderInfo]* get_first_order_info()
-        pair[long long, long long] find_closest_order(long long price_ticks)
-
-# Инициализируем NumPy C-API
-np.import_array()
 
 # Максимальное ожидаемое количество сделок за один шаг симуляции.
 # Используется для предварительного выделения памяти под NumPy массивы.
@@ -264,7 +229,7 @@ cpdef void build_observation_vector_c(
     float[::1] norm_cols_values,
     # ВЫХОДНОЙ ПАРАМЕТР: Указатель на заранее выделенный массив
     float[::1] out_features
-) nogil:
+) noexcept nogil:
     # `nogil` здесь возможен, так как мы убрали все Python-операции,
     # кроме чтения из `norm_cols_values`, что безопасно.
 
@@ -321,17 +286,14 @@ cpdef void build_observation_vector_c(
     cdef double mid_ret     = tanh((price - prev_price) / (prev_price + 1e-8))
     cdef double vol_int     = tanh(rel_volume)
     cdef double ofi_proxy   = mid_ret * vol_int
-    if FIDX_OFI < 0: FIDX_OFI = feature_idx
     out_features[feature_idx] = <float>ofi_proxy; feature_idx += 1
 
     # Queue-imbalance: уже передан last_vol_imbalance → нормализуем tanh
     cdef double qimb = tanh(last_vol_imbalance)
-    if FIDX_QIMB < 0: FIDX_QIMB = feature_idx
     out_features[feature_idx] = <float>qimb; feature_idx += 1
 
     # Microprice proxy: смещение от mid пропорционально половине спрэда и дисбалансу
     cdef double micro_dev = 0.5 * last_realized_spread * qimb
-    if FIDX_MICRO < 0: FIDX_MICRO = feature_idx
     out_features[feature_idx] = <float>micro_dev; feature_idx += 1
 
     # --- Признаки Bollinger Bands ---
@@ -384,13 +346,11 @@ cdef class EnvState:
     Высокопроизводительный контейнер для всех переменных состояния торговой среды.
     Все поля объявлены явно для максимальной производительности и безопасности.
     """
-    cdef AgentOrderTracker* agent_orders_ptr
-
     def __cinit__(self):
         # Этот метод вызывается для инициализации C/C++ полей ПЕРЕД __init__
         self.agent_orders_ptr = new AgentOrderTracker()
         self._position_value = 0.0 # Инициализация нулём
-        self.price_scale = PRICE_SCALE
+        self.price_scale = consts.PRICE_SCALE
         self._entry_price = -1.0
         self._atr_at_entry = -1.0
         self._initial_sl = -1.0
@@ -426,10 +386,6 @@ cdef class CyMicrostructureGenerator:
     """
     Cython-обертка для C++ генератора событий.
     """
-    cdef CppMicrostructureGenerator* thisptr
-    cdef public double base_order_imbalance_ratio
-    cdef public double base_cancel_ratio
-
     def __cinit__(self,
             base_order_imbalance_ratio=0.8,
             base_cancel_ratio=0.2,
@@ -527,7 +483,8 @@ cpdef tuple run_full_step_logic_cython(
     EnvState state
     
 ):
-    assert action.shape[0] >= 2, f"Action array must have at least 2 elements, but got shape {action.shape}"
+    if action.shape[0] < 2:
+        raise ValueError("Action array must have at least 2 elements")
 
     # --- Объявление переменных ---
     cdef int total_trades_count = 0
@@ -714,7 +671,7 @@ cpdef tuple run_full_step_logic_cython(
 
         # --- 1.3. Перемешивание всех событий ---
         if all_events.size() > 1:
-            random_shuffle(all_events.begin(), all_events.end())
+            _shuffle_events(all_events)
 
         # --- 1.4. НОВЫЙ ЦИКЛ: Исполнение перемешанных событий ---
         for i in range(all_events.size()):
@@ -724,7 +681,14 @@ cpdef tuple run_full_step_logic_cython(
 
             # Используем клон LOB для всех операций в цикле
             if current_event.type == AGENT_LIMIT_ADD or current_event.type == PUBLIC_LIMIT_ADD:
-                lob_clone.add_limit_order(current_event.is_buy, current_event.price, current_event.size, current_event.order_id, (current_event.type == AGENT_LIMIT_ADD), state.step_idx)
+                lob_clone.add_limit_order_with_id(
+                    current_event.is_buy,
+                    current_event.price,
+                    current_event.size,
+                    current_event.order_id,
+                    state.step_idx,
+                    current_event.type == AGENT_LIMIT_ADD,
+                )
 
             elif current_event.type == AGENT_MARKET_MATCH or current_event.type == PUBLIC_MARKET_MATCH:
                 is_agent_taker = (current_event.type == AGENT_MARKET_MATCH)
@@ -766,7 +730,7 @@ cpdef tuple run_full_step_logic_cython(
                     fee = state.taker_fee if is_taker else state.maker_fee
                     d_units = vol if is_buy_side_all_arr[j] else -vol
 
-                    delta.executed_notional += c_abs(vol * price)
+                    delta.executed_notional += fabs(vol * price)
 
                     delta.cash_delta -= d_units * price
                     delta.cash_delta -= vol * price * fee
