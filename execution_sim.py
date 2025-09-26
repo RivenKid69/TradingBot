@@ -729,11 +729,11 @@ class SymbolFilterSnapshot:
         side_norm = str(side).upper()
 
         if side_norm == "BUY":
-            preferred_up = self.ask_multiplier_up
-            preferred_down = self.ask_multiplier_down
-        elif side_norm == "SELL":
             preferred_up = self.bid_multiplier_up
             preferred_down = self.bid_multiplier_down
+        elif side_norm == "SELL":
+            preferred_up = self.ask_multiplier_up
+            preferred_down = self.ask_multiplier_down
         else:
             preferred_up = None
             preferred_down = None
