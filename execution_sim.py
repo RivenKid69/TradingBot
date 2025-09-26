@@ -2738,7 +2738,7 @@ class ExecutionSimulator:
             open_price = self._float_or_none(self._next_h1_open_price)
         high_price = self._float_or_none(snapshot.high)
         low_price = self._float_or_none(snapshot.low)
-        ts = int(snapshot.ts_open or now_ms())
+        ts = int(snapshot.ts_open) if snapshot.ts_open is not None else int(now_ms())
         if open_price is None or not math.isfinite(open_price):
             expired_count = 0
             pending = list(self._pending_next_open.values())
@@ -2939,7 +2939,7 @@ class ExecutionSimulator:
         bar_low: Optional[float],
         bar_close: Optional[float],
     ) -> ExecReport:
-        ts = int(now_ts or now_ms())
+        ts = int(now_ts) if now_ts is not None else int(now_ms())
         trades = list(self._next_open_ready_trades)
         self._next_open_ready_trades.clear()
         fee_total = float(self._next_open_ready_fee_total)
@@ -7368,7 +7368,7 @@ class ExecutionSimulator:
         qty_raw = abs(vol)
         if qty_raw <= 0.0:
             return cid
-        ts = int(now_ts or now_ms())
+        ts = int(now_ts) if now_ts is not None else int(now_ms())
         ref_market = self._float_or_none(self._last_ref_price)
         if ref_market is None or ref_market <= 0.0:
             self._next_open_cancelled.append(cid)
@@ -7473,7 +7473,7 @@ class ExecutionSimulator:
                 proto=proto,
                 client_order_id=cid,
                 remaining_lat=remaining,
-                timestamp=int(now_ts or now_ms()),
+                timestamp=int(now_ts) if now_ts is not None else int(now_ms()),
                 lat_ms=int(lat_ms),
                 timeout=bool(timeout),
                 spike=bool(spike),
@@ -8435,7 +8435,7 @@ class ExecutionSimulator:
         risk_events_buffer: List[RiskEvent] = []  # type: ignore[var-annotated]
         filter_rejections_step: List[Dict[str, Any]] = []
 
-        ts = int(now_ts or now_ms())
+        ts = int(now_ts) if now_ts is not None else int(now_ms())
         ref = self._ref(ref_price)
         self._vwap_on_tick(ts, ref, self._last_liquidity)
 
