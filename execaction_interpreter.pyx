@@ -276,18 +276,20 @@ def build_agent_event_set(state, tracker, params, action):
     cdef int existing_id = <int> lookup[1] if has_existing else -1
     cdef Side existing_side = desired_side
     cdef long long existing_price = -1
+    cdef int side_value = <int> desired_side
+    cdef bint should_cancel = False
     if has_existing and existing_id >= 0:
         try:
-            existing_side = <Side> int(lookup[2])
+            side_value = int(lookup[2])
+            existing_side = <Side> side_value
         except Exception:
             existing_side = desired_side
         try:
             existing_price = <long long> lookup[3]
         except Exception:
             existing_price = -1
-
+    should_cancel = False
     if has_existing and existing_id >= 0:
-        cdef bint should_cancel = False
         if use_market:
             should_cancel = True
         elif existing_side != desired_side:

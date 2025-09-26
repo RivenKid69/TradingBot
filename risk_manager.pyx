@@ -445,8 +445,9 @@ def _apply_close_if_needed_py(object state):
 
 def apply_close_if_needed(object state, bint readonly=False):
     """Python wrapper that accepts either EnvState or a duck-typed object."""
+    cdef ClosedReason reason
     if isinstance(state, PyEnvState):
-        cdef ClosedReason reason = _apply_close_if_needed_impl(state, readonly)
+        reason = _apply_close_if_needed_impl(state, readonly)
         return PyClosedReason(reason)
     if readonly:
         import copy

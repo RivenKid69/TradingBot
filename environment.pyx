@@ -27,7 +27,7 @@ cdef class TradingEnv:
     cdef object pending_order
     cdef double tick_size
 
-    def __init__(self, EnvConfig config=None):
+    def __init__(self, config=None):
         if config is None:
             config = EnvConfig.default()
         self.config = config
