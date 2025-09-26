@@ -1,4 +1,5 @@
 # cython: language_level=3
+# cython: language=c++
 # distutils: language = c++
 
 import numpy as np
@@ -6,6 +7,7 @@ import numpy as np
 cimport numpy as np
 
 from libc.stddef cimport size_t
+from cython cimport NULL
 from libc.stdint cimport uint64_t
 
 from core_constants cimport MarketRegime
@@ -29,6 +31,9 @@ cdef class MarketSimulatorWrapper:
                   object low_arr not None,
                   object volume_usd_arr not None,
                   uint64_t seed=0):
+        self._sim = <MarketSimulator*>NULL
+        self._price_data = <double*>NULL
+
         cdef np.ndarray[np.float64_t, ndim=1] price = np.ascontiguousarray(price_arr, dtype=np.float64)
         cdef np.ndarray[np.float64_t, ndim=1] open_ = np.ascontiguousarray(open_arr, dtype=np.float64)
         cdef np.ndarray[np.float64_t, ndim=1] high = np.ascontiguousarray(high_arr, dtype=np.float64)
@@ -85,6 +90,9 @@ cdef class MarketSimulatorWrapper:
 
     def set_seed(self, seed):
         cdef uint64_t c_seed = <uint64_t>seed
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
         self._sim.set_seed(c_seed)
         self._last_price = 0.0
         self._last_shock = False
@@ -95,6 +103,9 @@ cdef class MarketSimulatorWrapper:
         cdef double c_probability = float(probability)
         if c_probability < 0.0:
             c_probability = 0.0
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
         self._sim.enable_random_shocks(c_enable, c_probability)
         self._random_shocks_enabled = c_enable
         self._flash_probability = c_probability
@@ -105,6 +116,9 @@ cdef class MarketSimulatorWrapper:
             raise ValueError("step_index must be non-negative")
         cdef double c_prob = float(black_swan_probability)
         cdef bint c_training = <bint>is_training_mode
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
         self._last_step = <size_t>c_step_index
         self._last_price = self._sim.step(self._last_step, c_prob, c_training)
         self._last_shock = self._sim.shock_triggered(self._last_step) != 0
@@ -117,7 +131,10 @@ cdef class MarketSimulatorWrapper:
             idx = self._last_step
         else:
             idx = <size_t>c_step_idx
-        return self._sim.shock_triggered(idx)
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
+        return self._sim.shock_triggered(idx) != 0
 
     def get_last_price(self):
         if self._last_step < self._n_steps and self._price_data != NULL:
@@ -125,36 +142,58 @@ cdef class MarketSimulatorWrapper:
         return self._last_price
 
     def get_ma5(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_ma5(self._last_step)
 
     def get_ma20(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_ma20(self._last_step)
 
     def get_atr(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_atr(self._last_step)
 
     def get_rsi(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_rsi(self._last_step)
 
     def get_macd(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_macd(self._last_step)
 
     def get_macd_signal(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_macd_signal(self._last_step)
 
     def get_momentum(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_momentum(self._last_step)
 
     def get_cci(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_cci(self._last_step)
 
     def get_obv(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_obv(self._last_step)
 
     def get_bb_lower(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_bb_lower(self._last_step)
 
     def get_bb_upper(self):
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
         return self._sim.get_bb_upper(self._last_step)
 
     def set_regime_distribution(self, probabilities):
@@ -174,6 +213,9 @@ cdef class MarketSimulatorWrapper:
         for i in range(4):
             self._regime_probs[i] = probs[i] / total
             probs_ptr[i] = self._regime_probs[i]
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
         self._sim.set_regime_distribution(c_probs)
 
     def get_regime_distribution(self):
@@ -193,6 +235,9 @@ cdef class MarketSimulatorWrapper:
         for i in range(168):
             self._liquidity_multipliers[i] = _clamp_non_negative(mult[i])
             mult_ptr[i] = self._liquidity_multipliers[i]
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
         self._sim.set_liquidity_seasonality(c_mult)
 
     def get_liquidity_seasonality(self):
@@ -212,4 +257,7 @@ cdef class MarketSimulatorWrapper:
         cdef int c_duration = int(duration)
         if c_start < 0 or c_duration < 0:
             raise ValueError("start and duration must be non-negative")
+        if self._sim == NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
         self._sim.force_market_regime(regime_code, <size_t>c_start, <size_t>c_duration)
