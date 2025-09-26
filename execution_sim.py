@@ -7661,6 +7661,13 @@ class ExecutionSimulator:
             return None
         return val
 
+    @staticmethod
+    def _snap_qty_with_tolerance(value: float, step: float, tolerance: float) -> float:
+        if step <= 0.0:
+            return float(value)
+        tol = tolerance if tolerance > 0.0 else 0.0
+        return math.floor((float(value) + tol) / step) * step
+
     def _apply_close_lag(self, ts: Optional[int]) -> Optional[int]:
         if ts is None:
             return None
@@ -8068,7 +8075,9 @@ class ExecutionSimulator:
             return 0.0, reason
 
         if filters.qty_step > 0.0:
-            snapped_qty = math.floor(qty_quantized / filters.qty_step) * filters.qty_step
+            snapped_qty = self._snap_qty_with_tolerance(
+                qty_quantized, filters.qty_step, tolerance
+            )
             if abs(qty_quantized - snapped_qty) > tolerance:
                 reason = FilterRejectionReason(
                     code="LOT_SIZE",
@@ -8178,8 +8187,8 @@ class ExecutionSimulator:
                 return 0.0, reason
 
             if filters.qty_step > 0.0:
-                snapped_qty = (
-                    math.floor(qty_for_notional / filters.qty_step) * filters.qty_step
+                snapped_qty = self._snap_qty_with_tolerance(
+                    qty_for_notional, filters.qty_step, tolerance
                 )
                 if abs(qty_for_notional - snapped_qty) > tolerance:
                     reason = FilterRejectionReason(
@@ -8457,7 +8466,9 @@ class ExecutionSimulator:
             return price_quantized, 0.0, reason
 
         if filters.qty_step > 0.0:
-            snapped_qty = math.floor(qty_quantized / filters.qty_step) * filters.qty_step
+            snapped_qty = self._snap_qty_with_tolerance(
+                qty_quantized, filters.qty_step, tolerance
+            )
             if abs(qty_quantized - snapped_qty) > tolerance:
                 reason = FilterRejectionReason(
                     code="LOT_SIZE",
@@ -8578,8 +8589,8 @@ class ExecutionSimulator:
                 return price_quantized, 0.0, reason
 
             if filters.qty_step > 0.0:
-                snapped_qty = (
-                    math.floor(qty_for_notional / filters.qty_step) * filters.qty_step
+                snapped_qty = self._snap_qty_with_tolerance(
+                    qty_for_notional, filters.qty_step, tolerance
                 )
                 if abs(qty_for_notional - snapped_qty) > tolerance:
                     reason = FilterRejectionReason(
