@@ -21,6 +21,17 @@ class CythonLOB:
         self.orders[oid] = {'is_buy': bool(is_buy_side), 'price': int(price_ticks), 'volume': float(volume), 'ttl': 0}
         return oid, 0
 
+    def add_limit_order_with_id(self, is_buy_side, price_ticks, volume, order_id, timestamp, taker_is_agent=True):
+        if order_id is not None and order_id != 0:
+            oid = int(order_id)
+            if oid >= self.next_id:
+                self.next_id = oid + 1
+        else:
+            oid = self.next_id
+            self.next_id += 1
+        self.orders[oid] = {'is_buy': bool(is_buy_side), 'price': int(price_ticks), 'volume': float(volume), 'ttl': 0}
+        return oid, 0
+
     def remove_order(self, is_buy_side, price_ticks, order_id):
         return self.orders.pop(order_id, None) is not None
 

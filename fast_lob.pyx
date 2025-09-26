@@ -10,57 +10,6 @@ from libcpp cimport bool as cpp_bool
 from libcpp.vector cimport vector
 from libc.stddef cimport size_t
 
-ctypedef unsigned long long uint64_t
-ctypedef unsigned int uint32_t
-
-cdef extern from "OrderBook.h":
-    cdef struct FeeModel:
-        double maker_fee
-        double taker_fee
-        double slip_k
-
-    cdef struct Order:
-        uint64_t id
-        double volume
-        cpp_bool is_agent
-        int timestamp
-        int ttl_steps
-
-    cppclass OrderBook:
-        OrderBook() except +
-        void add_limit_order(cpp_bool is_buy_side,
-                             long long price_ticks,
-                             double volume,
-                             uint64_t order_id,
-                             cpp_bool is_agent,
-                             int timestamp)
-        void remove_order(cpp_bool is_buy_side,
-                          long long price_ticks,
-                          uint64_t order_id)
-        uint32_t get_queue_position(uint64_t order_id) const
-        int match_market_order(cpp_bool is_buy_side,
-                               double volume,
-                               int timestamp,
-                               cpp_bool taker_is_agent,
-                               double* out_prices,
-                               double* out_volumes,
-                               int* out_is_buy,
-                               int* out_is_self,
-                               long long* out_ids,
-                               int max_len,
-                               double* out_fee_total)
-        long long get_best_bid()
-        long long get_best_ask()
-        void prune_stale_orders(int current_step, int max_age)
-        void cancel_random_public_orders(cpp_bool is_buy_side, int n)
-        cpp_bool contains_order(uint64_t order_id) const
-        OrderBook* clone() const
-        void swap(OrderBook& other)
-        void set_fee_model(const FeeModel& fm)
-        void set_seed(unsigned long long seed)
-        cpp_bool set_order_ttl(uint64_t order_id, int ttl_steps)
-        int decay_ttl_and_cancel(void (*on_cancel)(const Order&))
-
 cdef vector[uint64_t]* _ttl_buf = NULL
 
 cdef void _collect_cancel(const Order& o) noexcept nogil:
@@ -74,8 +23,6 @@ cdef class CythonLOB:
       - add_limit_order(...) -> (order_id, queue_pos)
       - match_market_order(...) -> (n_trades, fee_total)
     """
-    cdef OrderBook* thisptr
-    cdef uint64_t _next_id
 
     def __cinit__(self):
         self.thisptr = new OrderBook()
@@ -96,6 +43,17 @@ cdef class CythonLOB:
         fm.slip_k = slip_k
         self.thisptr.set_fee_model(fm)
 
+    cdef inline uint64_t _assign_order_id(self, unsigned long long order_id) noexcept:
+        cdef uint64_t oid
+        if order_id != 0:
+            oid = <uint64_t>order_id
+            if oid >= self._next_id:
+                self._next_id = oid + 1
+        else:
+            oid = self._next_id
+            self._next_id += 1
+        return oid
+
     cpdef tuple add_limit_order(self,
                                 bint is_buy_side,
                                 long long price_ticks,
@@ -106,12 +64,26 @@ cdef class CythonLOB:
         Генерируем 64-битный ID на стороне обёртки, чтобы вернуть его вызывающему коду.
         Также возвращаем позицию в очереди по этому ID (если недоступна — None).
         """
-        cdef uint64_t oid = self._next_id
-        self._next_id += 1
+        cdef uint64_t oid = self._assign_order_id(0)
         self.thisptr.add_limit_order(is_buy_side, price_ticks, volume, oid,
-                                         taker_is_agent, timestamp)
+                                     taker_is_agent, timestamp)
         cdef uint32_t pos = self.thisptr.get_queue_position(oid)
         # 0xFFFFFFFF обычно используют как «нет позиции»
+        if pos == <uint32_t>0xFFFFFFFF:
+            return (oid, None)
+        return (oid, pos)
+
+    cpdef tuple add_limit_order_with_id(self,
+                                        bint is_buy_side,
+                                        long long price_ticks,
+                                        double volume,
+                                        unsigned long long order_id,
+                                        int timestamp,
+                                        bint taker_is_agent):
+        cdef uint64_t oid = self._assign_order_id(order_id)
+        self.thisptr.add_limit_order(is_buy_side, price_ticks, volume, oid,
+                                     taker_is_agent, timestamp)
+        cdef uint32_t pos = self.thisptr.get_queue_position(oid)
         if pos == <uint32_t>0xFFFFFFFF:
             return (oid, None)
         return (oid, pos)
