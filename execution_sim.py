@@ -158,6 +158,74 @@ try:
     import numpy as np
 except Exception:  # минимальная замена на случай отсутствия numpy на этапе интеграции
 
+    import operator
+    from typing import Iterable
+
+    def _to_float_list(seq: Iterable[Any]) -> List[float]:
+        return [float(x) for x in seq]
+
+    class _Array:
+        __slots__ = ("_data",)
+
+        def __init__(self, data: Iterable[Any]) -> None:
+            self._data = _to_float_list(data)
+
+        @property
+        def size(self) -> int:
+            return len(self._data)
+
+        def copy(self) -> "_Array":
+            return _Array(self._data)
+
+        def tolist(self) -> List[float]:
+            return list(self._data)
+
+        def __len__(self) -> int:
+            return len(self._data)
+
+        def __iter__(self):
+            return iter(self._data)
+
+        def __getitem__(self, item):
+            if isinstance(item, slice):
+                return _Array(self._data[item])
+            return self._data[item]
+
+        def __setitem__(self, key, value) -> None:
+            if isinstance(key, slice):
+                self._data[key] = _to_float_list(value)
+            else:
+                self._data[key] = float(value)
+
+        def _binary_op(self, other, op: Callable[[float, float], float]) -> "_Array":
+            if isinstance(other, _Array):
+                if len(other) != len(self):
+                    raise ValueError("array length mismatch")
+                return _Array(op(a, b) for a, b in zip(self._data, other._data))
+            if isinstance(other, Sequence) and not isinstance(
+                other, (str, bytes, bytearray)
+            ):
+                other_list = _to_float_list(other)
+                if len(other_list) != len(self._data):
+                    raise ValueError("array length mismatch")
+                return _Array(op(a, b) for a, b in zip(self._data, other_list))
+            try:
+                scalar = float(other)  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise TypeError("unsupported operand type") from exc
+            return _Array(op(a, scalar) for a in self._data)
+
+        def __mul__(self, other) -> "_Array":
+            return self._binary_op(other, operator.mul)
+
+        def __rmul__(self, other) -> "_Array":
+            return self.__mul__(other)
+
+        def __imul__(self, other):
+            result = self.__mul__(other)
+            self._data = result._data
+            return self
+
     class _R:
         def __init__(self, seed=0):
             self.s = seed
@@ -166,6 +234,31 @@ except Exception:  # минимальная замена на случай от�
             return a
 
     class np:  # type: ignore
+        ndarray = _Array
+
+        @staticmethod
+        def ones(n: int, dtype=float):
+            count = int(n)
+            if count < 0:
+                raise ValueError("negative dimensions are not allowed")
+            return _Array([1.0] * count)
+
+        @staticmethod
+        def asarray(seq: Iterable[Any], dtype=float):
+            if isinstance(seq, _Array):
+                data = seq.tolist()
+            else:
+                if isinstance(seq, (str, bytes, bytearray)):
+                    raise TypeError("asarray does not accept string inputs in shim")
+                data = list(seq)
+            if dtype is None or dtype == float or dtype == "float":
+                return _Array(data)
+            if dtype in {int, "int"}:
+                return _Array(int(x) for x in data)
+            return _Array(data)
+
+        array = asarray
+
         @staticmethod
         def random(seed=None):
             return _R(seed)
@@ -179,6 +272,8 @@ except Exception:  # минимальная замена на случай от�
 
             def randint(self, a, b=None, size=None):
                 return self._r.randint(a, b, size)
+
+    np.ndarray = _Array  # type: ignore[attr-defined]
 
 
 # --- Совместимость с ActionProto/ActionType ---
