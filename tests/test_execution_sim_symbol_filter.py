@@ -21,8 +21,8 @@ def test_min_qty_threshold_without_step_uses_min_qty():
     "qty_min, qty_step, expected",
     [
         (0.0, 0.0, 0.0),
-        (0.0, 0.001, 0.0),
-        (-0.5, 0.1, 0.0),
+        (0.0, 0.001, 0.001),
+        (-0.5, 0.1, 0.1),
         (1e-12, 0.1, 0.1),
     ],
 )

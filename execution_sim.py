@@ -725,7 +725,7 @@ class SymbolFilterSnapshot:
                 steps = math.ceil(ratio - 1e-12)
                 steps = max(steps, 1)
             else:
-                steps = 0
+                steps = 1
             return steps * qty_step
 
         if qty_min > 0.0:
