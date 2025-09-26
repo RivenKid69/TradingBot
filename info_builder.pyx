@@ -3,7 +3,7 @@
 """Helper utilities to build the info dictionary for environment metrics."""
 
 from lob_state_cython cimport EnvState
-from risk_manager cimport ClosedReason
+from risk_enums cimport ClosedReason
 
 
 cdef inline double _safe_div(double a, double b) nogil:

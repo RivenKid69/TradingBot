@@ -1,7 +1,7 @@
 # cython: language_level=3, language=c++
 
 from lob_state_cython cimport EnvState
-from risk_manager cimport ClosedReason
+from risk_enums cimport ClosedReason
 
 
 cdef double log_return(double net_worth, double prev_net_worth) noexcept nogil

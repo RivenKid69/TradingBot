@@ -5,7 +5,7 @@
 from libc.math cimport fabs, log, tanh
 
 from lob_state_cython cimport EnvState
-from risk_manager cimport ClosedReason
+from risk_enums cimport ClosedReason
 
 
 cdef inline double _clamp(double value, double lower, double upper) noexcept nogil:
