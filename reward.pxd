@@ -1,18 +1,7 @@
-# cython: language_level=3
+# cython: language_level=3, language=c++
 
 from lob_state_cython cimport EnvState
-
-
-cdef enum ClosedReason:
-    NONE = 0
-    ATR_SL_LONG = 1
-    ATR_SL_SHORT = 2
-    TRAILING_SL_LONG = 3
-    TRAILING_SL_SHORT = 4
-    STATIC_TP_LONG = 5
-    STATIC_TP_SHORT = 6
-    BANKRUPTCY = 7
-    MAX_DRAWDOWN = 8
+from risk_manager cimport ClosedReason
 
 
 cdef double log_return(double net_worth, double prev_net_worth) noexcept nogil

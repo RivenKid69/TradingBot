@@ -272,3 +272,5 @@ private:
     // Подготовить признаки на основе LOB
     MicroFeatures _features_from_lob(const OrderBook& lob) const;
 };
+
+using CppMicrostructureGenerator = MicrostructureGenerator;
