@@ -771,35 +771,18 @@ class _TradeCostResult:
 
     def to_dict(self) -> dict:
         return {
-            "trades": [t.__dict__ for t in self.trades],
-            "cancelled_ids": list(self.cancelled_ids),
-            "cancelled_reasons": {
-                int(k): str(v) for k, v in self.cancelled_reasons.items()
-            },
-            "new_order_ids": list(self.new_order_ids),
-            "fee_total": float(self.fee_total),
-            "new_order_pos": list(self.new_order_pos),
-            "funding_cashflow": float(self.funding_cashflow),
-            "funding_events": [fe.__dict__ for fe in self.funding_events],
-            "position_qty": float(self.position_qty),
-            "realized_pnl": float(self.realized_pnl),
-            "unrealized_pnl": float(self.unrealized_pnl),
-            "equity": float(self.equity),
-            "mark_price": float(self.mark_price),
-            "bid": float(self.bid),
-            "ask": float(self.ask),
-            "mtm_price": float(self.mtm_price),
-            "risk_events": [re.__dict__ for re in self.risk_events],
-            "risk_paused_until_ms": int(self.risk_paused_until_ms),
-            "spread_bps": (
-                float(self.spread_bps) if self.spread_bps is not None else None
+            "bps": float(self.bps) if self.bps is not None else None,
+            "mid": float(self.mid) if self.mid is not None else None,
+            "base_price": (
+                float(self.base_price) if self.base_price is not None else None
             ),
-            "vol_factor": (
-                float(self.vol_factor) if self.vol_factor is not None else None
+            "inputs": copy.deepcopy(self.inputs),
+            "metrics": copy.deepcopy(self.metrics),
+            "expected_spread_bps": (
+                float(self.expected_spread_bps)
+                if self.expected_spread_bps is not None
+                else None
             ),
-            "liquidity": float(self.liquidity) if self.liquidity is not None else None,
-            "latency_p50_ms": float(self.latency_p50_ms),
-            "latency_p95_ms": float(self.latency_p95_ms),
             "latency_timeout_ratio": float(self.latency_timeout_ratio),
             "execution_profile": str(self.execution_profile),
             "vol_raw": (
