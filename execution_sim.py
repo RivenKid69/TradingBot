@@ -7552,7 +7552,17 @@ class ExecutionSimulator:
                 lat_ms = int(d.get("total_ms", 0))
                 timeout = bool(d.get("timeout", False))
                 spike = bool(d.get("spike", False))
-                remaining = int(lat_ms // int(self.step_ms))
+                step_ms_val: Optional[int]
+                try:
+                    step_ms_val = int(self.step_ms)
+                except (TypeError, ValueError):
+                    step_ms_val = None
+                if step_ms_val is not None and step_ms_val > 0:
+                    remaining = int(math.ceil(lat_ms / step_ms_val))
+                    if remaining < 0:
+                        remaining = 0
+                else:
+                    remaining = self.latency_steps
                 latency_payload = d
             except Exception:
                 lat_ms = 0
