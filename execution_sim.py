@@ -9369,7 +9369,7 @@ class ExecutionSimulator:
                         elif best_ask is not None and price_q < best_ask:
                             filled_price = float(price_q)
                             liquidity_role = "maker"
-                            filled = True
+                            filled = False
                     else:  # SELL
                         if best_bid is not None and price_q <= best_bid:
                             filled_price = float(best_bid)
@@ -9380,7 +9380,7 @@ class ExecutionSimulator:
                         elif best_bid is not None and price_q > best_bid:
                             filled_price = float(price_q)
                             liquidity_role = "maker"
-                            filled = True
+                            filled = False
 
                 if filled and liquidity_role == "taker":
                     if tif == "FOK" and exec_qty + 1e-12 < qty_q:
