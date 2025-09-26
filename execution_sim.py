@@ -4764,9 +4764,9 @@ class ExecutionSimulator:
             getattr(self, "_fees_last_quote_equivalent", None)
         )
         fee_value = ExecutionSimulator._trade_cost_float(fee)
-        if quote_equivalent is not None and quote_equivalent > 0.0:
+        if quote_equivalent is not None:
             self.fees_cum += float(quote_equivalent)
-        elif fee_value is not None and fee_value > 0.0:
+        elif fee_value is not None:
             self.fees_cum += float(fee_value)
         self._fees_last_quote_equivalent = None
 
