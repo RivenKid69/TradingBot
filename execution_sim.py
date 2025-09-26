@@ -3520,7 +3520,7 @@ class ExecutionSimulator:
                     continue
                 if numeric_val < 0.0:
                     numeric_val = 0.0
-            dataset[symbol_key] = numeric_val
+                dataset[symbol_key] = numeric_val
         return dataset, meta
 
     def _resolve_cap_base_per_bar(
