@@ -9132,7 +9132,7 @@ class ExecutionSimulator:
                             taker_bps=fallback_slip
                         )
                         if blended is None:
-                            slip_bps = 0.0
+                            slip_bps = float(fallback_slip)
                         else:
                             slip_bps = float(blended)
                         if apply_slippage_price is not None:
@@ -9601,7 +9601,7 @@ class ExecutionSimulator:
             elif fallback_slip is not None:
                 blended = self._blend_expected_spread(taker_bps=fallback_slip)
                 if blended is None:
-                    slip_bps = 0.0
+                    slip_bps = float(fallback_slip)
                 else:
                     slip_bps = float(blended)
                 if apply_slippage_price is not None:
@@ -10513,7 +10513,7 @@ class ExecutionSimulator:
                             taker_bps=fallback_slip
                         )
                         if blended is None:
-                            slip_bps = 0.0
+                            slip_bps = float(fallback_slip)
                         else:
                             slip_bps = float(blended)
                         if apply_slippage_price is not None:
