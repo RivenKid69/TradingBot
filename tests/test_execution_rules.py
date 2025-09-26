@@ -242,6 +242,44 @@ def test_limit_ppbs_violation_without_quantizer():
     assert rejection.message == "PERCENT_PRICE_BY_SIDE violation"
 
 
+def test_limit_ppbs_skipped_when_strict_filters_disabled():
+    sim = ExecutionSimulator(filters_path=None)
+    sim.strict_filters = False
+    sim.enforce_ppbs = True
+    sim.quantizer = None
+    sim.filters = {
+        "BTCUSDT": {
+            "PRICE_FILTER": {
+                "minPrice": "0",
+                "maxPrice": "200",
+                "tickSize": "0.1",
+            },
+            "LOT_SIZE": {
+                "minQty": "0.1",
+                "maxQty": "100",
+                "stepSize": "0.1",
+            },
+            "MIN_NOTIONAL": {"minNotional": "5"},
+            "PERCENT_PRICE_BY_SIDE": {
+                "multiplierUp": "1.5",
+                "multiplierDown": "0.5",
+                "bidMultiplierUp": "1.01",
+                "bidMultiplierDown": "0.99",
+                "askMultiplierUp": "1.5",
+                "askMultiplierDown": "0.5",
+            },
+        }
+    }
+
+    price_adj, qty_adj, rejection = sim._apply_filters_limit(
+        "BUY", 170.0, 0.5, ref_price=100.0
+    )
+
+    assert rejection is None
+    assert price_adj == pytest.approx(170.0)
+    assert qty_adj == pytest.approx(0.5)
+
+
 def test_market_pop_ready_requantizes_post_risk_quantity():
     sim = make_sim(strict=True)
     sim._last_ref_price = 100.0
