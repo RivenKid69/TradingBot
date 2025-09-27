@@ -5,7 +5,7 @@ import json
 import math
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any, Tuple
 
@@ -162,7 +162,10 @@ class Quantizer:
         self.strict = bool(strict)
         self._filters: Dict[str, SymbolFilters] = {}
         for sym, f in (filters or {}).items():
-            self._filters[sym] = SymbolFilters.from_exchange_filters(f or {})
+            key = self._normalize_symbol_key(sym)
+            if not key:
+                continue
+            self._filters[key] = SymbolFilters.from_exchange_filters(f or {})
 
     # ------------ Вспомогательные методы ------------
     @staticmethod
@@ -181,11 +184,28 @@ class Quantizer:
         return snapped_units * step
 
     # ------------ Публичные методы ------------
+    @staticmethod
+    def _normalize_symbol_key(symbol: Any) -> str:
+        try:
+            text = str(symbol).strip()
+        except Exception:
+            return ""
+        return text.upper()
+
+    def _get_filters(self, symbol: str) -> Optional[SymbolFilters]:
+        key = self._normalize_symbol_key(symbol)
+        if not key:
+            return None
+        return self._filters.get(key)
+
     def has_symbol(self, symbol: str) -> bool:
-        return symbol in self._filters
+        key = self._normalize_symbol_key(symbol)
+        if not key:
+            return False
+        return key in self._filters
 
     def get_commission_step(self, symbol: str) -> float:
-        f = self._filters.get(symbol)
+        f = self._get_filters(symbol)
         if not f:
             return 0.0
         step = float(f.commission_step or 0.0)
@@ -200,7 +220,7 @@ class Quantizer:
         return 0.0
 
     def quantize_price(self, symbol: str, price: Number) -> Number:
-        f = self._filters.get(symbol)
+        f = self._get_filters(symbol)
         if not f:
             return float(price)
         p = float(price)
@@ -213,7 +233,7 @@ class Quantizer:
         return p
 
     def quantize_qty(self, symbol: str, qty: Number) -> Number:
-        f = self._filters.get(symbol)
+        f = self._get_filters(symbol)
         if not f:
             return float(qty)
         q = abs(float(qty))
@@ -226,7 +246,7 @@ class Quantizer:
         return q
 
     def clamp_notional(self, symbol: str, price: Number, qty: Number) -> Number:
-        f = self._filters.get(symbol)
+        f = self._get_filters(symbol)
         if not f:
             return float(qty)
         notional = abs(float(price) * float(qty))
@@ -253,7 +273,7 @@ class Quantizer:
         Проверка PERCENT_PRICE_BY_SIDE (для spot) или PERCENT_PRICE (для futures).
         :param side: "BUY" или "SELL"
         """
-        f = self._filters.get(symbol)
+        f = self._get_filters(symbol)
         if not f or f.multiplier_up is None or f.multiplier_down is None:
             return True
         p = float(price)
@@ -289,7 +309,7 @@ class Quantizer:
 
         quantized_price = float(self.quantize_price(symbol, price))
         quantized_qty = float(self.quantize_qty(symbol, qty))
-        filters = self._filters.get(symbol)
+        filters = self._get_filters(symbol)
 
         # Detect quantity being clipped to zero by LOT_SIZE
         if filters and quantized_qty <= 0.0 and float(qty) > 0.0 and filters.qty_min > 0.0:
@@ -352,6 +372,18 @@ class Quantizer:
         return OrderCheckResult(price=quantized_price, qty=quantized_qty)
 
     # ------------ Фабрики загрузки ------------
+    def raw_filters(self) -> Dict[str, Dict[str, Any]]:
+        exported: Dict[str, Dict[str, Any]] = {}
+        for key, value in self._filters.items():
+            try:
+                exported[key] = asdict(value)
+            except Exception:
+                try:
+                    exported[key] = dict(vars(value))
+                except Exception:
+                    exported[key] = {}
+        return exported
+
     @classmethod
     def from_json_file(cls, path: str, strict: bool = True) -> "Quantizer":
         with open(path, "r", encoding="utf-8") as f:

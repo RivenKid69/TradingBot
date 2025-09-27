@@ -244,6 +244,43 @@ def test_market_clamp_notional_growth_rejected_by_qty_limits():
     assert rejection.message == "Quantity above maximum"
 
 
+def test_lowercase_filters_enforce_strict_checks():
+    ref_price_high = 10000.0
+    ref_price_low = 50.0
+    lowercase_filters = {
+        "testusdt": {
+            "PRICE_FILTER": {"minPrice": "0", "maxPrice": "100000", "tickSize": "0.1"},
+            "LOT_SIZE": {"minQty": "0.1", "maxQty": "5", "stepSize": "0.1"},
+            "MIN_NOTIONAL": {"minNotional": "400"},
+        }
+    }
+
+    sim = ExecutionSimulator(symbol="TESTUSDT", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.set_quantizer(Quantizer(lowercase_filters, strict=True))
+
+    assert "TESTUSDT" in sim.filters
+
+    order_check = sim.quantizer_impl.validate_order(
+        "TESTUSDT", "BUY", ref_price_high, 0.05, ref_price_high, enforce_ppbs=False
+    )
+    assert order_check.reason_code is None
+    assert order_check.qty == pytest.approx(0.1)
+
+    qty_total, rejection = sim._apply_filters_market("BUY", 0.05, ref_price=ref_price_high)
+    assert qty_total == pytest.approx(0.1)
+    assert rejection is None
+
+    forced_qty = (
+        float(lowercase_filters["testusdt"]["MIN_NOTIONAL"]["minNotional"]) / ref_price_low
+    )
+    qty_total, rejection = sim._apply_filters_market("BUY", forced_qty, ref_price=ref_price_low)
+    assert qty_total == pytest.approx(0.0)
+    assert rejection is not None
+    assert rejection.code == "MIN_NOTIONAL"
+
+
 def test_next_open_risk_adjustment_revalidated_by_filters():
     sim = make_sim(strict=True)
     sim._last_ref_price = 100.0

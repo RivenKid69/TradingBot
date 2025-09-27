@@ -1208,6 +1208,126 @@ class ExecutionSimulator:
         return {}
 
     @staticmethod
+    def _normalize_symbol_key(symbol: Any) -> str:
+        try:
+            text = str(symbol).strip()
+        except Exception:
+            return ""
+        return text.upper()
+
+    @classmethod
+    def _normalize_filters_payload(
+        cls, filters: Mapping[str, Any]
+    ) -> Dict[str, Dict[str, Any]]:
+        normalized: Dict[str, Dict[str, Any]] = {}
+        if not isinstance(filters, Mapping):
+            return normalized
+        try:
+            items = filters.items()
+        except Exception:
+            try:
+                items = dict(filters).items()  # type: ignore[call-arg]
+            except Exception:
+                return normalized
+        for sym, value in items:
+            key = cls._normalize_symbol_key(sym)
+            if not key:
+                continue
+            entry: Dict[str, Any] = {}
+            if isinstance(value, Mapping):
+                try:
+                    entry = {str(k): v for k, v in value.items()}
+                except Exception:
+                    try:
+                        entry = dict(value)
+                    except Exception:
+                        entry = cls._plain_mapping(value)
+            else:
+                entry = cls._plain_mapping(value)
+            normalized[key] = entry
+        return normalized
+
+    @classmethod
+    def _uppercase_mapping_view(cls, mapping: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not isinstance(mapping, Mapping):
+            return {}
+        try:
+            keys = list(mapping.keys())
+        except Exception:
+            keys = []
+        if keys:
+            uppercase_only = True
+            for raw_key in keys:
+                normalized = cls._normalize_symbol_key(raw_key)
+                if not normalized:
+                    continue
+                try:
+                    original = str(raw_key).strip()
+                except Exception:
+                    uppercase_only = False
+                    break
+                if normalized != original:
+                    uppercase_only = False
+                    break
+            if uppercase_only:
+                return mapping
+
+        class _UpperCaseMappingView(Mapping[str, Any]):  # type: ignore[type-arg]
+            def __init__(self, source: Mapping[str, Any]) -> None:
+                self._source = source
+                self._cache: Dict[str, Any] = {}
+                self._rebuild()
+
+            def _rebuild(self) -> None:
+                normalized: Dict[str, Any] = {}
+                for raw_key, value in self._source.items():
+                    key = cls._normalize_symbol_key(raw_key)
+                    if not key:
+                        continue
+                    if key not in normalized:
+                        normalized[key] = value
+                self._cache = normalized
+
+            def __getitem__(self, key: str) -> Any:
+                normalized_key = cls._normalize_symbol_key(key)
+                if not normalized_key:
+                    raise KeyError(key)
+                try:
+                    return self._cache[normalized_key]
+                except KeyError:
+                    self._rebuild()
+                    return self._cache[normalized_key]
+
+            def __iter__(self):  # type: ignore[override]
+                self._rebuild()
+                return iter(self._cache)
+
+            def __len__(self) -> int:
+                self._rebuild()
+                return len(self._cache)
+
+            def get(self, key: str, default: Any = None) -> Any:
+                normalized_key = cls._normalize_symbol_key(key)
+                if not normalized_key:
+                    return default
+                self._rebuild()
+                return self._cache.get(normalized_key, default)
+
+            def items(self):
+                self._rebuild()
+                return self._cache.items()
+
+            def keys(self):
+                self._rebuild()
+                return self._cache.keys()
+
+            def values(self):
+                self._rebuild()
+                return self._cache.values()
+
+        return _UpperCaseMappingView(mapping)
+
+    @staticmethod
     def _make_legacy_quantizer_impl(
         quantizer: Any,
         *,
@@ -1232,24 +1352,24 @@ class ExecutionSimulator:
 
                 filters_payload: Dict[str, Dict[str, Any]] = {}
                 if isinstance(filters, Mapping):
+                    filters_payload = ExecutionSimulator._normalize_filters_payload(filters)
+                elif filters is not None:
                     try:
-                        filters_payload = {
-                            str(sym): dict(value or {})
-                            for sym, value in filters.items()
-                        }
+                        filters_payload = ExecutionSimulator._normalize_filters_payload(
+                            dict(filters)  # type: ignore[arg-type]
+                        )
                     except Exception:
-                        try:
-                            filters_payload = dict(filters)  # type: ignore[assignment]
-                        except Exception:
-                            filters_payload = {}
+                        filters_payload = {}
                 self._filters_raw = filters_payload
 
                 symbol_filters_attr = getattr(quantizer, "_filters", None)
                 if isinstance(symbol_filters_attr, Mapping):
                     try:
-                        self.symbol_filters = dict(symbol_filters_attr)
+                        self.symbol_filters = ExecutionSimulator._uppercase_mapping_view(
+                            symbol_filters_attr
+                        )
                     except Exception:
-                        self.symbol_filters = symbol_filters_attr
+                        self.symbol_filters = {}
                 else:
                     self.symbol_filters = {}
 
@@ -1679,6 +1799,7 @@ class ExecutionSimulator:
                 metadata_payload = None
 
             filters_dict = dict(filters_payload or {})
+            filters_dict = self._normalize_filters_payload(filters_dict)
             metadata_dict = (
                 dict(metadata_payload)
                 if isinstance(metadata_payload, Mapping)
@@ -3310,23 +3431,11 @@ class ExecutionSimulator:
         filters_payload: Dict[str, Dict[str, Any]] = {}
         raw_filters = getattr(impl, "_filters_raw", None)
         if isinstance(raw_filters, Mapping):
-            try:
-                filters_payload = {
-                    str(sym): dict(value or {})
-                    for sym, value in raw_filters.items()
-                }
-            except Exception:
-                try:
-                    filters_payload = dict(raw_filters)
-                except Exception:
-                    filters_payload = {}
+            filters_payload = self._normalize_filters_payload(raw_filters)
         elif hasattr(impl, "filters"):
             candidate = getattr(impl, "filters")
             if isinstance(candidate, Mapping):
-                try:
-                    filters_payload = dict(candidate)
-                except Exception:
-                    filters_payload = {}
+                filters_payload = self._normalize_filters_payload(candidate)
         self.filters = filters_payload
 
         try:
@@ -3335,7 +3444,14 @@ class ExecutionSimulator:
             symbol_filters = None
         if symbol_filters is not None:
             try:
-                setattr(self, "symbol_filters", symbol_filters)
+                if isinstance(symbol_filters, Mapping):
+                    setattr(
+                        self,
+                        "symbol_filters",
+                        self._uppercase_mapping_view(symbol_filters),
+                    )
+                else:
+                    setattr(self, "symbol_filters", symbol_filters)
             except Exception:
                 pass
 
@@ -3389,11 +3505,18 @@ class ExecutionSimulator:
 
         strict_flag = bool(self.strict_filters)
         enforce_flag = bool(self.enforce_ppbs)
-        filters_payload = (
-            dict(self.filters)
-            if isinstance(self.filters, Mapping) and self.filters
-            else None
-        )
+        filters_payload: Optional[Dict[str, Dict[str, Any]]]
+        if isinstance(self.filters, Mapping) and self.filters:
+            filters_payload = self._normalize_filters_payload(self.filters)
+        else:
+            filters_payload = None
+        if filters_payload is None:
+            export_raw = getattr(q, "raw_filters", None)
+            if callable(export_raw):
+                try:
+                    filters_payload = self._normalize_filters_payload(export_raw())
+                except Exception:
+                    filters_payload = None
         wrapper = self._make_legacy_quantizer_impl(
             q,
             strict=strict_flag,
@@ -8291,6 +8414,16 @@ class ExecutionSimulator:
                 qty_quantized = float(getattr(result, "qty", qty_raw))
             except (TypeError, ValueError):
                 qty_quantized = float(qty_raw)
+            if not validations_enabled and qty_quantized <= 0.0 and qty_raw > 0.0:
+                min_qty = 0.0
+                if filters is not None:
+                    try:
+                        min_qty = float(getattr(filters, "qty_min", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        min_qty = 0.0
+                qty_quantized = float(qty_raw)
+                if min_qty > 0.0:
+                    qty_quantized = max(qty_quantized, float(min_qty))
             reason = self._order_check_to_filter_reason(result)
             if reason is not None and validations_enabled:
                 return qty_quantized, reason
@@ -8598,6 +8731,16 @@ class ExecutionSimulator:
                 qty_quantized = float(getattr(result, "qty", qty_raw))
             except (TypeError, ValueError):
                 qty_quantized = float(qty_raw)
+            if not validations_enabled and qty_quantized <= 0.0 and qty_raw > 0.0:
+                min_qty = 0.0
+                if filters is not None:
+                    try:
+                        min_qty = float(getattr(filters, "qty_min", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        min_qty = 0.0
+                qty_quantized = float(qty_raw)
+                if min_qty > 0.0:
+                    qty_quantized = max(qty_quantized, float(min_qty))
             reason = self._order_check_to_filter_reason(result)
             if reason is not None and validations_enabled:
                 return price_quantized, qty_quantized, reason
