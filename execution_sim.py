@@ -9697,9 +9697,13 @@ class ExecutionSimulator:
                     continue
 
                 filled = False
+                maker_fill = False
                 liquidity_role = "taker"
                 filled_price = float(price_q)
+                limit_price_value = float(price_q)
                 exec_qty = qty_q
+                intrabar_fill_price = self._finite_float(limit_intrabar_price)
+                tolerance = 1e-12
                 if self._last_bid is not None or self._last_ask is not None:
                     best_ask = self._last_ask
                     best_bid = self._last_bid
@@ -9713,7 +9717,14 @@ class ExecutionSimulator:
                         elif best_ask is not None and price_q < best_ask:
                             filled_price = float(price_q)
                             liquidity_role = "maker"
-                            filled = False
+                            if (
+                                intrabar_fill_price is not None
+                                and intrabar_fill_price <= limit_price_value + tolerance
+                            ):
+                                maker_fill = True
+                                filled = True
+                            else:
+                                filled = False
                     else:  # SELL
                         if best_bid is not None and price_q <= best_bid:
                             filled_price = float(best_bid)
@@ -9724,7 +9735,14 @@ class ExecutionSimulator:
                         elif best_bid is not None and price_q > best_bid:
                             filled_price = float(price_q)
                             liquidity_role = "maker"
-                            filled = False
+                            if (
+                                intrabar_fill_price is not None
+                                and intrabar_fill_price >= limit_price_value - tolerance
+                            ):
+                                maker_fill = True
+                                filled = True
+                            else:
+                                filled = False
 
                 if filled and liquidity_role == "taker":
                     if tif == "FOK" and exec_qty + 1e-12 < qty_q:
@@ -9784,11 +9802,12 @@ class ExecutionSimulator:
                             continue
                         qty_q = qty_q - exec_qty
                         filled = False
+                        maker_fill = False
                         liquidity_role = "maker"
                     else:
                         continue
 
-                if filled and liquidity_role == "maker":
+                if maker_fill and liquidity_role == "maker":
                     if tif in ("IOC", "FOK"):
                         _cancel(p.client_order_id, tif)
                         continue
