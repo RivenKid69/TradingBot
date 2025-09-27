@@ -1776,6 +1776,8 @@ class ExecutionSimulator:
         self._fees_quote_currency_cache: Dict[str, Optional[str]] = {}
         self._fees_conversion_requests: Dict[str, float] = {}
         self._fees_last_quote_equivalent: Optional[float] = None
+        self._fees_last_fee_info: Optional[Dict[str, Any]] = None
+        self._fees_pending_settlements: Dict[Tuple[str, Optional[str]], float] = {}
         self._maker_taker_share_cfg: Optional[Dict[str, Any]] = None
         self._maker_taker_share_enabled: bool = False
         self._maker_taker_share_mode: Optional[str] = None
@@ -4498,6 +4500,14 @@ class ExecutionSimulator:
         return key or None
 
     @staticmethod
+    def _normalise_currency(currency: Optional[str]) -> Optional[str]:
+        if isinstance(currency, str):
+            value = currency.strip().upper()
+            if value:
+                return value
+        return None
+
+    @staticmethod
     def _fees_extract_quote_currency(
         mapping: Any,
         symbol_key: Optional[str],
@@ -4851,16 +4861,157 @@ class ExecutionSimulator:
                 settlement_currency or "BNB",
             )
 
+    def _fees_store_last_info(
+        self,
+        *,
+        symbol: Optional[str],
+        quote_currency: Optional[str],
+        fee_currency: Optional[str],
+        settlement_amount: Optional[float] = None,
+        conversion_rate: Optional[float] = None,
+        requires_conversion: bool = False,
+    ) -> None:
+        info: Dict[str, Any] = {}
+        if symbol:
+            info["symbol"] = symbol
+        normalised_quote = ExecutionSimulator._normalise_currency(quote_currency)
+        if normalised_quote:
+            info["quote_currency"] = normalised_quote
+        normalised_fee = ExecutionSimulator._normalise_currency(fee_currency)
+        if normalised_fee:
+            info["currency"] = normalised_fee
+        if (
+            settlement_amount is not None
+            and math.isfinite(settlement_amount)
+            and settlement_amount > 0.0
+        ):
+            info["settlement_amount"] = float(abs(settlement_amount))
+        if (
+            conversion_rate is not None
+            and math.isfinite(conversion_rate)
+            and conversion_rate > 0.0
+        ):
+            info["conversion_rate"] = float(conversion_rate)
+        if requires_conversion and info:
+            info["requires_conversion"] = True
+        self._fees_last_fee_info = info if info else None
+
     def _fees_apply_to_cumulative(self, fee: Any) -> None:
+        pending_converted = self._fees_convert_pending_with_cached_rates()
+        if pending_converted > 0.0:
+            self.fees_cum += pending_converted
+
+        last_info = getattr(self, "_fees_last_fee_info", None)
+        quote_currency: Optional[str] = None
+        fee_currency: Optional[str] = None
+        settlement_amount: Optional[float] = None
+        conversion_rate: Optional[float] = None
+        if isinstance(last_info, Mapping):
+            quote_currency = ExecutionSimulator._normalise_currency(last_info.get("quote_currency"))
+            fee_currency = ExecutionSimulator._normalise_currency(last_info.get("currency"))
+            settlement_amount = ExecutionSimulator._trade_cost_float(
+                last_info.get("settlement_amount")
+            )
+            conversion_rate = ExecutionSimulator._trade_cost_float(
+                last_info.get("conversion_rate")
+            )
+
         quote_equivalent = ExecutionSimulator._trade_cost_float(
             getattr(self, "_fees_last_quote_equivalent", None)
         )
         fee_value = ExecutionSimulator._trade_cost_float(fee)
+
+        if fee_currency and conversion_rate is None:
+            cached_rate = None
+            if isinstance(self.fees_conversion_rates, Mapping):
+                cached_rate = self.fees_conversion_rates.get(fee_currency)
+            conversion_rate = ExecutionSimulator._trade_cost_float(cached_rate)
+
+        if (
+            quote_equivalent is None
+            and conversion_rate is not None
+            and settlement_amount is not None
+        ):
+            quote_equivalent = settlement_amount * conversion_rate
+
         if quote_equivalent is not None:
             self.fees_cum += float(quote_equivalent)
-        elif fee_value is not None:
-            self.fees_cum += float(fee_value)
+            if (
+                fee_currency
+                and quote_currency
+                and fee_currency != quote_currency
+                and conversion_rate is not None
+            ):
+                converted = self._fees_convert_pending_for_currency(
+                    fee_currency=fee_currency,
+                    quote_currency=quote_currency,
+                    conversion_rate=conversion_rate,
+                )
+                if converted > 0.0:
+                    self.fees_cum += converted
+        else:
+            if (
+                fee_currency
+                and quote_currency
+                and fee_currency != quote_currency
+            ):
+                amount = settlement_amount
+                if amount is None:
+                    amount = fee_value
+                if amount is not None and math.isfinite(amount) and amount != 0.0:
+                    amount_val = abs(float(amount))
+                    if amount_val > 0.0:
+                        key = (fee_currency, quote_currency)
+                        prev = self._fees_pending_settlements.get(key, 0.0)
+                        self._fees_pending_settlements[key] = float(prev + amount_val)
+            elif fee_value is not None:
+                self.fees_cum += float(fee_value)
+
         self._fees_last_quote_equivalent = None
+        self._fees_last_fee_info = None
+
+    def _fees_convert_pending_for_currency(
+        self,
+        *,
+        fee_currency: str,
+        quote_currency: Optional[str],
+        conversion_rate: Optional[float],
+    ) -> float:
+        if conversion_rate is None or conversion_rate <= 0.0:
+            return 0.0
+        key = (fee_currency, quote_currency)
+        pending = self._fees_pending_settlements.pop(key, 0.0)
+        if pending <= 0.0:
+            return 0.0
+        converted = pending * conversion_rate
+        if not math.isfinite(converted) or converted <= 0.0:
+            return 0.0
+        return float(converted)
+
+    def _fees_convert_pending_with_cached_rates(self) -> float:
+        if not isinstance(self._fees_pending_settlements, Mapping):
+            return 0.0
+        converted_total = 0.0
+        to_remove: List[Tuple[str, Optional[str]]] = []
+        for key, pending in list(self._fees_pending_settlements.items()):
+            if pending <= 0.0:
+                to_remove.append(key)
+                continue
+            currency, quote_currency = key
+            cached_rate = None
+            if isinstance(self.fees_conversion_rates, Mapping):
+                cached_rate = self.fees_conversion_rates.get(currency)
+            conversion_rate = ExecutionSimulator._trade_cost_float(cached_rate)
+            if conversion_rate is None or conversion_rate <= 0.0:
+                continue
+            converted = pending * conversion_rate
+            if not math.isfinite(converted) or converted <= 0.0:
+                continue
+            converted_total += float(converted)
+            to_remove.append(key)
+        for key in to_remove:
+            self._fees_pending_settlements.pop(key, None)
+        return converted_total
 
     def _refresh_slippage_share_info(self) -> None:
         getter = getattr(self, "_slippage_get_maker_taker_share_info", None)
@@ -5204,6 +5355,7 @@ class ExecutionSimulator:
         liquidity: str,
     ) -> float:
         self._fees_last_quote_equivalent = None
+        self._fees_last_fee_info = None
         side_key = str(side).upper()
         liquidity_key = str(liquidity).lower()
         if liquidity_key not in ("maker", "taker") and logger.isEnabledFor(logging.DEBUG):
@@ -5223,6 +5375,7 @@ class ExecutionSimulator:
             return 0.0
 
         symbol_value: Optional[str] = getattr(self, "symbol", None)
+        quote_currency = self._resolve_quote_currency(symbol_value)
         is_maker = liquidity_key == "maker"
         rate_bps = self._resolve_fee_rate_bps(symbol=symbol_value, is_maker=is_maker)
         fee_model = getattr(self, "fees", None)
@@ -5294,6 +5447,11 @@ class ExecutionSimulator:
                                     symbol=symbol_value,
                                     settlement_currency=settlement_currency,
                                 )
+                            self._fees_store_last_info(
+                                symbol=symbol_value,
+                                quote_currency=quote_currency,
+                                fee_currency=quote_currency,
+                            )
                             if logger.isEnabledFor(logging.DEBUG):
                                 extra = {
                                     "event": "trade_fee",
@@ -5368,7 +5526,17 @@ class ExecutionSimulator:
 
                     if fee_amount is not None and fee_amount > 0.0:
                         fee_out = float(fee_amount)
-                        quote_currency = self._resolve_quote_currency(symbol_value)
+                        settlement_currency_norm = ExecutionSimulator._normalise_currency(
+                            settlement_currency
+                        )
+                        if settlement_currency_norm is None and use_bnb_settlement:
+                            settlement_currency_norm = "BNB"
+                        quote_currency_norm = ExecutionSimulator._normalise_currency(
+                            quote_currency
+                        )
+                        fee_currency = quote_currency_norm
+                        settlement_record_amount: Optional[float] = None
+                        inferred_conversion_rate: Optional[float] = None
                         conversion_rate: Optional[float] = None
                         if conversion_used is not None:
                             try:
@@ -5403,6 +5571,67 @@ class ExecutionSimulator:
                                 fee_quote_equivalent = None
                         else:
                             fee_quote_equivalent = fee_out
+
+                        if (
+                            settlement_currency_norm
+                            and settlement_currency_norm != quote_currency_norm
+                        ):
+                            settlement_record_amount = fee_out
+                            fee_currency = settlement_currency_norm
+                        elif (
+                            use_bnb_settlement
+                            and settlement_currency_norm
+                            and settlement_currency_norm != quote_currency_norm
+                        ):
+                            settlement_record_amount = fee_out
+                            fee_currency = settlement_currency_norm
+
+                        if (
+                            settlement_record_amount is not None
+                            and settlement_record_amount > 0.0
+                            and fee_quote_equivalent is not None
+                        ):
+                            try:
+                                inferred_conversion_rate = float(fee_quote_equivalent) / float(
+                                    settlement_record_amount
+                                )
+                            except (TypeError, ValueError, ZeroDivisionError):
+                                inferred_conversion_rate = None
+                            else:
+                                if not math.isfinite(inferred_conversion_rate) or inferred_conversion_rate <= 0.0:
+                                    inferred_conversion_rate = None
+                        if conversion_rate is None and inferred_conversion_rate is not None:
+                            conversion_rate = float(inferred_conversion_rate)
+
+                        if (
+                            conversion_rate is not None
+                            and fee_currency
+                            and quote_currency_norm
+                            and fee_currency != quote_currency_norm
+                        ):
+                            try:
+                                self.fees_conversion_rates[fee_currency] = float(conversion_rate)
+                            except Exception:
+                                pass
+
+                        requires_conversion_info = bool(
+                            needs_conversion
+                            or (
+                                fee_currency
+                                and quote_currency_norm
+                                and fee_currency != quote_currency_norm
+                                and conversion_rate is None
+                            )
+                        )
+
+                        self._fees_store_last_info(
+                            symbol=symbol_value,
+                            quote_currency=quote_currency,
+                            fee_currency=fee_currency or quote_currency_norm,
+                            settlement_amount=settlement_record_amount,
+                            conversion_rate=conversion_rate,
+                            requires_conversion=requires_conversion_info,
+                        )
 
                         if needs_conversion:
                             self._fees_request_bnb_conversion(
@@ -5468,6 +5697,11 @@ class ExecutionSimulator:
                 if commission_step_val is not None:
                     extra["commission_step"] = float(commission_step_val)
                 logger.debug("trade fee computed", extra=extra)
+            self._fees_store_last_info(
+                symbol=symbol_value,
+                quote_currency=quote_currency,
+                fee_currency=quote_currency,
+            )
             return fee_out
 
         if allow_simple:
@@ -5494,6 +5728,11 @@ class ExecutionSimulator:
                         if commission_step_val is not None:
                             extra["commission_step"] = float(commission_step_val)
                         logger.debug("trade fee computed", extra=extra)
+                    self._fees_store_last_info(
+                        symbol=symbol_value,
+                        quote_currency=quote_currency,
+                        fee_currency=quote_currency,
+                    )
                     return fee_out
 
         if logger.isEnabledFor(logging.DEBUG):
