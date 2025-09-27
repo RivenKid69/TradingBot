@@ -190,6 +190,23 @@ def test_execution_simulator_close_lag_applied():
     assert all(t.ts == 1_002_000 for t in release.trades)
 
 
+def test_run_step_reports_new_order_position_alignment(base_sim):
+    sim = base_sim
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=1.0)
+    report = sim.run_step(
+        ts=1_000,
+        ref_price=100.0,
+        bid=99.5,
+        ask=100.5,
+        liquidity=1.0,
+        actions=[(ActionType.MARKET, proto)],
+    )
+
+    assert report.new_order_ids
+    assert len(report.new_order_ids) == len(report.new_order_pos)
+    assert report.new_order_pos == [0] * len(report.new_order_ids)
+
+
 def test_mkt_open_next_h1_profile_close_lag(base_sim):
     sim = base_sim
     sim.close_lag_ms = 1500
