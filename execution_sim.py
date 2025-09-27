@@ -3137,6 +3137,7 @@ class ExecutionSimulator:
         self._next_open_cancelled_reasons = {}
         new_order_ids = list(self._next_open_new_orders)
         self._next_open_new_orders = []
+        new_order_pos = [0 for _ in new_order_ids]
         risk_events_all: List[RiskEvent] = list(self._next_open_ready_risk_events)  # type: ignore[var-annotated]
         self._next_open_ready_risk_events.clear()
         status = self._next_open_ready_status
@@ -3220,7 +3221,7 @@ class ExecutionSimulator:
             cancelled_reasons=cancelled_reasons,
             new_order_ids=new_order_ids,
             fee_total=fee_total,
-            new_order_pos=[],
+            new_order_pos=new_order_pos,
             funding_cashflow=funding_cashflow,
             funding_events=funding_events_list,  # type: ignore
             position_qty=float(self.position_qty),
