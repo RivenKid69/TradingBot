@@ -756,11 +756,12 @@ class SymbolFilterSnapshot:
             # minimum while keeping the result a multiple of ``qty_step``.
             if qty_min > 0.0:
                 ratio = qty_min / qty_step
-                # Subtracting a tiny epsilon compensates for floating-point
-                # rounding errors when ``qty_min`` is already an exact multiple
-                # of ``qty_step``.
-                steps = math.ceil(ratio - 1e-12)
-                steps = max(steps, 1)
+                nearest = round(ratio)
+                tolerance = max(math.ulp(ratio), math.ulp(float(nearest)))
+                if math.isclose(ratio, nearest, rel_tol=0.0, abs_tol=tolerance):
+                    steps = max(int(nearest), 1)
+                else:
+                    steps = math.ceil(ratio)
             else:
                 steps = 1
             return steps * qty_step

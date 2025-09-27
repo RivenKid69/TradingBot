@@ -17,6 +17,12 @@ def test_min_qty_threshold_without_step_uses_min_qty():
     assert filters.min_qty_threshold == pytest.approx(0.25)
 
 
+def test_min_qty_threshold_rounds_up_when_above_multiple():
+    filters = SymbolFilterSnapshot(qty_min=0.010000000000001, qty_step=0.01)
+
+    assert filters.min_qty_threshold == pytest.approx(0.02)
+
+
 @pytest.mark.parametrize(
     "qty_min, qty_step, expected",
     [
