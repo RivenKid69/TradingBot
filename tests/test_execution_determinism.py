@@ -171,3 +171,21 @@ def test_data_degradation_seed_zero_is_distinct_from_none():
 
     assert zero_val == random.Random(0).random()
     assert none_val == random.Random(123).random()
+
+
+@pytest.mark.parametrize("mode", ["python", "hash", "xor", "mix", "stable"])
+def test_intrabar_seed_modes_are_stable(mode):
+    common_kwargs = {"seed": 98765, "execution_config": {"intrabar_seed_mode": mode}}
+    sim_a = ExecutionSimulator(**common_kwargs)
+    sim_b = ExecutionSimulator(**common_kwargs)
+
+    inputs = [
+        {"bar_ts": 0, "side": "buy", "order_seq": 1},
+        {"bar_ts": 123456789, "side": "sell", "order_seq": 42},
+        {"bar_ts": None, "side": "BUY", "order_seq": 7},
+    ]
+
+    seeds_a = [sim_a._intrabar_rng_seed(**params) for params in inputs]
+    seeds_b = [sim_b._intrabar_rng_seed(**params) for params in inputs]
+
+    assert seeds_a == seeds_b

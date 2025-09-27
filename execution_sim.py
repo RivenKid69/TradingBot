@@ -6724,14 +6724,17 @@ class ExecutionSimulator:
         side_val = str(side).upper()
         key = f"{self.symbol}|{ts_val}|{side_val}|{int(order_seq)}|{int(self.seed)}"
         mode = (self._intrabar_seed_mode or "stable").strip().lower()
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        digest_prefix = digest[:8]
+        stable_unsigned = int.from_bytes(digest_prefix, "big", signed=False)
+        stable_signed = int.from_bytes(digest_prefix, "big", signed=True)
         if mode in {"off", "none"}:
             return int(self.seed)
         if mode in {"python", "hash"}:
-            return hash(key)
+            return stable_signed
         if mode in {"xor", "mix"}:
-            return hash(key) ^ int(self.seed)
-        digest = hashlib.sha256(key.encode("utf-8")).digest()
-        return int.from_bytes(digest[:8], "big", signed=False)
+            return stable_signed ^ int(self.seed)
+        return stable_unsigned
 
     def _clip_to_bar_range(self, price: float) -> tuple[float, bool]:
         """Clip ``price`` to the latest bar range when available."""
