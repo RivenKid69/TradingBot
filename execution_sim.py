@@ -8067,7 +8067,15 @@ class ExecutionSimulator:
         quantizer = self.quantizer
         filters = self._current_symbol_filters()
         validations_enabled = bool(self.strict_filters and filters is not None)
-        tolerance = 1e-12
+        base_tolerance = 1e-12
+        qty_tol = base_tolerance
+        if validations_enabled and filters is not None:
+            try:
+                qty_step = float(getattr(filters, "qty_step", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                qty_step = 0.0
+            if qty_step > 0.0 and math.isfinite(qty_step):
+                qty_tol = min(base_tolerance, qty_step / 2.0)
 
         quant_result: Any = None
         quantize_order = getattr(quantizer, "quantize_order", None)
@@ -8122,7 +8130,7 @@ class ExecutionSimulator:
             return 0.0, reason
 
         min_qty = filters.min_qty_threshold
-        if min_qty > 0.0 and qty_quantized + tolerance < min_qty:
+        if min_qty > 0.0 and qty_quantized + qty_tol < min_qty:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity below minimum",
@@ -8134,7 +8142,7 @@ class ExecutionSimulator:
             )
             return 0.0, reason
 
-        if filters.qty_max < float("inf") and qty_quantized - tolerance > filters.qty_max:
+        if filters.qty_max < float("inf") and qty_quantized - qty_tol > filters.qty_max:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity above maximum",
@@ -8144,9 +8152,9 @@ class ExecutionSimulator:
 
         if filters.qty_step > 0.0:
             snapped_qty = self._snap_qty_with_tolerance(
-                qty_quantized, filters.qty_step, tolerance
+                qty_quantized, filters.qty_step, qty_tol
             )
-            if abs(qty_quantized - snapped_qty) > tolerance:
+            if abs(qty_quantized - snapped_qty) > qty_tol:
                 reason = FilterRejectionReason(
                     code="LOT_SIZE",
                     message="Quantity not aligned to step",
@@ -8228,7 +8236,7 @@ class ExecutionSimulator:
                 )
                 return 0.0, reason
 
-            if min_qty > 0.0 and qty_for_notional + tolerance < min_qty:
+            if min_qty > 0.0 and qty_for_notional + qty_tol < min_qty:
                 reason = FilterRejectionReason(
                     code="LOT_SIZE",
                     message="Quantity below minimum",
@@ -8242,7 +8250,7 @@ class ExecutionSimulator:
 
             if (
                 filters.qty_max < float("inf")
-                and qty_for_notional - tolerance > filters.qty_max
+                and qty_for_notional - qty_tol > filters.qty_max
             ):
                 reason = FilterRejectionReason(
                     code="LOT_SIZE",
@@ -8256,9 +8264,9 @@ class ExecutionSimulator:
 
             if filters.qty_step > 0.0:
                 snapped_qty = self._snap_qty_with_tolerance(
-                    qty_for_notional, filters.qty_step, tolerance
+                    qty_for_notional, filters.qty_step, qty_tol
                 )
-                if abs(qty_for_notional - snapped_qty) > tolerance:
+                if abs(qty_for_notional - snapped_qty) > qty_tol:
                     reason = FilterRejectionReason(
                         code="LOT_SIZE",
                         message="Quantity not aligned to step",
@@ -8270,7 +8278,10 @@ class ExecutionSimulator:
                     return 0.0, reason
 
         notional = abs(ref_val * qty_for_notional)
-        if not math.isfinite(notional) or notional + tolerance < filters.min_notional:
+        if (
+            not math.isfinite(notional)
+            or notional + base_tolerance < filters.min_notional
+        ):
             reason = FilterRejectionReason(
                 code="MIN_NOTIONAL",
                 message="Notional below minimum",
@@ -8344,7 +8355,22 @@ class ExecutionSimulator:
         quantizer = self.quantizer
         filters = self._current_symbol_filters()
         validations_enabled = bool(self.strict_filters and filters is not None)
-        tolerance = 1e-12
+        base_tolerance = 1e-12
+        qty_tol = base_tolerance
+        price_tol = base_tolerance
+        if validations_enabled and filters is not None:
+            try:
+                qty_step = float(getattr(filters, "qty_step", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                qty_step = 0.0
+            if qty_step > 0.0 and math.isfinite(qty_step):
+                qty_tol = min(base_tolerance, qty_step / 2.0)
+            try:
+                price_tick = float(getattr(filters, "price_tick", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                price_tick = 0.0
+            if price_tick > 0.0 and math.isfinite(price_tick):
+                price_tol = min(base_tolerance, price_tick / 2.0)
         ref_ppbs = self._resolve_filter_reference(ref_price)
         enforce_ppbs = bool(self.enforce_ppbs and validations_enabled)
 
@@ -8427,7 +8453,7 @@ class ExecutionSimulator:
             )
             return 0.0, 0.0, reason
 
-        if filters.price_min > 0.0 and price_quantized + tolerance < filters.price_min:
+        if filters.price_min > 0.0 and price_quantized + price_tol < filters.price_min:
             reason = FilterRejectionReason(
                 code="PRICE_FILTER",
                 message="Price below minimum",
@@ -8440,7 +8466,7 @@ class ExecutionSimulator:
             return 0.0, 0.0, reason
 
         if math.isfinite(filters.price_max) and filters.price_max > 0.0:
-            if price_quantized - tolerance > filters.price_max:
+            if price_quantized - price_tol > filters.price_max:
                 reason = FilterRejectionReason(
                     code="PRICE_FILTER",
                     message="Price above maximum",
@@ -8457,23 +8483,23 @@ class ExecutionSimulator:
             if not math.isfinite(origin) or origin <= 0.0:
                 origin = 0.0
             offset = price_quantized - origin
-            if offset < 0.0 and abs(offset) <= tolerance:
+            if offset < 0.0 and abs(offset) <= price_tol:
                 offset = 0.0
             step_size = filters.price_tick
             if step_size <= 0.0 or not math.isfinite(step_size):
                 step_size = 0.0
             if step_size > 0.0:
-                steps = math.floor((offset + tolerance) / step_size)
+                steps = math.floor((offset + price_tol) / step_size)
                 if steps < 0:
                     steps = 0
                 snapped = origin + steps * step_size
                 snapped_next = snapped + step_size
                 diff_primary = abs(price_quantized - snapped)
                 diff_next = abs(price_quantized - snapped_next)
-                if diff_primary <= tolerance:
+                if diff_primary <= price_tol:
                     aligned = True
                     snap_target = snapped
-                elif diff_next <= tolerance:
+                elif diff_next <= price_tol:
                     aligned = True
                     snap_target = snapped_next
                 else:
@@ -8508,7 +8534,7 @@ class ExecutionSimulator:
             return price_quantized, 0.0, reason
 
         min_qty = filters.min_qty_threshold
-        if min_qty > 0.0 and qty_quantized + tolerance < min_qty:
+        if min_qty > 0.0 and qty_quantized + qty_tol < min_qty:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity below minimum",
@@ -8521,7 +8547,7 @@ class ExecutionSimulator:
             )
             return price_quantized, 0.0, reason
 
-        if filters.qty_max < float("inf") and qty_quantized - tolerance > filters.qty_max:
+        if filters.qty_max < float("inf") and qty_quantized - qty_tol > filters.qty_max:
             reason = FilterRejectionReason(
                 code="LOT_SIZE",
                 message="Quantity above maximum",
@@ -8535,9 +8561,9 @@ class ExecutionSimulator:
 
         if filters.qty_step > 0.0:
             snapped_qty = self._snap_qty_with_tolerance(
-                qty_quantized, filters.qty_step, tolerance
+                qty_quantized, filters.qty_step, qty_tol
             )
-            if abs(qty_quantized - snapped_qty) > tolerance:
+            if abs(qty_quantized - snapped_qty) > qty_tol:
                 reason = FilterRejectionReason(
                     code="LOT_SIZE",
                     message="Quantity not aligned to step",
@@ -8628,7 +8654,7 @@ class ExecutionSimulator:
                 )
                 return price_quantized, 0.0, reason
 
-            if min_qty > 0.0 and qty_for_notional + tolerance < min_qty:
+            if min_qty > 0.0 and qty_for_notional + qty_tol < min_qty:
                 reason = FilterRejectionReason(
                     code="LOT_SIZE",
                     message="Quantity below minimum",
@@ -8643,7 +8669,7 @@ class ExecutionSimulator:
 
             if (
                 filters.qty_max < float("inf")
-                and qty_for_notional - tolerance > filters.qty_max
+                and qty_for_notional - qty_tol > filters.qty_max
             ):
                 reason = FilterRejectionReason(
                     code="LOT_SIZE",
@@ -8658,9 +8684,9 @@ class ExecutionSimulator:
 
             if filters.qty_step > 0.0:
                 snapped_qty = self._snap_qty_with_tolerance(
-                    qty_for_notional, filters.qty_step, tolerance
+                    qty_for_notional, filters.qty_step, qty_tol
                 )
-                if abs(qty_for_notional - snapped_qty) > tolerance:
+                if abs(qty_for_notional - snapped_qty) > qty_tol:
                     reason = FilterRejectionReason(
                         code="LOT_SIZE",
                         message="Quantity not aligned to step",
@@ -8672,7 +8698,10 @@ class ExecutionSimulator:
                     )
                     return price_quantized, 0.0, reason
             notional = abs(price_for_notional * qty_for_notional)
-            if not math.isfinite(notional) or notional + tolerance < filters.min_notional:
+            if (
+                not math.isfinite(notional)
+                or notional + base_tolerance < filters.min_notional
+            ):
                 reason = FilterRejectionReason(
                     code="MIN_NOTIONAL",
                     message="Notional below minimum",
@@ -8706,11 +8735,11 @@ class ExecutionSimulator:
                     ppbs_ok = True
                     if mult_up is not None:
                         allowed_up = ref_ppbs * float(mult_up)
-                        if price_quantized - tolerance > allowed_up:
+                        if price_quantized - price_tol > allowed_up:
                             ppbs_ok = False
                     if ppbs_ok and mult_down is not None:
                         allowed_down = ref_ppbs * float(mult_down)
-                        if price_quantized + tolerance < allowed_down:
+                        if price_quantized + price_tol < allowed_down:
                             ppbs_ok = False
                 if not ppbs_ok:
                     reason = FilterRejectionReason(
