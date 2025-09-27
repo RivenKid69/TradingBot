@@ -8497,6 +8497,74 @@ class ExecutionSimulator:
                     )
                 normalized = alt_qty
 
+            qty_limit_tol = max(1e-12, abs(qty) * 1e-12)
+            if normalized > qty + qty_limit_tol:
+                requested_qty = min(qty, remaining)
+                try:
+                    capped_qty = float(
+                        quantizer.quantize_qty(self.symbol, requested_qty)
+                    )
+                except ValueError as exc:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message=str(exc),
+                        constraint={"quantity": requested_qty},
+                    )
+                except Exception as exc:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="quantize_qty failed",
+                        constraint={"error": str(exc), "quantity": requested_qty},
+                    )
+                if capped_qty <= 0.0:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Quantity is not positive",
+                        constraint={"quantity": capped_qty},
+                    )
+                min_qty_threshold = float(
+                    getattr(filters_snapshot, "min_qty_threshold", 0.0) or 0.0
+                )
+                if min_qty_threshold > 0.0 and capped_qty + qty_limit_tol < min_qty_threshold:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Quantity below minimum",
+                        constraint={
+                            "min_qty": min_qty_threshold,
+                            "quantity": capped_qty,
+                        },
+                    )
+                if (
+                    ref_val is not None
+                    and ref_val > 0.0
+                    and min_notional > 0.0
+                ):
+                    capped_notional = abs(ref_val * capped_qty)
+                    if (
+                        not math.isfinite(capped_notional)
+                        or capped_notional + 1e-12 < min_notional
+                    ):
+                        return 0.0, FilterRejectionReason(
+                            code="MIN_NOTIONAL",
+                            message="Notional below minimum",
+                            constraint={
+                                "min_notional": min_notional,
+                                "price": ref_val,
+                                "quantity": capped_qty,
+                                "notional": capped_notional,
+                            },
+                        )
+                normalized = min(capped_qty, remaining)
+                if normalized > qty + qty_limit_tol:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Quantity exceeds requested amount",
+                        constraint={
+                            "requested_qty": qty,
+                            "normalized_qty": normalized,
+                        },
+                    )
+
             return max(0.0, float(normalized)), None
 
         # Legacy path without quantizer: snap to exchange filters manually.
@@ -8525,23 +8593,32 @@ class ExecutionSimulator:
             qty_tol = base_tolerance
 
         candidate = min(qty, remaining)
+        original_candidate = candidate
         if qty_step > 0.0:
             snapped = self._snap_qty_with_tolerance(candidate, qty_step, qty_tol)
             if abs(snapped - candidate) > qty_tol:
-                alt_candidate = self._snap_qty_with_tolerance(remaining, qty_step, qty_tol)
-                if abs(alt_candidate - remaining) <= qty_tol and alt_candidate > 0.0:
-                    snapped = alt_candidate
-                else:
-                    return 0.0, FilterRejectionReason(
-                        code="LOT_SIZE",
-                        message="Quantity not aligned to step",
-                        constraint={
-                            "step": qty_step,
-                            "quantity": candidate,
-                            "remaining_capacity": remaining,
-                        },
+                capacity_limited = remaining > 0.0 and (
+                    remaining - original_candidate
+                ) <= qty_tol
+                if capacity_limited:
+                    alt_candidate = self._snap_qty_with_tolerance(
+                        remaining, qty_step, qty_tol
                     )
-            candidate = snapped
+                    if abs(alt_candidate - remaining) <= qty_tol and alt_candidate > 0.0:
+                        snapped = alt_candidate
+                    else:
+                        return 0.0, FilterRejectionReason(
+                            code="LOT_SIZE",
+                            message="Quantity not aligned to step",
+                            constraint={
+                                "step": qty_step,
+                                "quantity": candidate,
+                                "remaining_capacity": remaining,
+                            },
+                        )
+                candidate = snapped
+            else:
+                candidate = snapped
 
         if candidate <= 0.0:
             return 0.0, FilterRejectionReason(
@@ -8564,6 +8641,42 @@ class ExecutionSimulator:
                     },
                 )
             candidate = alt_candidate
+
+        requested_qty = min(qty, remaining)
+        if candidate > qty + qty_tol:
+            if qty_step > 0.0:
+                clamped_candidate = self._snap_qty_with_tolerance(
+                    requested_qty, qty_step, qty_tol
+                )
+                if clamped_candidate <= 0.0:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Requested quantity below step",
+                        constraint={
+                            "step": qty_step,
+                            "requested_qty": qty,
+                            "remaining_capacity": remaining,
+                        },
+                    )
+                if clamped_candidate > qty + qty_tol:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Quantity exceeds requested amount",
+                        constraint={
+                            "requested_qty": qty,
+                            "normalized_qty": clamped_candidate,
+                            "step": qty_step,
+                        },
+                    )
+                candidate = clamped_candidate
+            else:
+                candidate = min(candidate, requested_qty)
+                if candidate <= 0.0:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Quantity is not positive",
+                        constraint={"quantity": candidate},
+                    )
 
         min_qty = float(getattr(filters_snapshot, "min_qty_threshold", 0.0) or 0.0)
         if min_qty > 0.0 and candidate + qty_tol < min_qty:

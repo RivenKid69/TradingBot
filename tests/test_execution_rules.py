@@ -311,6 +311,21 @@ def test_market_clamp_notional_growth_rejected_by_qty_limits():
     assert rejection.message == "Quantity above maximum"
 
 
+def test_capacity_normalization_caps_to_requested_qty_without_quantizer():
+    sim = ExecutionSimulator(symbol="BTCUSDT", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.quantizer = None
+    sim.filters = json.loads(json.dumps(filters))
+
+    normalized, rejection = sim._normalize_capacity_quantity(
+        0.15, remaining_base=0.3, ref_price=100.0
+    )
+
+    assert rejection is None
+    assert normalized == pytest.approx(0.1)
+
+
 def test_lowercase_filters_enforce_strict_checks():
     ref_price_high = 10000.0
     ref_price_low = 50.0
