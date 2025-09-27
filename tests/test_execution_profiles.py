@@ -202,9 +202,34 @@ def test_run_step_reports_new_order_position_alignment(base_sim):
         actions=[(ActionType.MARKET, proto)],
     )
 
-    assert report.new_order_ids
     assert len(report.new_order_ids) == len(report.new_order_pos)
     assert report.new_order_pos == [0] * len(report.new_order_ids)
+
+
+def test_run_step_market_orders_do_not_emit_new_order_ids(base_sim):
+    sim = base_sim
+    proto = ActionProto(action_type=ActionType.MARKET, volume_frac=1.0)
+    report = sim.run_step(
+        ts=1_000,
+        ref_price=100.0,
+        bid=99.5,
+        ask=100.5,
+        liquidity=1.0,
+        actions=[(ActionType.MARKET, proto)],
+    )
+
+    assert report.new_order_ids == []
+    assert report.new_order_pos == []
+
+
+def test_limit_order_reports_new_order_position_alignment(base_sim):
+    sim = base_sim
+    proto = ActionProto(action_type=ActionType.LIMIT, volume_frac=1.0, abs_price=99.0)
+    oid = sim.submit(proto)
+    report = sim.pop_ready(ref_price=100.0)
+
+    assert report.new_order_ids == [oid]
+    assert report.new_order_pos == [0]
 
 
 def test_mkt_open_next_h1_profile_close_lag(base_sim):
