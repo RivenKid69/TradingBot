@@ -10359,9 +10359,20 @@ class ExecutionSimulator:
                 exec_qty = qty_q
                 intrabar_fill_price = self._finite_float(limit_intrabar_price)
                 tolerance = 1e-12
-                if self._last_bid is not None or self._last_ask is not None:
-                    best_ask = self._last_ask
-                    best_bid = self._last_bid
+                best_bid = self._finite_float(self._last_bid)
+                best_ask = self._finite_float(self._last_ask)
+                if best_bid is None and best_ask is None:
+                    synthetic_best = self._finite_float(price_q)
+                    if synthetic_best is None:
+                        synthetic_best = self._finite_float(ref_limit)
+                    if synthetic_best is None:
+                        synthetic_best = self._finite_float(ref)
+                    if synthetic_best is not None:
+                        if side == "BUY":
+                            best_ask = synthetic_best
+                        else:
+                            best_bid = synthetic_best
+                if best_bid is not None or best_ask is not None:
                     if side == "BUY":
                         if best_ask is not None and price_q >= best_ask:
                             filled_price = float(best_ask)

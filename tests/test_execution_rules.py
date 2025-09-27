@@ -139,10 +139,20 @@ def test_unquantized_limit_executes_permissive():
     report = sim.pop_ready(ref_price=100.0)
 
     assert report.cancelled_ids == []
+    assert report.new_order_ids == []
     assert len(report.trades) == 1
     trade = report.trades[0]
     assert trade.client_order_id == oid
-    assert trade.price == pytest.approx(100.0)
+    expected_price = sim.quantizer.quantize_price("BTCUSDT", proto.abs_price)
+    expected_qty = sim.quantizer.quantize_qty("BTCUSDT", abs(proto.volume_frac))
+    expected_qty = sim.quantizer.clamp_notional(
+        "BTCUSDT",
+        expected_price if expected_price > 0 else proto.abs_price,
+        expected_qty,
+    )
+    assert trade.price == pytest.approx(expected_price)
+    assert trade.qty == pytest.approx(expected_qty)
+    assert sim._last_bid is None and sim._last_ask is None
     assert sim.strict_filters is False
 
 
@@ -154,10 +164,20 @@ def test_unquantized_limit_rejected_strict():
     report = sim.pop_ready(ref_price=100.0)
 
     assert report.cancelled_ids == []
+    assert report.new_order_ids == []
     assert len(report.trades) == 1
     trade = report.trades[0]
     assert trade.client_order_id == oid
-    assert trade.price == pytest.approx(100.0)
+    expected_price = sim.quantizer.quantize_price("BTCUSDT", proto.abs_price)
+    expected_qty = sim.quantizer.quantize_qty("BTCUSDT", abs(proto.volume_frac))
+    expected_qty = sim.quantizer.clamp_notional(
+        "BTCUSDT",
+        expected_price if expected_price > 0 else proto.abs_price,
+        expected_qty,
+    )
+    assert trade.price == pytest.approx(expected_price)
+    assert trade.qty == pytest.approx(expected_qty)
+    assert sim._last_bid is None and sim._last_ask is None
 
 
 def test_cancel_all_cancels_open_limits():
