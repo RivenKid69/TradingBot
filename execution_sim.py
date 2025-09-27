@@ -10246,7 +10246,8 @@ class ExecutionSimulator:
             adv_capacity_norm = None
         self._last_adv_bar_capacity = adv_capacity_norm
         self._last_liquidity = self._combine_liquidity(incoming_liq, adv_capacity_norm)
-        self._last_ref_price = ref_val
+        if ref_val is not None:
+            self._last_ref_price = ref_val
         self._last_bar_open = bar_open_val
         self._last_bar_high = bar_high_val
         self._last_bar_low = bar_low_val
