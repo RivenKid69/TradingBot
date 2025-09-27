@@ -8069,13 +8069,12 @@ class ExecutionSimulator:
         validations_enabled = bool(self.strict_filters and filters is not None)
         base_tolerance = 1e-12
         qty_tol = base_tolerance
+        qty_step = 0.0
         if validations_enabled and filters is not None:
             try:
                 qty_step = float(getattr(filters, "qty_step", 0.0) or 0.0)
             except (TypeError, ValueError):
                 qty_step = 0.0
-            if qty_step > 0.0 and math.isfinite(qty_step):
-                qty_tol = min(base_tolerance, qty_step / 2.0)
 
         quant_result: Any = None
         quantize_order = getattr(quantizer, "quantize_order", None)
@@ -8117,6 +8116,27 @@ class ExecutionSimulator:
                         constraint={"error": str(exc), "quantity": qty_raw},
                     )
                     return 0.0, reason
+
+        if validations_enabled and filters is not None:
+            tol_candidates: list[float] = []
+            if qty_step > 0.0 and math.isfinite(qty_step):
+                step_tol = qty_step / 2.0
+                if step_tol > 0.0 and math.isfinite(step_tol):
+                    tol_candidates.append(step_tol)
+            if math.isfinite(qty_quantized):
+                magnitude_tol = abs(qty_quantized) * 1e-12
+                if magnitude_tol > 0.0 and math.isfinite(magnitude_tol):
+                    tol_candidates.append(magnitude_tol)
+            if tol_candidates:
+                qty_tol = max(base_tolerance, min(tol_candidates))
+            else:
+                qty_tol = base_tolerance
+            if qty_step > 0.0 and math.isfinite(qty_step):
+                half_step = qty_step / 2.0
+                if half_step > 0.0 and math.isfinite(half_step):
+                    qty_tol = min(qty_tol, half_step)
+            if not math.isfinite(qty_tol) or qty_tol <= 0.0:
+                qty_tol = base_tolerance
 
         if not validations_enabled or filters is None:
             return qty_quantized, None
