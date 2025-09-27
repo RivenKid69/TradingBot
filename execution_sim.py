@@ -12214,7 +12214,6 @@ class ExecutionSimulator:
                 for child in plan:
                     child_offset = int(getattr(child, "ts_offset_ms", 0))
                     base_ts = int(ts + child_offset)
-                    ts_fill = int(base_ts)
                     q_child = float(child.qty)
                     q_child = self._limit_by_intrabar_volume(q_child)
                     if q_child <= 0.0:
@@ -12245,25 +12244,13 @@ class ExecutionSimulator:
                         continue
                     order_qty_base = max(0.0, float(q_child))
 
-                    # риск: дросселирование
-                    if self.risk is not None:
-                        if not self.risk.can_send_order(ts_fill):
-                            self.risk._emit(
-                                ts_fill,
-                                "THROTTLE",
-                                "order throttled by rate limit",
-                                ts_ms=int(ts_fill),
-                            )
-                            continue
-                        self.risk.on_new_order(ts_fill)
-
-                    # латентность и intrabar-референс
+                    # латентность и intrabar-референс (включая задержку отправки)
                     lat_ms = 0
                     lat_spike = False
                     latency_payload: Any = lat_ms
                     if self.latency is not None:
                         try:
-                            d = self.latency.sample(int(ts_fill))
+                            d = self.latency.sample(int(base_ts))
                         except TypeError:  # fallback for non-seasonal models
                             d = self.latency.sample()  # type: ignore[call-arg]
                         lat_ms = int(d.get("total_ms", 0))
@@ -12272,6 +12259,20 @@ class ExecutionSimulator:
                             _cancel(cli_id)
                             continue
                         latency_payload = d
+                    ts_send = int(base_ts + lat_ms)
+
+                    # риск: дросселирование
+                    if self.risk is not None:
+                        if not self.risk.can_send_order(ts_send):
+                            self.risk._emit(
+                                ts_send,
+                                "THROTTLE",
+                                "order throttled by rate limit",
+                                ts_ms=int(ts_send),
+                            )
+                            continue
+                        self.risk.on_new_order(ts_send)
+
                     child_latency = self._intrabar_latency_ms(
                         latency_payload, child_offset_ms=child_offset
                     )
@@ -12546,7 +12547,7 @@ class ExecutionSimulator:
                         fill_qty_base = min(fill_qty_base, remaining_base)
 
                     if cap_enforced and fill_qty_base <= 0.0:
-                        ts_zero = int(base_ts + lat_ms)
+                        ts_zero = int(ts_send)
                         if cli_id not in cancelled_ids:
                             _cancel(cli_id, "BAR_CAPACITY_BASE")
                         else:
@@ -12592,10 +12593,9 @@ class ExecutionSimulator:
                     if q_child <= 0.0:
                         continue
 
-                    ts_fill = int(base_ts + lat_ms)
                     # цена исполнения
                     if VWAPExecutor is not None and isinstance(executor, VWAPExecutor):
-                        self._vwap_on_tick(ts_fill, None, None)
+                        self._vwap_on_tick(ts_send, None, None)
                         base_price = (
                             self._last_hour_vwap
                             if self._last_hour_vwap is not None
@@ -12763,7 +12763,7 @@ class ExecutionSimulator:
 
                     # запись трейда
                     trade = ExecTrade(
-                        ts=self._trade_timestamp_with_close_lag(ts_fill),
+                        ts=self._trade_timestamp_with_close_lag(ts_send),
                         side=side,
                         price=filled_price,
                         qty=q_child,
