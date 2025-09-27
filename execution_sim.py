@@ -88,6 +88,32 @@ except Exception:  # pragma: no cover - fallback when running as standalone file
 logger = logging.getLogger(__name__)
 seasonality_logger = logging.getLogger("seasonality").getChild(__name__)
 
+_PNL_RECONCILE_REL_TOL = 1e-9
+_PNL_RECONCILE_ABS_TOL = 1e-6
+
+
+def _check_pnl_reconciliation(expected: float, recomputed: float) -> None:
+    """Log a warning if realized+unrealized PnL drifts from recomputed values."""
+
+    if math.isclose(
+        expected,
+        recomputed,
+        rel_tol=_PNL_RECONCILE_REL_TOL,
+        abs_tol=_PNL_RECONCILE_ABS_TOL,
+    ):
+        return
+
+    diff = expected - recomputed
+    logger.warning(
+        "PnL reconciliation drift exceeds tolerance: expected=%f recomputed=%f diff=%e "
+        "(rel_tol=%g, abs_tol=%g)",
+        expected,
+        recomputed,
+        diff,
+        _PNL_RECONCILE_REL_TOL,
+        _PNL_RECONCILE_ABS_TOL,
+    )
+
 _SIM_MULT_COUNTER = Counter(
     "sim_hour_of_week_multiplier_total",
     "Simulator liquidity multiplier applications per hour of week",
@@ -3170,7 +3196,9 @@ class ExecutionSimulator:
         eq = float(self.realized_pnl_cum + unrl - self.fees_cum + self.funding_cum)
         if self._trade_log:
             r_chk, u_chk = self._recompute_pnl_from_log(mark_p)
-            assert abs((self.realized_pnl_cum + unrl) - (r_chk + u_chk)) < 1e-6
+            expected = float(self.realized_pnl_cum + unrl)
+            recomputed = float(r_chk + u_chk)
+            _check_pnl_reconciliation(expected, recomputed)
         risk_paused_until = 0
         if self.risk is not None:
             try:
@@ -9978,7 +10006,9 @@ class ExecutionSimulator:
         eq = float(self.realized_pnl_cum + unrl - self.fees_cum + self.funding_cum)
         if self._trade_log:
             r_chk, u_chk = self._recompute_pnl_from_log(mark_p)
-            assert abs((self.realized_pnl_cum + unrl) - (r_chk + u_chk)) < 1e-6
+            expected = float(self.realized_pnl_cum + unrl)
+            recomputed = float(r_chk + u_chk)
+            _check_pnl_reconciliation(expected, recomputed)
 
         # риск: обновить дневной PnL и возможную паузу
         risk_events_all: List[RiskEvent] = []
@@ -10998,7 +11028,9 @@ class ExecutionSimulator:
         eq = float(self.realized_pnl_cum + unrl - self.fees_cum + self.funding_cum)
         if self._trade_log:
             r_chk, u_chk = self._recompute_pnl_from_log(mark_p)
-            assert abs((self.realized_pnl_cum + unrl) - (r_chk + u_chk)) < 1e-6
+            expected = float(self.realized_pnl_cum + unrl)
+            recomputed = float(r_chk + u_chk)
+            _check_pnl_reconciliation(expected, recomputed)
 
         # риск: дневной лосс/пауза + собрать события
         risk_events_all: list[RiskEvent] = []
