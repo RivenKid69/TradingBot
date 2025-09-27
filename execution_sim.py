@@ -10456,6 +10456,7 @@ class ExecutionSimulator:
             cli_id = int(self._next_cli_id)
             self._next_cli_id += 1
             new_order_ids.append(cli_id)
+            new_order_pos.append(0)
 
             # только MARKET
             if str(
