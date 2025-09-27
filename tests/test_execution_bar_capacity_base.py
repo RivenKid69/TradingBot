@@ -161,3 +161,34 @@ def test_run_step_emits_cancel_when_capacity_exhausted(tmp_path: pathlib.Path) -
     assert report.cancelled_ids == [cancel_trade.client_order_id]
     assert report.cancelled_reasons[cancel_trade.client_order_id] == "BAR_CAPACITY_BASE"
     assert sim._used_base_in_bar[sim.symbol] == pytest.approx(2.0)
+
+
+def test_limit_taker_execution_clamped_by_bar_capacity(
+    tmp_path: pathlib.Path,
+) -> None:
+    sim = _make_sim_with_capacity(tmp_path, per_bar=2.0)
+    sim._last_bid = 99.0
+    sim._last_ask = 100.0
+    sim._last_liquidity = 10.0
+    proto = ActionProto(
+        action_type=ActionType.LIMIT,
+        volume_frac=3.0,
+        abs_price=101.0,
+    )
+
+    cid = sim.submit(proto, now_ts=789_000)
+
+    report = sim.pop_ready(now_ts=789_000, ref_price=100.0)
+
+    assert len(report.trades) == 1
+    trade = report.trades[0]
+    assert trade.qty == pytest.approx(2.0)
+    assert trade.used_base_before == pytest.approx(0.0)
+    assert trade.used_base_after == pytest.approx(2.0)
+    assert trade.cap_base_per_bar == pytest.approx(2.0)
+    assert trade.fill_ratio == pytest.approx(2.0 / 3.0)
+    assert trade.capacity_reason == "BAR_CAPACITY_BASE"
+    assert trade.exec_status == "PARTIAL"
+    assert sim._used_base_in_bar[sim.symbol] == pytest.approx(2.0)
+    assert report.new_order_ids == [cid]
+    assert report.cancelled_ids == []

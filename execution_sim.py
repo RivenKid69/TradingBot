@@ -9696,6 +9696,15 @@ class ExecutionSimulator:
                     _cancel(p.client_order_id, reason_code)
                     continue
 
+                qty_initial_limit = float(qty_q)
+                cap_base_per_bar = self._reset_bar_capacity_if_needed(ts)
+                cap_enforced = bool(
+                    self._bar_cap_base_enabled and cap_base_per_bar > 0.0
+                )
+                symbol_key = (
+                    str(self.symbol).upper() if self.symbol is not None else ""
+                )
+
                 filled = False
                 maker_fill = False
                 liquidity_role = "taker"
@@ -9745,121 +9754,234 @@ class ExecutionSimulator:
                                 filled = False
 
                 if filled and liquidity_role == "taker":
-                    if tif == "FOK" and exec_qty + 1e-12 < qty_q:
-                        _cancel(p.client_order_id, "FOK")
-                        continue
-                    filled_price, final_clip = self._clip_to_bar_range(filled_price)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        limit = int(self._intrabar_debug_max_logs)
-                        if limit <= 0 or self._intrabar_debug_logged < limit:
-                            logger.debug(
-                                "intrabar fill lat=%sms t=%.4f price=%.6f base_clip=%s final_clip=%s final=%.6f seq=%s",
-                                int(limit_latency),
-                                float(limit_intrabar_frac),
-                                float(intrabar_base_price)
-                                if intrabar_base_price is not None
-                                else float(price_q),
-                                bool(limit_intrabar_clipped),
-                                bool(final_clip),
-                                float(filled_price),
-                                int(order_seq),
+                    used_base_before = max(
+                        0.0, float(self._used_base_in_bar.get(symbol_key, 0.0))
+                    )
+                    remaining_base = (
+                        max(0.0, cap_base_per_bar - used_base_before)
+                        if cap_enforced
+                        else float("inf")
+                    )
+                    cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
+                    truncated_by_capacity = False
+                    if cap_enforced:
+                        if remaining_base <= 0.0:
+                            exec_qty = 0.0
+                        elif exec_qty > remaining_base:
+                            exec_qty = float(remaining_base)
+                            truncated_by_capacity = True
+                    if exec_qty <= 0.0:
+                        if cap_enforced:
+                            self._record_bar_capacity_metrics(
+                                capacity_reason="BAR_CAPACITY_BASE",
+                                exec_status="REJECTED_BY_CAPACITY",
+                                fill_ratio=0.0,
                             )
-                            self._intrabar_debug_logged += 1
-                    fee = self._compute_trade_fee(
-                        side=side,
-                        price=filled_price,
-                        qty=exec_qty,
-                        liquidity=liquidity_role,
-                    )
-                    fee_total += float(fee)
-                    self._fees_apply_to_cumulative(fee)
-                    _ = self._apply_trade_inventory(
-                        side=side, price=filled_price, qty=exec_qty
-                    )
-                    sbps = self._last_spread_bps
-                    trade = ExecTrade(
-                        ts=self._trade_timestamp_with_close_lag(ts),
-                        side=side,
-                        price=filled_price,
-                        qty=exec_qty,
-                        notional=filled_price * exec_qty,
-                        liquidity=liquidity_role,
-                        proto_type=atype,
-                        client_order_id=p.client_order_id,
-                        fee=float(fee),
-                        slippage_bps=0.0,
-                        spread_bps=self._report_spread_bps(sbps),
-                        latency_ms=int(p.lat_ms),
-                        latency_spike=bool(p.spike),
-                        tif=tif,
-                        ttl_steps=ttl_steps,
-                    )
-                    trades.append(trade)
-                    self._trade_log.append(trade)
-                    if exec_qty + 1e-12 < qty_q:
-                        if tif == "IOC":
-                            _cancel(p.client_order_id, "IOC")
-                            continue
-                        qty_q = qty_q - exec_qty
                         filled = False
                         maker_fill = False
-                        liquidity_role = "maker"
+                        if tif in ("IOC", "FOK"):
+                            _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
+                            continue
                     else:
-                        continue
+                        if tif == "FOK" and exec_qty + 1e-12 < qty_q:
+                            _cancel(p.client_order_id, "FOK")
+                            continue
+                        filled_price, final_clip = self._clip_to_bar_range(
+                            filled_price
+                        )
+                        if logger.isEnabledFor(logging.DEBUG):
+                            limit = int(self._intrabar_debug_max_logs)
+                            if limit <= 0 or self._intrabar_debug_logged < limit:
+                                logger.debug(
+                                    "intrabar fill lat=%sms t=%.4f price=%.6f base_clip=%s final_clip=%s final=%.6f seq=%s",
+                                    int(limit_latency),
+                                    float(limit_intrabar_frac),
+                                    float(intrabar_base_price)
+                                    if intrabar_base_price is not None
+                                    else float(price_q),
+                                    bool(limit_intrabar_clipped),
+                                    bool(final_clip),
+                                    float(filled_price),
+                                    int(order_seq),
+                                )
+                                self._intrabar_debug_logged += 1
+                        fee = self._compute_trade_fee(
+                            side=side,
+                            price=filled_price,
+                            qty=exec_qty,
+                            liquidity=liquidity_role,
+                        )
+                        fee_total += float(fee)
+                        self._fees_apply_to_cumulative(fee)
+                        _ = self._apply_trade_inventory(
+                            side=side, price=filled_price, qty=exec_qty
+                        )
+                        used_base_after = max(
+                            0.0, float(used_base_before + float(exec_qty))
+                        )
+                        self._used_base_in_bar[symbol_key] = used_base_after
+                        fill_ratio = (
+                            float(exec_qty) / qty_initial_limit
+                            if qty_initial_limit > 0.0
+                            else 0.0
+                        )
+                        capacity_reason = (
+                            "BAR_CAPACITY_BASE" if truncated_by_capacity else ""
+                        )
+                        exec_status = (
+                            "PARTIAL" if truncated_by_capacity else "FILLED"
+                        )
+                        sbps = self._last_spread_bps
+                        trade = ExecTrade(
+                            ts=self._trade_timestamp_with_close_lag(ts),
+                            side=side,
+                            price=filled_price,
+                            qty=float(exec_qty),
+                            notional=filled_price * float(exec_qty),
+                            liquidity=liquidity_role,
+                            proto_type=atype,
+                            client_order_id=p.client_order_id,
+                            fee=float(fee),
+                            slippage_bps=0.0,
+                            spread_bps=self._report_spread_bps(sbps),
+                            latency_ms=int(p.lat_ms),
+                            latency_spike=bool(p.spike),
+                            tif=tif,
+                            ttl_steps=ttl_steps,
+                            used_base_before=used_base_before,
+                            used_base_after=used_base_after,
+                            cap_base_per_bar=cap_val,
+                            fill_ratio=float(fill_ratio),
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                        )
+                        trades.append(trade)
+                        self._trade_log.append(trade)
+                        if truncated_by_capacity:
+                            self._record_bar_capacity_metrics(
+                                capacity_reason=capacity_reason,
+                                exec_status=exec_status,
+                                fill_ratio=float(fill_ratio),
+                            )
+                        if exec_qty + 1e-12 < qty_q:
+                            if tif == "IOC":
+                                _cancel(p.client_order_id, "IOC")
+                                continue
+                            qty_q = qty_q - exec_qty
+                            filled = False
+                            maker_fill = False
+                            liquidity_role = "maker"
+                        else:
+                            continue
 
                 if maker_fill and liquidity_role == "maker":
                     if tif in ("IOC", "FOK"):
                         _cancel(p.client_order_id, tif)
                         continue
-                    filled_price, final_clip = self._clip_to_bar_range(filled_price)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        limit = int(self._intrabar_debug_max_logs)
-                        if limit <= 0 or self._intrabar_debug_logged < limit:
-                            logger.debug(
-                                "intrabar fill lat=%sms t=%.4f price=%.6f base_clip=%s final_clip=%s final=%.6f seq=%s",
-                                int(limit_latency),
-                                float(limit_intrabar_frac),
-                                float(intrabar_base_price)
-                                if intrabar_base_price is not None
-                                else float(price_q),
-                                bool(limit_intrabar_clipped),
-                                bool(final_clip),
-                                float(filled_price),
-                                int(order_seq),
+                    maker_qty_initial = float(qty_q)
+                    used_base_before = max(
+                        0.0, float(self._used_base_in_bar.get(symbol_key, 0.0))
+                    )
+                    remaining_base = (
+                        max(0.0, cap_base_per_bar - used_base_before)
+                        if cap_enforced
+                        else float("inf")
+                    )
+                    cap_val = float(cap_base_per_bar) if cap_enforced else 0.0
+                    truncated_by_capacity = False
+                    qty_exec = float(qty_q)
+                    if cap_enforced:
+                        if remaining_base <= 0.0:
+                            qty_exec = 0.0
+                        elif qty_exec > remaining_base:
+                            qty_exec = float(remaining_base)
+                            truncated_by_capacity = True
+                    if qty_exec <= 0.0:
+                        if cap_enforced:
+                            self._record_bar_capacity_metrics(
+                                capacity_reason="BAR_CAPACITY_BASE",
+                                exec_status="REJECTED_BY_CAPACITY",
+                                fill_ratio=0.0,
                             )
-                            self._intrabar_debug_logged += 1
-                    fee = self._compute_trade_fee(
-                        side=side,
-                        price=filled_price,
-                        qty=qty_q,
-                        liquidity=liquidity_role,
-                    )
-                    fee_total += float(fee)
-                    self._fees_apply_to_cumulative(fee)
-                    _ = self._apply_trade_inventory(
-                        side=side, price=filled_price, qty=qty_q
-                    )
-                    sbps = self._last_spread_bps
-                    trade = ExecTrade(
-                        ts=self._trade_timestamp_with_close_lag(ts),
-                        side=side,
-                        price=filled_price,
-                        qty=qty_q,
-                        notional=filled_price * qty_q,
-                        liquidity=liquidity_role,
-                        proto_type=atype,
-                        client_order_id=p.client_order_id,
-                        fee=float(fee),
-                        slippage_bps=0.0,
-                        spread_bps=self._report_spread_bps(sbps),
-                        latency_ms=int(p.lat_ms),
-                        latency_spike=bool(p.spike),
-                        tif=tif,
-                        ttl_steps=ttl_steps,
-                    )
-                    trades.append(trade)
-                    self._trade_log.append(trade)
-                    continue
+                        maker_fill = False
+                    else:
+                        qty_q = float(qty_exec)
+                        filled_price, final_clip = self._clip_to_bar_range(
+                            filled_price
+                        )
+                        if logger.isEnabledFor(logging.DEBUG):
+                            limit = int(self._intrabar_debug_max_logs)
+                            if limit <= 0 or self._intrabar_debug_logged < limit:
+                                logger.debug(
+                                    "intrabar fill lat=%sms t=%.4f price=%.6f base_clip=%s final_clip=%s final=%.6f seq=%s",
+                                    int(limit_latency),
+                                    float(limit_intrabar_frac),
+                                    float(intrabar_base_price)
+                                    if intrabar_base_price is not None
+                                    else float(price_q),
+                                    bool(limit_intrabar_clipped),
+                                    bool(final_clip),
+                                    float(filled_price),
+                                    int(order_seq),
+                                )
+                                self._intrabar_debug_logged += 1
+                        fee = self._compute_trade_fee(
+                            side=side,
+                            price=filled_price,
+                            qty=qty_q,
+                            liquidity=liquidity_role,
+                        )
+                        fee_total += float(fee)
+                        self._fees_apply_to_cumulative(fee)
+                        _ = self._apply_trade_inventory(
+                            side=side, price=filled_price, qty=qty_q
+                        )
+                        used_base_after = max(
+                            0.0, float(used_base_before + float(qty_q))
+                        )
+                        self._used_base_in_bar[symbol_key] = used_base_after
+                        fill_ratio = (
+                            qty_q / maker_qty_initial if maker_qty_initial > 0.0 else 0.0
+                        )
+                        capacity_reason = (
+                            "BAR_CAPACITY_BASE" if truncated_by_capacity else ""
+                        )
+                        exec_status = (
+                            "PARTIAL" if truncated_by_capacity else "FILLED"
+                        )
+                        sbps = self._last_spread_bps
+                        trade = ExecTrade(
+                            ts=self._trade_timestamp_with_close_lag(ts),
+                            side=side,
+                            price=filled_price,
+                            qty=qty_q,
+                            notional=filled_price * qty_q,
+                            liquidity=liquidity_role,
+                            proto_type=atype,
+                            client_order_id=p.client_order_id,
+                            fee=float(fee),
+                            slippage_bps=0.0,
+                            spread_bps=self._report_spread_bps(sbps),
+                            latency_ms=int(p.lat_ms),
+                            latency_spike=bool(p.spike),
+                            tif=tif,
+                            ttl_steps=ttl_steps,
+                            used_base_before=used_base_before,
+                            used_base_after=used_base_after,
+                            cap_base_per_bar=cap_val,
+                            fill_ratio=float(fill_ratio),
+                            capacity_reason=capacity_reason,
+                            exec_status=exec_status,
+                        )
+                        trades.append(trade)
+                        self._trade_log.append(trade)
+                        if truncated_by_capacity:
+                            self._record_bar_capacity_metrics(
+                                capacity_reason=capacity_reason,
+                                exec_status=exec_status,
+                                fill_ratio=float(fill_ratio),
+                            )
+                        continue
 
                 if tif in ("IOC", "FOK"):
                     _cancel(p.client_order_id, tif)
