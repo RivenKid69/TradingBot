@@ -9351,29 +9351,234 @@ class ExecutionSimulator:
                         fill_qty_base = q_child
 
                     if self.quantizer is not None:
-                        fill_qty_base = self.quantizer.quantize_qty(
-                            self.symbol, fill_qty_base
-                        )
-                        if cap_enforced and fill_qty_base > remaining_base + 1e-12:
-                            alt_qty = self.quantizer.quantize_qty(
-                                self.symbol, max(0.0, remaining_base)
+                        def _abort_child(reason: FilterRejectionReason) -> bool:
+                            self._log_filter_rejection(reason)
+                            filter_rejections_step.append(
+                                self._make_filter_rejection_entry(
+                                    reason,
+                                    client_order_id=p.client_order_id,
+                                    order_type="MARKET_CHILD",
+                                )
                             )
+                            self._record_filter_rejection(reason, "MARKET")
+                            cancel_code = str(getattr(reason, "code", "") or "FILTER")
+                            _cancel(p.client_order_id, cancel_code)
+                            return True
+
+                        quant_error = None
+                        try:
+                            fill_qty_base = self.quantizer.quantize_qty(
+                                self.symbol, fill_qty_base
+                            )
+                        except ValueError as exc:
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    "quantize_qty ValueError for MARKET child (symbol=%s): %s",
+                                    self.symbol,
+                                    exc,
+                                )
+                            quant_error = FilterRejectionReason(
+                                code="LOT_SIZE",
+                                message=str(exc),
+                                constraint={"quantity": fill_qty_base},
+                            )
+                        except Exception as exc:
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    "quantize_qty failed for MARKET child (symbol=%s): %s",
+                                    self.symbol,
+                                    exc,
+                                )
+                            quant_error = FilterRejectionReason(
+                                code="LOT_SIZE",
+                                message="quantize_qty failed",
+                                constraint={
+                                    "error": str(exc),
+                                    "quantity": fill_qty_base,
+                                },
+                            )
+                        if quant_error is not None:
+                            reject_parent = _abort_child(quant_error)
+                            if reject_parent:
+                                break
+                            continue
+                        if cap_enforced and fill_qty_base > remaining_base + 1e-12:
+                            try:
+                                alt_qty = self.quantizer.quantize_qty(
+                                    self.symbol, max(0.0, remaining_base)
+                                )
+                            except ValueError as exc:
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        "quantize_qty ValueError for MARKET child (symbol=%s): %s",
+                                        self.symbol,
+                                        exc,
+                                    )
+                                quant_error = FilterRejectionReason(
+                                    code="LOT_SIZE",
+                                    message=str(exc),
+                                    constraint={"quantity": max(0.0, remaining_base)},
+                                )
+                            except Exception as exc:
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        "quantize_qty failed for MARKET child (symbol=%s): %s",
+                                        self.symbol,
+                                        exc,
+                                    )
+                                quant_error = FilterRejectionReason(
+                                    code="LOT_SIZE",
+                                    message="quantize_qty failed",
+                                    constraint={
+                                        "error": str(exc),
+                                        "quantity": max(0.0, remaining_base),
+                                    },
+                                )
+                            else:
+                                quant_error = None
+                            if quant_error is not None:
+                                reject_parent = _abort_child(quant_error)
+                                if reject_parent:
+                                    break
+                                continue
                             if alt_qty <= remaining_base + 1e-12:
                                 fill_qty_base = alt_qty
                             else:
                                 fill_qty_base = 0.0
                         if fill_qty_base > 0.0:
-                            fill_qty_base = self.quantizer.clamp_notional(
-                                self.symbol, ref_child_price, fill_qty_base
+                            clamp_error = None
+                            filters_snapshot = self._current_symbol_filters()
+                            min_notional = (
+                                float(getattr(filters_snapshot, "min_notional", 0.0))
+                                if filters_snapshot is not None
+                                else 0.0
                             )
-                            if cap_enforced and fill_qty_base > remaining_base + 1e-12:
-                                alt_qty = self.quantizer.quantize_qty(
-                                    self.symbol, max(0.0, remaining_base)
+                            try:
+                                fill_qty_base = self.quantizer.clamp_notional(
+                                    self.symbol, ref_child_price, fill_qty_base
                                 )
-                                if alt_qty > 0.0:
-                                    alt_qty = self.quantizer.clamp_notional(
-                                        self.symbol, ref_child_price, alt_qty
+                            except ValueError as exc:
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        "clamp_notional ValueError for MARKET child (symbol=%s): %s",
+                                        self.symbol,
+                                        exc,
                                     )
+                                clamp_error = FilterRejectionReason(
+                                    code="MIN_NOTIONAL",
+                                    message=str(exc),
+                                    constraint={
+                                        "min_notional": min_notional,
+                                        "price": ref_child_price,
+                                        "quantity": fill_qty_base,
+                                    },
+                                )
+                            except Exception as exc:
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        "clamp_notional failed for MARKET child (symbol=%s): %s",
+                                        self.symbol,
+                                        exc,
+                                    )
+                                clamp_error = FilterRejectionReason(
+                                    code="MIN_NOTIONAL",
+                                    message="clamp_notional failed",
+                                    constraint={
+                                        "error": str(exc),
+                                        "min_notional": min_notional,
+                                        "price": ref_child_price,
+                                    },
+                                )
+                            if clamp_error is not None:
+                                reject_parent = _abort_child(clamp_error)
+                                if reject_parent:
+                                    break
+                                continue
+                            if cap_enforced and fill_qty_base > remaining_base + 1e-12:
+                                try:
+                                    alt_qty = self.quantizer.quantize_qty(
+                                        self.symbol, max(0.0, remaining_base)
+                                    )
+                                except ValueError as exc:
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(
+                                            "quantize_qty ValueError for MARKET child (symbol=%s): %s",
+                                            self.symbol,
+                                            exc,
+                                        )
+                                    quant_error = FilterRejectionReason(
+                                        code="LOT_SIZE",
+                                        message=str(exc),
+                                        constraint={
+                                            "quantity": max(0.0, remaining_base)
+                                        },
+                                    )
+                                except Exception as exc:
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(
+                                            "quantize_qty failed for MARKET child (symbol=%s): %s",
+                                            self.symbol,
+                                            exc,
+                                        )
+                                    quant_error = FilterRejectionReason(
+                                        code="LOT_SIZE",
+                                        message="quantize_qty failed",
+                                        constraint={
+                                            "error": str(exc),
+                                            "quantity": max(0.0, remaining_base),
+                                        },
+                                    )
+                                else:
+                                    quant_error = None
+                                if quant_error is not None:
+                                    reject_parent = _abort_child(quant_error)
+                                    if reject_parent:
+                                        break
+                                    continue
+                                if alt_qty > 0.0:
+                                    try:
+                                        alt_qty = self.quantizer.clamp_notional(
+                                            self.symbol, ref_child_price, alt_qty
+                                        )
+                                    except ValueError as exc:
+                                        if logger.isEnabledFor(logging.DEBUG):
+                                            logger.debug(
+                                                "clamp_notional ValueError for MARKET child (symbol=%s): %s",
+                                                self.symbol,
+                                                exc,
+                                            )
+                                        clamp_error = FilterRejectionReason(
+                                            code="MIN_NOTIONAL",
+                                            message=str(exc),
+                                            constraint={
+                                                "min_notional": min_notional,
+                                                "price": ref_child_price,
+                                                "quantity": alt_qty,
+                                            },
+                                        )
+                                    except Exception as exc:
+                                        if logger.isEnabledFor(logging.DEBUG):
+                                            logger.debug(
+                                                "clamp_notional failed for MARKET child (symbol=%s): %s",
+                                                self.symbol,
+                                                exc,
+                                            )
+                                        clamp_error = FilterRejectionReason(
+                                            code="MIN_NOTIONAL",
+                                            message="clamp_notional failed",
+                                            constraint={
+                                                "error": str(exc),
+                                                "min_notional": min_notional,
+                                                "price": ref_child_price,
+                                            },
+                                        )
+                                    else:
+                                        clamp_error = None
+                                    if clamp_error is not None:
+                                        reject_parent = _abort_child(clamp_error)
+                                        if reject_parent:
+                                            break
+                                        continue
                                 if alt_qty <= remaining_base + 1e-12:
                                     fill_qty_base = alt_qty
                                 else:
@@ -11011,29 +11216,234 @@ class ExecutionSimulator:
                         fill_qty_base = q_child
 
                     if self.quantizer is not None:
-                        fill_qty_base = self.quantizer.quantize_qty(
-                            self.symbol, fill_qty_base
-                        )
-                        if cap_enforced and fill_qty_base > remaining_base + 1e-12:
-                            alt_qty = self.quantizer.quantize_qty(
-                                self.symbol, max(0.0, remaining_base)
+                        def _abort_child(reason: FilterRejectionReason) -> bool:
+                            self._log_filter_rejection(reason)
+                            filter_rejections_step.append(
+                                self._make_filter_rejection_entry(
+                                    reason,
+                                    client_order_id=cli_id,
+                                    order_type="MARKET_CHILD",
+                                )
                             )
+                            self._record_filter_rejection(reason, "MARKET")
+                            cancel_code = str(getattr(reason, "code", "") or "FILTER")
+                            _cancel(cli_id, cancel_code)
+                            return True
+
+                        quant_error = None
+                        try:
+                            fill_qty_base = self.quantizer.quantize_qty(
+                                self.symbol, fill_qty_base
+                            )
+                        except ValueError as exc:
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    "quantize_qty ValueError for MARKET child (symbol=%s): %s",
+                                    self.symbol,
+                                    exc,
+                                )
+                            quant_error = FilterRejectionReason(
+                                code="LOT_SIZE",
+                                message=str(exc),
+                                constraint={"quantity": fill_qty_base},
+                            )
+                        except Exception as exc:
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    "quantize_qty failed for MARKET child (symbol=%s): %s",
+                                    self.symbol,
+                                    exc,
+                                )
+                            quant_error = FilterRejectionReason(
+                                code="LOT_SIZE",
+                                message="quantize_qty failed",
+                                constraint={
+                                    "error": str(exc),
+                                    "quantity": fill_qty_base,
+                                },
+                            )
+                        if quant_error is not None:
+                            reject_parent = _abort_child(quant_error)
+                            if reject_parent:
+                                break
+                            continue
+                        if cap_enforced and fill_qty_base > remaining_base + 1e-12:
+                            try:
+                                alt_qty = self.quantizer.quantize_qty(
+                                    self.symbol, max(0.0, remaining_base)
+                                )
+                            except ValueError as exc:
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        "quantize_qty ValueError for MARKET child (symbol=%s): %s",
+                                        self.symbol,
+                                        exc,
+                                    )
+                                quant_error = FilterRejectionReason(
+                                    code="LOT_SIZE",
+                                    message=str(exc),
+                                    constraint={"quantity": max(0.0, remaining_base)},
+                                )
+                            except Exception as exc:
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        "quantize_qty failed for MARKET child (symbol=%s): %s",
+                                        self.symbol,
+                                        exc,
+                                    )
+                                quant_error = FilterRejectionReason(
+                                    code="LOT_SIZE",
+                                    message="quantize_qty failed",
+                                    constraint={
+                                        "error": str(exc),
+                                        "quantity": max(0.0, remaining_base),
+                                    },
+                                )
+                            else:
+                                quant_error = None
+                            if quant_error is not None:
+                                reject_parent = _abort_child(quant_error)
+                                if reject_parent:
+                                    break
+                                continue
                             if alt_qty <= remaining_base + 1e-12:
                                 fill_qty_base = alt_qty
                             else:
                                 fill_qty_base = 0.0
                         if fill_qty_base > 0.0:
-                            fill_qty_base = self.quantizer.clamp_notional(
-                                self.symbol, ref_child_price, fill_qty_base
+                            clamp_error = None
+                            filters_snapshot = self._current_symbol_filters()
+                            min_notional = (
+                                float(getattr(filters_snapshot, "min_notional", 0.0))
+                                if filters_snapshot is not None
+                                else 0.0
                             )
-                            if cap_enforced and fill_qty_base > remaining_base + 1e-12:
-                                alt_qty = self.quantizer.quantize_qty(
-                                    self.symbol, max(0.0, remaining_base)
+                            try:
+                                fill_qty_base = self.quantizer.clamp_notional(
+                                    self.symbol, ref_child_price, fill_qty_base
                                 )
-                                if alt_qty > 0.0:
-                                    alt_qty = self.quantizer.clamp_notional(
-                                        self.symbol, ref_child_price, alt_qty
+                            except ValueError as exc:
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        "clamp_notional ValueError for MARKET child (symbol=%s): %s",
+                                        self.symbol,
+                                        exc,
                                     )
+                                clamp_error = FilterRejectionReason(
+                                    code="MIN_NOTIONAL",
+                                    message=str(exc),
+                                    constraint={
+                                        "min_notional": min_notional,
+                                        "price": ref_child_price,
+                                        "quantity": fill_qty_base,
+                                    },
+                                )
+                            except Exception as exc:
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        "clamp_notional failed for MARKET child (symbol=%s): %s",
+                                        self.symbol,
+                                        exc,
+                                    )
+                                clamp_error = FilterRejectionReason(
+                                    code="MIN_NOTIONAL",
+                                    message="clamp_notional failed",
+                                    constraint={
+                                        "error": str(exc),
+                                        "min_notional": min_notional,
+                                        "price": ref_child_price,
+                                    },
+                                )
+                            if clamp_error is not None:
+                                reject_parent = _abort_child(clamp_error)
+                                if reject_parent:
+                                    break
+                                continue
+                            if cap_enforced and fill_qty_base > remaining_base + 1e-12:
+                                try:
+                                    alt_qty = self.quantizer.quantize_qty(
+                                        self.symbol, max(0.0, remaining_base)
+                                    )
+                                except ValueError as exc:
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(
+                                            "quantize_qty ValueError for MARKET child (symbol=%s): %s",
+                                            self.symbol,
+                                            exc,
+                                        )
+                                    quant_error = FilterRejectionReason(
+                                        code="LOT_SIZE",
+                                        message=str(exc),
+                                        constraint={
+                                            "quantity": max(0.0, remaining_base)
+                                        },
+                                    )
+                                except Exception as exc:
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(
+                                            "quantize_qty failed for MARKET child (symbol=%s): %s",
+                                            self.symbol,
+                                            exc,
+                                        )
+                                    quant_error = FilterRejectionReason(
+                                        code="LOT_SIZE",
+                                        message="quantize_qty failed",
+                                        constraint={
+                                            "error": str(exc),
+                                            "quantity": max(0.0, remaining_base),
+                                        },
+                                    )
+                                else:
+                                    quant_error = None
+                                if quant_error is not None:
+                                    reject_parent = _abort_child(quant_error)
+                                    if reject_parent:
+                                        break
+                                    continue
+                                if alt_qty > 0.0:
+                                    try:
+                                        alt_qty = self.quantizer.clamp_notional(
+                                            self.symbol, ref_child_price, alt_qty
+                                        )
+                                    except ValueError as exc:
+                                        if logger.isEnabledFor(logging.DEBUG):
+                                            logger.debug(
+                                                "clamp_notional ValueError for MARKET child (symbol=%s): %s",
+                                                self.symbol,
+                                                exc,
+                                            )
+                                        clamp_error = FilterRejectionReason(
+                                            code="MIN_NOTIONAL",
+                                            message=str(exc),
+                                            constraint={
+                                                "min_notional": min_notional,
+                                                "price": ref_child_price,
+                                                "quantity": alt_qty,
+                                            },
+                                        )
+                                    except Exception as exc:
+                                        if logger.isEnabledFor(logging.DEBUG):
+                                            logger.debug(
+                                                "clamp_notional failed for MARKET child (symbol=%s): %s",
+                                                self.symbol,
+                                                exc,
+                                            )
+                                        clamp_error = FilterRejectionReason(
+                                            code="MIN_NOTIONAL",
+                                            message="clamp_notional failed",
+                                            constraint={
+                                                "error": str(exc),
+                                                "min_notional": min_notional,
+                                                "price": ref_child_price,
+                                            },
+                                        )
+                                    else:
+                                        clamp_error = None
+                                    if clamp_error is not None:
+                                        reject_parent = _abort_child(clamp_error)
+                                        if reject_parent:
+                                            break
+                                        continue
                                 if alt_qty <= remaining_base + 1e-12:
                                     fill_qty_base = alt_qty
                                 else:
