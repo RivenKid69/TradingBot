@@ -3336,6 +3336,35 @@ class ExecutionSimulator:
                     continue
                 if qty_total > remaining:
                     qty_total = remaining
+                normalized_qty, norm_rejection = self._normalize_capacity_quantity(
+                    qty_total,
+                    remaining_base=remaining,
+                    ref_price=open_price,
+                )
+                if norm_rejection is not None or normalized_qty <= 0.0:
+                    if norm_rejection is not None:
+                        self._log_filter_rejection(norm_rejection)
+                        self._record_filter_rejection(norm_rejection, "LIMIT")
+                        cancel_code = (
+                            norm_rejection.code
+                            if getattr(norm_rejection, "code", None)
+                            else "FILTER"
+                        )
+                        cancelled_reasons[state.client_order_id] = str(cancel_code)
+                    else:
+                        cancelled_reasons[state.client_order_id] = "BAR_CAPACITY_BASE"
+                    cancelled.append(state.client_order_id)
+                    self._pending_next_open.pop(key, None)
+                    self._record_bar_capacity_metrics(
+                        capacity_reason="BAR_CAPACITY_BASE",
+                        exec_status="REJECTED_BY_CAPACITY",
+                        fill_ratio=0.0,
+                    )
+                    continue
+                if normalized_qty + 1e-12 < qty_total:
+                    qty_total = float(normalized_qty)
+                else:
+                    qty_total = float(normalized_qty)
             sbps = self._last_spread_bps
             vf = self._last_vol_factor
             liq = self._limit_optional_by_intrabar_volume(self._last_liquidity)
@@ -8317,6 +8346,261 @@ class ExecutionSimulator:
         tol = tolerance if tolerance > 0.0 else 0.0
         return math.floor((float(value) + tol) / step) * step
 
+    def _normalize_capacity_quantity(
+        self,
+        qty: float,
+        *,
+        remaining_base: float,
+        ref_price: float | None,
+    ) -> tuple[float, Optional[FilterRejectionReason]]:
+        """Adjust a truncated quantity so it respects exchange filters."""
+
+        qty = max(0.0, float(qty))
+        remaining = max(0.0, float(remaining_base))
+        if qty <= 0.0 or remaining <= 0.0:
+            return 0.0, None
+
+        ref_val = self._finite_float(ref_price)
+        quantizer = self.quantizer
+        filters_snapshot = self._current_symbol_filters()
+        validations_enabled = bool(self.strict_filters and filters_snapshot is not None)
+        min_notional = (
+            float(getattr(filters_snapshot, "min_notional", 0.0))
+            if filters_snapshot is not None
+            else 0.0
+        )
+
+        if quantizer is not None:
+            quant_error: Optional[FilterRejectionReason] = None
+            try:
+                normalized = float(quantizer.quantize_qty(self.symbol, qty))
+            except ValueError as exc:
+                quant_error = FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message=str(exc),
+                    constraint={"quantity": qty},
+                )
+            except Exception as exc:
+                quant_error = FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message="quantize_qty failed",
+                    constraint={"error": str(exc), "quantity": qty},
+                )
+            else:
+                if normalized <= 0.0:
+                    quant_error = FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Quantity is not positive",
+                        constraint={"quantity": normalized, "raw_quantity": qty},
+                    )
+            if quant_error is not None:
+                return 0.0, quant_error
+
+            if ref_val is not None and ref_val > 0.0:
+                clamp_error: Optional[FilterRejectionReason] = None
+                try:
+                    normalized = float(
+                        quantizer.clamp_notional(self.symbol, ref_val, normalized)
+                    )
+                except ValueError as exc:
+                    clamp_error = FilterRejectionReason(
+                        code="MIN_NOTIONAL",
+                        message=str(exc),
+                        constraint={
+                            "min_notional": min_notional,
+                            "price": ref_val,
+                            "quantity": normalized,
+                        },
+                    )
+                except Exception as exc:
+                    clamp_error = FilterRejectionReason(
+                        code="MIN_NOTIONAL",
+                        message="clamp_notional failed",
+                        constraint={
+                            "error": str(exc),
+                            "min_notional": min_notional,
+                            "price": ref_val,
+                            "quantity": normalized,
+                        },
+                    )
+                if clamp_error is not None:
+                    return 0.0, clamp_error
+            else:
+                normalized = float(normalized)
+
+            if normalized <= 0.0:
+                return 0.0, FilterRejectionReason(
+                    code="MIN_NOTIONAL",
+                    message="Quantity rejected by notional clamp",
+                    constraint={"price": ref_val, "raw_quantity": qty},
+                )
+
+            if normalized > remaining + 1e-12:
+                alt_qty = max(0.0, remaining)
+                if alt_qty <= 0.0:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Remaining capacity exhausted",
+                        constraint={"quantity": remaining},
+                    )
+                try:
+                    alt_qty = float(quantizer.quantize_qty(self.symbol, alt_qty))
+                except ValueError as exc:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message=str(exc),
+                        constraint={"quantity": remaining},
+                    )
+                except Exception as exc:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="quantize_qty failed",
+                        constraint={"error": str(exc), "quantity": remaining},
+                    )
+                if ref_val is not None and ref_val > 0.0 and alt_qty > 0.0:
+                    try:
+                        alt_qty = float(
+                            quantizer.clamp_notional(self.symbol, ref_val, alt_qty)
+                        )
+                    except ValueError as exc:
+                        return 0.0, FilterRejectionReason(
+                            code="MIN_NOTIONAL",
+                            message=str(exc),
+                            constraint={
+                                "min_notional": min_notional,
+                                "price": ref_val,
+                                "quantity": alt_qty,
+                            },
+                        )
+                    except Exception as exc:
+                        return 0.0, FilterRejectionReason(
+                            code="MIN_NOTIONAL",
+                            message="clamp_notional failed",
+                            constraint={
+                                "error": str(exc),
+                                "min_notional": min_notional,
+                                "price": ref_val,
+                                "quantity": alt_qty,
+                            },
+                        )
+                if alt_qty <= 0.0 or alt_qty > remaining + 1e-12:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Capacity remainder below step",
+                        constraint={"quantity": remaining},
+                    )
+                normalized = alt_qty
+
+            return max(0.0, float(normalized)), None
+
+        # Legacy path without quantizer: snap to exchange filters manually.
+        if not validations_enabled or filters_snapshot is None:
+            return min(qty, remaining), None
+
+        qty_step = float(getattr(filters_snapshot, "qty_step", 0.0) or 0.0)
+        base_tolerance = 1e-12
+        qty_tol_candidates: List[float] = []
+        if qty_step > 0.0 and math.isfinite(qty_step):
+            half_step = qty_step / 2.0
+            if half_step > 0.0 and math.isfinite(half_step):
+                qty_tol_candidates.append(half_step)
+        magnitude_tol = abs(qty) * 1e-12
+        if magnitude_tol > 0.0 and math.isfinite(magnitude_tol):
+            qty_tol_candidates.append(magnitude_tol)
+        if qty_tol_candidates:
+            qty_tol = max(base_tolerance, min(qty_tol_candidates))
+        else:
+            qty_tol = base_tolerance
+        if qty_step > 0.0 and math.isfinite(qty_step):
+            half_step = qty_step / 2.0
+            if half_step > 0.0 and math.isfinite(half_step):
+                qty_tol = min(qty_tol, half_step)
+        if not math.isfinite(qty_tol) or qty_tol <= 0.0:
+            qty_tol = base_tolerance
+
+        candidate = min(qty, remaining)
+        if qty_step > 0.0:
+            snapped = self._snap_qty_with_tolerance(candidate, qty_step, qty_tol)
+            if abs(snapped - candidate) > qty_tol:
+                alt_candidate = self._snap_qty_with_tolerance(remaining, qty_step, qty_tol)
+                if abs(alt_candidate - remaining) <= qty_tol and alt_candidate > 0.0:
+                    snapped = alt_candidate
+                else:
+                    return 0.0, FilterRejectionReason(
+                        code="LOT_SIZE",
+                        message="Quantity not aligned to step",
+                        constraint={
+                            "step": qty_step,
+                            "quantity": candidate,
+                            "remaining_capacity": remaining,
+                        },
+                    )
+            candidate = snapped
+
+        if candidate <= 0.0:
+            return 0.0, FilterRejectionReason(
+                code="LOT_SIZE",
+                message="Quantity is not positive",
+                constraint={"quantity": candidate},
+            )
+
+        if candidate > remaining + qty_tol:
+            alt_candidate = remaining
+            if qty_step > 0.0:
+                alt_candidate = self._snap_qty_with_tolerance(remaining, qty_step, qty_tol)
+            if alt_candidate <= 0.0 or alt_candidate > remaining + qty_tol:
+                return 0.0, FilterRejectionReason(
+                    code="LOT_SIZE",
+                    message="Quantity above remaining capacity",
+                    constraint={
+                        "quantity": candidate,
+                        "remaining_capacity": remaining,
+                    },
+                )
+            candidate = alt_candidate
+
+        min_qty = float(getattr(filters_snapshot, "min_qty_threshold", 0.0) or 0.0)
+        if min_qty > 0.0 and candidate + qty_tol < min_qty:
+            return 0.0, FilterRejectionReason(
+                code="LOT_SIZE",
+                message="Quantity below minimum",
+                constraint={
+                    "min_qty": min_qty,
+                    "step": qty_step,
+                    "quantity": candidate,
+                },
+            )
+
+        qty_max = float(getattr(filters_snapshot, "qty_max", float("inf")))
+        if qty_max < float("inf") and candidate - qty_tol > qty_max:
+            return 0.0, FilterRejectionReason(
+                code="LOT_SIZE",
+                message="Quantity above maximum",
+                constraint={"max_qty": qty_max, "quantity": candidate},
+            )
+
+        effective_price = ref_val if ref_val is not None else 0.0
+        notional = abs(effective_price * candidate)
+        if (
+            min_notional > 0.0
+            and (
+                not math.isfinite(notional)
+                or notional + base_tolerance < min_notional
+            )
+        ):
+            return 0.0, FilterRejectionReason(
+                code="MIN_NOTIONAL",
+                message="Notional below minimum",
+                constraint={
+                    "min_notional": min_notional,
+                    "price": effective_price,
+                    "quantity": candidate,
+                    "notional": notional,
+                },
+            )
+
+        return max(0.0, min(candidate, remaining)), None
+
     def _apply_close_lag(self, ts: Optional[int]) -> Optional[int]:
         if ts is None:
             return None
@@ -10659,12 +10943,53 @@ class ExecutionSimulator:
                             _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
                             continue
                     else:
-                        if tif == "FOK" and exec_qty + 1e-12 < qty_q:
-                            _cancel(p.client_order_id, "FOK")
-                            continue
                         filled_price, final_clip = self._clip_to_bar_range(
                             filled_price
                         )
+                        if cap_enforced and exec_qty > 0.0:
+                            normalized_qty, norm_rejection = (
+                                self._normalize_capacity_quantity(
+                                    exec_qty,
+                                    remaining_base=remaining_base,
+                                    ref_price=filled_price,
+                                )
+                            )
+                            if norm_rejection is not None or normalized_qty <= 0.0:
+                                if norm_rejection is not None:
+                                    self._log_filter_rejection(norm_rejection)
+                                    filter_rejections_step.append(
+                                        self._make_filter_rejection_entry(
+                                            norm_rejection,
+                                            client_order_id=p.client_order_id,
+                                            order_type="LIMIT",
+                                            extra={"source": "BAR_CAPACITY"},
+                                        )
+                                    )
+                                    self._record_filter_rejection(
+                                        norm_rejection, "LIMIT"
+                                    )
+                                    cancel_code = (
+                                        norm_rejection.code
+                                        if getattr(norm_rejection, "code", None)
+                                        else "FILTER"
+                                    )
+                                    _cancel(p.client_order_id, cancel_code)
+                                else:
+                                    _cancel(p.client_order_id, "BAR_CAPACITY_BASE")
+                                self._record_bar_capacity_metrics(
+                                    capacity_reason="BAR_CAPACITY_BASE",
+                                    exec_status="REJECTED_BY_CAPACITY",
+                                    fill_ratio=0.0,
+                                )
+                                filled = False
+                                maker_fill = False
+                                continue
+                            if normalized_qty + 1e-12 < exec_qty:
+                                truncated_by_capacity = True
+                            exec_qty = float(normalized_qty)
+                        if tif == "FOK" and exec_qty + 1e-12 < qty_q:
+                            _cancel(p.client_order_id, "FOK")
+                            continue
                         if logger.isEnabledFor(logging.DEBUG):
                             limit = int(self._intrabar_debug_max_logs)
                             if limit <= 0 or self._intrabar_debug_logged < limit:
@@ -10781,10 +11106,48 @@ class ExecutionSimulator:
                             )
                         maker_fill = False
                     else:
-                        qty_q = float(qty_exec)
                         filled_price, final_clip = self._clip_to_bar_range(
                             filled_price
                         )
+                        if cap_enforced and qty_exec > 0.0:
+                            normalized_qty, norm_rejection = (
+                                self._normalize_capacity_quantity(
+                                    qty_exec,
+                                    remaining_base=remaining_base,
+                                    ref_price=filled_price,
+                                )
+                            )
+                            if norm_rejection is not None or normalized_qty <= 0.0:
+                                if norm_rejection is not None:
+                                    self._log_filter_rejection(norm_rejection)
+                                    filter_rejections_step.append(
+                                        self._make_filter_rejection_entry(
+                                            norm_rejection,
+                                            client_order_id=p.client_order_id,
+                                            order_type="LIMIT",
+                                            extra={"source": "BAR_CAPACITY"},
+                                        )
+                                    )
+                                    self._record_filter_rejection(
+                                        norm_rejection, "LIMIT"
+                                    )
+                                    cancel_code = (
+                                        norm_rejection.code
+                                        if getattr(norm_rejection, "code", None)
+                                        else "FILTER"
+                                    )
+                                    _cancel(p.client_order_id, cancel_code)
+                                self._record_bar_capacity_metrics(
+                                    capacity_reason="BAR_CAPACITY_BASE",
+                                    exec_status="REJECTED_BY_CAPACITY",
+                                    fill_ratio=0.0,
+                                )
+                                maker_fill = False
+                                continue
+                            if normalized_qty + 1e-12 < qty_exec:
+                                truncated_by_capacity = True
+                            qty_exec = float(normalized_qty)
+                        qty_q = float(qty_exec)
                         if logger.isEnabledFor(logging.DEBUG):
                             limit = int(self._intrabar_debug_max_logs)
                             if limit <= 0 or self._intrabar_debug_logged < limit:
