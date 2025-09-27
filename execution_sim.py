@@ -10191,6 +10191,55 @@ class ExecutionSimulator:
         report.expected_spread_bps = None
         return report
 
+    def _action_type_code(self, atype: object) -> int:
+        """Normalize action type payload into an integer code."""
+
+        try:
+            return int(atype)  # covers ints and IntEnum instances
+        except (TypeError, ValueError):
+            pass
+
+        if isinstance(atype, ActionType):
+            try:
+                return int(atype.value)
+            except (TypeError, ValueError):
+                pass
+
+        value_attr = getattr(atype, "value", None)
+        if value_attr is not None:
+            try:
+                return int(value_attr)
+            except (TypeError, ValueError):
+                pass
+
+        candidate_names: list[str] = []
+        name_attr = getattr(atype, "name", None)
+        if isinstance(name_attr, str):
+            candidate_names.append(name_attr)
+        if isinstance(atype, str):
+            candidate_names.append(atype)
+        elif not isinstance(atype, (bytes, bytearray)):
+            try:
+                candidate_names.append(str(atype))
+            except Exception:
+                pass
+
+        for raw in candidate_names:
+            if not raw:
+                continue
+            key = raw.strip().upper()
+            if not key:
+                continue
+            if "." in key:
+                key = key.rsplit(".", 1)[-1]
+            if key in ActionType.__members__:
+                try:
+                    return int(ActionType[key])
+                except (TypeError, ValueError):
+                    continue
+
+        return 0
+
     def run_step(
         self,
         *,
@@ -10535,7 +10584,7 @@ class ExecutionSimulator:
                             qty=0.0,
                             notional=0.0,
                             liquidity="taker",
-                            proto_type=getattr(atype, "value", 0),
+                            proto_type=self._action_type_code(atype),
                             client_order_id=int(cli_id),
                             slippage_bps=0.0,
                             spread_bps=self._report_spread_bps(self._last_spread_bps),
@@ -10575,7 +10624,7 @@ class ExecutionSimulator:
                             qty=0.0,
                             notional=0.0,
                             liquidity="taker",
-                            proto_type=getattr(atype, "value", 0),
+                            proto_type=self._action_type_code(atype),
                             client_order_id=int(cli_id),
                             slippage_bps=0.0,
                             spread_bps=self._report_spread_bps(self._last_spread_bps),
@@ -10773,7 +10822,7 @@ class ExecutionSimulator:
                             qty=0.0,
                             notional=0.0,
                             liquidity="taker",
-                            proto_type=getattr(atype, "value", 0),
+                            proto_type=self._action_type_code(atype),
                             client_order_id=int(cli_id),
                             slippage_bps=0.0,
                             spread_bps=self._report_spread_bps(self._last_spread_bps),
@@ -10980,7 +11029,7 @@ class ExecutionSimulator:
                         qty=q_child,
                         notional=trade_notional,
                         liquidity="taker",
-                        proto_type=getattr(atype, "value", 0),
+                        proto_type=self._action_type_code(atype),
                         client_order_id=int(cli_id),
                         fee=float(fee),
                         slippage_bps=float(slip_bps),
