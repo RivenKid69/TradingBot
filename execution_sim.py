@@ -1640,14 +1640,20 @@ class ExecutionSimulator:
                         except Exception:
                             manual_check_needed = True
                             ppbs_ok = True
-                    if manual_check_needed and (multiplier_up is not None or multiplier_down is not None):
-                        side_norm = str(side).upper()
-                        if side_norm == "BUY" and multiplier_up is not None and ref_float > 0.0:
-                            limit_up = ref_float * multiplier_up
-                            ppbs_ok = price_val <= limit_up + 1e-12
-                        elif side_norm != "BUY" and multiplier_down is not None and ref_float > 0.0:
-                            limit_down = ref_float * multiplier_down
-                            ppbs_ok = price_val + 1e-12 >= limit_down
+                    if manual_check_needed and (
+                        multiplier_up is not None or multiplier_down is not None
+                    ):
+                        upper_bound: Optional[float] = None
+                        lower_bound: Optional[float] = None
+                        if ref_float > 0.0:
+                            if multiplier_up is not None:
+                                upper_bound = ref_float * multiplier_up
+                            if multiplier_down is not None:
+                                lower_bound = ref_float * multiplier_down
+                        if upper_bound is not None and price_val > upper_bound + 1e-12:
+                            ppbs_ok = False
+                        if lower_bound is not None and price_val + 1e-12 < lower_bound:
+                            ppbs_ok = False
                     if not ppbs_ok:
                         return SimpleNamespace(
                             price=price_val,

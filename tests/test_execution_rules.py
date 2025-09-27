@@ -157,6 +157,26 @@ class _LegacyQuantizerWithoutQuantizeOrder:
         )
 
 
+class _LegacyQuantizerWithoutPercentPriceCheck:
+    def __init__(self, filters_payload):
+        self._filters_raw = filters_payload
+        self._delegate = Quantizer(filters_payload, strict=True)
+        self._filters = self._delegate._filters
+        self.strict = True
+
+    def raw_filters(self):
+        return self._filters_raw
+
+    def quantize_price(self, symbol: str, price: float) -> float:
+        return float(self._delegate.quantize_price(symbol, price))
+
+    def quantize_qty(self, symbol: str, qty: float) -> float:
+        return float(self._delegate.quantize_qty(symbol, qty))
+
+    def clamp_notional(self, symbol: str, ref_price: float, qty: float) -> float:
+        return float(self._delegate.clamp_notional(symbol, ref_price, qty))
+
+
 # --- Python ExecutionSimulator tests ---
 
 def test_unquantized_limit_executes_permissive():
@@ -377,6 +397,42 @@ def test_legacy_quantizer_without_quantize_order_rejects_percent_price():
     details = getattr(result, "details", None)
     assert details is not None
     assert details.get("multiplier_up") == pytest.approx(1.05)
+
+
+def test_legacy_quantizer_percent_price_fallback_rejects_both_limits():
+    legacy_filters = {
+        "LEGACYFALLBACK": {
+            "PRICE_FILTER": {"minPrice": "0.01", "maxPrice": "100000", "tickSize": "0.01"},
+            "LOT_SIZE": {"minQty": "0.001", "maxQty": "10", "stepSize": "0.001"},
+            "MIN_NOTIONAL": {"minNotional": "0.5"},
+            "PERCENT_PRICE_BY_SIDE": {"multiplierUp": "1.05", "multiplierDown": "0.95"},
+        }
+    }
+
+    sim = ExecutionSimulator(symbol="LEGACYFALLBACK", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = True
+    sim.set_quantizer(_LegacyQuantizerWithoutPercentPriceCheck(legacy_filters))
+
+    buy_result = sim.quantizer_impl.validate_order(
+        "LEGACYFALLBACK", "BUY", 90.0, 0.01, 100.0, enforce_ppbs=True
+    )
+    assert buy_result.reason_code == "PPBS"
+
+    sell_result = sim.quantizer_impl.validate_order(
+        "LEGACYFALLBACK", "SELL", 110.0, 0.01, 100.0, enforce_ppbs=True
+    )
+    assert sell_result.reason_code == "PPBS"
+
+    buy_ok = sim.quantizer_impl.validate_order(
+        "LEGACYFALLBACK", "BUY", 100.0, 0.01, 100.0, enforce_ppbs=True
+    )
+    assert buy_ok.reason_code is None
+
+    sell_ok = sim.quantizer_impl.validate_order(
+        "LEGACYFALLBACK", "SELL", 100.0, 0.01, 100.0, enforce_ppbs=True
+    )
+    assert sell_ok.reason_code is None
 
 
 def test_next_open_risk_adjustment_revalidated_by_filters():
