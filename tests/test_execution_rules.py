@@ -197,6 +197,28 @@ def test_market_quantity_rounded_up_passes_filters():
     assert rejection is None
 
 
+def test_market_filters_enforced_without_quantizer(monkeypatch, tmp_path):
+    filters_file = tmp_path / "filters.json"
+    filters_file.write_text(json.dumps({"filters": filters}))
+
+    monkeypatch.setattr(exec_mod, "Quantizer", None)
+    monkeypatch.setattr(exec_mod, "load_filters", None, raising=False)
+    monkeypatch.setattr(exec_mod, "QuantizerImpl", None)
+
+    sim = ExecutionSimulator(filters_path=str(filters_file), strict_filters=True)
+
+    assert sim.quantizer is None
+    assert sim.quantizer_impl is None
+    assert "BTCUSDT" in sim.filters
+    assert sim.strict_filters is True
+
+    qty_total, rejection = sim._apply_filters_market("BUY", 0.05, ref_price=100.0)
+
+    assert qty_total == pytest.approx(0.0)
+    assert rejection is not None
+    assert rejection.code == "LOT_SIZE"
+
+
 def test_market_clamp_notional_growth_rejected_by_qty_limits():
     ref_price = 50.0
     local_filters = {

@@ -1610,10 +1610,10 @@ class ExecutionSimulator:
         self.strict_filters = bool(strict_filters)
 
         def _legacy_setup() -> None:
-            if Quantizer is None or not filters_path:
+            if not filters_path:
                 self.quantizer = None
-                self.filters = {}
                 self.quantizer_impl = None
+                self.filters = {}
                 self._update_quantizer_metadata({})
                 return
 
@@ -1623,17 +1623,34 @@ class ExecutionSimulator:
                 max_age = 30
             fatal = os.getenv("TB_FAIL_ON_STALE_FILTERS") not in (None, "0", "")
 
+            filters_payload: Dict[str, Dict[str, Any]] = {}
+            metadata_payload: Optional[Mapping[str, Any]] = None
+            loader: Optional[Callable[..., Any]] = globals().get("load_filters")  # type: ignore[arg-type]
             try:
-                filters_payload, metadata_payload = load_filters(
-                    filters_path, max_age_days=max_age, fatal=fatal
-                )
+                if callable(loader):
+                    filters_payload, metadata_payload = loader(  # type: ignore[misc]
+                        filters_path,
+                        max_age_days=max_age,
+                        fatal=fatal,
+                    )
+                else:
+                    with open(filters_path, "r", encoding="utf-8") as fh:
+                        raw_payload = json.load(fh) or {}
+                    if isinstance(raw_payload, Mapping):
+                        if "filters" in raw_payload:
+                            filters_payload = dict(raw_payload.get("filters") or {})
+                            metadata_payload = raw_payload.get("metadata")  # type: ignore[assignment]
+                        else:
+                            filters_payload = dict(raw_payload)
+                    else:
+                        filters_payload = {}
             except Exception:
                 logger.exception(
                     "Failed to load quantizer filters from %s; quantizer disabled",
                     filters_path,
                 )
-                self._update_quantizer_metadata({})
-                return
+                filters_payload = {}
+                metadata_payload = None
 
             filters_dict = dict(filters_payload or {})
             metadata_dict = (
@@ -1641,35 +1658,43 @@ class ExecutionSimulator:
                 if isinstance(metadata_payload, Mapping)
                 else {}
             )
-            if filters_dict and Quantizer is not None:
-                try:
-                    quantizer_obj = Quantizer(filters_dict, strict=strict_filters)
-                except Exception:
-                    logger.exception(
-                        "Failed to construct Quantizer from filters at %s",
-                        filters_path,
-                    )
-                    self._update_quantizer_metadata(metadata_dict)
-                    return
-                wrapper = self._make_legacy_quantizer_impl(
-                    quantizer_obj,
-                    strict=strict_filters,
-                    enforce=self.enforce_ppbs,
-                    filters=filters_dict,
-                    metadata=metadata_dict,
-                )
-                wrapper_meta = getattr(wrapper, "filters_metadata", None)
-                metadata_for_attach = (
-                    dict(wrapper_meta)
-                    if isinstance(wrapper_meta, Mapping)
-                    else dict(metadata_dict)
-                )
-                self.attach_quantizer(
-                    impl=wrapper,
-                    metadata=metadata_for_attach,
-                )
-            else:
+            self.filters = filters_dict
+
+            if not filters_dict or Quantizer is None:
+                self.quantizer = None
+                self.quantizer_impl = None
                 self._update_quantizer_metadata(metadata_dict)
+                return
+
+            try:
+                quantizer_obj = Quantizer(filters_dict, strict=strict_filters)
+            except Exception:
+                logger.exception(
+                    "Failed to construct Quantizer from filters at %s",
+                    filters_path,
+                )
+                self.quantizer = None
+                self.quantizer_impl = None
+                self._update_quantizer_metadata(metadata_dict)
+                return
+
+            wrapper = self._make_legacy_quantizer_impl(
+                quantizer_obj,
+                strict=strict_filters,
+                enforce=self.enforce_ppbs,
+                filters=filters_dict,
+                metadata=metadata_dict,
+            )
+            wrapper_meta = getattr(wrapper, "filters_metadata", None)
+            metadata_for_attach = (
+                dict(wrapper_meta)
+                if isinstance(wrapper_meta, Mapping)
+                else dict(metadata_dict)
+            )
+            self.attach_quantizer(
+                impl=wrapper,
+                metadata=metadata_for_attach,
+            )
 
         attached_quantizer = False
         if quantizer_impl is not None:
