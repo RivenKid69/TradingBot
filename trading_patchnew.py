@@ -16,11 +16,53 @@ from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Sequence, Tuple
+import types
 from core_constants import PRICE_SCALE
-import gymnasium as gym
+
+try:  # Prefer gymnasium but gracefully fall back to classic gym.
+    import gymnasium as gym
+    from gymnasium import spaces as spaces
+except ModuleNotFoundError:  # pragma: no cover - depends on optional dependency
+    try:
+        import gym  # type: ignore[no-redef]
+        from gym import spaces as spaces  # type: ignore[assignment]
+    except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
+        class _BaseSpace:
+            def sample(self) -> Any:
+                raise NotImplementedError
+
+        class _Discrete(_BaseSpace):
+            def __init__(self, n: int):
+                self.n = int(n)
+
+        class _Box(_BaseSpace):
+            def __init__(self, low: Any, high: Any, shape: Tuple[int, ...] | None = None, dtype: Any | None = None):
+                self.low = low
+                self.high = high
+                self.shape = shape
+                self.dtype = dtype
+
+        class _Dict(_BaseSpace, dict):
+            def __init__(self, mapping: dict[str, _BaseSpace]):
+                dict.__init__(self, mapping)
+                self.mapping = mapping
+
+        class _Env:
+            metadata: dict[str, Any] = {}
+            observation_space: _BaseSpace | None = None
+            action_space: _BaseSpace | None = None
+
+            def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+                return None, {}
+
+            def step(self, action: Any):
+                raise NotImplementedError
+
+        spaces = types.SimpleNamespace(Box=_Box, Discrete=_Discrete, Dict=_Dict)
+        gym = types.SimpleNamespace(Env=_Env, spaces=spaces)
+
 import numpy as np
 import pandas as pd
-from gymnasium import spaces as spaces
 from infra.event_bus import Topics
 from infra.time_provider import TimeProvider, RealTimeProvider
 from leakguard import LeakGuard, LeakConfig
