@@ -11940,6 +11940,7 @@ class ExecutionSimulator:
         new_order_pos: list[int] = []
         fee_total: float = 0.0
         filter_rejections_step: List[Dict[str, Any]] = []
+        risk_events_step: List[RiskEvent] = []  # type: ignore[var-annotated]
 
         # --- обработать действия ---
         acts = list(actions or [])
@@ -12061,9 +12062,9 @@ class ExecutionSimulator:
                         total_notional=portfolio_total,
                     )
                     qty_total = float(adj_qty)
-                    for _e in self.risk.pop_events():
-                        # события риска будут добавлены позже через on_mark(); здесь просто очищаем очередь
-                        pass
+                    risk_events_local = list(self.risk.pop_events())
+                    if risk_events_local:
+                        risk_events_step.extend(risk_events_local)
                     if qty_total <= 0.0:
                         _cancel(cli_id)
                         continue
@@ -12822,7 +12823,7 @@ class ExecutionSimulator:
             _check_pnl_reconciliation(expected, recomputed)
 
         # риск: дневной лосс/пауза + собрать события
-        risk_events_all: list[RiskEvent] = []
+        risk_events_all: list[RiskEvent] = list(risk_events_step)
         risk_paused_until = 0
         if self.risk is not None:
             try:
