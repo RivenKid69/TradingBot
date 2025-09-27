@@ -10590,6 +10590,13 @@ class ExecutionSimulator:
                     elif cap_enforced:
                         fill_qty_base = min(fill_qty_base, remaining_base)
 
+                    fill_qty_base = self._limit_by_intrabar_volume(fill_qty_base)
+                    if cap_enforced:
+                        remaining_base = max(
+                            0.0, cap_base_per_bar - used_base_before_child
+                        )
+                        fill_qty_base = min(fill_qty_base, remaining_base)
+
                     if cap_enforced and fill_qty_base <= 0.0:
                         ts_zero = int(base_ts + lat_ms)
                         cid_int = int(p.client_order_id)
@@ -10794,6 +10801,13 @@ class ExecutionSimulator:
                     fill_qty_base = max(0.0, float(quant_qty))
                     if fill_qty_base <= 0.0:
                         continue
+
+                    fill_qty_base = self._limit_by_intrabar_volume(fill_qty_base)
+                    if cap_enforced:
+                        remaining_base = max(
+                            0.0, cap_base_per_bar - used_base_before_child
+                        )
+                        fill_qty_base = min(fill_qty_base, remaining_base)
 
                     q_child = float(fill_qty_base)
                     self._consume_intrabar_volume(q_child)
@@ -12547,6 +12561,13 @@ class ExecutionSimulator:
                     elif cap_enforced:
                         fill_qty_base = min(fill_qty_base, remaining_base)
 
+                    fill_qty_base = self._limit_by_intrabar_volume(fill_qty_base)
+                    if cap_enforced:
+                        remaining_base = max(
+                            0.0, cap_base_per_bar - used_base_before_child
+                        )
+                        fill_qty_base = min(fill_qty_base, remaining_base)
+
                     if cap_enforced and fill_qty_base <= 0.0:
                         ts_zero = int(ts_send)
                         if cli_id not in cancelled_ids:
@@ -12728,6 +12749,13 @@ class ExecutionSimulator:
                     fill_qty_base = max(0.0, float(quant_qty))
                     if fill_qty_base <= 0.0:
                         continue
+
+                    fill_qty_base = self._limit_by_intrabar_volume(fill_qty_base)
+                    if cap_enforced:
+                        remaining_base = max(
+                            0.0, cap_base_per_bar - used_base_before_child
+                        )
+                        fill_qty_base = min(fill_qty_base, remaining_base)
 
                     q_child = float(fill_qty_base)
                     self._consume_intrabar_volume(q_child)
