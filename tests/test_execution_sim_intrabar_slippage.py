@@ -71,3 +71,49 @@ def test_intrabar_fallback_slip_uses_estimate(monkeypatch):
     assert trade.slippage_bps == pytest.approx(fallback_bps)
     assert trade.price == pytest.approx(expected_price)
     assert any(pytest.approx(fallback_bps) == call for call in blend_calls)
+
+
+def test_maker_limit_intrabar_order_executes_immediately():
+    latency_cfg = {
+        "base_ms": 0,
+        "jitter_ms": 0,
+        "spike_p": 0.0,
+        "timeout_ms": 1000,
+        "retries": 0,
+    }
+    execution_cfg = {"intrabar_price_model": "low"}
+
+    sim = ExecutionSimulator(
+        filters_path=None,
+        latency_config=latency_cfg,
+        execution_config=execution_cfg,
+    )
+
+    sim.run_step(
+        ts=0,
+        ref_price=101.0,
+        bid=100.0,
+        ask=101.0,
+        bar_open=101.0,
+        bar_high=105.0,
+        bar_low=99.0,
+        bar_close=102.0,
+        liquidity=10.0,
+        trade_price=101.0,
+        trade_qty=1.0,
+        actions=[],
+    )
+
+    limit_proto = ActionProto(
+        action_type=ActionType.LIMIT,
+        volume_frac=1.0,
+        abs_price=99.5,
+    )
+
+    sim.submit(limit_proto, now_ts=0)
+    report = sim.pop_ready(now_ts=0, ref_price=101.0)
+
+    assert report.trades, "Maker limit order should fill intrabar"
+    trade = report.trades[0]
+    assert trade.liquidity == "maker"
+    assert trade.price == pytest.approx(99.5)
