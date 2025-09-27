@@ -290,6 +290,41 @@ def test_market_step_violation_rejected_without_quantizer():
     assert rejection.message == "Quantity not aligned to step"
 
 
+def test_market_qty_max_enforced_with_sub_picosecond_step():
+    max_qty = 1e-9
+    qty_step = 2e-15
+    local_filters = {
+        "FEMTOQTY": {
+            "PRICE_FILTER": {
+                "minPrice": "0",
+                "maxPrice": "1000000",
+                "tickSize": "0.0001",
+            },
+            "LOT_SIZE": {
+                "minQty": "0",
+                "maxQty": f"{max_qty}",
+                "stepSize": f"{qty_step}",
+            },
+            "MIN_NOTIONAL": {"minNotional": "0"},
+        }
+    }
+
+    sim = ExecutionSimulator(symbol="FEMTOQTY", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.quantizer = None
+    sim.filters = local_filters
+
+    qty_total, rejection = sim._apply_filters_market(
+        "BUY", max_qty + 1e-13, ref_price=1.0
+    )
+
+    assert qty_total == pytest.approx(0.0)
+    assert rejection is not None
+    assert rejection.code == "LOT_SIZE"
+    assert rejection.message == "Quantity above maximum"
+
+
 def test_limit_ppbs_violation_without_quantizer():
     sim = ExecutionSimulator(filters_path=None)
     sim.strict_filters = True
@@ -502,6 +537,38 @@ def test_limit_tick_alignment_with_offset_min_price():
     assert rejection_bad.constraint.get("min_price") == pytest.approx(0.35)
     snapped = rejection_bad.constraint.get("snapped_price")
     assert snapped == pytest.approx(0.35) or snapped == pytest.approx(0.55)
+
+
+def test_limit_price_max_enforced_with_sub_picosecond_tick():
+    price_max = 1e-9
+    price_tick = 2e-15
+    local_filters = {
+        "FEMTOPRICE": {
+            "PRICE_FILTER": {
+                "minPrice": "0",
+                "maxPrice": f"{price_max}",
+                "tickSize": f"{price_tick}",
+            },
+            "LOT_SIZE": {"minQty": "0", "maxQty": "10", "stepSize": "1"},
+            "MIN_NOTIONAL": {"minNotional": "0"},
+        }
+    }
+
+    sim = ExecutionSimulator(symbol="FEMTOPRICE", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.quantizer = None
+    sim.filters = local_filters
+
+    price_adj, qty_adj, rejection = sim._apply_filters_limit(
+        "BUY", price=price_max + 1e-13, qty=1.0, ref_price=price_max
+    )
+
+    assert price_adj == pytest.approx(0.0)
+    assert qty_adj == pytest.approx(0.0)
+    assert rejection is not None
+    assert rejection.code == "PRICE_FILTER"
+    assert rejection.message == "Price above maximum"
 
 
 def test_attach_quantizer_sets_metadata(tmp_path: pathlib.Path):
