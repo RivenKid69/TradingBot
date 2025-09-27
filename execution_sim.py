@@ -8378,19 +8378,17 @@ class ExecutionSimulator:
         base_tolerance = 1e-12
         qty_tol = base_tolerance
         price_tol = base_tolerance
+        qty_step = 0.0
+        price_tick = 0.0
         if validations_enabled and filters is not None:
             try:
                 qty_step = float(getattr(filters, "qty_step", 0.0) or 0.0)
             except (TypeError, ValueError):
                 qty_step = 0.0
-            if qty_step > 0.0 and math.isfinite(qty_step):
-                qty_tol = min(base_tolerance, qty_step / 2.0)
             try:
                 price_tick = float(getattr(filters, "price_tick", 0.0) or 0.0)
             except (TypeError, ValueError):
                 price_tick = 0.0
-            if price_tick > 0.0 and math.isfinite(price_tick):
-                price_tol = min(base_tolerance, price_tick / 2.0)
         ref_ppbs = self._resolve_filter_reference(ref_price)
         enforce_ppbs = bool(self.enforce_ppbs and validations_enabled)
 
@@ -8458,6 +8456,47 @@ class ExecutionSimulator:
                         },
                     )
                     return price_quantized, 0.0, reason
+
+        if validations_enabled and filters is not None:
+            qty_tol_candidates: List[float] = []
+            if qty_step > 0.0 and math.isfinite(qty_step):
+                step_tol = qty_step / 2.0
+                if step_tol > 0.0 and math.isfinite(step_tol):
+                    qty_tol_candidates.append(step_tol)
+            if math.isfinite(qty_quantized):
+                magnitude_tol = abs(qty_quantized) * 1e-12
+                if magnitude_tol > 0.0 and math.isfinite(magnitude_tol):
+                    qty_tol_candidates.append(magnitude_tol)
+            if qty_tol_candidates:
+                qty_tol = max(base_tolerance, min(qty_tol_candidates))
+            else:
+                qty_tol = base_tolerance
+            if qty_step > 0.0 and math.isfinite(qty_step):
+                half_step = qty_step / 2.0
+                if half_step > 0.0 and math.isfinite(half_step):
+                    qty_tol = min(qty_tol, half_step)
+            if not math.isfinite(qty_tol) or qty_tol <= 0.0:
+                qty_tol = base_tolerance
+
+            price_tol_candidates: List[float] = []
+            if price_tick > 0.0 and math.isfinite(price_tick):
+                half_tick = price_tick / 2.0
+                if half_tick > 0.0 and math.isfinite(half_tick):
+                    price_tol_candidates.append(half_tick)
+            if math.isfinite(price_quantized):
+                magnitude_tol = abs(price_quantized) * 1e-12
+                if magnitude_tol > 0.0 and math.isfinite(magnitude_tol):
+                    price_tol_candidates.append(magnitude_tol)
+            if price_tol_candidates:
+                price_tol = max(base_tolerance, min(price_tol_candidates))
+            else:
+                price_tol = base_tolerance
+            if price_tick > 0.0 and math.isfinite(price_tick):
+                half_tick = price_tick / 2.0
+                if half_tick > 0.0 and math.isfinite(half_tick):
+                    price_tol = min(price_tol, half_tick)
+            if not math.isfinite(price_tol) or price_tol <= 0.0:
+                price_tol = base_tolerance
 
         if not validations_enabled or filters is None:
             return price_quantized, qty_quantized, None

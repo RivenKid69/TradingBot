@@ -539,6 +539,46 @@ def test_limit_tick_alignment_with_offset_min_price():
     assert snapped == pytest.approx(0.35) or snapped == pytest.approx(0.55)
 
 
+def test_limit_large_tick_aligned_price_survives_price_filter():
+    price_tick = 0.01
+    large_price = 123_456_789.23
+    local_filters = {
+        "BIGNUM": {
+            "PRICE_FILTER": {
+                "minPrice": "0",
+                "maxPrice": "1000000000",
+                "tickSize": f"{price_tick}",
+            },
+            "LOT_SIZE": {"minQty": "0.01", "maxQty": "1000", "stepSize": "0.01"},
+            "MIN_NOTIONAL": {"minNotional": "0"},
+        }
+    }
+
+    sim = ExecutionSimulator(symbol="BIGNUM", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = False
+    sim.quantizer = None
+    sim.filters = local_filters
+
+    price_ok, qty_ok, rejection_ok = sim._apply_filters_limit_legacy(
+        "BUY", price=large_price, qty=1.0, ref_price=large_price
+    )
+
+    assert rejection_ok is None
+    assert price_ok == pytest.approx(large_price)
+    assert qty_ok == pytest.approx(1.0)
+
+    misaligned_price = large_price + price_tick * 0.4
+    price_bad, qty_bad, rejection_bad = sim._apply_filters_limit_legacy(
+        "BUY", price=misaligned_price, qty=1.0, ref_price=large_price
+    )
+
+    assert rejection_bad is not None
+    assert rejection_bad.code == "PRICE_FILTER"
+    assert price_bad == pytest.approx(0.0)
+    assert qty_bad == pytest.approx(0.0)
+
+
 def test_limit_price_max_enforced_with_sub_picosecond_tick():
     price_max = 1e-9
     price_tick = 2e-15
