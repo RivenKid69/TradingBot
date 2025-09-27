@@ -130,6 +130,33 @@ class _ClampNotionalQuantizer:
         return max(float(qty), self._forced_qty)
 
 
+class _LegacyQuantizerWithoutQuantizeOrder:
+    def __init__(self, filters_payload):
+        self._filters_raw = filters_payload
+        self._delegate = Quantizer(filters_payload, strict=True)
+        self._filters = self._delegate._filters
+        self.strict = True
+
+    def raw_filters(self):
+        return self._filters_raw
+
+    def quantize_price(self, symbol: str, price: float) -> float:
+        return float(self._delegate.quantize_price(symbol, price))
+
+    def quantize_qty(self, symbol: str, qty: float) -> float:
+        return float(self._delegate.quantize_qty(symbol, qty))
+
+    def clamp_notional(self, symbol: str, ref_price: float, qty: float) -> float:
+        return float(self._delegate.clamp_notional(symbol, ref_price, qty))
+
+    def check_percent_price_by_side(
+        self, symbol: str, side: str, price: float, ref_price: float
+    ) -> bool:
+        return bool(
+            self._delegate.check_percent_price_by_side(symbol, side, price, ref_price)
+        )
+
+
 # --- Python ExecutionSimulator tests ---
 
 def test_unquantized_limit_executes_permissive():
@@ -299,6 +326,57 @@ def test_lowercase_filters_enforce_strict_checks():
     assert qty_total == pytest.approx(0.0)
     assert rejection is not None
     assert rejection.code == "MIN_NOTIONAL"
+
+
+def test_legacy_quantizer_without_quantize_order_rejects_min_notional():
+    legacy_filters = {
+        "LEGACYMN": {
+            "PRICE_FILTER": {"minPrice": "0.01", "maxPrice": "100000", "tickSize": "0.01"},
+            "LOT_SIZE": {"minQty": "0.1", "maxQty": "0.5", "stepSize": "0.1"},
+            "MIN_NOTIONAL": {"minNotional": "10"},
+        }
+    }
+
+    sim = ExecutionSimulator(symbol="LEGACYMN", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = True
+    sim.set_quantizer(_LegacyQuantizerWithoutQuantizeOrder(legacy_filters))
+
+    result = sim.quantizer_impl.validate_order(
+        "LEGACYMN", "BUY", 10.0, 0.2, 10.0, enforce_ppbs=True
+    )
+
+    assert result.reason_code == "MIN_NOTIONAL"
+    assert result.qty == pytest.approx(0.0)
+    details = getattr(result, "details", None)
+    assert details is not None
+    assert details.get("min_notional") == pytest.approx(10.0)
+
+
+def test_legacy_quantizer_without_quantize_order_rejects_percent_price():
+    legacy_filters = {
+        "LEGACYPBS": {
+            "PRICE_FILTER": {"minPrice": "0.01", "maxPrice": "100000", "tickSize": "0.01"},
+            "LOT_SIZE": {"minQty": "0.001", "maxQty": "10", "stepSize": "0.001"},
+            "MIN_NOTIONAL": {"minNotional": "0.5"},
+            "PERCENT_PRICE_BY_SIDE": {"multiplierUp": "1.05", "multiplierDown": "0.95"},
+        }
+    }
+
+    sim = ExecutionSimulator(symbol="LEGACYPBS", filters_path=None)
+    sim.strict_filters = True
+    sim.enforce_ppbs = True
+    sim.set_quantizer(_LegacyQuantizerWithoutQuantizeOrder(legacy_filters))
+
+    result = sim.quantizer_impl.validate_order(
+        "LEGACYPBS", "BUY", 110.0, 0.01, 100.0, enforce_ppbs=True
+    )
+
+    assert result.reason_code == "PPBS"
+    assert result.qty == pytest.approx(0.0)
+    details = getattr(result, "details", None)
+    assert details is not None
+    assert details.get("multiplier_up") == pytest.approx(1.05)
 
 
 def test_next_open_risk_adjustment_revalidated_by_filters():

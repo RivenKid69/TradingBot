@@ -1432,6 +1432,127 @@ class ExecutionSimulator:
 
                 price_val = float(price)
                 qty_val = float(qty)
+
+                def _coerce_float(value: Any) -> Optional[float]:
+                    if value is None:
+                        return None
+                    if isinstance(value, (int, float)):
+                        try:
+                            result = float(value)
+                        except (TypeError, ValueError):
+                            return None
+                        return result if math.isfinite(result) else None
+                    try:
+                        text = str(value).strip()
+                    except Exception:
+                        return None
+                    if not text:
+                        return None
+                    try:
+                        result = float(text)
+                    except (TypeError, ValueError):
+                        return None
+                    return result if math.isfinite(result) else None
+
+                symbol_key = ExecutionSimulator._normalize_symbol_key(symbol)
+                min_notional: Optional[float] = None
+                multiplier_up: Optional[float] = None
+                multiplier_down: Optional[float] = None
+
+                def _update_from_candidate(candidate: Any) -> None:
+                    nonlocal min_notional, multiplier_up, multiplier_down
+                    if candidate is None:
+                        return
+                    mapping = ExecutionSimulator._plain_mapping(candidate)
+                    if not mapping and hasattr(candidate, "__dict__"):
+                        try:
+                            mapping = {
+                                str(k): v
+                                for k, v in vars(candidate).items()
+                                if not str(k).startswith("_")
+                            }
+                        except Exception:
+                            mapping = {}
+                    if not mapping:
+                        return
+
+                    if min_notional is None:
+                        min_candidate: Any = mapping.get("min_notional")
+                        if min_candidate is None:
+                            min_candidate = mapping.get("minNotional")
+                        if min_candidate is None:
+                            min_section = mapping.get("MIN_NOTIONAL")
+                            if isinstance(min_section, Mapping):
+                                min_candidate = (
+                                    min_section.get("minNotional")
+                                    or min_section.get("min_notional")
+                                )
+                        coerced = _coerce_float(min_candidate)
+                        if coerced is not None:
+                            min_notional = coerced
+
+                    if multiplier_up is None:
+                        mu_candidate: Any = mapping.get("multiplier_up")
+                        if mu_candidate is None:
+                            ppbs_section = (
+                                mapping.get("PERCENT_PRICE_BY_SIDE")
+                                or mapping.get("PERCENT_PRICE")
+                            )
+                            if isinstance(ppbs_section, Mapping):
+                                mu_candidate = (
+                                    ppbs_section.get("multiplierUp")
+                                    or ppbs_section.get("askMultiplierUp")
+                                    or ppbs_section.get("bidMultiplierUp")
+                                )
+                        coerced_mu = _coerce_float(mu_candidate)
+                        if coerced_mu is not None:
+                            multiplier_up = coerced_mu
+
+                    if multiplier_down is None:
+                        md_candidate: Any = mapping.get("multiplier_down")
+                        if md_candidate is None:
+                            ppbs_section = (
+                                mapping.get("PERCENT_PRICE_BY_SIDE")
+                                or mapping.get("PERCENT_PRICE")
+                            )
+                            if isinstance(ppbs_section, Mapping):
+                                md_candidate = (
+                                    ppbs_section.get("multiplierDown")
+                                    or ppbs_section.get("askMultiplierDown")
+                                    or ppbs_section.get("bidMultiplierDown")
+                                )
+                        coerced_md = _coerce_float(md_candidate)
+                        if coerced_md is not None:
+                            multiplier_down = coerced_md
+
+                if symbol_key:
+                    try:
+                        symbol_filters = self.symbol_filters
+                    except Exception:
+                        symbol_filters = None
+                    if isinstance(symbol_filters, Mapping):
+                        try:
+                            _update_from_candidate(symbol_filters.get(symbol_key))
+                        except Exception:
+                            pass
+                    try:
+                        raw_filters = self._filters_raw
+                    except Exception:
+                        raw_filters = None
+                    if isinstance(raw_filters, Mapping):
+                        try:
+                            _update_from_candidate(raw_filters.get(symbol_key))
+                        except Exception:
+                            pass
+
+                try:
+                    ref_float = float(ref_value)
+                except (TypeError, ValueError):
+                    ref_float = price_val
+                else:
+                    if not math.isfinite(ref_float):
+                        ref_float = price_val
+
                 quantize_price = getattr(q_obj, "quantize_price", None)
                 if callable(quantize_price):
                     try:
@@ -1444,6 +1565,104 @@ class ExecutionSimulator:
                         qty_val = float(quantize_qty(symbol, qty_val))
                     except Exception:
                         qty_val = float(qty)
+
+                clamp_notional = getattr(q_obj, "clamp_notional", None)
+                clamp_price = price_val
+                if clamp_price <= 0.0 and ref_float > 0.0:
+                    clamp_price = ref_float
+                if callable(clamp_notional):
+                    try:
+                        qty_candidate = clamp_notional(symbol, clamp_price, qty_val)
+                    except TypeError:
+                        qty_candidate = clamp_notional(symbol, clamp_price)
+                    except ValueError as exc:
+                        return SimpleNamespace(
+                            price=price_val,
+                            qty=0.0,
+                            reason_code="MIN_NOTIONAL",
+                            reason=str(exc),
+                            details={
+                                "min_notional": min_notional,
+                                "price": clamp_price,
+                                "qty": qty_val,
+                            },
+                        )
+                    except Exception:
+                        qty_candidate = qty_val
+                    else:
+                        try:
+                            qty_val = float(qty_candidate)
+                        except (TypeError, ValueError):
+                            qty_val = float(qty)
+
+                price_for_notional = price_val
+                if (price_for_notional <= 0.0 or not math.isfinite(price_for_notional)) and (
+                    ref_float > 0.0 and math.isfinite(ref_float)
+                ):
+                    price_for_notional = ref_float
+                notional = abs(price_for_notional * qty_val)
+                min_notional_threshold = min_notional if min_notional is not None else 0.0
+                if (
+                    min_notional_threshold > 0.0
+                    and qty_val > 0.0
+                    and notional + 1e-12 < min_notional_threshold
+                ):
+                    return SimpleNamespace(
+                        price=price_val,
+                        qty=qty_val,
+                        reason_code="MIN_NOTIONAL",
+                        reason=(
+                            f"Order notional {notional} below MIN_NOTIONAL="
+                            f"{min_notional_threshold}"
+                        ),
+                        details={
+                            "min_notional": min_notional_threshold,
+                            "price": price_for_notional,
+                            "qty": qty_val,
+                        },
+                    )
+
+                if enforce_flag:
+                    ppbs_ok = True
+                    ppbs_checker = getattr(q_obj, "check_percent_price_by_side", None)
+                    manual_check_needed = True
+                    if callable(ppbs_checker):
+                        manual_check_needed = False
+                        try:
+                            ppbs_ok = bool(
+                                ppbs_checker(
+                                    symbol,
+                                    side,
+                                    price_val,
+                                    ref_float,
+                                )
+                            )
+                        except Exception:
+                            manual_check_needed = True
+                            ppbs_ok = True
+                    if manual_check_needed and (multiplier_up is not None or multiplier_down is not None):
+                        side_norm = str(side).upper()
+                        if side_norm == "BUY" and multiplier_up is not None and ref_float > 0.0:
+                            limit_up = ref_float * multiplier_up
+                            ppbs_ok = price_val <= limit_up + 1e-12
+                        elif side_norm != "BUY" and multiplier_down is not None and ref_float > 0.0:
+                            limit_down = ref_float * multiplier_down
+                            ppbs_ok = price_val + 1e-12 >= limit_down
+                    if not ppbs_ok:
+                        return SimpleNamespace(
+                            price=price_val,
+                            qty=0.0,
+                            reason_code="PPBS",
+                            reason="PERCENT_PRICE_BY_SIDE filter rejected the order",
+                            details={
+                                "side": str(side).upper(),
+                                "price": price_val,
+                                "ref_price": ref_float,
+                                "multiplier_up": multiplier_up,
+                                "multiplier_down": multiplier_down,
+                            },
+                        )
+
                 return SimpleNamespace(
                     price=price_val,
                     qty=qty_val,
