@@ -7390,6 +7390,7 @@ class ExecutionSimulator:
         px = float(price)
         pos = float(self.position_qty)
         avg = self._avg_entry_price
+        tolerance = 1e-12
 
         if str(side).upper() == "BUY":
             if pos < 0.0:
@@ -7398,12 +7399,13 @@ class ExecutionSimulator:
                     realized += (avg - px) * close_qty
                 pos += close_qty
                 q_rem = q - close_qty
-                if q_rem > 0.0:
+                if q_rem > tolerance:
                     self.position_qty = q_rem
                     self._avg_entry_price = px
                 else:
                     self.position_qty = pos
-                    if self.position_qty == 0.0:
+                    if abs(self.position_qty) <= tolerance:
+                        self.position_qty = 0.0
                         self._avg_entry_price = None
             else:
                 new_pos = pos + q
@@ -7422,12 +7424,13 @@ class ExecutionSimulator:
                     realized += (px - avg) * close_qty
                 pos -= close_qty
                 q_rem = q - close_qty
-                if q_rem > 0.0:
+                if q_rem > tolerance:
                     self.position_qty = -q_rem
                     self._avg_entry_price = px
                 else:
                     self.position_qty = pos
-                    if self.position_qty == 0.0:
+                    if abs(self.position_qty) <= tolerance:
+                        self.position_qty = 0.0
                         self._avg_entry_price = None
             else:
                 new_pos = pos - q
@@ -7439,6 +7442,10 @@ class ExecutionSimulator:
                 else:
                     self._avg_entry_price = None
                 self.position_qty = new_pos
+
+        if abs(self.position_qty) <= tolerance:
+            self.position_qty = 0.0
+            self._avg_entry_price = None
 
         self.realized_pnl_cum += float(realized)
         return float(realized)
