@@ -1139,7 +1139,7 @@ class FundingCalculator:
             return 0.0, []
         if mark_price is None or not math.isfinite(float(mark_price)) or abs(position_qty) <= 0.0:
             # Нет цены или позиции — funding не начисляем
-            self._next_ts_ms = None if self._next_ts_ms is None else self._next_ts_ms
+            self._next_ts_ms = None
             return 0.0, []
 
         total = 0.0
