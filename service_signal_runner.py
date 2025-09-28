@@ -981,6 +981,18 @@ class _Worker:
         )
         if not normalization_details:
             normalization_details = self._materialize_mapping(snapshot.get("normalization"))
+        reason_val = self._find_in_mapping(decision, ("reason", "skip_reason"))
+        if reason_val is None and snapshot is not None:
+            reason_val = snapshot.get("reason") or snapshot.get("skip_reason")
+        reason_label: str | None = None
+        if isinstance(reason_val, str):
+            candidate = reason_val.strip()
+            reason_label = candidate if candidate else None
+        elif reason_val is not None:
+            try:
+                reason_label = str(reason_val)
+            except Exception:
+                reason_label = None
         metrics: Dict[str, Any] = {
             "decisions": 1,
             "act_now": 1 if act_now_flag else 0,
@@ -988,6 +1000,8 @@ class _Worker:
             "cap_usd": cap_value,
             "normalized": bool(normalized_flag),
         }
+        if reason_label:
+            metrics["reason"] = reason_label
         if normalization_details:
             metrics["normalization"] = normalization_details
         return metrics
@@ -3124,6 +3138,27 @@ class _Worker:
                             )
                         except Exception:
                             pass
+                        reason = str(bar_metrics.get("reason") or "").strip()
+                        if reason:
+                            try:
+                                self._logger.info(
+                                    "BAR_EXECUTOR_SKIP %s",
+                                    {"symbol": bar.symbol, "reason": reason},
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                monitoring.inc_reason(reason)
+                            except Exception:
+                                pass
+                            try:
+                                pipeline_stage_drop_count.labels(
+                                    bar.symbol,
+                                    Stage.PUBLISH.name,
+                                    reason,
+                                ).inc()
+                            except Exception:
+                                pass
                 pnl_value = self._extract_daily_pnl(snapshot)
                 if pnl_value is not None:
                     try:
