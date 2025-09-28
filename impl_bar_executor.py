@@ -203,6 +203,7 @@ class BarExecutor(TradeExecutor):
         self.safety_margin_bps = float(safety_margin_bps)
         self.default_equity_usd = float(default_equity_usd)
         self._states: Dict[str, PortfolioState] = {}
+        self._last_snapshot: Dict[str, Any] = {}
         if initial_weights:
             for symbol, weight in initial_weights.items():
                 self._states[symbol] = PortfolioState(
@@ -299,6 +300,23 @@ class BarExecutor(TradeExecutor):
         if adv_quote is not None:
             report_meta["adv_quote"] = adv_quote
 
+        snapshot: Dict[str, Any] = {
+            "execution_mode": "bar",
+            "mode": mode,
+            "target_weight": target_weight,
+            "delta_weight": delta_weight,
+            "decision": decision_data,
+            "act_now": bool(getattr(metrics, "act_now", False)),
+            "turnover_usd": float(getattr(metrics, "turnover_usd", 0.0)),
+            "adv_quote": float(adv_quote) if adv_quote is not None else None,
+            "min_step_enforced": bool(skip_due_to_step),
+        }
+        if instructions:
+            snapshot["instructions"] = [instr.to_dict() for instr in instructions]
+        if bar is not None:
+            snapshot["bar_ts"] = int(bar.ts)
+        self._last_snapshot = snapshot
+
         return ExecReport(
             ts=bar.ts if bar is not None else order.ts,
             run_id=self.run_id,
@@ -314,6 +332,13 @@ class BarExecutor(TradeExecutor):
             client_order_id=order.client_order_id,
             meta=report_meta,
         )
+
+    # ------------------------------------------------------------------
+    # Monitoring helpers
+    def monitoring_snapshot(self) -> Dict[str, Any]:  # pragma: no cover - simple access
+        if not self._last_snapshot:
+            return {"execution_mode": "bar"}
+        return dict(self._last_snapshot)
 
     def cancel(self, client_order_id: str) -> None:  # pragma: no cover - no-op
         logger.debug("cancel() called on BarExecutor for %s", client_order_id)

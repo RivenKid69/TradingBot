@@ -16,9 +16,10 @@ python aggregate_exec_logs.py \
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 import pandas as pd
 
@@ -175,6 +176,85 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
             "meta_json",
         ]
     ]
+
+
+def _parse_meta(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            return dict(json.loads(text))
+        except Exception:
+            return {}
+    try:
+        text = str(value)
+    except Exception:
+        return {}
+    try:
+        return dict(json.loads(text))
+    except Exception:
+        return {}
+
+
+def _extract_meta_float(meta: Dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if key in meta and meta[key] is not None:
+            try:
+                return float(meta[key])
+            except (TypeError, ValueError):
+                pass
+    decision = meta.get("decision")
+    if isinstance(decision, dict):
+        for key in keys:
+            if key in decision and decision[key] is not None:
+                try:
+                    return float(decision[key])
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def _extract_meta_bool(meta: Dict[str, Any], keys: tuple[str, ...]) -> bool | None:
+    for key in keys:
+        if key in meta:
+            value = meta[key]
+            if value is None:
+                continue
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if not normalized:
+                    continue
+                if normalized in {"1", "true", "yes", "y"}:
+                    return True
+                if normalized in {"0", "false", "no", "n"}:
+                    return False
+            try:
+                return bool(value)
+            except Exception:
+                continue
+    decision = meta.get("decision")
+    if isinstance(decision, dict):
+        return _extract_meta_bool(decision, keys)
+    return None
+
+
+def _infer_execution_mode(meta: Dict[str, Any]) -> str:
+    raw = meta.get("execution_mode") or meta.get("mode")
+    if isinstance(raw, str):
+        mode = raw.strip().lower()
+        if mode in {"order", "bar"}:
+            return mode
+    decision = meta.get("decision")
+    if isinstance(decision, dict) and any(
+        key in decision for key in ("turnover_usd", "turnover", "notional_usd")
+    ):
+        return "bar"
+    return "order"
 
 
 def _normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
@@ -375,9 +455,53 @@ def aggregate(
 
     # Ensure numeric types
     trades["price"] = pd.to_numeric(trades["price"], errors="coerce")
-    trades["quantity"] = pd.to_numeric(trades["quantity"], errors="coerce")
+    trades["quantity"] = pd.to_numeric(trades["quantity"], errors="coerce").fillna(0.0)
     trades["ts"] = pd.to_numeric(trades["ts"], errors="coerce").astype("Int64")
     trades["side_sign"] = trades["side"].astype(str).map(lambda s: 1 if s.upper() == "BUY" else -1)
+
+    # Extract execution metadata (supports both order and bar modes)
+    meta_series = trades["meta_json"].apply(_parse_meta)
+    trades["execution_mode"] = meta_series.apply(_infer_execution_mode)
+
+    turnover_from_meta = meta_series.apply(
+        lambda m: _extract_meta_float(m, ("turnover_usd", "turnover", "notional_usd")) or 0.0
+    )
+    cap_from_meta = meta_series.apply(
+        lambda m: _extract_meta_float(m, ("cap_usd", "adv_quote", "cap_quote", "daily_notional_cap"))
+    )
+    act_now_from_meta = meta_series.apply(
+        lambda m: _extract_meta_bool(m, ("act_now", "execute_now"))
+    )
+
+    if "turnover_usd" in trades.columns:
+        trades["turnover_usd"] = (
+            pd.to_numeric(trades["turnover_usd"], errors="coerce").fillna(0.0)
+        )
+    else:
+        trades["turnover_usd"] = turnover_from_meta
+
+    if "cap_usd" in trades.columns:
+        trades["cap_usd"] = pd.to_numeric(trades["cap_usd"], errors="coerce")
+    else:
+        trades["cap_usd"] = cap_from_meta
+
+    if "act_now" in trades.columns:
+        trades["act_now_flag"] = trades["act_now"].apply(
+            lambda v: bool(v) if pd.notna(v) else None
+        )
+    else:
+        trades["act_now_flag"] = act_now_from_meta
+
+    trades["act_now_flag"] = trades["act_now_flag"].astype(object)
+    trades.loc[trades["execution_mode"] != "bar", "turnover_usd"] = 0.0
+    trades.loc[trades["execution_mode"] != "bar", "cap_usd"] = float("nan")
+    trades.loc[trades["execution_mode"] != "bar", "act_now_flag"] = None
+
+    trades["bar_decision_count"] = trades["execution_mode"].eq("bar").astype(int)
+    act_now_mask = trades["act_now_flag"].apply(lambda v: bool(v) if v is not None else False)
+    trades["bar_act_now_count"] = (
+        trades["execution_mode"].eq("bar") & act_now_mask
+    ).astype(int)
 
     # Per-bar aggregation
     trades["ts_bucket"] = _bucket_ts_ms(trades["ts"], bar_seconds=bar_seconds)
@@ -389,8 +513,16 @@ def aggregate(
         vwap = float(notional / qty_abs) if qty_abs and math.isfinite(notional) else float("nan")
         buy_qty = df.loc[df["side_sign"]>0, "quantity"].abs().sum()
         sell_qty = df.loc[df["side_sign"]<0, "quantity"].abs().sum()
-        n_trades = int(len(df))
+        trade_mask = df["quantity"].abs() > 0
+        n_trades = int(trade_mask.sum())
         fee_sum = float(pd.to_numeric(df["fee"], errors="coerce").fillna(0.0).sum()) if "fee" in df.columns else 0.0
+        bar_decisions = int(df["bar_decision_count"].sum()) if "bar_decision_count" in df.columns else 0
+        bar_act_now = int(df["bar_act_now_count"].sum()) if "bar_act_now_count" in df.columns else 0
+        turnover_total = float(df.get("turnover_usd", pd.Series(dtype=float)).sum())
+        cap_series = df.get("cap_usd", pd.Series(dtype=float))
+        cap_sum = float(cap_series.dropna().sum())
+        ratio = float(turnover_total / cap_sum) if cap_sum > 0 else float("nan")
+        act_rate = float(bar_act_now / bar_decisions) if bar_decisions > 0 else float("nan")
         return pd.Series({
             "volume": float(qty_abs),
             "buy_qty": float(buy_qty),
@@ -398,6 +530,12 @@ def aggregate(
             "trades": n_trades,
             "vwap": float(vwap),
             "fee_total": fee_sum,
+            "bar_decisions": bar_decisions,
+            "bar_act_now": bar_act_now,
+            "bar_act_now_rate": act_rate,
+            "bar_turnover_usd": turnover_total,
+            "bar_cap_usd": float(cap_sum) if cap_sum > 0 else float("nan"),
+            "bar_turnover_vs_cap": ratio,
         })
 
     bars = g.apply(_agg)
@@ -408,14 +546,29 @@ def aggregate(
     day_ms = 24*60*60*1000
     trades["day"] = (trades["ts"].astype("Int64") // day_ms) * day_ms
     gd = trades.groupby(["symbol","day"], as_index=False)
-    days = gd.apply(lambda df: pd.Series({
-        "volume": float(df["quantity"].abs().sum()),
+    def _agg_day(df: pd.DataFrame) -> pd.Series:
+        cap_series = df.get("cap_usd", pd.Series(dtype=float))
+        cap_sum = float(cap_series.dropna().sum())
+        bar_decisions = float(df.get("bar_decision_count", pd.Series(dtype=float)).sum())
+        bar_act_now = float(df.get("bar_act_now_count", pd.Series(dtype=float)).sum())
+        return pd.Series({
+            "volume": float(df["quantity"].abs().sum()),
         "trades": int(len(df)),
         "buy_qty": float(df.loc[df["side_sign"]>0, "quantity"].abs().sum()),
         "sell_qty": float(df.loc[df["side_sign"]<0, "quantity"].abs().sum()),
         "fee_total": float(pd.to_numeric(df["fee"], errors="coerce").fillna(0.0).sum()) if "fee" in df.columns else 0.0,
         "vwap": float(((df["price"] * df["quantity"].abs()).sum() / df["quantity"].abs().sum())) if df["quantity"].abs().sum() else float("nan"),
-    }))
+        "bar_decisions": int(bar_decisions),
+        "bar_act_now": int(bar_act_now),
+        "bar_act_now_rate": float(bar_act_now / bar_decisions) if bar_decisions > 0 else float("nan"),
+        "bar_turnover_usd": float(df.get("turnover_usd", pd.Series(dtype=float)).sum()),
+        "bar_cap_usd": float(cap_sum) if cap_sum > 0 else float("nan"),
+        "bar_turnover_vs_cap": float(
+            df.get("turnover_usd", pd.Series(dtype=float)).sum() / cap_sum
+        ) if cap_sum > 0 else float("nan"),
+    })
+
+    days = gd.apply(_agg_day)
     days = days.rename(columns={"day":"ts"})
     days["ts"] = days["ts"].astype("Int64")
 
