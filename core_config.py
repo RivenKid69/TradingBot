@@ -377,6 +377,57 @@ class ClipToBarConfig(BaseModel):
     )
 
 
+class SpotImpactConfig(BaseModel):
+    """Coefficients for simple spot-market impact models."""
+
+    sqrt_coeff: float = Field(
+        default=0.0,
+        description="Coefficient applied to the square-root participation term (bps).",
+    )
+    linear_coeff: float = Field(
+        default=0.0,
+        description="Coefficient applied to the linear participation term (bps).",
+    )
+
+    class Config:
+        extra = "allow"
+
+
+class SpotCostConfig(BaseModel):
+    """Container describing spot execution cost assumptions."""
+
+    taker_fee_bps: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Taker fee expressed in basis points.",
+    )
+    half_spread_bps: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Half spread assumption used for slippage modelling (bps).",
+    )
+    impact: SpotImpactConfig = Field(
+        default_factory=SpotImpactConfig,
+        description="Coefficients for the simple impact model applied to participation rates.",
+    )
+
+    class Config:
+        extra = "allow"
+
+
+class PortfolioConfig(BaseModel):
+    """High-level portfolio assumptions shared between runtime components."""
+
+    equity_usd: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Capital base in USD; ``None`` leaves it unspecified (legacy behaviour).",
+    )
+
+    class Config:
+        extra = "allow"
+
+
 class ExecutionRuntimeConfig(BaseModel):
     """Runtime execution configuration shared across run modes."""
 
@@ -392,8 +443,23 @@ class ExecutionRuntimeConfig(BaseModel):
         default=ExecutionEntryMode.DEFAULT,
         description="Режим выбора точки входа; ``default`` соответствует текущему поведению.",
     )
+    mode: Literal["order", "bar"] = Field(
+        default="order",
+        description="Execution runtime mode. ``order`` preserves legacy per-order behaviour.",
+    )
+    bar_price: Optional[str] = Field(
+        default=None,
+        description="Reference price to use when ``mode`` is ``bar`` (e.g. 'close').",
+    )
+    min_rebalance_step: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Minimum rebalance step size expressed as a fraction of target quantity.",
+    )
     clip_to_bar: ClipToBarConfig = Field(default_factory=ClipToBarConfig)
     bridge: ExecutionBridgeConfig = Field(default_factory=ExecutionBridgeConfig)
+    portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
+    costs: SpotCostConfig = Field(default_factory=SpotCostConfig)
 
     class Config:
         extra = "allow"
@@ -404,9 +470,10 @@ class ExecutionRuntimeConfig(BaseModel):
         exporter = getattr(super(), method)
         payload = exporter(*args, **kwargs)
         if isinstance(payload, dict):
-            clip_cfg = payload.get("clip_to_bar")
-            if isinstance(clip_cfg, BaseModel):
-                payload["clip_to_bar"] = clip_cfg.dict(exclude_unset=False)
+            for key in ("clip_to_bar", "bridge", "portfolio", "costs"):
+                nested = payload.get(key)
+                if isinstance(nested, BaseModel):
+                    payload[key] = nested.dict(exclude_unset=False)
         return payload
 
     def dict(self, *args, **kwargs):  # type: ignore[override]
@@ -546,6 +613,8 @@ class CommonRunConfig(BaseModel):
     state: StateConfig = Field(default_factory=StateConfig)
     risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
     adv: AdvRuntimeConfig = Field(default_factory=AdvRuntimeConfig)
+    portfolio: PortfolioConfig = Field(default_factory=PortfolioConfig)
+    costs: SpotCostConfig = Field(default_factory=SpotCostConfig)
     latency: LatencyConfig = Field(default_factory=LatencyConfig)
     execution: ExecutionRuntimeConfig = Field(default_factory=ExecutionRuntimeConfig)
     slippage_calibration_enabled: bool = Field(
@@ -567,6 +636,82 @@ class CommonRunConfig(BaseModel):
         description="Forward market regime updates to the slippage component for calibrated overrides.",
     )
     components: Components
+
+    @model_validator(mode="after")
+    def _sync_runtime_sections(cls, values: "CommonRunConfig") -> "CommonRunConfig":
+        exec_cfg = getattr(values, "execution", None)
+        if not isinstance(exec_cfg, ExecutionRuntimeConfig):
+            try:
+                exec_cfg = ExecutionRuntimeConfig.parse_obj(exec_cfg or {})
+            except Exception:
+                exec_cfg = ExecutionRuntimeConfig()
+            object.__setattr__(values, "execution", exec_cfg)
+
+        fields_set = getattr(values, "__fields_set__", set())
+        exec_fields_set = getattr(exec_cfg, "__fields_set__", set())
+
+        portfolio_cfg = getattr(values, "portfolio", None)
+        if isinstance(portfolio_cfg, Mapping):
+            try:
+                portfolio_cfg = PortfolioConfig.parse_obj(portfolio_cfg)
+            except Exception:
+                portfolio_cfg = PortfolioConfig()
+        elif not isinstance(portfolio_cfg, PortfolioConfig):
+            portfolio_cfg = PortfolioConfig()
+        exec_portfolio_raw = getattr(exec_cfg, "portfolio", None)
+        if isinstance(exec_portfolio_raw, Mapping):
+            try:
+                exec_portfolio = PortfolioConfig.parse_obj(exec_portfolio_raw)
+            except Exception:
+                exec_portfolio = PortfolioConfig()
+        elif isinstance(exec_portfolio_raw, PortfolioConfig):
+            exec_portfolio = exec_portfolio_raw
+        else:
+            exec_portfolio = None
+        exec_provided = "portfolio" in exec_fields_set and exec_portfolio is not None
+        top_provided = "portfolio" in fields_set
+        if exec_provided and exec_portfolio is not None:
+            portfolio_cfg = exec_portfolio
+        elif top_provided:
+            exec_portfolio = portfolio_cfg
+        else:
+            portfolio_cfg = exec_portfolio or portfolio_cfg
+        if portfolio_cfg is None:
+            portfolio_cfg = PortfolioConfig()
+        object.__setattr__(exec_cfg, "portfolio", portfolio_cfg)
+        object.__setattr__(values, "portfolio", portfolio_cfg)
+
+        costs_cfg = getattr(values, "costs", None)
+        if isinstance(costs_cfg, Mapping):
+            try:
+                costs_cfg = SpotCostConfig.parse_obj(costs_cfg)
+            except Exception:
+                costs_cfg = SpotCostConfig()
+        elif not isinstance(costs_cfg, SpotCostConfig):
+            costs_cfg = SpotCostConfig()
+        exec_costs_raw = getattr(exec_cfg, "costs", None)
+        if isinstance(exec_costs_raw, Mapping):
+            try:
+                exec_costs = SpotCostConfig.parse_obj(exec_costs_raw)
+            except Exception:
+                exec_costs = SpotCostConfig()
+        elif isinstance(exec_costs_raw, SpotCostConfig):
+            exec_costs = exec_costs_raw
+        else:
+            exec_costs = None
+        exec_costs_provided = "costs" in exec_fields_set and exec_costs is not None
+        top_costs_provided = "costs" in fields_set
+        if exec_costs_provided and exec_costs is not None:
+            costs_cfg = exec_costs
+        elif top_costs_provided:
+            exec_costs = costs_cfg
+        else:
+            costs_cfg = exec_costs or costs_cfg
+        if costs_cfg is None:
+            costs_cfg = SpotCostConfig()
+        object.__setattr__(exec_cfg, "costs", costs_cfg)
+        object.__setattr__(values, "costs", costs_cfg)
+        return values
 
 
 class ExecutionProfile(str, Enum):
@@ -953,6 +1098,9 @@ __all__ = [
     "LatencyConfig",
     "ExecutionBridgeConfig",
     "ExecutionRuntimeConfig",
+    "PortfolioConfig",
+    "SpotCostConfig",
+    "SpotImpactConfig",
     "AdvRuntimeConfig",
     "MonitoringThresholdsConfig",
     "MonitoringAlertConfig",
