@@ -18,6 +18,7 @@ reports = from_config(cfg, df)
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Mapping, Sequence
 import logging
 import os
@@ -31,12 +32,14 @@ from adv_store import ADVStore
 from sandbox.backtest_adapter import BacktestAdapter
 from sandbox.sim_adapter import SimAdapter
 from core_contracts import SignalPolicy
+from core_models import Bar
 from services.utils_config import snapshot_config  # сохранение снапшота конфига
 from services.utils_sandbox import read_df
 from core_config import CommonRunConfig, ExecutionProfile
 from impl_quantizer import QuantizerImpl
 import di_registry
 from impl_sim_executor import SimExecutor
+from impl_bar_executor import BarExecutor
 
 
 try:  # pragma: no cover - optional dependency in sandbox setups
@@ -47,6 +50,246 @@ except Exception:  # pragma: no cover - fallback when implementation missing
 
 logger = logging.getLogger(__name__)
 
+
+class _NullVolEstimator:
+    """Minimal volatility estimator placeholder for bar-mode backtests."""
+
+    def observe(
+        self,
+        *,
+        symbol: str,
+        high: float | None = None,
+        low: float | None = None,
+        close: float | None = None,
+    ) -> float:
+        return 0.0
+
+    def value(self, symbol: str, metric: str | None = None) -> float | None:  # pragma: no cover - trivial
+        return None
+
+    def last(self, symbol: str, metric: str | None = None) -> float | None:  # pragma: no cover - trivial
+        return None
+
+
+class BarBacktestSimBridge:
+    """Lightweight adapter that accumulates bar-level equity via :class:`BarExecutor`."""
+
+    def __init__(
+        self,
+        executor: BarExecutor,
+        *,
+        symbol: str,
+        timeframe_ms: int,
+        initial_equity: float = 0.0,
+        bar_price_field: str = "close",
+        run_config: CommonRunConfig | None = None,
+    ) -> None:
+        self.executor = executor
+        self.sim = self  # BacktestAdapter expects ``sim`` attribute on the bridge
+        self.symbol = str(symbol or getattr(executor, "symbol", "")).upper() or ""
+        self.interval_ms = max(1, int(timeframe_ms or 1))
+        self.run_config = run_config
+        self._bar_price_field = str(bar_price_field or "close")
+        self._vol_estimator = _NullVolEstimator()
+        self._equity = float(initial_equity or 0.0)
+        self._initial_equity = float(initial_equity or 0.0)
+        self._weights: Dict[str, float] = {}
+        self._last_prices: Dict[str, float] = {}
+        self._active_symbol: str = self.symbol
+        self._cum_cost_usd = 0.0
+
+    # ------------------------------------------------------------------
+    # BacktestAdapter hooks
+    # ------------------------------------------------------------------
+    @property
+    def vol_estimator(self) -> _NullVolEstimator:
+        return self._vol_estimator
+
+    def set_active_symbol(self, symbol: str) -> None:
+        try:
+            sym = str(symbol or "").upper()
+        except Exception:
+            sym = ""
+        if sym:
+            self._active_symbol = sym
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return default
+        return out
+
+    def _coerce_price(self, value: Any, fallback: Any) -> float:
+        candidate = self._safe_float(value, default=float("nan"))
+        if math.isfinite(candidate) and candidate > 0.0:
+            return candidate
+        fallback_val = self._safe_float(fallback, default=float("nan"))
+        if math.isfinite(fallback_val) and fallback_val > 0.0:
+            return fallback_val
+        return 0.0
+
+    def _build_bar(
+        self,
+        *,
+        ts_ms: int,
+        symbol: str,
+        open_price: Any,
+        high_price: Any,
+        low_price: Any,
+        close_price: float,
+    ) -> Bar:
+        def _to_decimal(val: Any, default: float) -> Decimal:
+            coerced = self._safe_float(val, default)
+            return Decimal(str(coerced))
+
+        return Bar(
+            ts=int(ts_ms),
+            symbol=str(symbol).upper(),
+            open=_to_decimal(open_price, close_price),
+            high=_to_decimal(high_price, close_price),
+            low=_to_decimal(low_price, close_price),
+            close=Decimal(str(close_price)),
+            volume_base=Decimal("0"),
+            volume_quote=Decimal("0"),
+        )
+
+    # ------------------------------------------------------------------
+    # Simulation step
+    # ------------------------------------------------------------------
+    def step(
+        self,
+        *,
+        ts_ms: int,
+        ref_price: Optional[float],
+        bid: Optional[float],
+        ask: Optional[float],
+        vol_factor: Optional[float],
+        liquidity: Optional[float],
+        orders: Sequence[Any],
+        bar_open: Optional[float] = None,
+        bar_high: Optional[float] = None,
+        bar_low: Optional[float] = None,
+        bar_close: Optional[float] = None,
+        bar_timeframe_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        symbol = self._active_symbol or self.symbol
+        close_price = self._coerce_price(bar_close, ref_price)
+        prev_price = self._last_prices.get(symbol)
+        prev_weight = self._weights.get(symbol, 0.0)
+
+        bar_return = 0.0
+        pnl_from_price = 0.0
+        if prev_price is not None and prev_price > 0.0:
+            try:
+                bar_return = (close_price / prev_price) - 1.0
+            except ZeroDivisionError:
+                bar_return = 0.0
+            pnl_from_price = self._equity * prev_weight * bar_return
+
+        equity_before_costs = self._equity + pnl_from_price
+
+        trade_cost_usd = 0.0
+        total_turnover = 0.0
+        decisions: List[Mapping[str, Any]] = []
+        instructions: List[Mapping[str, Any]] = []
+
+        if orders:
+            bar_payload = self._build_bar(
+                ts_ms=ts_ms,
+                symbol=symbol,
+                open_price=bar_open,
+                high_price=bar_high,
+                low_price=bar_low,
+                close_price=close_price,
+            )
+        else:
+            bar_payload = None
+
+        for order in orders:
+            meta = getattr(order, "meta", None)
+            if isinstance(meta, Mapping):
+                payload = dict(meta)
+            else:
+                payload = {}
+            payload.setdefault("payload", {})
+            if bar_payload is not None:
+                payload.setdefault("bar", bar_payload)
+            payload["equity_usd"] = equity_before_costs
+            order.meta = payload
+
+            report = self.executor.execute(order)
+            report_meta = getattr(report, "meta", {})
+            decision = {}
+            if isinstance(report_meta, Mapping):
+                decision_candidate = report_meta.get("decision")
+                if isinstance(decision_candidate, Mapping):
+                    decision = dict(decision_candidate)
+                instructions_payload = report_meta.get("instructions")
+                if isinstance(instructions_payload, Sequence) and not isinstance(
+                    instructions_payload, (str, bytes)
+                ):
+                    instructions.extend(
+                        [instr for instr in instructions_payload if isinstance(instr, Mapping)]
+                    )
+            decisions.append(decision)
+            turnover = self._safe_float(decision.get("turnover_usd"))
+            cost_bps = self._safe_float(decision.get("cost_bps"))
+            total_turnover += abs(turnover)
+            if abs(turnover) > 0.0 and math.isfinite(cost_bps):
+                trade_cost_usd += abs(turnover) * cost_bps / 10_000.0
+
+        self._equity = equity_before_costs - trade_cost_usd
+        self._cum_cost_usd += trade_cost_usd
+        self._last_prices[symbol] = close_price
+
+        weight = 0.0
+        positions = self.executor.get_open_positions([symbol])
+        if isinstance(positions, Mapping):
+            pos = positions.get(symbol)
+        else:  # pragma: no cover - defensive fallback
+            pos = None
+        if pos is not None:
+            meta = getattr(pos, "meta", None)
+            if isinstance(meta, Mapping):
+                weight = self._safe_float(meta.get("weight"))
+        self._weights[symbol] = weight
+
+        bar_pnl = pnl_from_price - trade_cost_usd
+        cumulative_pnl = self._equity - self._initial_equity
+
+        report: Dict[str, Any] = {
+            "ts_ms": int(ts_ms),
+            "symbol": symbol,
+            "run_id": getattr(self.executor, "run_id", "bar"),
+            "ref_price": close_price,
+            "equity": self._equity,
+            "equity_before_costs": equity_before_costs,
+            "equity_after_costs": self._equity,
+            "bar_return": bar_return,
+            "bar_weight": weight,
+            "bar_pnl": bar_pnl,
+            "pnl": bar_pnl,
+            "cumulative_pnl": cumulative_pnl,
+            "turnover_usd": total_turnover,
+            "bar_cost_usd": trade_cost_usd,
+            "fee_total": trade_cost_usd,
+            "trades": [],
+            "core_exec_reports": [],
+            "core_order_intents": [],
+            "expected_cost_components": {"cost_usd": trade_cost_usd}
+            if trade_cost_usd
+            else {},
+            "decisions": decisions,
+            "decision": decisions[-1] if decisions else None,
+            "instructions": instructions,
+        }
+
+        return report
 
 def _coerce_timeframe_ms(value: Any) -> Optional[int]:
     """Best-effort conversion of ``value`` to timeframe in milliseconds."""
@@ -1567,8 +1810,15 @@ def from_config(
     sym_col = params.get("symbol_col", "symbol")
     price_col = params.get("price_col", "ref_price")
 
+    exec_cfg_block = getattr(cfg, "execution", None)
+    exec_mode_value = getattr(exec_cfg_block, "mode", "order") if exec_cfg_block is not None else "order"
+    try:
+        exec_mode = str(exec_mode_value or "order").lower()
+    except Exception:
+        exec_mode = "order"
+
     exec_spec = cfg.components.executor
-    if exec_spec and isinstance(exec_spec.params, dict):
+    if exec_mode != "bar" and exec_spec and isinstance(exec_spec.params, dict):
         target = exec_spec.target or ""
         try:
             lat_cfg_dict = cfg.latency.dict(exclude_unset=False)
@@ -1580,23 +1830,70 @@ def from_config(
     container = di_registry.build_graph(cfg.components, cfg)
     policy: SignalPolicy = container["policy"]
     executor_obj = container["executor"]
-    sim: ExecutionSimulator
-    if isinstance(executor_obj, ExecutionSimulator):
-        sim = executor_obj
+
+    if exec_mode == "bar":
+        if not isinstance(executor_obj, BarExecutor):
+            raise TypeError("Executor component must be BarExecutor in bar mode")
+
+        timeframe_ms = _coerce_timeframe_ms(svc_cfg.timeframe)
+        if timeframe_ms is None:
+            try:
+                timeframe_ms = int(getattr(cfg.timing, "timeframe_ms", 60_000))
+            except Exception:
+                timeframe_ms = 60_000
+
+        portfolio_cfg = getattr(cfg, "portfolio", None)
+        try:
+            initial_equity = float(getattr(portfolio_cfg, "equity_usd", 0.0)) if portfolio_cfg else 0.0
+        except Exception:
+            initial_equity = 0.0
+
+        bar_price_field = getattr(exec_cfg_block, "bar_price", None)
+        if not bar_price_field:
+            bar_price_field = getattr(executor_obj, "bar_price_field", "close")
+
+        bridge = BarBacktestSimBridge(
+            executor_obj,
+            symbol=svc_cfg.symbol,
+            timeframe_ms=timeframe_ms,
+            initial_equity=initial_equity,
+            bar_price_field=bar_price_field,
+            run_config=cfg,
+        )
+
+        adapter = BacktestAdapter(
+            policy=policy,
+            sim_bridge=bridge,
+            dynamic_spread_config=svc_cfg.dynamic_spread_config,
+            exchange_specs_path=svc_cfg.exchange_specs_path,
+            guards_config=svc_cfg.guards_config,
+            signal_cooldown_s=svc_cfg.signal_cooldown_s,
+            no_trade_config=svc_cfg.no_trade_config,
+            timing_config=svc_cfg.timing_config,
+        )
+
+        if svc_cfg.snapshot_config_path and svc_cfg.artifacts_dir:
+            snapshot_config(svc_cfg.snapshot_config_path, svc_cfg.artifacts_dir)
+
+        reports = adapter.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
     else:
-        candidate = getattr(executor_obj, "_sim", None)
-        if isinstance(candidate, ExecutionSimulator):
-            sim = candidate
+        sim: ExecutionSimulator
+        if isinstance(executor_obj, ExecutionSimulator):
+            sim = executor_obj
         else:
-            candidate = getattr(executor_obj, "sim", None)
+            candidate = getattr(executor_obj, "_sim", None)
             if isinstance(candidate, ExecutionSimulator):
                 sim = candidate
             else:
-                raise TypeError(
-                    "Executor component must provide an ExecutionSimulator instance"
-                )
-    service = ServiceBacktest(policy, sim, svc_cfg, run_config=cfg)
-    reports = service.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
+                candidate = getattr(executor_obj, "sim", None)
+                if isinstance(candidate, ExecutionSimulator):
+                    sim = candidate
+                else:
+                    raise TypeError(
+                        "Executor component must provide an ExecutionSimulator instance"
+                    )
+        service = ServiceBacktest(policy, sim, svc_cfg, run_config=cfg)
+        reports = service.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
 
     out_path = params.get("out_reports", "logs/sandbox_reports.csv")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

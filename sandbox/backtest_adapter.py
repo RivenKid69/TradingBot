@@ -621,6 +621,13 @@ class BacktestAdapter:
             )
             core_order_intents = [it.to_dict() for it in orders_to_order_intents(orders, _ctx)]
 
+            setter = getattr(self.sim, "set_active_symbol", None)
+            if callable(setter):
+                try:
+                    setter(sym)
+                except Exception:
+                    pass
+
             rep = self.sim.step(
                 ts_ms=ts,
                 ref_price=ref,

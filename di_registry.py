@@ -138,7 +138,22 @@ def build_graph(components: Components, run_config: Optional[CommonRunConfig] = 
     build_component("feature_pipe", components.feature_pipe, container)
     build_component("policy", components.policy, container)
     build_component("risk_guards", components.risk_guards, container)
-    build_component("executor", components.executor, container)
+
+    executor_spec = components.executor
+    if run_config is not None:
+        exec_cfg = getattr(run_config, "execution", None)
+        mode_value = getattr(exec_cfg, "mode", None) if exec_cfg is not None else None
+        if isinstance(mode_value, str) and mode_value.lower() == "bar":
+            target = str(executor_spec.target or "")
+            if target == "impl_sim_executor:SimExecutor":
+                executor_spec = ComponentSpec.parse_obj(
+                    {
+                        "target": "impl_bar_executor:BarExecutor",
+                        "params": dict(executor_spec.params or {}),
+                    }
+                )
+
+    build_component("executor", executor_spec, container)
     if components.backtest_engine:
         build_component("backtest_engine", components.backtest_engine, container)
     global _GLOBAL_CONTAINER
