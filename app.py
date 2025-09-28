@@ -1357,6 +1357,231 @@ with tabs[6]:
                 st.info("Нет изменений")
 
     st.divider()
+    st.markdown("#### Execution / Costs / Portfolio overrides")
+    runtime_exec_cfg = copy.deepcopy(runtime_data.get("execution") or {})
+    runtime_portfolio_cfg = copy.deepcopy(
+        runtime_data.get("portfolio") or runtime_exec_cfg.get("portfolio") or {}
+    )
+    runtime_costs_cfg = copy.deepcopy(
+        runtime_data.get("costs") or runtime_exec_cfg.get("costs") or {}
+    )
+    runtime_impact_cfg = copy.deepcopy(runtime_costs_cfg.get("impact") or {})
+
+    mode_options = ["order", "bar"]
+    current_mode = str(runtime_exec_cfg.get("mode", "order") or "order").lower()
+    if current_mode not in mode_options:
+        current_mode = "order"
+    bar_price_default = str(runtime_exec_cfg.get("bar_price") or "")
+
+    def _format_optional_number(value: Any) -> str:
+        if value in (None, ""):
+            return ""
+        return str(value)
+
+    min_step_default = _format_optional_number(
+        runtime_exec_cfg.get("min_rebalance_step")
+    )
+    safety_default = _format_optional_number(runtime_exec_cfg.get("safety_margin_bps"))
+    equity_default = _format_optional_number(runtime_portfolio_cfg.get("equity_usd"))
+    taker_default = _format_optional_number(runtime_costs_cfg.get("taker_fee_bps"))
+    half_default = _format_optional_number(runtime_costs_cfg.get("half_spread_bps"))
+    impact_sqrt_default = _format_optional_number(runtime_impact_cfg.get("sqrt_coeff"))
+    impact_linear_default = _format_optional_number(runtime_impact_cfg.get("linear_coeff"))
+
+    def _parse_non_negative_float(
+        raw_value: str, label: str, errors: List[str]
+    ) -> float | None:
+        text = str(raw_value).strip()
+        if text == "":
+            return None
+        try:
+            parsed = float(text)
+        except ValueError:
+            errors.append(f"{label}: не удалось преобразовать '{raw_value}' к числу")
+            return None
+        if parsed < 0:
+            errors.append(f"{label}: значение {parsed} должно быть ≥ 0")
+        return parsed
+
+    with st.form("runtime_execution_form"):
+        exec_cols = st.columns(2)
+        mode_choice = exec_cols[0].selectbox(
+            "execution.mode",
+            mode_options,
+            index=mode_options.index(current_mode),
+            help="Режим исполнения: order — поведение по умолчанию, bar — сводное исполнение по барам.",
+        )
+        bar_price_input = exec_cols[1].text_input(
+            "execution.bar_price",
+            value=bar_price_default,
+            help="Референсная цена для режима bar (например, close). Пусто = дефолт.",
+        )
+        min_step_input = exec_cols[0].text_input(
+            "execution.min_rebalance_step",
+            value=min_step_default,
+            help="Минимальный шаг ребалансировки (доля позиции). Пусто = без ограничения.",
+        )
+        safety_input = exec_cols[1].text_input(
+            "execution.safety_margin_bps",
+            value=safety_default,
+            help="Запас по безопасности в б.п. для бар-режима. Пусто = 0.",
+        )
+        equity_input = st.text_input(
+            "portfolio.equity_usd",
+            value=equity_default,
+            help="Оценка капитала в USD. Пусто = использовать значение из базового конфига.",
+        )
+        cost_cols = st.columns(2)
+        taker_input = cost_cols[0].text_input(
+            "costs.taker_fee_bps",
+            value=taker_default,
+            help="Тейкерская комиссия в б.п. Пусто = оставить без изменений.",
+        )
+        half_spread_input = cost_cols[1].text_input(
+            "costs.half_spread_bps",
+            value=half_default,
+            help="Половина спреда в б.п. Пусто = оставить без изменений.",
+        )
+        impact_cols = st.columns(2)
+        impact_sqrt_input = impact_cols[0].text_input(
+            "costs.impact.sqrt_coeff",
+            value=impact_sqrt_default,
+            help="Коэффициент квадратного влияния (б.п.).",
+        )
+        impact_linear_input = impact_cols[1].text_input(
+            "costs.impact.linear_coeff",
+            value=impact_linear_default,
+            help="Линейный коэффициент влияния (б.п.).",
+        )
+        submit_runtime = st.form_submit_button(
+            "Сохранить execution/cost/portfolio", type="secondary"
+        )
+
+    if submit_runtime:
+        errors: List[str] = []
+        min_step_value = _parse_non_negative_float(
+            min_step_input, "execution.min_rebalance_step", errors
+        )
+        safety_value = _parse_non_negative_float(
+            safety_input, "execution.safety_margin_bps", errors
+        )
+        equity_value = _parse_non_negative_float(
+            equity_input, "portfolio.equity_usd", errors
+        )
+        taker_value = _parse_non_negative_float(
+            taker_input, "costs.taker_fee_bps", errors
+        )
+        half_value = _parse_non_negative_float(
+            half_spread_input, "costs.half_spread_bps", errors
+        )
+        impact_sqrt_value = _parse_non_negative_float(
+            impact_sqrt_input, "costs.impact.sqrt_coeff", errors
+        )
+        impact_linear_value = _parse_non_negative_float(
+            impact_linear_input, "costs.impact.linear_coeff", errors
+        )
+
+        if errors:
+            for msg in errors:
+                st.error(msg)
+        else:
+            new_runtime = copy.deepcopy(runtime_data)
+            new_exec = copy.deepcopy(runtime_exec_cfg)
+            new_exec["mode"] = str(mode_choice).strip().lower()
+            bar_price_value = bar_price_input.strip()
+            if bar_price_value:
+                new_exec["bar_price"] = bar_price_value
+            else:
+                new_exec.pop("bar_price", None)
+
+            if min_step_value is None:
+                new_exec.pop("min_rebalance_step", None)
+            else:
+                new_exec["min_rebalance_step"] = float(min_step_value)
+
+            if safety_value is None:
+                new_exec.pop("safety_margin_bps", None)
+            else:
+                new_exec["safety_margin_bps"] = float(safety_value)
+
+            new_portfolio = copy.deepcopy(runtime_portfolio_cfg)
+            exec_portfolio = copy.deepcopy(
+                runtime_exec_cfg.get("portfolio") or runtime_portfolio_cfg or {}
+            )
+            if equity_value is None:
+                new_portfolio.pop("equity_usd", None)
+                exec_portfolio.pop("equity_usd", None)
+            else:
+                new_portfolio["equity_usd"] = float(equity_value)
+                exec_portfolio["equity_usd"] = float(equity_value)
+            if exec_portfolio:
+                new_exec["portfolio"] = exec_portfolio
+            else:
+                new_exec.pop("portfolio", None)
+            if new_portfolio:
+                new_runtime["portfolio"] = new_portfolio
+            else:
+                new_runtime.pop("portfolio", None)
+
+            new_costs = copy.deepcopy(runtime_costs_cfg)
+            exec_costs = copy.deepcopy(
+                runtime_exec_cfg.get("costs") or runtime_costs_cfg or {}
+            )
+            if taker_value is None:
+                new_costs.pop("taker_fee_bps", None)
+                exec_costs.pop("taker_fee_bps", None)
+            else:
+                new_costs["taker_fee_bps"] = float(taker_value)
+                exec_costs["taker_fee_bps"] = float(taker_value)
+            if half_value is None:
+                new_costs.pop("half_spread_bps", None)
+                exec_costs.pop("half_spread_bps", None)
+            else:
+                new_costs["half_spread_bps"] = float(half_value)
+                exec_costs["half_spread_bps"] = float(half_value)
+
+            current_impact = copy.deepcopy(new_costs.get("impact") or {})
+            exec_impact = copy.deepcopy(exec_costs.get("impact") or {})
+            if impact_sqrt_value is None:
+                current_impact.pop("sqrt_coeff", None)
+                exec_impact.pop("sqrt_coeff", None)
+            else:
+                current_impact["sqrt_coeff"] = float(impact_sqrt_value)
+                exec_impact["sqrt_coeff"] = float(impact_sqrt_value)
+            if impact_linear_value is None:
+                current_impact.pop("linear_coeff", None)
+                exec_impact.pop("linear_coeff", None)
+            else:
+                current_impact["linear_coeff"] = float(impact_linear_value)
+                exec_impact["linear_coeff"] = float(impact_linear_value)
+            if current_impact:
+                new_costs["impact"] = current_impact
+            else:
+                new_costs.pop("impact", None)
+            if exec_impact:
+                exec_costs["impact"] = exec_impact
+            else:
+                exec_costs.pop("impact", None)
+            if exec_costs:
+                new_exec["costs"] = exec_costs
+            else:
+                new_exec.pop("costs", None)
+            if new_costs:
+                new_runtime["costs"] = new_costs
+            else:
+                new_runtime.pop("costs", None)
+
+            new_runtime["execution"] = new_exec
+            new_runtime_text = _dump_yaml(new_runtime)
+            diff = _show_diff(runtime_text, new_runtime_text, runtime_yaml)
+            if diff.strip():
+                atomic_write_with_retry(runtime_yaml, new_runtime_text)
+                st.success("Настройки execution/cost/portfolio сохранены")
+                st.info("Запросите reload для применения изменений.")
+            else:
+                st.info("Нет изменений")
+
+    st.divider()
     st.markdown("#### TTL")
     ttl_cfg = copy.deepcopy(live_data.get("ttl") or {})
     ttl_mode_options = ["relative", "absolute", "off"]

@@ -7,10 +7,117 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Dict
 
 from core_config import load_config
 from service_backtest import from_config
 from scripts.offline_utils import resolve_split_bundle
+
+
+def _apply_runtime_overrides(
+    cfg_dict: Dict[str, Any], args: argparse.Namespace
+) -> Dict[str, Any]:
+    """Apply CLI-provided runtime overrides to a config mapping."""
+
+    def _require_non_negative(value: float, label: str) -> float:
+        if value < 0:
+            raise SystemExit(f"{label} must be non-negative")
+        return float(value)
+
+    exec_block = dict(cfg_dict.get("execution") or {})
+    exec_changed = False
+
+    if args.execution_mode:
+        exec_block["mode"] = str(args.execution_mode).strip().lower()
+        exec_changed = True
+
+    if args.execution_bar_price is not None:
+        bar_price = str(args.execution_bar_price or "").strip()
+        if bar_price:
+            exec_block["bar_price"] = bar_price
+        else:
+            exec_block.pop("bar_price", None)
+        exec_changed = True
+
+    if args.execution_min_step is not None:
+        exec_block["min_rebalance_step"] = _require_non_negative(
+            args.execution_min_step, "execution-min-step"
+        )
+        exec_changed = True
+
+    if args.execution_safety_margin_bps is not None:
+        exec_block["safety_margin_bps"] = _require_non_negative(
+            args.execution_safety_margin_bps, "execution-safety-margin-bps"
+        )
+        exec_changed = True
+
+    if args.portfolio_equity_usd is not None:
+        equity = _require_non_negative(args.portfolio_equity_usd, "portfolio-equity-usd")
+        portfolio_block = dict(cfg_dict.get("portfolio") or {})
+        portfolio_block["equity_usd"] = equity
+        cfg_dict["portfolio"] = portfolio_block
+        exec_portfolio = dict(exec_block.get("portfolio") or {})
+        exec_portfolio["equity_usd"] = equity
+        exec_block["portfolio"] = exec_portfolio
+        exec_changed = True
+
+    if any(
+        value is not None
+        for value in (
+            args.costs_taker_fee_bps,
+            args.costs_half_spread_bps,
+            args.costs_impact_sqrt,
+            args.costs_impact_linear,
+        )
+    ):
+        costs_block = dict(cfg_dict.get("costs") or {})
+        exec_costs = dict(exec_block.get("costs") or {})
+        impact_block = dict(costs_block.get("impact") or {})
+        exec_impact = dict(exec_costs.get("impact") or {})
+
+        if args.costs_taker_fee_bps is not None:
+            fee = _require_non_negative(args.costs_taker_fee_bps, "costs-taker-fee-bps")
+            costs_block["taker_fee_bps"] = fee
+            exec_costs["taker_fee_bps"] = fee
+
+        if args.costs_half_spread_bps is not None:
+            half = _require_non_negative(args.costs_half_spread_bps, "costs-half-spread-bps")
+            costs_block["half_spread_bps"] = half
+            exec_costs["half_spread_bps"] = half
+
+        if args.costs_impact_sqrt is not None:
+            sqrt_coeff = _require_non_negative(args.costs_impact_sqrt, "costs-impact-sqrt")
+            impact_block["sqrt_coeff"] = sqrt_coeff
+            exec_impact["sqrt_coeff"] = sqrt_coeff
+
+        if args.costs_impact_linear is not None:
+            linear_coeff = _require_non_negative(
+                args.costs_impact_linear, "costs-impact-linear"
+            )
+            impact_block["linear_coeff"] = linear_coeff
+            exec_impact["linear_coeff"] = linear_coeff
+
+        if impact_block:
+            costs_block["impact"] = impact_block
+        else:
+            costs_block.pop("impact", None)
+
+        if exec_impact:
+            exec_costs["impact"] = exec_impact
+        else:
+            exec_costs.pop("impact", None)
+
+        cfg_dict["costs"] = costs_block
+        if exec_costs:
+            exec_block["costs"] = exec_costs
+        else:
+            exec_block.pop("costs", None)
+        exec_changed = True
+
+    if exec_changed:
+        cfg_dict["execution"] = exec_block
+
+    return cfg_dict
 
 
 def main() -> None:
@@ -42,6 +149,51 @@ def main() -> None:
         "--dataset-split",
         default="val",
         help="Dataset split identifier (use 'none' to disable offline bundle integration)",
+    )
+    runtime_group = p.add_argument_group("Runtime overrides")
+    runtime_group.add_argument(
+        "--execution-mode",
+        choices=["order", "bar"],
+        help="Override execution.mode for the run (order/bar mode switch)",
+    )
+    runtime_group.add_argument(
+        "--execution-bar-price",
+        help="Override execution.bar_price (empty string to clear)",
+    )
+    runtime_group.add_argument(
+        "--execution-min-step",
+        type=float,
+        help="Override execution.min_rebalance_step (fraction, >=0)",
+    )
+    runtime_group.add_argument(
+        "--execution-safety-margin-bps",
+        type=float,
+        help="Override execution.safety_margin_bps applied by the bar executor",
+    )
+    runtime_group.add_argument(
+        "--portfolio-equity-usd",
+        type=float,
+        help="Override portfolio.equity_usd assumption (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-taker-fee-bps",
+        type=float,
+        help="Override costs.taker_fee_bps (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-half-spread-bps",
+        type=float,
+        help="Override costs.half_spread_bps (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-impact-sqrt",
+        type=float,
+        help="Override costs.impact.sqrt_coeff (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-impact-linear",
+        type=float,
+        help="Override costs.impact.linear_coeff (>=0)",
     )
     args = p.parse_args()
 
@@ -103,6 +255,7 @@ def main() -> None:
             bar_block = execution_block.setdefault("bar_capacity_base", {})
             if not bar_block.get("adv_base_path"):
                 bar_block["adv_base_path"] = adv_path
+    cfg_dict = _apply_runtime_overrides(cfg_dict, args)
     cfg = cfg.__class__.parse_obj(cfg_dict)
 
     if seasonality_path and not Path(seasonality_path).exists():
