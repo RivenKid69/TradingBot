@@ -8079,24 +8079,70 @@ class ExecutionSimulator:
     def _mark_price(
         self, ref: Optional[float], bid: Optional[float], ask: Optional[float]
     ) -> Optional[float]:
-        """Возвращает цену маркировки позиции.
+        """Возвращает цену маркировки позиции в зависимости от режима mark-to-market."""
 
-        Лонги маркируются по bid, шорты — по ask. При отсутствии позиции
-        используется mid (если доступны обе стороны) либо ref_price.
-        """
-        b = bid if bid is not None else None
-        a = ask if ask is not None else None
-        if self.position_qty > 0.0:
-            return (
-                float(b) if b is not None else (float(ref) if ref is not None else None)
-            )
-        if self.position_qty < 0.0:
-            return (
-                float(a) if a is not None else (float(ref) if ref is not None else None)
-            )
-        if b is not None and a is not None:
-            return float((float(b) + float(a)) / 2.0)
-        return float(ref) if ref is not None else None
+        def _to_float(value: Optional[float]) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        b = _to_float(bid)
+        a = _to_float(ask)
+        r = _to_float(ref)
+
+        def _mid_from_quotes() -> Optional[float]:
+            if b is not None and a is not None:
+                return (b + a) / 2.0
+            return None
+
+        mark_mode = getattr(self, "_pnl_mark_to", "side") or "side"
+        pos = float(self.position_qty)
+
+        if mark_mode == "mid":
+            mid = _mid_from_quotes()
+            if mid is not None:
+                return mid
+            if r is not None:
+                return r
+            return b if b is not None else a
+
+        if mark_mode == "bid":
+            if b is not None:
+                return b
+            if r is not None:
+                return r
+            return a
+
+        if mark_mode == "ask":
+            if a is not None:
+                return a
+            if r is not None:
+                return r
+            return b
+
+        # режим "side" или неизвестный — используем логику по стороне позиции
+        if pos > 0.0:
+            if b is not None:
+                return b
+            if r is not None:
+                return r
+            return a
+        if pos < 0.0:
+            if a is not None:
+                return a
+            if r is not None:
+                return r
+            return b
+
+        mid = _mid_from_quotes()
+        if mid is not None:
+            return mid
+        if r is not None:
+            return r
+        return b if b is not None else a
 
     def _unrealized_pnl(self, mark_price: Optional[float]) -> float:
         """
