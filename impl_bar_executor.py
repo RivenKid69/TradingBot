@@ -228,6 +228,15 @@ class BarExecutor(TradeExecutor):
             state = PortfolioState(symbol=symbol, equity_usd=self.default_equity_usd)
 
         payload = self._extract_payload(order.meta)
+        meta_map = order.meta if isinstance(order.meta, Mapping) else {}
+        normalized_flag = self._coerce_bool(payload.get("normalized"))
+        if not normalized_flag and meta_map:
+            normalized_flag = self._coerce_bool(meta_map.get("normalized"))
+        normalization_data = self._materialize_mapping(payload.get("normalization"))
+        if not normalization_data and meta_map:
+            normalization_data = self._materialize_mapping(meta_map.get("normalization"))
+        if normalization_data:
+            normalized_flag = True
         adv_quote = self._coerce_float(order.meta.get("adv_quote"))
         bar = self._extract_bar(order.meta)
 
@@ -244,6 +253,10 @@ class BarExecutor(TradeExecutor):
         target_weight, mode, delta_weight = self._resolve_target_weight(state, payload)
 
         decision_signal: Dict[str, Any] = dict(payload)
+        if normalized_flag:
+            decision_signal["normalized"] = True
+        if normalization_data:
+            decision_signal["normalization"] = dict(normalization_data)
         decision_signal.setdefault("target_weight", target_weight)
         metrics = decide_spot_trade(
             decision_signal,
@@ -290,6 +303,10 @@ class BarExecutor(TradeExecutor):
 
         dump_fn = getattr(metrics, "model_dump", None)
         decision_data = dump_fn() if callable(dump_fn) else metrics.dict()
+        if normalized_flag:
+            decision_data["normalized"] = True
+        if normalization_data:
+            decision_data["normalization"] = dict(normalization_data)
         report_meta: Dict[str, Any] = {
             "mode": mode,
             "decision": decision_data,
@@ -305,6 +322,10 @@ class BarExecutor(TradeExecutor):
             report_meta["reference_price"] = float(price)
         if adv_quote is not None:
             report_meta["adv_quote"] = adv_quote
+        if normalized_flag:
+            report_meta["normalized"] = True
+        if normalization_data:
+            report_meta["normalization"] = dict(normalization_data)
 
         snapshot: Dict[str, Any] = {
             "execution_mode": "bar",
@@ -321,6 +342,9 @@ class BarExecutor(TradeExecutor):
             snapshot["instructions"] = [instr.to_dict() for instr in instructions]
         if bar is not None:
             snapshot["bar_ts"] = int(bar.ts)
+        snapshot["normalized"] = bool(normalized_flag)
+        if normalization_data:
+            snapshot["normalization"] = dict(normalization_data)
         self._last_snapshot = snapshot
 
         return ExecReport(
@@ -407,6 +431,20 @@ class BarExecutor(TradeExecutor):
             return dict(rebalance_payload)
         return {}
 
+    def _materialize_mapping(self, value: Any) -> Dict[str, Any]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        for attr in ("model_dump", "dict"):
+            getter = getattr(value, attr, None)
+            if callable(getter):
+                try:
+                    data = getter()
+                except Exception:
+                    continue
+                if isinstance(data, Mapping):
+                    return dict(data)
+        return {}
+
     def _coerce_float(self, value: Any) -> Optional[float]:
         if value is None:
             return None
@@ -414,6 +452,15 @@ class BarExecutor(TradeExecutor):
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _coerce_bool(self, value: Any) -> bool:
+        if isinstance(value, str):
+            candidate = value.strip().lower()
+            if candidate in {"", "0", "false", "no", "off"}:
+                return False
+            if candidate in {"1", "true", "yes", "on"}:
+                return True
+        return bool(value)
 
     def _extract_bar(self, meta: Mapping[str, Any]) -> Optional[Bar]:
         bar_value = meta.get("bar")
