@@ -83,6 +83,32 @@ def test_exponential_backoff():
     assert rl._current_backoff == pytest.approx(0.05)
 
 
+def test_rate_limiter_sub_unit_rate_backoff():
+    rl = SignalRateLimiter(max_per_sec=0.5, backoff_base=2.0, max_backoff=60.0)
+    now = 0.0
+
+    allowed, status = rl.can_send(now)
+    assert allowed and status == "ok"
+
+    allowed, status = rl.can_send(now)
+    assert not allowed and status == "rejected"
+    assert rl._current_backoff == pytest.approx(2.0)
+    assert rl._cooldown_until == pytest.approx(now + 2.0)
+
+    allowed, status = rl.can_send(now + 1.0)
+    assert not allowed and status == "delayed"
+    assert rl._current_backoff == pytest.approx(2.0)
+
+    resume_time = now + 2.0 + 1e-6
+    allowed, status = rl.can_send(resume_time)
+    assert allowed and status == "ok"
+    assert rl._current_backoff == pytest.approx(0.0)
+
+    allowed, status = rl.can_send(resume_time)
+    assert not allowed and status == "rejected"
+    assert rl._current_backoff == pytest.approx(2.0)
+
+
 # --- BinancePublicClient REST integration ---
 
 @pytest.mark.parametrize(

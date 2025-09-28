@@ -78,7 +78,7 @@ class SignalRateLimiter:
 
         # limit exceeded -> backoff
         if self._current_backoff == 0.0:
-            self._current_backoff = 1.0 / max(self.max_per_sec, 1.0)
+            self._current_backoff = 1.0 / self.max_per_sec
         else:
             self._current_backoff = min(self._current_backoff * self.backoff_base, self.max_backoff)
         self._cooldown_until = ts + self._current_backoff
