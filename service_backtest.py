@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Mapping, Sequence
+from typing import Any, Dict, List, Optional, Mapping, Sequence, TYPE_CHECKING
 import logging
 import os
 import math
@@ -27,10 +27,8 @@ import time
 from datetime import datetime, timezone
 import pandas as pd
 
-from execution_sim import ExecutionSimulator  # type: ignore
 from adv_store import ADVStore
 from sandbox.backtest_adapter import BacktestAdapter
-from sandbox.sim_adapter import SimAdapter
 from core_contracts import SignalPolicy
 from core_models import Bar
 from services.utils_config import snapshot_config  # сохранение снапшота конфига
@@ -38,7 +36,6 @@ from services.utils_sandbox import read_df
 from core_config import CommonRunConfig, ExecutionProfile
 from impl_quantizer import QuantizerImpl
 import di_registry
-from impl_sim_executor import SimExecutor
 from impl_bar_executor import BarExecutor
 
 
@@ -48,7 +45,43 @@ except Exception:  # pragma: no cover - fallback when implementation missing
     SlippageImpl = None  # type: ignore
 
 
+if TYPE_CHECKING:  # pragma: no cover - typing helpers
+    from execution_sim import ExecutionSimulator  # type: ignore
+    from sandbox.sim_adapter import SimAdapter  # type: ignore
+    from impl_sim_executor import SimExecutor  # type: ignore
+else:  # pragma: no cover - runtime placeholders
+    ExecutionSimulator = Any  # type: ignore
+    SimAdapter = Any  # type: ignore
+    SimExecutor = Any  # type: ignore
+
+
 logger = logging.getLogger(__name__)
+
+
+def _require_execution_simulator() -> type:
+    """Load :class:`ExecutionSimulator` only when needed."""
+
+    try:
+        from execution_sim import ExecutionSimulator as _ExecutionSimulator  # type: ignore
+    except Exception as exc:  # pragma: no cover - dependency missing
+        raise ImportError("ExecutionSimulator is required for order-mode backtests") from exc
+    return _ExecutionSimulator
+
+
+def _require_sim_executor() -> Any:
+    try:
+        from impl_sim_executor import SimExecutor as _SimExecutor  # type: ignore
+    except Exception as exc:  # pragma: no cover - dependency missing
+        raise ImportError("SimExecutor is required for order-mode backtests") from exc
+    return _SimExecutor
+
+
+def _require_sim_adapter() -> Any:
+    try:
+        from sandbox.sim_adapter import SimAdapter as _SimAdapter  # type: ignore
+    except Exception as exc:  # pragma: no cover - dependency missing
+        raise ImportError("SimAdapter is required for order-mode backtests") from exc
+    return _SimAdapter
 
 
 class _NullVolEstimator:
@@ -639,7 +672,7 @@ def _finalise_bar_capacity_payload(
 
 
 def _apply_bar_capacity_base_config(
-    sim: ExecutionSimulator,
+    sim: Any,
     raw_cfg: Optional[Dict[str, Any]],
     *,
     adv_store: Optional[ADVStore],
@@ -825,7 +858,7 @@ def _collect_filter_rejection_counts(target: Dict[str, int], reason: Any) -> boo
 
 
 def _configure_adv_runtime(
-    sim: ExecutionSimulator,
+    sim: Any,
     run_cfg: CommonRunConfig | None,
     *,
     context: str,
@@ -921,7 +954,7 @@ class ServiceBacktest:
 
     @staticmethod
     def _ensure_quantizer_attached(
-        sim: ExecutionSimulator,
+        sim: Any,
         quantizer: QuantizerImpl,
     ) -> None:
         metadata_view = getattr(quantizer, "filters_metadata", None)
@@ -980,7 +1013,7 @@ class ServiceBacktest:
     def __init__(
         self,
         policy: SignalPolicy,
-        sim: ExecutionSimulator,
+        sim: Any,
         cfg: BacktestConfig,
         *,
         run_config: CommonRunConfig | None = None,
@@ -1003,17 +1036,18 @@ class ServiceBacktest:
             if self._run_config is not None
             else ExecutionProfile.MKT_OPEN_NEXT_H1
         )
+        SimExecutorCls = _require_sim_executor()
         (
             entry_mode,
             exec_profile,
             clip_to_bar_enabled,
             strict_open_fill,
-        ) = SimExecutor.configure_simulator_execution(
+        ) = SimExecutorCls.configure_simulator_execution(
             self.sim,
             exec_cfg_block,
             default_profile=default_profile_cfg,
         )
-        SimExecutor.apply_execution_profile(
+        SimExecutorCls.apply_execution_profile(
             self.sim,
             exec_profile,
             getattr(self._run_config, "execution_params", None)
@@ -1027,13 +1061,13 @@ class ServiceBacktest:
             else None
         )
         dedup_enabled_val = (
-            SimExecutor._bool_or_none(getattr(ws_dedup_cfg, "enabled", None))
+            SimExecutorCls._bool_or_none(getattr(ws_dedup_cfg, "enabled", None))
             if ws_dedup_cfg is not None
             else None
         )
         dedup_enabled = bool(dedup_enabled_val) if dedup_enabled_val is not None else False
         dedup_log_val = (
-            SimExecutor._bool_or_none(getattr(ws_dedup_cfg, "log_skips", None))
+            SimExecutorCls._bool_or_none(getattr(ws_dedup_cfg, "log_skips", None))
             if ws_dedup_cfg is not None
             else None
         )
@@ -1128,7 +1162,8 @@ class ServiceBacktest:
         except Exception:
             pass
 
-        self.sim_bridge = SimAdapter(
+        SimAdapterCls = _require_sim_adapter()
+        self.sim_bridge = SimAdapterCls(
             sim,
             symbol=self.cfg.symbol,
             timeframe=self.cfg.timeframe,
@@ -1877,16 +1912,16 @@ def from_config(
 
         reports = adapter.run(df, ts_col=ts_col, symbol_col=sym_col, price_col=price_col)
     else:
-        sim: ExecutionSimulator
-        if isinstance(executor_obj, ExecutionSimulator):
+        ExecutionSimulatorCls = _require_execution_simulator()
+        if isinstance(executor_obj, ExecutionSimulatorCls):
             sim = executor_obj
         else:
             candidate = getattr(executor_obj, "_sim", None)
-            if isinstance(candidate, ExecutionSimulator):
+            if isinstance(candidate, ExecutionSimulatorCls):
                 sim = candidate
             else:
                 candidate = getattr(executor_obj, "sim", None)
-                if isinstance(candidate, ExecutionSimulator):
+                if isinstance(candidate, ExecutionSimulatorCls):
                     sim = candidate
                 else:
                     raise TypeError(

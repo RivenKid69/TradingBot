@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, replace, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 import pandas as pd
 import clock
@@ -12,7 +12,10 @@ from utils_time import bar_close_ms, is_bar_closed
 
 from core_contracts import SignalPolicy, PolicyCtx
 from core_models import Order, Side
-from sandbox.sim_adapter import SimAdapter
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from sandbox.sim_adapter import SimAdapter  # type: ignore
+else:  # pragma: no cover - runtime placeholder for annotations
+    SimAdapter = Any  # type: ignore
 from exchange.specs import load_specs, round_price_to_tick
 from services.monitoring import skipped_incomplete_bars
 

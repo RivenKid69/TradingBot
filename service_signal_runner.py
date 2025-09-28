@@ -19,7 +19,18 @@ for report in from_config(cfg):
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict, is_dataclass
-from typing import Any, Dict, Optional, Sequence, Iterator, Protocol, Callable, Mapping, Tuple
+from typing import (
+    Any,
+    Dict,
+    Optional,
+    Sequence,
+    Iterator,
+    Protocol,
+    Callable,
+    Mapping,
+    Tuple,
+    TYPE_CHECKING,
+)
 from collections.abc import Mapping as MappingABC, Sequence as SequenceABC
 import os
 import logging
@@ -61,7 +72,13 @@ from services.shutdown import ShutdownManager
 from services.signal_csv_writer import SignalCSVWriter
 from adapters.binance_spot_private import reconcile_state
 
-from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
+# ``SimAdapter`` pulls in heavy execution-simulator dependencies.  Import it lazily to
+# allow bar-mode setups to operate without the microstructure stack being available at
+# runtime.
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+    from sandbox.sim_adapter import SimAdapter  # type: ignore
+else:  # pragma: no cover - runtime placeholder
+    SimAdapter = Any  # type: ignore
 from impl_bar_executor import BarExecutor
 from core_models import Bar, Tick
 from core_contracts import FeaturePipe, SignalPolicy

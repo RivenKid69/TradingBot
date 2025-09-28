@@ -31,3 +31,23 @@ jobs:
         run: |
           pip install pytest
           pytest tests/test_integration_seasonality_simulation.py -q
+
+  service-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        execution_mode: [order, bar]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v3
+        with:
+          python-version: '3.x'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_extra.txt pytest
+      - name: Run service smoke tests
+        env:
+          EXECUTION_MODE: ${{ matrix.execution_mode }}
+        run: |
+          pytest tests/test_service_mode_smoke.py -k "${{ matrix.execution_mode }}" -q
