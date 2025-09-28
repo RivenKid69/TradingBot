@@ -7,6 +7,10 @@
 
 Документация по утилите скользящего среднего доступна в [docs/moving_average.md](docs/moving_average.md) (English/Russian).
 Обзор конвейера принятия решений описан в [docs/pipeline.md](docs/pipeline.md).
+Баровый режим исполнения и формат сигналов описаны в [docs/bar_execution.md](docs/bar_execution.md)
+с публичными JSON-схемами: [envelope](docs/spot_signal_envelope.schema.json),
+[target_weight](docs/spot_signal_target_weight.schema.json) и
+[delta_weight](docs/spot_signal_delta_weight.schema.json).
 
 ## File Ownership and Permissions
 
@@ -103,6 +107,48 @@ Schedule the command daily via cron or rely on the automatic refresh at
 startup.  Use ``--liquidity-threshold 0`` to bypass the volume filter or
 point ``--output`` to maintain a custom symbols file.  See
 [docs/universe.md](docs/universe.md) for details.
+
+### Bar-mode quickstart
+
+Bar execution swaps the per-order runtime for deterministic bar-level
+rebalances driven by signed signal envelopes.  The recommended starting point
+is [`configs/runtime_trade.yaml`](configs/runtime_trade.yaml); include the
+snippet below in your live or simulation runtime overrides to enable the mode:
+
+```yaml
+portfolio:
+  equity_usd: 1_000_000.0
+costs:
+  taker_fee_bps: 7.5
+  half_spread_bps: 1.5
+  impact:
+    sqrt_coeff: 15.0
+    linear_coeff: 2.5
+execution:
+  mode: bar
+  bar_price: close
+  min_rebalance_step: 0.05
+```
+
+CLI runners expose the same knobs for quick experimentation.  The following
+command flips a backtest into bar mode with custom economics and portfolio
+size, keeping everything else from the YAML unchanged:
+
+```bash
+python script_backtest.py --config configs/config_sim.yaml \
+  --execution-mode bar --execution-bar-price close \
+  --portfolio-equity-usd 1_000_000 \
+  --costs-taker-fee-bps 7.5 --costs-half-spread-bps 1.5 \
+  --costs-impact-sqrt 15 --costs-impact-linear 2.5
+```
+
+Signals delivered to the bar executor must follow the
+[spot signal envelope](docs/bar_execution.md#signal-envelope) contract.  Each
+payload carries pre-computed economics (``edge_bps``, ``cost_bps``, ``net_bps``,
+``turnover_usd``) alongside an ``act_now`` flag.  The executor rechecks the net
+edge after subtracting the optional ``execution.safety_margin_bps`` buffer; only
+signals with positive ``net_bps`` and non-zero turnover keep ``act_now=True`` and
+immediately enter the schedule.
 
 ### Обновление биржевых фильтров и спецификаций
 
