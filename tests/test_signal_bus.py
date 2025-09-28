@@ -172,6 +172,47 @@ def test_publish_signal_payload_fields(tmp_path):
     assert "signature" not in envelope
 
 
+def test_publish_signal_rejects_expired_valid_until(tmp_path):
+    sb._STATE_PATH = tmp_path / "seen.json"
+    sb._SEEN.clear()
+    sb.dropped_by_reason.clear()
+    sb._loaded = False
+    sb.load_state()
+
+    sent: list[dict[str, Any]] = []
+
+    def send_fn(payload):
+        sent.append(payload)
+
+    now = 10_000
+    stale_payload = _make_payload(0.1).model_dump()
+    stale_payload["valid_until_ms"] = now - 1
+
+    assert not sb.publish_signal(
+        "BTCUSDT",
+        1,
+        stale_payload,
+        send_fn,
+        expires_at_ms=now + 5_000,
+        now_ms=now,
+    )
+    assert sent == []
+    assert sb.dropped_by_reason["valid_until_expired"] == 1
+
+    fresh_payload = _make_payload(0.2).model_dump()
+    fresh_payload["valid_until_ms"] = now + 5_000
+
+    assert sb.publish_signal(
+        "BTCUSDT",
+        1,
+        fresh_payload,
+        send_fn,
+        expires_at_ms=now + 10_000,
+        now_ms=now,
+    )
+    assert len(sent) == 1
+
+
 def test_publish_signal_disabled(tmp_path):
     sb._STATE_PATH = tmp_path / "seen.json"
     sb._SEEN.clear()
