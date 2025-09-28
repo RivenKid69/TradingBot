@@ -129,10 +129,29 @@ class DataValidator:
                     )
 
     def _check_timestamp_continuity(self, df: pd.DataFrame, frequency: str = None):
-        # если индекс не DateTimeIndex, проверяем, что разница == 1
+        # если индекс не DateTimeIndex, проверяем равномерность шага
         if not isinstance(df.index, pd.DatetimeIndex):
             arr = df.index.to_numpy()
-            if (np.diff(arr) != 1).any():
+
+            if arr.size <= 1:
+                return
+
+            if not np.issubdtype(arr.dtype, np.number):
+                raise ValueError(
+                    "Неподдерживаемый тип индекса для проверки непрерывности. "
+                    "Ожидается числовой индекс."
+                )
+
+            diffs = np.diff(arr)
+            if diffs.size == 0:
+                return
+
+            non_zero = diffs[diffs != 0]
+            if non_zero.size == 0:
+                raise ValueError("Невозможно определить шаг индекса: все значения повторяются.")
+
+            expected_step = non_zero[0]
+            if (diffs != expected_step).any():
                 raise ValueError("timestamp gap detected")
             return
         """Проверяет непрерывность временного ряда в DatetimeIndex."""
