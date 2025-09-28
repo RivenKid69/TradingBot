@@ -45,7 +45,26 @@ def main():
             for r in rdr:
                 if not r:
                     continue
-                existing_rows.append([int(r[0]), int(r[1]) if len(r) > 1 else int(r[1]) if r[1].isdigit() else int(float(r[1]))])
+
+                try:
+                    ts = int(r[0])
+                except (TypeError, ValueError):
+                    continue
+
+                if len(r) < 2:
+                    # Skip rows without a value column to avoid indexing errors
+                    continue
+
+                raw_val = r[1]
+                try:
+                    val = int(raw_val)
+                except (TypeError, ValueError):
+                    try:
+                        val = float(raw_val)
+                    except (TypeError, ValueError):
+                        continue
+
+                existing_rows.append([ts, val])
             if existing_rows:
                 last_ts = max(x[0] for x in existing_rows)
 
