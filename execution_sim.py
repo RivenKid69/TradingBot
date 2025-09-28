@@ -812,10 +812,10 @@ class SimStepReport:
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
     equity: float = 0.0
-    mark_price: float = 0.0
-    bid: float = 0.0
-    ask: float = 0.0
-    mtm_price: float = 0.0
+    mark_price: float = float("nan")
+    bid: float = float("nan")
+    ask: float = float("nan")
+    mtm_price: float = float("nan")
     risk_events: List[RiskEvent] = field(default_factory=list)  # type: ignore
     risk_paused_until_ms: int = 0
     spread_bps: Optional[float] = None
@@ -3605,10 +3605,10 @@ class ExecutionSimulator:
             realized_pnl=float(self.realized_pnl_cum),
             unrealized_pnl=float(unrl),
             equity=float(eq),
-            mark_price=float(mark_p if mark_p is not None else 0.0),
-            bid=float(bid) if bid is not None else 0.0,
-            ask=float(ask) if ask is not None else 0.0,
-            mtm_price=float(mark_p if mark_p is not None else 0.0),
+            mark_price=self._float_or_nan(mark_p),
+            bid=self._float_or_nan(bid),
+            ask=self._float_or_nan(ask),
+            mtm_price=self._float_or_nan(mark_p),
             risk_events=risk_events_all,  # type: ignore
             risk_paused_until_ms=int(risk_paused_until),
             spread_bps=self._last_spread_bps,
@@ -4444,6 +4444,20 @@ class ExecutionSimulator:
             return None
         if not math.isfinite(result):
             return None
+        return result
+
+    @staticmethod
+    def _float_or_nan(value: Any) -> float:
+        if value is None:
+            return float("nan")
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+        if math.isnan(result):
+            return float("nan")
+        if math.isinf(result):
+            return float("nan")
         return result
 
     @staticmethod
@@ -11595,10 +11609,10 @@ class ExecutionSimulator:
             realized_pnl=float(self.realized_pnl_cum),
             unrealized_pnl=float(unrl),
             equity=float(eq),
-            mark_price=float(mark_p if mark_p is not None else 0.0),
-            bid=float(self._last_bid) if self._last_bid is not None else 0.0,
-            ask=float(self._last_ask) if self._last_ask is not None else 0.0,
-            mtm_price=float(mark_p if mark_p is not None else 0.0),
+            mark_price=self._float_or_nan(mark_p),
+            bid=self._float_or_nan(self._last_bid),
+            ask=self._float_or_nan(self._last_ask),
+            mtm_price=self._float_or_nan(mark_p),
             risk_events=risk_events_all,  # type: ignore
             risk_paused_until_ms=int(risk_paused_until),
             spread_bps=self._last_spread_bps,
@@ -12875,10 +12889,10 @@ class ExecutionSimulator:
             realized_pnl=float(self.realized_pnl_cum),
             unrealized_pnl=float(unrl),
             equity=float(eq),
-            mark_price=float(mark_p if mark_p is not None else 0.0),
-            bid=float(self._last_bid) if self._last_bid is not None else 0.0,
-            ask=float(self._last_ask) if self._last_ask is not None else 0.0,
-            mtm_price=float(mark_p if mark_p is not None else 0.0),
+            mark_price=self._float_or_nan(mark_p),
+            bid=self._float_or_nan(self._last_bid),
+            ask=self._float_or_nan(self._last_ask),
+            mtm_price=self._float_or_nan(mark_p),
             risk_events=risk_events_all,  # type: ignore
             risk_paused_until_ms=int(risk_paused_until),
             spread_bps=self._last_spread_bps,
