@@ -40,3 +40,25 @@ def test_accepts_clean_data():
     df = _make_df('seasonal pattern')
     validator = DataValidator()
     validator.validate(df)
+
+
+def test_integer_index_with_custom_step_passes():
+    idx = pd.Index([0, 5, 10], name="row")
+    timestamps = pd.date_range('2024-01-01', periods=3, freq='1T')
+    data = {
+        'timestamp': timestamps,
+        'symbol': ['BTCUSDT'] * 3,
+        'open': [1.0, 1.1, 1.2],
+        'high': [1.1, 1.2, 1.3],
+        'low': [0.9, 1.0, 1.1],
+        'close': [1.05, 1.15, 1.25],
+        'volume': [1.0, 1.0, 1.0],
+        'quote_asset_volume': [1.0, 1.0, 1.0],
+        'number_of_trades': [1, 1, 1],
+        'taker_buy_base_asset_volume': [1.0, 1.0, 1.0],
+        'taker_buy_quote_asset_volume': [1.0, 1.0, 1.0],
+        'note': ['clean'] * 3,
+    }
+    df = pd.DataFrame(data, index=idx)
+    validator = DataValidator()
+    validator.validate(df)
