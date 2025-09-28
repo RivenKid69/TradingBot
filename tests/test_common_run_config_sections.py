@@ -1,6 +1,8 @@
-import textwrap
 import sys
 import pathlib
+import textwrap
+
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -91,3 +93,37 @@ def test_common_run_config_reads_embedded_sections():
     assert cfg.execution.costs.taker_fee_bps == 4.5
     assert cfg.costs.impact.sqrt_coeff == 6.0
     assert cfg.execution.costs.impact.linear_coeff == 1.5
+
+
+def test_execution_runtime_config_serializes_new_fields():
+    yaml_cfg = _wrap_payload(
+        """
+        execution:
+          mode: bar
+          safety_margin_bps: 7.5
+          max_participation: 0.05
+          costs:
+            turnover_caps:
+              per_symbol:
+                bps: 250
+              portfolio:
+                usd: 50000.0
+        """
+    )
+    cfg = load_config_from_str(yaml_cfg)
+
+    assert pytest.approx(cfg.execution.safety_margin_bps) == 7.5
+    assert cfg.execution.max_participation is not None
+    assert pytest.approx(cfg.execution.max_participation, rel=1e-9) == 0.05
+    caps = cfg.execution.costs.turnover_caps
+    assert caps.per_symbol is not None
+    assert caps.per_symbol.bps == 250
+    assert caps.portfolio is not None
+    assert caps.portfolio.usd == 50_000.0
+
+    dumped = cfg.execution.dict()
+    assert dumped["safety_margin_bps"] == 7.5
+    assert pytest.approx(dumped["max_participation"], rel=1e-9) == 0.05
+    turnover_caps = dumped["costs"]["turnover_caps"]
+    assert turnover_caps["per_symbol"]["bps"] == 250
+    assert turnover_caps["portfolio"]["usd"] == 50_000.0

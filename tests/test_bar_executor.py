@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from core_config import SpotCostConfig, SpotImpactConfig
+from core_config import SpotCostConfig, SpotImpactConfig, SpotTurnoverCaps, SpotTurnoverLimit
 from core_models import Bar, Order, OrderType, Side
 from impl_bar_executor import BarExecutor, PortfolioState, decide_spot_trade
 from service_signal_runner import _Worker
@@ -156,6 +156,116 @@ def test_bar_executor_delta_weight_twap_and_participation():
     assert instructions[-1]["slice_index"] == 7
     assert instructions[-1]["target_weight"] == 0.4
 
+
+def test_bar_executor_uses_default_max_participation():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000_000.0,
+        max_participation=0.05,
+    )
+    bar = make_bar(20, 10_000.0)
+    order = Order(
+        ts=20,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "adv_quote": 1_000_000.0,
+            "payload": {"delta_weight": 0.2, "edge_bps": 25.0},
+        },
+    )
+
+    report = executor.execute(order)
+    instructions = report.meta["instructions"]
+    assert len(instructions) == 4
+    assert instructions[-1]["target_weight"] == pytest.approx(0.2)
+
+
+def test_bar_executor_turnover_cap_blocks_trade():
+    cost_cfg = SpotCostConfig(
+        turnover_caps=SpotTurnoverCaps(
+            per_symbol=SpotTurnoverLimit(usd=100.0)
+        )
+    )
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=cost_cfg,
+        default_equity_usd=1000.0,
+    )
+    order = Order(
+        ts=30,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(30, 10_000.0),
+            "payload": {"target_weight": 0.2, "edge_bps": 20.0},
+        },
+    )
+
+    report = executor.execute(order)
+    assert report.meta["instructions"] == []
+    assert report.meta.get("turnover_cap_enforced") is True
+    assert report.meta["decision"]["act_now"] is False
+    assert report.meta["cap_usd"] == pytest.approx(100.0)
+
+
+def test_bar_executor_turnover_cap_tracks_portfolio_usage():
+    cost_cfg = SpotCostConfig(
+        turnover_caps=SpotTurnoverCaps(
+            portfolio=SpotTurnoverLimit(usd=150.0)
+        )
+    )
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=cost_cfg,
+        default_equity_usd=1000.0,
+    )
+    bar = make_bar(40, 5000.0)
+
+    first_order = Order(
+        ts=40,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "payload": {"target_weight": 0.05, "edge_bps": 15.0},
+        },
+    )
+    first_report = executor.execute(first_order)
+    assert first_report.meta["instructions"]
+    assert first_report.meta.get("turnover_cap_enforced") is None
+    assert first_report.meta["portfolio_turnover_cap_usd"] == pytest.approx(150.0)
+    assert first_report.meta["cap_usd"] == pytest.approx(100.0)
+
+    second_order = Order(
+        ts=41,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "payload": {"target_weight": 0.25, "edge_bps": 25.0},
+        },
+    )
+    second_report = executor.execute(second_order)
+    assert second_report.meta["instructions"] == []
+    assert second_report.meta.get("turnover_cap_enforced") is True
+    assert second_report.meta["cap_usd"] == pytest.approx(100.0)
 
 def test_bar_executor_respects_min_rebalance_step():
     executor = BarExecutor(

@@ -5114,6 +5114,7 @@ def clear_dirty_restart(
             min_step = 0.0
             cost_cfg = getattr(self._run_config, "costs", None)
             safety_margin = 0.0
+            max_participation = None
             default_equity = None
             weight_cap_raw: Any = None
             if exec_cfg is not None:
@@ -5127,6 +5128,14 @@ def clear_dirty_restart(
                     safety_margin = float(getattr(exec_cfg, "safety_margin_bps", 0.0) or 0.0)
                 except (TypeError, ValueError):
                     safety_margin = 0.0
+                participation_candidate = getattr(exec_cfg, "max_participation", None)
+                if participation_candidate is None and isinstance(exec_cfg, MappingABC):
+                    participation_candidate = exec_cfg.get("max_participation")
+                if participation_candidate is not None:
+                    try:
+                        max_participation = float(participation_candidate)
+                    except (TypeError, ValueError):
+                        max_participation = None
                 portfolio_cfg = getattr(exec_cfg, "portfolio", None)
                 if portfolio_cfg is None:
                     portfolio_cfg = getattr(self._run_config, "portfolio", None)
@@ -5168,12 +5177,16 @@ def clear_dirty_restart(
             if portfolio_weight_cap is not None:
                 if not math.isfinite(portfolio_weight_cap) or portfolio_weight_cap <= 0.0:
                     portfolio_weight_cap = None
+            if max_participation is not None:
+                if not math.isfinite(max_participation) or max_participation <= 0.0:
+                    max_participation = None
             executor_for_worker = BarExecutor(
                 run_id=self.cfg.run_id or "bar",
                 bar_price=bar_price,
                 min_rebalance_step=min_step,
                 cost_config=cost_cfg,
                 safety_margin_bps=safety_margin,
+                max_participation=max_participation,
                 default_equity_usd=portfolio_equity or 0.0,
             )
 
