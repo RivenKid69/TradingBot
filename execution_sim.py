@@ -5271,12 +5271,8 @@ class ExecutionSimulator:
         normalised_fee = ExecutionSimulator._normalise_currency(fee_currency)
         if normalised_fee:
             info["currency"] = normalised_fee
-        if (
-            settlement_amount is not None
-            and math.isfinite(settlement_amount)
-            and settlement_amount > 0.0
-        ):
-            info["settlement_amount"] = float(abs(settlement_amount))
+        if settlement_amount is not None and math.isfinite(settlement_amount):
+            info["settlement_amount"] = float(settlement_amount)
         if (
             conversion_rate is not None
             and math.isfinite(conversion_rate)
@@ -5289,7 +5285,7 @@ class ExecutionSimulator:
 
     def _fees_apply_to_cumulative(self, fee: Any) -> None:
         pending_converted = self._fees_convert_pending_with_cached_rates()
-        if pending_converted > 0.0:
+        if pending_converted:
             self.fees_cum += pending_converted
 
         last_info = getattr(self, "_fees_last_fee_info", None)
@@ -5338,7 +5334,7 @@ class ExecutionSimulator:
                     quote_currency=quote_currency,
                     conversion_rate=conversion_rate,
                 )
-                if converted > 0.0:
+                if converted:
                     self.fees_cum += converted
         else:
             if (
@@ -5350,11 +5346,10 @@ class ExecutionSimulator:
                 if amount is None:
                     amount = fee_value
                 if amount is not None and math.isfinite(amount) and amount != 0.0:
-                    amount_val = abs(float(amount))
-                    if amount_val > 0.0:
-                        key = (fee_currency, quote_currency)
-                        prev = self._fees_pending_settlements.get(key, 0.0)
-                        self._fees_pending_settlements[key] = float(prev + amount_val)
+                    amount_val = float(amount)
+                    key = (fee_currency, quote_currency)
+                    prev = self._fees_pending_settlements.get(key, 0.0)
+                    self._fees_pending_settlements[key] = float(prev + amount_val)
             elif fee_value is not None:
                 self.fees_cum += float(fee_value)
 
@@ -5372,10 +5367,10 @@ class ExecutionSimulator:
             return 0.0
         key = (fee_currency, quote_currency)
         pending = self._fees_pending_settlements.pop(key, 0.0)
-        if pending <= 0.0:
+        if not math.isfinite(pending) or pending == 0.0:
             return 0.0
         converted = pending * conversion_rate
-        if not math.isfinite(converted) or converted <= 0.0:
+        if not math.isfinite(converted) or converted == 0.0:
             return 0.0
         return float(converted)
 
@@ -5385,7 +5380,7 @@ class ExecutionSimulator:
         converted_total = 0.0
         to_remove: List[Tuple[str, Optional[str]]] = []
         for key, pending in list(self._fees_pending_settlements.items()):
-            if pending <= 0.0:
+            if not math.isfinite(pending) or pending == 0.0:
                 to_remove.append(key)
                 continue
             currency, quote_currency = key
@@ -5396,7 +5391,7 @@ class ExecutionSimulator:
             if conversion_rate is None or conversion_rate <= 0.0:
                 continue
             converted = pending * conversion_rate
-            if not math.isfinite(converted) or converted <= 0.0:
+            if not math.isfinite(converted) or converted == 0.0:
                 continue
             converted_total += float(converted)
             to_remove.append(key)
