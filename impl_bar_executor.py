@@ -35,7 +35,12 @@ from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
 from api.spot_signals import SpotSignalEconomics, SpotSignalEnvelope
-from core_config import SpotCostConfig
+from core_config import (
+    ResolvedTurnoverCaps,
+    ResolvedTurnoverLimit,
+    SpotCostConfig,
+    SpotTurnoverCaps,
+)
 from core_contracts import TradeExecutor
 from core_models import (
     Bar,
@@ -72,6 +77,20 @@ def _ensure_cost_config(cost_config: SpotCostConfig | Mapping[str, Any] | None) 
     except Exception:  # pragma: no cover - defensive fallback
         logger.exception("Failed to parse cost_config, falling back to defaults")
         return SpotCostConfig()
+
+
+def _ensure_turnover_caps(
+    turnover_caps: SpotTurnoverCaps | Mapping[str, Any] | None,
+) -> SpotTurnoverCaps:
+    if turnover_caps is None:
+        return SpotTurnoverCaps()
+    if isinstance(turnover_caps, SpotTurnoverCaps):
+        return turnover_caps
+    try:
+        return SpotTurnoverCaps.parse_obj(turnover_caps)
+    except Exception:  # pragma: no cover - defensive fallback
+        logger.exception("Failed to parse turnover_caps, falling back to defaults")
+        return SpotTurnoverCaps()
 
 
 @dataclass
@@ -199,6 +218,8 @@ class BarExecutor(TradeExecutor):
         min_rebalance_step: float = 0.0,
         cost_config: SpotCostConfig | Mapping[str, Any] | None = None,
         safety_margin_bps: float = 0.0,
+        max_participation: Optional[float] = None,
+        turnover_caps: SpotTurnoverCaps | Mapping[str, Any] | None = None,
         default_equity_usd: float = 0.0,
         initial_weights: Optional[Mapping[str, float]] = None,
     ) -> None:
@@ -207,9 +228,25 @@ class BarExecutor(TradeExecutor):
         self.min_rebalance_step = max(0.0, float(min_rebalance_step))
         self.cost_config = _ensure_cost_config(cost_config)
         self.safety_margin_bps = float(safety_margin_bps)
+        if max_participation is not None:
+            try:
+                max_participation = float(max_participation)
+            except (TypeError, ValueError):
+                max_participation = None
+        if max_participation is not None:
+            if not math.isfinite(max_participation) or max_participation <= 0.0:
+                max_participation = None
+        self.max_participation = max_participation
+        caps_source: SpotTurnoverCaps | Mapping[str, Any] | None = turnover_caps
+        if caps_source is None:
+            caps_source = getattr(self.cost_config, "turnover_caps", None)
+        self.turnover_caps = _ensure_turnover_caps(caps_source)
+        self._resolved_turnover_caps: ResolvedTurnoverCaps = self.turnover_caps.resolve()
         self.default_equity_usd = float(default_equity_usd)
         self._states: Dict[str, PortfolioState] = {}
         self._last_snapshot: Dict[str, Any] = {}
+        self._symbol_turnover: Dict[str, Dict[str, Any]] = {}
+        self._portfolio_turnover: Dict[str, Any] = {"ts": None, "total": 0.0}
         if initial_weights:
             for symbol, weight in initial_weights.items():
                 self._states[symbol] = PortfolioState(
@@ -275,10 +312,21 @@ class BarExecutor(TradeExecutor):
             else:  # pragma: no cover - compatibility fallback
                 metrics = metrics.copy(update={"act_now": False})
 
+        caps_eval = self._evaluate_turnover_caps(symbol, state, bar)
+        turnover_usd = float(getattr(metrics, "turnover_usd", 0.0))
+        skip_due_to_cap = False
+        effective_cap = caps_eval.get("effective_cap")
+        if effective_cap is not None and turnover_usd > float(effective_cap) + 1e-9:
+            skip_due_to_cap = True
+            if hasattr(metrics, "model_copy"):
+                metrics = metrics.model_copy(update={"act_now": False})
+            else:  # pragma: no cover - compatibility fallback
+                metrics = metrics.copy(update={"act_now": False})
+
         instructions: List[RebalanceInstruction] = []
         final_state = state
 
-        if metrics.act_now and not skip_due_to_step:
+        if metrics.act_now and not skip_due_to_step and not skip_due_to_cap:
             instructions = self._build_instructions(
                 state=state,
                 target_weight=target_weight,
@@ -288,6 +336,25 @@ class BarExecutor(TradeExecutor):
                 adv_quote=adv_quote,
             )
             final_state = replace(state, weight=target_weight)
+            self._register_turnover(symbol, caps_eval.get("ts"), turnover_usd)
+            if caps_eval.get("symbol_remaining") is not None:
+                caps_eval["symbol_remaining"] = max(
+                    0.0, float(caps_eval["symbol_remaining"]) - turnover_usd
+                )
+            if caps_eval.get("portfolio_remaining") is not None:
+                caps_eval["portfolio_remaining"] = max(
+                    0.0, float(caps_eval["portfolio_remaining"]) - turnover_usd
+                )
+            remaining_candidates = [
+                value
+                for value in (
+                    caps_eval.get("symbol_remaining"),
+                    caps_eval.get("portfolio_remaining"),
+                )
+                if value is not None
+            ]
+            if remaining_candidates:
+                caps_eval["effective_cap"] = min(remaining_candidates)
         else:
             dump_fn = getattr(metrics, "model_dump", None)
             metrics_data = dump_fn() if callable(dump_fn) else metrics.dict()
@@ -316,12 +383,31 @@ class BarExecutor(TradeExecutor):
         }
         if skip_due_to_step:
             report_meta["min_step_enforced"] = True
+        if skip_due_to_cap:
+            report_meta["turnover_cap_enforced"] = True
         if bar is not None:
             report_meta["bar_ts"] = bar.ts
         if price is not None:
             report_meta["reference_price"] = float(price)
         if adv_quote is not None:
             report_meta["adv_quote"] = adv_quote
+        cap_effective = caps_eval.get("effective_cap")
+        if cap_effective is not None:
+            report_meta["cap_usd"] = float(cap_effective)
+        if caps_eval.get("symbol_limit") is not None:
+            report_meta["symbol_turnover_cap_usd"] = float(caps_eval["symbol_limit"])
+        if caps_eval.get("portfolio_limit") is not None:
+            report_meta["portfolio_turnover_cap_usd"] = float(
+                caps_eval["portfolio_limit"]
+            )
+        if caps_eval.get("symbol_remaining") is not None:
+            report_meta["symbol_turnover_remaining_usd"] = float(
+                caps_eval["symbol_remaining"]
+            )
+        if caps_eval.get("portfolio_remaining") is not None:
+            report_meta["portfolio_turnover_remaining_usd"] = float(
+                caps_eval["portfolio_remaining"]
+            )
         if normalized_flag:
             report_meta["normalized"] = True
         if normalization_data:
@@ -345,6 +431,20 @@ class BarExecutor(TradeExecutor):
         snapshot["normalized"] = bool(normalized_flag)
         if normalization_data:
             snapshot["normalization"] = dict(normalization_data)
+        if cap_effective is not None:
+            snapshot["cap_usd"] = float(cap_effective)
+        if caps_eval.get("symbol_limit") is not None:
+            snapshot["symbol_cap_usd"] = float(caps_eval["symbol_limit"])
+        if caps_eval.get("portfolio_limit") is not None:
+            snapshot["portfolio_cap_usd"] = float(caps_eval["portfolio_limit"])
+        if caps_eval.get("symbol_remaining") is not None:
+            snapshot["symbol_cap_remaining_usd"] = float(caps_eval["symbol_remaining"])
+        if caps_eval.get("portfolio_remaining") is not None:
+            snapshot["portfolio_cap_remaining_usd"] = float(
+                caps_eval["portfolio_remaining"]
+            )
+        if skip_due_to_cap:
+            snapshot["turnover_cap_enforced"] = True
         self._last_snapshot = snapshot
 
         return ExecReport(
@@ -453,6 +553,70 @@ class BarExecutor(TradeExecutor):
         except (TypeError, ValueError):
             return None
 
+    def _evaluate_turnover_caps(
+        self, symbol: str, state: PortfolioState, bar: Optional[Bar]
+    ) -> Dict[str, Optional[float]]:
+        caps: ResolvedTurnoverCaps = self._resolved_turnover_caps
+        equity = float(state.equity_usd)
+        symbol_limit = caps.per_symbol.limit_for_equity(equity)
+        portfolio_limit = caps.portfolio.limit_for_equity(equity)
+        current_ts: Optional[int]
+        if bar is not None and getattr(bar, "ts", None) is not None:
+            current_ts = int(bar.ts)
+        else:
+            current_ts = int(state.ts) if state.ts is not None else None
+        tracker = self._symbol_turnover.get(symbol)
+        if tracker is None or tracker.get("ts") != current_ts:
+            tracker = {"ts": current_ts, "total": 0.0}
+            self._symbol_turnover[symbol] = tracker
+        used_symbol = float(tracker.get("total", 0.0) or 0.0)
+        symbol_remaining = (
+            None if symbol_limit is None else max(0.0, symbol_limit - used_symbol)
+        )
+        portfolio_tracker = self._portfolio_turnover
+        stored_ts = portfolio_tracker.get("ts")
+        if stored_ts != current_ts:
+            portfolio_tracker["ts"] = current_ts
+            portfolio_tracker["total"] = 0.0
+        used_portfolio = float(portfolio_tracker.get("total", 0.0) or 0.0)
+        portfolio_remaining = (
+            None if portfolio_limit is None else max(0.0, portfolio_limit - used_portfolio)
+        )
+        candidates = [
+            value
+            for value in (symbol_remaining, portfolio_remaining)
+            if value is not None
+        ]
+        effective_cap = min(candidates) if candidates else None
+        return {
+            "ts": current_ts,
+            "symbol_limit": symbol_limit,
+            "symbol_remaining": symbol_remaining,
+            "portfolio_limit": portfolio_limit,
+            "portfolio_remaining": portfolio_remaining,
+            "effective_cap": effective_cap,
+        }
+
+    def _register_turnover(self, symbol: str, ts: Optional[int], turnover_usd: float) -> None:
+        if turnover_usd <= 0.0:
+            return
+        symbol_tracker = self._symbol_turnover.setdefault(
+            symbol, {"ts": ts, "total": 0.0}
+        )
+        if symbol_tracker.get("ts") != ts:
+            symbol_tracker["ts"] = ts
+            symbol_tracker["total"] = 0.0
+        symbol_tracker["total"] = float(symbol_tracker.get("total", 0.0) or 0.0) + float(
+            turnover_usd
+        )
+        portfolio_tracker = self._portfolio_turnover
+        if portfolio_tracker.get("ts") != ts:
+            portfolio_tracker["ts"] = ts
+            portfolio_tracker["total"] = 0.0
+        portfolio_tracker["total"] = float(
+            portfolio_tracker.get("total", 0.0) or 0.0
+        ) + float(turnover_usd)
+
     def _coerce_bool(self, value: Any) -> bool:
         if isinstance(value, str):
             candidate = value.strip().lower()
@@ -550,6 +714,8 @@ class BarExecutor(TradeExecutor):
         max_participation = self._coerce_float(
             twap_cfg.get("max_participation", payload.get("max_participation"))
         )
+        if max_participation is None and self.max_participation is not None:
+            max_participation = self.max_participation
         if max_participation is not None and max_participation > 0.0 and adv_quote and adv_quote > 0.0:
             max_slice_notional = adv_quote * max_participation
             if max_slice_notional > 0.0:

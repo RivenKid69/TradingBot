@@ -57,6 +57,12 @@ def _apply_runtime_overrides(
         )
         exec_changed = True
 
+    if args.execution_max_participation is not None:
+        exec_block["max_participation"] = _require_non_negative(
+            args.execution_max_participation, "execution-max-participation"
+        )
+        exec_changed = True
+
     if args.portfolio_equity_usd is not None:
         equity = _require_non_negative(args.portfolio_equity_usd, "portfolio-equity-usd")
         portfolio_block = dict(cfg_dict.get("portfolio") or {})
@@ -74,12 +80,22 @@ def _apply_runtime_overrides(
             args.costs_half_spread_bps,
             args.costs_impact_sqrt,
             args.costs_impact_linear,
+            args.costs_turnover_cap_symbol_bps,
+            args.costs_turnover_cap_symbol_usd,
+            args.costs_turnover_cap_portfolio_bps,
+            args.costs_turnover_cap_portfolio_usd,
         )
     ):
         costs_block = dict(cfg_dict.get("costs") or {})
         exec_costs = dict(exec_block.get("costs") or {})
         impact_block = dict(costs_block.get("impact") or {})
         exec_impact = dict(exec_costs.get("impact") or {})
+        turnover_caps_block = dict(costs_block.get("turnover_caps") or {})
+        exec_turnover_caps = dict(exec_costs.get("turnover_caps") or {})
+        symbol_caps_block = dict(turnover_caps_block.get("per_symbol") or {})
+        exec_symbol_caps_block = dict(exec_turnover_caps.get("per_symbol") or {})
+        portfolio_caps_block = dict(turnover_caps_block.get("portfolio") or {})
+        exec_portfolio_caps_block = dict(exec_turnover_caps.get("portfolio") or {})
 
         if args.costs_taker_fee_bps is not None:
             fee = _require_non_negative(args.costs_taker_fee_bps, "costs-taker-fee-bps")
@@ -103,6 +119,32 @@ def _apply_runtime_overrides(
             impact_block["linear_coeff"] = linear_coeff
             exec_impact["linear_coeff"] = linear_coeff
 
+        if args.costs_turnover_cap_symbol_bps is not None:
+            symbol_caps_block["bps"] = _require_non_negative(
+                args.costs_turnover_cap_symbol_bps, "costs-turnover-cap-symbol-bps"
+            )
+            exec_symbol_caps_block["bps"] = symbol_caps_block["bps"]
+
+        if args.costs_turnover_cap_symbol_usd is not None:
+            symbol_caps_block["usd"] = _require_non_negative(
+                args.costs_turnover_cap_symbol_usd, "costs-turnover-cap-symbol-usd"
+            )
+            exec_symbol_caps_block["usd"] = symbol_caps_block["usd"]
+
+        if args.costs_turnover_cap_portfolio_bps is not None:
+            portfolio_caps_block["bps"] = _require_non_negative(
+                args.costs_turnover_cap_portfolio_bps,
+                "costs-turnover-cap-portfolio-bps",
+            )
+            exec_portfolio_caps_block["bps"] = portfolio_caps_block["bps"]
+
+        if args.costs_turnover_cap_portfolio_usd is not None:
+            portfolio_caps_block["usd"] = _require_non_negative(
+                args.costs_turnover_cap_portfolio_usd,
+                "costs-turnover-cap-portfolio-usd",
+            )
+            exec_portfolio_caps_block["usd"] = portfolio_caps_block["usd"]
+
         if impact_block:
             costs_block["impact"] = impact_block
         else:
@@ -112,6 +154,30 @@ def _apply_runtime_overrides(
             exec_costs["impact"] = exec_impact
         else:
             exec_costs.pop("impact", None)
+
+        if symbol_caps_block:
+            turnover_caps_block["per_symbol"] = symbol_caps_block
+            exec_turnover_caps["per_symbol"] = exec_symbol_caps_block
+        else:
+            turnover_caps_block.pop("per_symbol", None)
+            exec_turnover_caps.pop("per_symbol", None)
+
+        if portfolio_caps_block:
+            turnover_caps_block["portfolio"] = portfolio_caps_block
+            exec_turnover_caps["portfolio"] = exec_portfolio_caps_block
+        else:
+            turnover_caps_block.pop("portfolio", None)
+            exec_turnover_caps.pop("portfolio", None)
+
+        if turnover_caps_block:
+            costs_block["turnover_caps"] = turnover_caps_block
+        else:
+            costs_block.pop("turnover_caps", None)
+
+        if exec_turnover_caps:
+            exec_costs["turnover_caps"] = exec_turnover_caps
+        else:
+            exec_costs.pop("turnover_caps", None)
 
         cfg_dict["costs"] = costs_block
         if exec_costs:
@@ -231,6 +297,11 @@ def main() -> None:
         help="Override execution.safety_margin_bps used by the bar executor",
     )
     runtime_group.add_argument(
+        "--execution-max-participation",
+        type=float,
+        help="Override execution.max_participation (fraction of ADV, >=0)",
+    )
+    runtime_group.add_argument(
         "--portfolio-equity-usd",
         type=float,
         help="Override portfolio.equity_usd assumption (>=0)",
@@ -254,6 +325,26 @@ def main() -> None:
         "--costs-impact-linear",
         type=float,
         help="Override costs.impact.linear_coeff (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-turnover-cap-symbol-bps",
+        type=float,
+        help="Override costs.turnover_caps.per_symbol.bps (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-turnover-cap-symbol-usd",
+        type=float,
+        help="Override costs.turnover_caps.per_symbol.usd (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-turnover-cap-portfolio-bps",
+        type=float,
+        help="Override costs.turnover_caps.portfolio.bps (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-turnover-cap-portfolio-usd",
+        type=float,
+        help="Override costs.turnover_caps.portfolio.usd (>=0)",
     )
     args = p.parse_args()
     symbols = (

@@ -403,6 +403,84 @@ class SpotImpactConfig(BaseModel):
         extra = "allow"
 
 
+@dataclass(frozen=True)
+class ResolvedTurnoverLimit:
+    """Resolved turnover cap expressed in USD terms."""
+
+    bps: Optional[float] = None
+    usd: Optional[float] = None
+
+    def limit_for_equity(self, equity_usd: float) -> Optional[float]:
+        """Compute the USD cap implied by the specification."""
+
+        values: List[float] = []
+        if self.usd is not None:
+            usd_value = float(self.usd)
+            if math.isfinite(usd_value) and usd_value > 0.0:
+                values.append(usd_value)
+        if self.bps is not None and equity_usd > 0.0:
+            bps_value = float(self.bps)
+            if math.isfinite(bps_value) and bps_value > 0.0:
+                values.append(equity_usd * bps_value / 10_000.0)
+        if not values:
+            return None
+        return min(values)
+
+
+@dataclass(frozen=True)
+class ResolvedTurnoverCaps:
+    """Resolved turnover caps for per-symbol and portfolio aggregates."""
+
+    per_symbol: ResolvedTurnoverLimit = field(default_factory=ResolvedTurnoverLimit)
+    portfolio: ResolvedTurnoverLimit = field(default_factory=ResolvedTurnoverLimit)
+
+
+class SpotTurnoverLimit(BaseModel):
+    """Per-entity turnover guard expressed in USD/bps terms."""
+
+    bps: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Maximum turnover expressed as basis points of portfolio equity.",
+    )
+    usd: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Absolute turnover cap in USD.",
+    )
+
+    class Config:
+        extra = "allow"
+
+    def resolve(self) -> ResolvedTurnoverLimit:
+        return ResolvedTurnoverLimit(
+            bps=float(self.bps) if self.bps is not None else None,
+            usd=float(self.usd) if self.usd is not None else None,
+        )
+
+
+class SpotTurnoverCaps(BaseModel):
+    """Turnover guardrails applied to bar-execution decisions."""
+
+    per_symbol: Optional[SpotTurnoverLimit] = Field(
+        default=None,
+        description="Cap applied per symbol (per bar).",
+    )
+    portfolio: Optional[SpotTurnoverLimit] = Field(
+        default=None,
+        description="Aggregate cap applied across all symbols (per bar).",
+    )
+
+    class Config:
+        extra = "allow"
+
+    def resolve(self) -> ResolvedTurnoverCaps:
+        return ResolvedTurnoverCaps(
+            per_symbol=self.per_symbol.resolve() if self.per_symbol else ResolvedTurnoverLimit(),
+            portfolio=self.portfolio.resolve() if self.portfolio else ResolvedTurnoverLimit(),
+        )
+
+
 class SpotCostConfig(BaseModel):
     """Container describing spot execution cost assumptions."""
 
@@ -419,6 +497,10 @@ class SpotCostConfig(BaseModel):
     impact: SpotImpactConfig = Field(
         default_factory=SpotImpactConfig,
         description="Coefficients for the simple impact model applied to participation rates.",
+    )
+    turnover_caps: SpotTurnoverCaps = Field(
+        default_factory=SpotTurnoverCaps,
+        description="Turnover guardrails evaluated by the bar executor.",
     )
 
     class Config:
@@ -473,7 +555,17 @@ class ExecutionRuntimeConfig(BaseModel):
     min_rebalance_step: float = Field(
         default=0.0,
         ge=0.0,
-        description="Minimum rebalance step size expressed as a fraction of target quantity.",
+        description="Minimum rebalance weight threshold expressed as a fraction of portfolio equity.",
+    )
+    safety_margin_bps: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Additional safety margin applied to bar-mode economics (bps).",
+    )
+    max_participation: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Default per-slice participation cap expressed as a fraction of ADV.",
     )
     clip_to_bar: ClipToBarConfig = Field(default_factory=ClipToBarConfig)
     bridge: ExecutionBridgeConfig = Field(default_factory=ExecutionBridgeConfig)
@@ -1120,6 +1212,10 @@ __all__ = [
     "PortfolioConfig",
     "SpotCostConfig",
     "SpotImpactConfig",
+    "SpotTurnoverLimit",
+    "SpotTurnoverCaps",
+    "ResolvedTurnoverLimit",
+    "ResolvedTurnoverCaps",
     "AdvRuntimeConfig",
     "MonitoringThresholdsConfig",
     "MonitoringAlertConfig",
