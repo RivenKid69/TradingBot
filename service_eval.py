@@ -21,6 +21,7 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+import math
 
 import pandas as pd
 from services.utils_config import snapshot_config
@@ -65,6 +66,42 @@ class ServiceEval:
         trades = _read(self.cfg.trades_path)
         reports = _read(self.cfg.reports_path)
 
+        def _ensure_equity_frame(data: Any) -> Any:
+            if isinstance(data, dict):
+                return {k: _ensure_equity_frame(v) for k, v in data.items()}
+            if not isinstance(data, pd.DataFrame) or data.empty:
+                return data
+            if "equity" in data.columns:
+                return data
+            df = data.copy()
+            if "equity_after_costs" in df.columns:
+                df["equity"] = df["equity_after_costs"].astype(float)
+            elif "bar_pnl" in df.columns:
+                base = float(self.cfg.capital_base)
+                cumulative = df["bar_pnl"].astype(float).cumsum()
+                if math.isfinite(base) and base != 0.0:
+                    df["equity"] = base + cumulative
+                else:
+                    df["equity"] = cumulative
+            return df
+
+        def _synth_trades_frame(source: Any) -> pd.DataFrame:
+            if not isinstance(source, pd.DataFrame) or source.empty:
+                return pd.DataFrame()
+            if "pnl" in source.columns:
+                return source
+            if "bar_pnl" not in source.columns:
+                return pd.DataFrame()
+            payload: Dict[str, Any] = {}
+            if "ts_ms" in source.columns:
+                payload["ts_ms"] = source["ts_ms"]
+            if "symbol" in source.columns:
+                payload["symbol"] = source["symbol"]
+            payload["pnl"] = source["bar_pnl"].astype(float)
+            return pd.DataFrame(payload)
+
+        reports = _ensure_equity_frame(reports)
+
         def _normalize(tr: pd.DataFrame) -> pd.DataFrame:
             if set([
                 "ts",
@@ -84,6 +121,25 @@ class ServiceEval:
             trades = {k: _normalize(v) for k, v in trades.items()}
         else:
             trades = _normalize(trades)
+
+        if isinstance(trades, dict):
+            enriched: Dict[str, pd.DataFrame] = {}
+            for name, tdf in trades.items():
+                if isinstance(tdf, pd.DataFrame) and not tdf.empty and "pnl" in tdf.columns:
+                    enriched[name] = tdf
+                    continue
+                report_source = reports.get(name) if isinstance(reports, dict) else reports
+                synthetic = _synth_trades_frame(report_source)
+                enriched[name] = synthetic if not synthetic.empty else tdf
+            trades = enriched
+        else:
+            needs_synth = not isinstance(trades, pd.DataFrame) or trades.empty or "pnl" not in trades.columns
+            if needs_synth:
+                if isinstance(reports, dict):
+                    first_report = next(iter(reports.values()), pd.DataFrame())
+                else:
+                    first_report = reports
+                trades = _synth_trades_frame(first_report)
 
         def _filter_profile(data: Any, prof: str) -> Any:
             def _trim(df: Any) -> Any:
