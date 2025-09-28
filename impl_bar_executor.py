@@ -34,6 +34,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
+from api.spot_signals import SpotSignalEconomics, SpotSignalEnvelope
 from core_config import SpotCostConfig
 from core_contracts import TradeExecutor
 from core_models import (
@@ -115,7 +116,7 @@ def decide_spot_trade(
     cost_config: SpotCostConfig,
     adv_quote: Optional[float],
     safety_margin_bps: float = 0.0,
-) -> Dict[str, Any]:
+) -> SpotSignalEconomics:
     """Evaluate whether the current signal justifies trading.
 
     Parameters
@@ -172,13 +173,13 @@ def decide_spot_trade(
     net_bps = edge_bps - cost_bps - float(safety_margin_bps)
     act_now = net_bps > 0.0 and turnover_usd > 0.0
 
-    return {
-        "edge_bps": edge_bps,
-        "cost_bps": cost_bps,
-        "net_bps": net_bps,
-        "turnover_usd": turnover_usd,
-        "act_now": act_now,
-    }
+    return SpotSignalEconomics(
+        edge_bps=edge_bps,
+        cost_bps=cost_bps,
+        net_bps=net_bps,
+        turnover_usd=turnover_usd,
+        act_now=act_now,
+    )
 
 
 class BarExecutor(TradeExecutor):
@@ -249,12 +250,15 @@ class BarExecutor(TradeExecutor):
         skip_due_to_step = False
         if min_step > 0.0 and abs(delta_weight) < min_step:
             skip_due_to_step = True
-            metrics["act_now"] = False
+            if hasattr(metrics, "model_copy"):
+                metrics = metrics.model_copy(update={"act_now": False})
+            else:  # pragma: no cover - compatibility fallback
+                metrics = metrics.copy(update={"act_now": False})
 
         instructions: List[RebalanceInstruction] = []
         final_state = state
 
-        if metrics["act_now"] and not skip_due_to_step:
+        if metrics.act_now and not skip_due_to_step:
             instructions = self._build_instructions(
                 state=state,
                 target_weight=target_weight,
@@ -265,19 +269,23 @@ class BarExecutor(TradeExecutor):
             )
             final_state = replace(state, weight=target_weight)
         else:
+            dump_fn = getattr(metrics, "model_dump", None)
+            metrics_data = dump_fn() if callable(dump_fn) else metrics.dict()
             logger.debug(
                 "Skipping rebalance for %s (mode=%s, delta=%.6f, metrics=%s)",
                 symbol,
                 mode,
                 delta_weight,
-                metrics,
+                metrics_data,
             )
 
         self._states[symbol] = final_state
 
+        dump_fn = getattr(metrics, "model_dump", None)
+        decision_data = dump_fn() if callable(dump_fn) else metrics.dict()
         report_meta: Dict[str, Any] = {
             "mode": mode,
-            "decision": metrics,
+            "decision": decision_data,
             "target_weight": target_weight,
             "delta_weight": delta_weight,
             "instructions": [instr.to_dict() for instr in instructions],
@@ -343,6 +351,24 @@ class BarExecutor(TradeExecutor):
     # ------------------------------------------------------------------
     def _extract_payload(self, meta: Mapping[str, Any]) -> Dict[str, Any]:
         payload = meta.get("payload")
+        if isinstance(payload, SpotSignalEnvelope):
+            inner = payload.payload
+            dump = getattr(inner, "model_dump", None)
+            if callable(dump):
+                return dict(dump())
+            if hasattr(inner, "dict"):
+                return dict(inner.dict())
+        dump = getattr(payload, "model_dump", None)
+        if callable(dump):
+            try:
+                return dict(dump())
+            except Exception:
+                pass
+        if hasattr(payload, "dict"):
+            try:
+                return dict(payload.dict())
+            except Exception:
+                pass
         if isinstance(payload, Mapping):
             return dict(payload)
         rebalance_payload = meta.get("rebalance")
