@@ -87,6 +87,8 @@ cdef class EnvState:
     cdef AgentOrderTracker* agent_orders_ptr
     cdef public unsigned long long next_order_id
 
+    cdef public double realized_pnl_cum
+
     cdef public bint use_atr_stop
     cdef public bint use_trailing_stop
     cdef public bint terminate_on_sl_tp
