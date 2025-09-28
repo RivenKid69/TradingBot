@@ -22,6 +22,8 @@ from core_config import (
     CommonRunConfig,
     RetryConfig,
     AdvRuntimeConfig,
+    PortfolioConfig,
+    SpotCostConfig,
 )
 from impl_quantizer import QuantizerImpl
 
@@ -110,6 +112,14 @@ def build_graph(components: Components, run_config: Optional[CommonRunConfig] = 
         container["run_config"] = run_config
         container["retry_cfg"] = run_config.retry
         container[RetryConfig] = run_config.retry
+        portfolio_cfg = getattr(run_config, "portfolio", None)
+        if isinstance(portfolio_cfg, PortfolioConfig):
+            container["portfolio"] = portfolio_cfg
+            container[PortfolioConfig] = portfolio_cfg
+        costs_cfg = getattr(run_config, "costs", None)
+        if isinstance(costs_cfg, SpotCostConfig):
+            container["costs"] = costs_cfg
+            container[SpotCostConfig] = costs_cfg
         q_cfg = getattr(run_config, "quantizer", None)
         if isinstance(q_cfg, Mapping):
             try:

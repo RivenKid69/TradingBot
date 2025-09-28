@@ -1,0 +1,18 @@
+# Reference runtime trade configuration showcasing bar-mode tuning knobs.
+# This snippet is intended for inclusion/inspection rather than direct execution.
+portfolio:
+  equity_usd: 1_000_000.0
+costs:
+  taker_fee_bps: 7.5
+  half_spread_bps: 1.5
+  impact:
+    sqrt_coeff: 15.0
+    linear_coeff: 2.5
+execution:
+  mode: bar
+  bar_price: close
+  min_rebalance_step: 0.05
+risk:
+  max_weight: 0.25
+  turnover_cap: 0.5
+  cooldown_bars: 2
