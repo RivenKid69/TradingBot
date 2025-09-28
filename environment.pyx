@@ -43,6 +43,7 @@ cdef class TradingEnv:
         self.state.prev_net_worth = self.config.market.initial_balance
         self.state.peak_value = self.config.market.initial_balance
         self.state._position_value = 0.0
+        self.state.realized_pnl_cum = 0.0
         self.state.step_idx = 0
         self.state.is_bankrupt = False
         self.state.next_order_id = 1

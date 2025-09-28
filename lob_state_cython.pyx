@@ -243,6 +243,7 @@ cdef class EnvState:
         self.last_executed_notional = 0.0
         self.last_bar_atr = 0.0
         self.lob = None
+        self.realized_pnl_cum = 0.0
         if self.agent_orders_ptr is NULL:
             raise MemoryError("Failed to allocate AgentOrderTracker")
 
@@ -305,6 +306,7 @@ cdef struct StateUpdateDelta:
     double cash_delta
     double units_delta
     double position_value_delta
+    double realized_pnl_delta
 
     # Полные значения, которые вычисляются в конце и заменяют старые
     double final_net_worth
@@ -432,6 +434,7 @@ cpdef tuple run_full_step_logic_cython(
     delta.cash_delta = 0.0
     delta.units_delta = 0.0
     delta.position_value_delta = 0.0
+    delta.realized_pnl_delta = 0.0
     delta.executed_notional = 0.0
     
     delta.clear_all_agent_orders = False
@@ -619,7 +622,7 @@ cpdef tuple run_full_step_logic_cython(
                     else: # Разворот
                         old_avg_price = old_value / old_units if abs(old_units) > 1e-8 else 0.0
                         realized_pnl = old_units * (price - old_avg_price)
-                        delta.cash_delta += realized_pnl
+                        delta.realized_pnl_delta += realized_pnl
                         temp_pos_value = temp_units * price
 
                 delta.units_delta = temp_units - state.units
@@ -762,9 +765,10 @@ cpdef tuple run_full_step_logic_cython(
     lob.swap(lob_clone)
     
     # Применяем дельты
-    state.cash += delta.cash_delta # PnL от разворотов уже учтён внутри cash_delta
+    state.cash += delta.cash_delta
     state._position_value += delta.position_value_delta
     state.units += delta.units_delta
+    state.realized_pnl_cum += delta.realized_pnl_delta
 
     # Обновляем ордера агента
     if delta.clear_all_agent_orders:
