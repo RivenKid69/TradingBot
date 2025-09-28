@@ -496,6 +496,11 @@ class _Worker:
         self._monitoring: MonitoringAggregator | None = (
             monitoring if monitoring is not None else monitoring_agg
         )
+        if self._monitoring is not None:
+            try:
+                self._monitoring.set_execution_mode(self._execution_mode)
+            except Exception:
+                pass
         self._portfolio_guard: PortfolioLimitGuard | None = None
         self._global_bucket = None
         self._symbol_bucket_factory = None
@@ -895,6 +900,48 @@ class _Worker:
                 requested = 1.0
                 filled = ratio
         return requested, filled
+
+    def _extract_bar_execution_metrics(
+        self, snapshot: Mapping[str, Any] | None
+    ) -> Dict[str, Any] | None:
+        if not snapshot or self._execution_mode != "bar":
+            return None
+        decision_raw = snapshot.get("decision")
+        decision = self._materialize_mapping(decision_raw)
+        turnover = self._coerce_float(
+            self._find_in_mapping(decision, ("turnover_usd", "turnover", "notional_usd"))
+        )
+        if turnover is None:
+            turnover = self._coerce_float(snapshot.get("turnover_usd"))
+        if turnover is None:
+            turnover = 0.0
+        act_now_val = self._find_in_mapping(decision, ("act_now", "execute_now"))
+        if act_now_val is None:
+            act_now_val = snapshot.get("act_now")
+        if isinstance(act_now_val, str):
+            act_now_flag = act_now_val.strip().lower() in {"1", "true", "yes", "y"}
+        elif act_now_val is None:
+            act_now_flag = False
+        else:
+            try:
+                act_now_flag = bool(act_now_val)
+            except Exception:
+                act_now_flag = False
+        cap_value = self._coerce_float(snapshot.get("cap_usd"))
+        if cap_value is None:
+            cap_value = self._coerce_float(snapshot.get("adv_quote"))
+        if cap_value is None:
+            cap_value = self._coerce_float(
+                self._find_in_mapping(decision, ("adv_quote", "cap_usd", "cap_quote", "daily_notional_cap"))
+            )
+        if cap_value is not None and cap_value <= 0.0:
+            cap_value = None
+        return {
+            "decisions": 1,
+            "act_now": 1 if act_now_flag else 0,
+            "turnover_usd": float(turnover),
+            "cap_usd": cap_value,
+        }
 
     def _extract_daily_pnl(self, snapshot: Mapping[str, Any] | None) -> float | None:
         if not snapshot:
@@ -2581,7 +2628,8 @@ class _Worker:
                 return False
         try:
             age_ms = now_ms - created_ts
-            monitoring.age_at_publish_ms.labels(symbol).observe(age_ms)
+            if self._execution_mode != "bar":
+                monitoring.age_at_publish_ms.labels(symbol).observe(age_ms)
             monitoring.signal_published_count.labels(symbol).inc()
         except Exception:
             pass
@@ -2854,6 +2902,19 @@ class _Worker:
                     if requested is not None and filled is not None:
                         try:
                             runtime_monitoring.record_fill(requested, filled)
+                        except Exception:
+                            pass
+                else:
+                    bar_metrics = self._extract_bar_execution_metrics(snapshot)
+                    if bar_metrics:
+                        try:
+                            runtime_monitoring.record_bar_execution(
+                                bar.symbol,
+                                decisions=int(bar_metrics.get("decisions", 0)),
+                                act_now=int(bar_metrics.get("act_now", 0)),
+                                turnover_usd=float(bar_metrics.get("turnover_usd", 0.0)),
+                                cap_usd=bar_metrics.get("cap_usd"),
+                            )
                         except Exception:
                             pass
                 pnl_value = self._extract_daily_pnl(snapshot)

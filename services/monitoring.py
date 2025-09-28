@@ -586,6 +586,16 @@ class MonitoringAggregator:
         self.daily_pnl: Optional[float] = None
 
         self._bar_interval_ms: Dict[str, int] = {}
+        self._execution_mode: str = "order"
+        self._bar_events: Dict[str, deque[tuple[int, int, int, float, Optional[float]]]] = {
+            key: deque() for key in self._window_ms
+        }
+        self._bar_totals: Dict[str, float] = {
+            "decisions": 0.0,
+            "act_now": 0.0,
+            "turnover_usd": 0.0,
+            "cap_usd": 0.0,
+        }
         self.last_ws_reconnect_ms: Optional[int] = None
         self.last_ws_failure_ms: Optional[int] = None
         self.throttle_queue_depth: Dict[str, int] = {"size": 0, "max": 0}
@@ -717,6 +727,14 @@ class MonitoringAggregator:
         cutoff = now_ms - self._window_ms[window]
         dq = self._http_attempts[window]
         while dq and dq[0] < cutoff:
+            dq.popleft()
+
+    def _prune_bar_events(self, window: str, now_ms: int) -> None:
+        dq = self._bar_events.get(window)
+        if dq is None:
+            return
+        cutoff = now_ms - self._window_ms[window]
+        while dq and dq[0][0] < cutoff:
             dq.popleft()
 
     def _prune_signal_window(self, window: str, now_ms: int) -> None:
@@ -862,6 +880,109 @@ class MonitoringAggregator:
         global _zero_signal_streaks_snapshot
         _zero_signal_streaks_snapshot = dict(active)
 
+    def set_execution_mode(self, mode: str) -> None:
+        normalized = str(mode or "order").lower()
+        if normalized not in {"order", "bar"}:
+            normalized = "order"
+        if normalized == self._execution_mode:
+            return
+        self._execution_mode = normalized
+        if normalized != "bar":
+            self._bar_events = {key: deque() for key in self._window_ms}
+            self._bar_totals = {
+                "decisions": 0.0,
+                "act_now": 0.0,
+                "turnover_usd": 0.0,
+                "cap_usd": 0.0,
+            }
+
+    def _bar_window_snapshot(self, window: str) -> Dict[str, Any]:
+        dq = self._bar_events.get(window, deque())
+        decisions = sum(item[1] for item in dq)
+        act_now = sum(item[2] for item in dq)
+        turnover = sum(item[3] for item in dq)
+        cap_sum = sum(item[4] for item in dq if item[4] is not None and item[4] > 0)
+        rate = float(act_now / decisions) if decisions > 0 else None
+        ratio = float(turnover / cap_sum) if cap_sum > 0 else None
+        return {
+            "decisions": int(decisions),
+            "act_now": int(act_now),
+            "act_now_rate": rate,
+            "turnover_usd": float(turnover),
+            "cap_usd": float(cap_sum) if cap_sum > 0 else None,
+            "turnover_vs_cap": ratio,
+        }
+
+    def _bar_execution_snapshot(self) -> Dict[str, Any]:
+        cumulative_decisions = float(self._bar_totals.get("decisions", 0.0))
+        cumulative_act = float(self._bar_totals.get("act_now", 0.0))
+        cumulative_turnover = float(self._bar_totals.get("turnover_usd", 0.0))
+        cumulative_cap = float(self._bar_totals.get("cap_usd", 0.0))
+        cumulative_rate = (
+            float(cumulative_act / cumulative_decisions)
+            if cumulative_decisions > 0
+            else None
+        )
+        cumulative_ratio = (
+            float(cumulative_turnover / cumulative_cap)
+            if cumulative_cap > 0
+            else None
+        )
+        return {
+            "window_1m": self._bar_window_snapshot("1m"),
+            "window_5m": self._bar_window_snapshot("5m"),
+            "cumulative": {
+                "decisions": int(cumulative_decisions),
+                "act_now": int(cumulative_act),
+                "act_now_rate": cumulative_rate,
+                "turnover_usd": cumulative_turnover,
+                "cap_usd": cumulative_cap if cumulative_cap > 0 else None,
+                "turnover_vs_cap": cumulative_ratio,
+            },
+        }
+
+    def record_bar_execution(
+        self,
+        symbol: str,
+        *,
+        decisions: int,
+        act_now: int,
+        turnover_usd: float,
+        cap_usd: Optional[float] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        try:
+            dec = max(0, int(decisions))
+        except Exception:
+            dec = 0
+        if dec <= 0:
+            return
+        try:
+            act = max(0, min(dec, int(act_now)))
+        except Exception:
+            act = 0
+        try:
+            turnover = float(turnover_usd)
+        except Exception:
+            turnover = 0.0
+        cap_value: Optional[float]
+        try:
+            cap_value = float(cap_usd) if cap_usd is not None else None
+        except Exception:
+            cap_value = None
+        ts_ms = int(time.time() * 1000)
+        self._execution_mode = "bar"
+        for window in self._window_ms:
+            dq = self._bar_events.setdefault(window, deque())
+            dq.append((ts_ms, dec, act, turnover, cap_value if cap_value and cap_value > 0 else None))
+            self._prune_bar_events(window, ts_ms)
+        self._bar_totals["decisions"] += dec
+        self._bar_totals["act_now"] += act
+        self._bar_totals["turnover_usd"] += turnover
+        if cap_value is not None and cap_value > 0:
+            self._bar_totals["cap_usd"] += cap_value
+
     def _build_metrics(self, now_ms: int, feed_lags: Dict[str, int], stale: list[str]) -> Dict[str, Any]:
         worst_feed = max(feed_lags.items(), key=lambda item: item[1], default=(None, 0))
         ws_snapshot = {
@@ -895,6 +1016,8 @@ class MonitoringAggregator:
             "stale_symbols": stale,
             "fill_ratio": self.fill_ratio,
             "pnl": self.daily_pnl,
+            "execution_mode": self._execution_mode,
+            "bar_execution": self._bar_execution_snapshot() if self._execution_mode == "bar" else {},
             "ws": ws_snapshot,
             "http": http_snapshot,
             "signals": signal_snapshot,
@@ -1051,6 +1174,9 @@ class MonitoringAggregator:
     def record_fill(self, requested: Optional[float], filled: Optional[float]) -> None:
         if not self.enabled:
             return
+        if self._execution_mode == "bar":
+            self.fill_ratio = None
+            return
         if requested is None or filled is None:
             return
         try:
@@ -1097,6 +1223,7 @@ class MonitoringAggregator:
             self._prune_http_window(window, now_ms)
             self._prune_http_attempts(window, now_ms)
             self._prune_signal_window(window, now_ms)
+            self._prune_bar_events(window, now_ms)
 
         th = self.thresholds
 
