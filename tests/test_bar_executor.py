@@ -218,6 +218,41 @@ def test_bar_executor_turnover_cap_blocks_trade():
     assert report.meta["cap_usd"] == pytest.approx(100.0)
 
 
+@pytest.mark.parametrize("price", [0.0, -100.0])
+def test_bar_executor_skips_when_price_invalid(price: float):
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1000.0,
+    )
+    bar = make_bar(123, price)
+    order = Order(
+        ts=123,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "payload": {"target_weight": 0.5, "edge_bps": 50.0},
+        },
+    )
+
+    report = executor.execute(order)
+
+    assert report.meta["instructions"] == []
+    assert report.meta.get("reason") == "no_price"
+    decision = report.meta["decision"]
+    assert decision["act_now"] is False
+    assert decision.get("reason") == "no_price"
+
+    snapshot = executor.monitoring_snapshot()
+    assert snapshot.get("act_now") is False
+    assert snapshot.get("reason") == "no_price"
+
+
 def test_bar_executor_turnover_cap_tracks_portfolio_usage():
     cost_cfg = SpotCostConfig(
         turnover_caps=SpotTurnoverCaps(

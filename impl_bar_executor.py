@@ -277,11 +277,16 @@ class BarExecutor(TradeExecutor):
         adv_quote = self._coerce_float(order.meta.get("adv_quote"))
         bar = self._extract_bar(order.meta)
 
+        skip_reason: Optional[str] = None
+
         if bar is not None:
             price = self._select_bar_price(bar)
             state = state.with_bar(bar, price)
         else:
             price = state.price
+
+        if price is None or price <= Decimal("0"):
+            skip_reason = "no_price"
 
         equity_override = self._coerce_float(order.meta.get("equity_usd"))
         if equity_override is not None:
@@ -302,6 +307,12 @@ class BarExecutor(TradeExecutor):
             adv_quote,
             self.safety_margin_bps,
         )
+
+        if skip_reason is not None:
+            if hasattr(metrics, "model_copy"):
+                metrics = metrics.model_copy(update={"act_now": False})
+            else:  # pragma: no cover - compatibility fallback
+                metrics = metrics.copy(update={"act_now": False})
 
         min_step = self.min_rebalance_step
         skip_due_to_step = False
@@ -326,7 +337,12 @@ class BarExecutor(TradeExecutor):
         instructions: List[RebalanceInstruction] = []
         final_state = state
 
-        if metrics.act_now and not skip_due_to_step and not skip_due_to_cap:
+        if (
+            metrics.act_now
+            and not skip_due_to_step
+            and not skip_due_to_cap
+            and skip_reason is None
+        ):
             instructions = self._build_instructions(
                 state=state,
                 target_weight=target_weight,
@@ -358,6 +374,8 @@ class BarExecutor(TradeExecutor):
         else:
             dump_fn = getattr(metrics, "model_dump", None)
             metrics_data = dump_fn() if callable(dump_fn) else metrics.dict()
+            if skip_reason is not None:
+                metrics_data["reason"] = skip_reason
             logger.debug(
                 "Skipping rebalance for %s (mode=%s, delta=%.6f, metrics=%s)",
                 symbol,
@@ -374,6 +392,8 @@ class BarExecutor(TradeExecutor):
             decision_data["normalized"] = True
         if normalization_data:
             decision_data["normalization"] = dict(normalization_data)
+        if skip_reason is not None:
+            decision_data["reason"] = skip_reason
         report_meta: Dict[str, Any] = {
             "mode": mode,
             "decision": decision_data,
@@ -385,6 +405,8 @@ class BarExecutor(TradeExecutor):
             report_meta["min_step_enforced"] = True
         if skip_due_to_cap:
             report_meta["turnover_cap_enforced"] = True
+        if skip_reason is not None:
+            report_meta["reason"] = skip_reason
         if bar is not None:
             report_meta["bar_ts"] = bar.ts
         if price is not None:
@@ -431,6 +453,8 @@ class BarExecutor(TradeExecutor):
         snapshot["normalized"] = bool(normalized_flag)
         if normalization_data:
             snapshot["normalization"] = dict(normalization_data)
+        if skip_reason is not None:
+            snapshot["reason"] = skip_reason
         if cap_effective is not None:
             snapshot["cap_usd"] = float(cap_effective)
         if caps_eval.get("symbol_limit") is not None:
