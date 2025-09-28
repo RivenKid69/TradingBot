@@ -25,6 +25,10 @@ class ExecutionConfig:
     taker_fee: float = 0.0005
     maker_fee: float = 0.0002
     slip_k: float = 0.0
+    half_spread_bps: float = 0.0
+    impact_coefficient: float = 0.0
+    impact_exponent: float = 1.0
+    adv_quote: float = 0.0
 
 
 @dataclass(slots=True)

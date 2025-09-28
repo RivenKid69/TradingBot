@@ -110,6 +110,11 @@ cdef class EnvState:
 
     cdef public double taker_fee
     cdef public double maker_fee
+    cdef public double spot_cost_taker_fee_bps
+    cdef public double spot_cost_half_spread_bps
+    cdef public double spot_cost_impact_coeff
+    cdef public double spot_cost_impact_exponent
+    cdef public double spot_cost_adv_quote
     cdef public double profit_close_bonus
     cdef public double loss_close_penalty
     cdef public double bankruptcy_threshold
