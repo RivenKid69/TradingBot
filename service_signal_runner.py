@@ -476,6 +476,7 @@ class _Worker:
         status_callback: Callable[[str, Dict[str, Any]], None] | None = None,
         execution_mode: str = "order",
         portfolio_equity: float | None = None,
+        max_total_weight: float | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -530,6 +531,16 @@ class _Worker:
             )
         except (TypeError, ValueError):
             self._portfolio_equity = None
+        try:
+            weight_cap = (
+                float(max_total_weight) if max_total_weight is not None else None
+            )
+        except (TypeError, ValueError):
+            weight_cap = None
+        if weight_cap is not None:
+            if not math.isfinite(weight_cap) or weight_cap <= 0.0:
+                weight_cap = None
+        self._max_total_weight: float | None = weight_cap
         self._weights: Dict[str, float] = {}
         self._pending_weight: Dict[int, Dict[str, Any]] = {}
         entry_cfg = self._resolve_entry_limiter_config(executor)
@@ -944,6 +955,18 @@ class _Worker:
                 act_now_flag = bool(act_now_val)
             except Exception:
                 act_now_flag = False
+        normalized_val = self._find_in_mapping(decision, ("normalized",))
+        if normalized_val is None:
+            normalized_val = snapshot.get("normalized")
+        if isinstance(normalized_val, str):
+            normalized_flag = normalized_val.strip().lower() in {"1", "true", "yes", "y"}
+        elif normalized_val is None:
+            normalized_flag = False
+        else:
+            try:
+                normalized_flag = bool(normalized_val)
+            except Exception:
+                normalized_flag = False
         cap_value = self._coerce_float(snapshot.get("cap_usd"))
         if cap_value is None:
             cap_value = self._coerce_float(snapshot.get("adv_quote"))
@@ -953,12 +976,21 @@ class _Worker:
             )
         if cap_value is not None and cap_value <= 0.0:
             cap_value = None
-        return {
+        normalization_details = self._materialize_mapping(
+            self._find_in_mapping(decision, ("normalization",))
+        )
+        if not normalization_details:
+            normalization_details = self._materialize_mapping(snapshot.get("normalization"))
+        metrics: Dict[str, Any] = {
             "decisions": 1,
             "act_now": 1 if act_now_flag else 0,
             "turnover_usd": float(turnover),
             "cap_usd": cap_value,
+            "normalized": bool(normalized_flag),
         }
+        if normalization_details:
+            metrics["normalization"] = normalization_details
+        return metrics
 
     def _extract_daily_pnl(self, snapshot: Mapping[str, Any] | None) -> float | None:
         if not snapshot:
@@ -1605,6 +1637,164 @@ class _Worker:
             self._positions.pop(sym, None)
         else:
             self._positions[sym] = qty
+
+    def _normalize_weight_targets(
+        self, orders: Sequence[Any]
+    ) -> tuple[list[Any], bool]:
+        if not orders or self._execution_mode != "bar":
+            return list(orders), False
+        cap = self._max_total_weight
+        if cap is None or cap <= 0.0:
+            return list(orders), False
+
+        orders_list = list(orders)
+        scalable_infos: list[Dict[str, Any]] = []
+        seen_symbols: set[str] = set()
+        normalized_total = 0.0
+        requested_total = 0.0
+
+        for order in orders_list:
+            symbol = str(getattr(order, "symbol", "") or "").upper()
+            payload = self._extract_signal_payload(order)
+            target, _ = self._resolve_weight_targets(symbol, payload)
+            meta_raw = getattr(order, "meta", None)
+            normalized_flag = False
+            if payload.get("normalized"):
+                normalized_flag = True
+            elif isinstance(meta_raw, MappingABC):
+                normalized_flag = bool(meta_raw.get("normalized"))
+            try:
+                current_weight = float(self._weights.get(symbol, 0.0))
+            except (TypeError, ValueError):
+                current_weight = 0.0
+            if not math.isfinite(current_weight) or current_weight < 0.0:
+                current_weight = 0.0
+            info = {
+                "order": order,
+                "symbol": symbol,
+                "payload": payload,
+                "current": current_weight,
+                "target": float(target),
+                "requested": float(target),
+                "normalized": bool(normalized_flag),
+            }
+            if symbol:
+                seen_symbols.add(symbol)
+            if normalized_flag:
+                normalized_total += max(0.0, float(target))
+            elif symbol:
+                scalable_infos.append(info)
+                requested_total += max(0.0, float(target))
+
+        if not scalable_infos:
+            return orders_list, False
+
+        existing_total = 0.0
+        for sym, weight in self._weights.items():
+            if sym in seen_symbols:
+                continue
+            try:
+                weight_val = float(weight)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(weight_val) or weight_val <= 0.0:
+                continue
+            existing_total += weight_val
+
+        available = float(cap) - existing_total - normalized_total
+        if available >= requested_total and available >= 0.0:
+            return orders_list, False
+        available = max(0.0, available)
+        if requested_total <= 0.0:
+            factor = 0.0
+        else:
+            factor = max(0.0, min(1.0, available / requested_total))
+        if math.isclose(factor, 1.0, rel_tol=1e-9):
+            return orders_list, False
+
+        normalization_payload: Dict[str, Any] = {
+            "factor": factor,
+            "cap": float(cap),
+            "existing_total": existing_total,
+            "normalized_total": normalized_total,
+            "requested_total": requested_total,
+            "available_total": available,
+        }
+        equity = self._portfolio_equity
+        if equity is not None and math.isfinite(equity):
+            normalization_payload["cap_usd"] = float(cap) * float(equity)
+
+        def _ensure_meta(order_obj: Any) -> Dict[str, Any]:
+            meta_val = getattr(order_obj, "meta", None)
+            if isinstance(meta_val, dict):
+                return meta_val
+            if isinstance(meta_val, MappingABC):
+                meta_dict = dict(meta_val)
+            else:
+                meta_dict = {}
+            try:
+                setattr(order_obj, "meta", meta_dict)
+            except Exception:
+                pass
+            return meta_dict if isinstance(meta_dict, dict) else {}
+
+        changed = False
+        for info in scalable_infos:
+            symbol = info["symbol"]
+            if not symbol:
+                continue
+            order = info["order"]
+            current_weight = info["current"]
+            original_target = max(0.0, info["target"])
+            new_target = self._clamp_weight(original_target * factor)
+            new_delta = new_target - current_weight
+            payload_map = dict(info["payload"])
+            payload_map["normalized"] = True
+            payload_map["normalization"] = dict(normalization_payload)
+            payload_map["target_weight"] = new_target
+            payload_map["target"] = new_target
+            payload_map["weight"] = new_target
+            payload_map["delta_weight"] = new_delta
+            payload_map["delta"] = new_delta
+            info["payload"] = payload_map
+            info["target"] = new_target
+            meta_map = _ensure_meta(order)
+            meta_map["payload"] = payload_map
+            meta_map["normalized"] = True
+            meta_map["normalization"] = dict(normalization_payload)
+            self._pending_weight[id(order)] = {
+                "symbol": symbol,
+                "target_weight": new_target,
+                "delta_weight": new_delta,
+                "normalized": True,
+                "factor": factor,
+                "normalization": dict(normalization_payload),
+            }
+            changed = True
+
+        if changed:
+            try:
+                symbols_requested = {
+                    info["symbol"]: info["requested"]
+                    for info in scalable_infos
+                    if info.get("symbol")
+                }
+                log_payload = {
+                    "cap": float(cap),
+                    "existing_total": existing_total,
+                    "normalized_total": normalized_total,
+                    "requested_total": requested_total,
+                    "available_total": available,
+                    "factor": factor,
+                    "symbols": symbols_requested,
+                }
+                if equity is not None and math.isfinite(equity):
+                    log_payload["cap_usd"] = float(cap) * float(equity)
+                self._logger.info("WEIGHT_CAP_NORMALIZED %s", log_payload)
+            except Exception:
+                pass
+
+        return orders_list, changed
 
     def _register_pending_exposure(self, order: Any, ts_ms: int) -> bool:
         if self._execution_mode == "bar":
@@ -3354,6 +3544,9 @@ class _Worker:
             setattr(o, "created_ts_ms", created_ts_ms)
             checked_orders.append(o)
 
+        if checked_orders:
+            checked_orders, _ = self._normalize_weight_targets(checked_orders)
+
         for o in checked_orders:
             res = self.publish_decision(
                 o,
@@ -4914,6 +5107,7 @@ def clear_dirty_restart(
 
         executor_for_worker = self.adapter
         portfolio_equity = None
+        portfolio_weight_cap = None
         if self._execution_mode == "bar":
             exec_cfg = getattr(self._run_config, "execution", None)
             bar_price = "close"
@@ -4921,6 +5115,7 @@ def clear_dirty_restart(
             cost_cfg = getattr(self._run_config, "costs", None)
             safety_margin = 0.0
             default_equity = None
+            weight_cap_raw: Any = None
             if exec_cfg is not None:
                 bar_price = getattr(exec_cfg, "bar_price", bar_price) or bar_price
                 try:
@@ -4936,15 +5131,43 @@ def clear_dirty_restart(
                 if portfolio_cfg is None:
                     portfolio_cfg = getattr(self._run_config, "portfolio", None)
                 if portfolio_cfg is not None:
-                    default_equity = getattr(portfolio_cfg, "equity_usd", None)
+                    equity_candidate = getattr(portfolio_cfg, "equity_usd", None)
+                    if equity_candidate is None and isinstance(portfolio_cfg, MappingABC):
+                        equity_candidate = portfolio_cfg.get("equity_usd")
+                    if equity_candidate is not None:
+                        default_equity = equity_candidate
+                    weight_candidate = getattr(portfolio_cfg, "max_total_weight", None)
+                    if weight_candidate is None and isinstance(portfolio_cfg, MappingABC):
+                        weight_candidate = portfolio_cfg.get("max_total_weight")
+                    if weight_candidate is not None:
+                        weight_cap_raw = weight_candidate
             if default_equity is None:
                 portfolio_cfg = getattr(self._run_config, "portfolio", None)
                 if portfolio_cfg is not None:
-                    default_equity = getattr(portfolio_cfg, "equity_usd", None)
+                    equity_candidate = getattr(portfolio_cfg, "equity_usd", None)
+                    if equity_candidate is None and isinstance(portfolio_cfg, MappingABC):
+                        equity_candidate = portfolio_cfg.get("equity_usd")
+                    if equity_candidate is not None:
+                        default_equity = equity_candidate
+                    if weight_cap_raw is None:
+                        weight_candidate = getattr(portfolio_cfg, "max_total_weight", None)
+                        if weight_candidate is None and isinstance(portfolio_cfg, MappingABC):
+                            weight_candidate = portfolio_cfg.get("max_total_weight")
+                        if weight_candidate is not None:
+                            weight_cap_raw = weight_candidate
             try:
                 portfolio_equity = float(default_equity) if default_equity is not None else None
             except (TypeError, ValueError):
                 portfolio_equity = None
+            try:
+                portfolio_weight_cap = (
+                    float(weight_cap_raw) if weight_cap_raw is not None else None
+                )
+            except (TypeError, ValueError):
+                portfolio_weight_cap = None
+            if portfolio_weight_cap is not None:
+                if not math.isfinite(portfolio_weight_cap) or portfolio_weight_cap <= 0.0:
+                    portfolio_weight_cap = None
             executor_for_worker = BarExecutor(
                 run_id=self.cfg.run_id or "bar",
                 bar_price=bar_price,
@@ -4983,6 +5206,7 @@ def clear_dirty_restart(
             status_callback=self._update_runner_status,
             execution_mode=self._execution_mode,
             portfolio_equity=portfolio_equity,
+            max_total_weight=portfolio_weight_cap,
         )
         self._worker_ref = worker
         self._write_runner_status()

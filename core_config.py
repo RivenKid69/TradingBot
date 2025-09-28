@@ -433,6 +433,15 @@ class PortfolioConfig(BaseModel):
         ge=0.0,
         description="Capital base in USD; ``None`` leaves it unspecified (legacy behaviour).",
     )
+    max_total_weight: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Optional cap on the sum of absolute portfolio weights submitted in a single bar "
+            "run. When the requested targets exceed the cap the runner will scale them "
+            "pro-rata. ``None`` disables the guard."
+        ),
+    )
 
     class Config:
         extra = "allow"
