@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 import os
 
+from api.spot_signals import SpotSignalEnvelope, build_envelope, sign_envelope
 import utils_time
 from .utils_app import append_row_csv
 from . import ops_kill_switch
@@ -24,6 +25,7 @@ _SEEN: Dict[str, int] = {}
 dropped_by_reason: Dict[str, int] = defaultdict(int)
 _lock = threading.Lock()
 _loaded = False
+_SIGNING_SECRET: bytes | None = None
 
 # Optional CSV output paths
 OUT_CSV: str | None = None
@@ -41,6 +43,16 @@ config = _Config()
 def signal_id(symbol: str, bar_close_ms: int) -> str:
     """Построить уникальный идентификатор сигнала."""
     return f"{symbol}:{int(bar_close_ms)}"
+
+
+def configure_signing(secret: str | bytes | None) -> None:
+    """Configure HMAC signing for published envelopes."""
+
+    global _SIGNING_SECRET
+    if not secret:
+        _SIGNING_SECRET = None
+        return
+    _SIGNING_SECRET = secret if isinstance(secret, bytes) else secret.encode("utf-8")
 
 
 def _atomic_write(path: Path) -> None:
@@ -153,7 +165,7 @@ def mark_emitted(
         _flush()
 
 
-def log_drop(symbol: str, bar_close_ms: int, payload: Any, reason: str) -> None:
+def log_drop(envelope: SpotSignalEnvelope, reason: str) -> None:
     """Log a dropped signal to ``DROPS_CSV`` with a reason.
 
     The CSV mirrors the structure of ``publish_signal``: ``symbol``,
@@ -169,8 +181,13 @@ def log_drop(symbol: str, bar_close_ms: int, payload: Any, reason: str) -> None:
         dropped_by_reason[str(reason)] += 1
         return
     try:
-        header = ["symbol", "bar_close_ms", "payload", "reason"]
-        row = [symbol, int(bar_close_ms), json.dumps(payload), str(reason)]
+        header = ["symbol", "bar_close_ms", "envelope", "reason"]
+        row = [
+            envelope.symbol,
+            int(envelope.bar_close_ms),
+            json.dumps(envelope.to_wire(), separators=(",", ":")),
+            str(reason),
+        ]
         append_row_csv(DROPS_CSV, header, row)
         dropped_by_reason[str(reason)] += 1
     except Exception:
@@ -198,27 +215,49 @@ def publish_signal(
 
     Возвращает ``True``, если сигнал был отправлен, иначе ``False``.
     """
+
+    bar_close_ms_int = int(bar_close_ms)
+    expires_at_ms_int = int(expires_at_ms)
+
+    envelope_cache: SpotSignalEnvelope | None = None
+
+    def _envelope() -> SpotSignalEnvelope:
+        nonlocal envelope_cache
+        if envelope_cache is None:
+            envelope_cache = build_envelope(
+                symbol=symbol,
+                bar_close_ms=bar_close_ms_int,
+                expires_at_ms=expires_at_ms_int,
+                payload=payload,
+            )
+        return envelope_cache
+
     if not config.enabled:
-        log_drop(symbol, bar_close_ms, payload, "disabled")
+        log_drop(_envelope(), "disabled")
         return False
 
     _ensure_loaded()
-    sid = dedup_key or signal_id(symbol, bar_close_ms)
+    sid = dedup_key or signal_id(symbol, bar_close_ms_int)
     now = now_ms if now_ms is not None else utils_time.now_ms()
-    if now >= int(expires_at_ms):
-        log_drop(symbol, bar_close_ms, payload, "expired")
+    if now >= expires_at_ms_int:
+        log_drop(_envelope(), "expired")
         return False
 
     with _lock:
         _purge(now)
         if sid in _SEEN:
-            log_drop(symbol, bar_close_ms, payload, "duplicate")
+            log_drop(_envelope(), "duplicate")
             return False
 
-    send_fn(payload)
+    envelope = _envelope()
+    if _SIGNING_SECRET is not None:
+        envelope = sign_envelope(envelope, _SIGNING_SECRET)
+
+    wire_payload = envelope.to_wire()
+    send_fn(wire_payload)
 
     with _lock:
-        _SEEN[sid] = int(expires_at_ms)
+        _SEEN[sid] = expires_at_ms_int
         _flush()
 
     try:
@@ -228,8 +267,13 @@ def publish_signal(
 
     if OUT_CSV:
         try:
-            header = ["symbol", "bar_close_ms", "payload", "expires_at_ms"]
-            row = [symbol, int(bar_close_ms), json.dumps(payload), int(expires_at_ms)]
+            header = ["symbol", "bar_close_ms", "envelope", "expires_at_ms"]
+            row = [
+                symbol,
+                bar_close_ms_int,
+                json.dumps(wire_payload, separators=(",", ":")),
+                expires_at_ms_int,
+            ]
             append_row_csv(OUT_CSV, header, row)
         except Exception:
             pass

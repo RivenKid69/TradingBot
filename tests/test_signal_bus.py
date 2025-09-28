@@ -2,11 +2,17 @@ import sys
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from api.spot_signals import (
+    SpotSignalEconomics,
+    SpotSignalTargetWeightPayload,
+    build_envelope,
+)
 import services.signal_bus as sb
 from services import ops_kill_switch
 
@@ -35,19 +41,32 @@ def test_publish_signal_dedup(tmp_path):
 
     sid = sb.signal_id("BTCUSDT", 1)
 
-    # first call should send and mark emitted
-    assert sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, expires_at_ms=now + 100, now_ms=now)
-    assert sent == [{"p": 1}]
+    first_payload = _make_payload(0.1)
+    assert sb.publish_signal(
+        "BTCUSDT", 1, first_payload, send_fn, expires_at_ms=now + 100, now_ms=now
+    )
+    assert sent[0]["payload"]["target_weight"] == pytest.approx(0.1)
+    assert sent[0]["payload"]["economics"]["edge_bps"] == pytest.approx(10.0)
     assert sb._SEEN[sid] == now + 100
 
     # duplicate before expiry should be skipped
-    assert not sb.publish_signal("BTCUSDT", 1, {"p": 2}, send_fn, expires_at_ms=now + 150, now_ms=now + 50)
-    assert sent == [{"p": 1}]
+    assert not sb.publish_signal(
+        "BTCUSDT", 1, _make_payload(0.2), send_fn, expires_at_ms=now + 150, now_ms=now + 50
+    )
+    assert len(sent) == 1
     assert sb._SEEN[sid] == now + 100
 
     # after expiration it should send again
-    assert sb.publish_signal("BTCUSDT", 1, {"p": 3}, send_fn, expires_at_ms=now + 200 + 100, now_ms=now + 200)
-    assert sent == [{"p": 1}, {"p": 3}]
+    assert sb.publish_signal(
+        "BTCUSDT",
+        1,
+        _make_payload(0.3),
+        send_fn,
+        expires_at_ms=now + 200 + 100,
+        now_ms=now + 200,
+    )
+    assert len(sent) == 2
+    assert sent[-1]["payload"]["target_weight"] == pytest.approx(0.3)
     assert sb._SEEN[sid] == now + 200 + 100
 
 
@@ -58,19 +77,25 @@ def test_duplicate_counter_resets(tmp_path):
     sb._loaded = False
     sb.load_state()
 
-    sent: list[dict[str, int]] = []
+    sent: list[dict[str, Any]] = []
     now = 1000
 
     def send_fn(payload):
         sent.append(payload)
 
-    assert sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, expires_at_ms=now + 100, now_ms=now)
+    assert sb.publish_signal(
+        "BTCUSDT", 1, _make_payload(0.1), send_fn, expires_at_ms=now + 100, now_ms=now
+    )
     assert ops_kill_switch._counters["duplicates"] == 0
 
-    assert not sb.publish_signal("BTCUSDT", 1, {"p": 2}, send_fn, expires_at_ms=now + 150, now_ms=now)
+    assert not sb.publish_signal(
+        "BTCUSDT", 1, _make_payload(0.2), send_fn, expires_at_ms=now + 150, now_ms=now
+    )
     assert ops_kill_switch._counters["duplicates"] == 1
 
-    assert sb.publish_signal("ETHUSDT", 2, {"p": 3}, send_fn, expires_at_ms=now + 200, now_ms=now)
+    assert sb.publish_signal(
+        "ETHUSDT", 2, _make_payload(0.3), send_fn, expires_at_ms=now + 200, now_ms=now
+    )
     assert ops_kill_switch._counters["duplicates"] == 0
 
 
@@ -81,7 +106,7 @@ def test_publish_signal_custom_dedup_key(tmp_path):
     sb._loaded = False
     sb.load_state()
 
-    sent: list[dict[str, int]] = []
+    sent: list[dict[str, Any]] = []
     now = 1000
 
     def send_fn(payload):
@@ -91,7 +116,7 @@ def test_publish_signal_custom_dedup_key(tmp_path):
     assert sb.publish_signal(
         "BTCUSDT",
         1,
-        {"p": 1},
+        _make_payload(0.2),
         send_fn,
         expires_at_ms=now + 100,
         now_ms=now,
@@ -101,7 +126,7 @@ def test_publish_signal_custom_dedup_key(tmp_path):
     assert not sb.publish_signal(
         "BTCUSDT",
         1,
-        {"p": 2},
+        _make_payload(0.3),
         send_fn,
         expires_at_ms=now + 200,
         now_ms=now + 50,
@@ -111,14 +136,14 @@ def test_publish_signal_custom_dedup_key(tmp_path):
     assert sb.publish_signal(
         "BTCUSDT",
         1,
-        {"p": 3},
+        _make_payload(0.4),
         send_fn,
         expires_at_ms=now + 300,
         now_ms=now + 60,
         dedup_key="custom2",
     )
 
-    assert sent == [{"p": 1}, {"p": 3}]
+    assert [row["payload"]["target_weight"] for row in sent] == [pytest.approx(0.2), pytest.approx(0.4)]
 
 
 def test_publish_signal_payload_fields(tmp_path):
@@ -133,9 +158,18 @@ def test_publish_signal_payload_fields(tmp_path):
     def send_fn(payload):
         captured.append(payload)
 
-    payload = {"score": 1.23, "features_hash": "abc"}
+    payload = _make_payload(0.5, edge=20.0)
     assert sb.publish_signal("ETHUSDT", 2, payload, send_fn, expires_at_ms=1100, now_ms=1000)
-    assert captured == [payload]
+    assert len(captured) == 1
+    envelope = captured[0]
+    assert envelope["symbol"] == "ETHUSDT"
+    assert envelope["bar_close_ms"] == 2
+    assert envelope["expires_at_ms"] == 1100
+    assert envelope["payload"]["target_weight"] == pytest.approx(0.5)
+    economics = envelope["payload"]["economics"]
+    assert economics["edge_bps"] == pytest.approx(20.0)
+    assert economics["net_bps"] == pytest.approx(15.0)
+    assert "signature" not in envelope
 
 
 def test_publish_signal_disabled(tmp_path):
@@ -152,7 +186,9 @@ def test_publish_signal_disabled(tmp_path):
 
     sb.config.enabled = False
     try:
-        assert not sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, expires_at_ms=100, now_ms=0)
+        assert not sb.publish_signal(
+            "BTCUSDT", 1, _make_payload(0.1), send_fn, expires_at_ms=100, now_ms=0
+        )
         assert sent == []
         assert sb._SEEN == {}
     finally:
@@ -210,14 +246,16 @@ def test_publish_signal_loads_once_and_flushes(tmp_path):
 
     sb.load_state = _load  # type: ignore
     try:
-        sent: list[dict[str, int]] = []
+        sent: list[dict[str, Any]] = []
 
         def send_fn(payload):
             sent.append(payload)
 
         now = 1000
         sid = sb.signal_id("BTCUSDT", 1)
-        ok = sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, expires_at_ms=now + 100, now_ms=now)
+        ok = sb.publish_signal(
+            "BTCUSDT", 1, _make_payload(0.2), send_fn, expires_at_ms=now + 100, now_ms=now
+        )
         assert ok
         assert calls == [1]
         assert json.loads(sb._STATE_PATH.read_text()) == {sid: now + 100}
@@ -252,17 +290,21 @@ def test_publish_signal_csv_logging(tmp_path):
         sent.append(payload)
 
     now = 1000
-    ok = sb.publish_signal("BTCUSDT", 1, {"p": 1}, send_fn, expires_at_ms=now + 100, now_ms=now)
+    ok = sb.publish_signal(
+        "BTCUSDT", 1, _make_payload(0.1), send_fn, expires_at_ms=now + 100, now_ms=now
+    )
     assert ok
-    assert sent == [{"p": 1}]
+    assert sent[0]["payload"]["target_weight"] == pytest.approx(0.1)
     out_path = Path(sb.OUT_CSV)
     assert out_path.exists()
     assert len(out_path.read_text().strip().splitlines()) == 2
 
     # expired signal should be logged to drops CSV and not sent
-    ok = sb.publish_signal("BTCUSDT", 2, {"p": 2}, send_fn, expires_at_ms=now - 1, now_ms=now)
+    ok = sb.publish_signal(
+        "BTCUSDT", 2, _make_payload(0.2), send_fn, expires_at_ms=now - 1, now_ms=now
+    )
     assert not ok
-    assert sent == [{"p": 1}]
+    assert len(sent) == 1
     drop_path = Path(sb.DROPS_CSV)
     assert drop_path.exists()
     assert len(drop_path.read_text().strip().splitlines()) == 2
@@ -273,5 +315,21 @@ def test_publish_signal_csv_logging(tmp_path):
 
 def test_log_drop_counts():
     sb.dropped_by_reason.clear()
-    sb.log_drop("BTC", 1, {}, "RISK_TEST")
+    envelope = build_envelope(
+        symbol="BTC",
+        bar_close_ms=1,
+        expires_at_ms=2,
+        payload=_make_payload(),
+    )
+    sb.log_drop(envelope, "RISK_TEST")
     assert sb.dropped_by_reason["RISK_TEST"] == 1
+def _make_payload(weight: float = 0.1, *, edge: float = 10.0) -> SpotSignalTargetWeightPayload:
+    economics = SpotSignalEconomics(
+        edge_bps=edge,
+        cost_bps=5.0,
+        net_bps=edge - 5.0,
+        turnover_usd=100.0,
+        act_now=True,
+    )
+    return SpotSignalTargetWeightPayload(target_weight=weight, economics=economics)
+

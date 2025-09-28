@@ -32,13 +32,13 @@ def test_decide_spot_trade_costs_and_net():
     metrics = decide_spot_trade(signal, state, cfg, adv_quote=50000.0, safety_margin_bps=3.0)
 
     # Expected delta = 0.2 -> turnover_usd = 200.0, participation = 0.004
-    assert metrics["turnover_usd"] == pytest.approx(200.0)
+    assert metrics.turnover_usd == pytest.approx(200.0)
     base_cost = 15.0  # 5 + 10
     impact = 15.0 * (0.004 ** 0.5) + 2.0 * 0.004
-    assert metrics["cost_bps"] == pytest.approx(base_cost + impact)
-    assert metrics["edge_bps"] == 50.0
-    assert metrics["net_bps"] == pytest.approx(50.0 - (base_cost + impact) - 3.0)
-    assert metrics["act_now"] is True
+    assert metrics.cost_bps == pytest.approx(base_cost + impact)
+    assert metrics.edge_bps == 50.0
+    assert metrics.net_bps == pytest.approx(50.0 - (base_cost + impact) - 3.0)
+    assert metrics.act_now is True
 
 
 def test_bar_executor_target_weight_single_instruction():
