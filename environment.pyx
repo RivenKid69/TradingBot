@@ -50,6 +50,14 @@ cdef class TradingEnv:
 
         self.state.taker_fee = self.config.execution.taker_fee
         self.state.maker_fee = self.config.execution.maker_fee
+        self.state.spot_cost_taker_fee_bps = max(0.0, float(self.config.execution.taker_fee) * 10000.0)
+        self.state.spot_cost_half_spread_bps = max(0.0, float(getattr(self.config.execution, "half_spread_bps", 0.0)))
+        self.state.spot_cost_impact_coeff = max(0.0, float(getattr(self.config.execution, "impact_coefficient", 0.0)))
+        impact_exp = float(getattr(self.config.execution, "impact_exponent", 1.0))
+        if impact_exp <= 0.0:
+            impact_exp = 1.0
+        self.state.spot_cost_impact_exponent = impact_exp
+        self.state.spot_cost_adv_quote = max(0.0, float(getattr(self.config.execution, "adv_quote", 0.0)))
         self.state.profit_close_bonus = self.config.reward.profit_close_bonus
         self.state.loss_close_penalty = self.config.reward.loss_close_penalty
         self.state.bankruptcy_threshold = self.config.risk.bankruptcy_threshold

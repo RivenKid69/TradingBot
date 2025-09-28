@@ -24,6 +24,7 @@ from core_config import (
     AdvRuntimeConfig,
     PortfolioConfig,
     SpotCostConfig,
+    ExecutionRuntimeConfig,
 )
 from impl_quantizer import QuantizerImpl
 
@@ -120,6 +121,11 @@ def build_graph(components: Components, run_config: Optional[CommonRunConfig] = 
         if isinstance(costs_cfg, SpotCostConfig):
             container["costs"] = costs_cfg
             container[SpotCostConfig] = costs_cfg
+        exec_cfg = getattr(run_config, "execution", None)
+        if isinstance(exec_cfg, ExecutionRuntimeConfig):
+            container["execution"] = exec_cfg
+            container["execution_config"] = exec_cfg
+            container[ExecutionRuntimeConfig] = exec_cfg
         q_cfg = getattr(run_config, "quantizer", None)
         if isinstance(q_cfg, Mapping):
             try:

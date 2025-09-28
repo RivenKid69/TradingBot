@@ -242,6 +242,11 @@ cdef class EnvState:
         self.last_realized_spread = 0.0
         self.last_executed_notional = 0.0
         self.last_bar_atr = 0.0
+        self.spot_cost_taker_fee_bps = 0.0
+        self.spot_cost_half_spread_bps = 0.0
+        self.spot_cost_impact_coeff = 0.0
+        self.spot_cost_impact_exponent = 1.0
+        self.spot_cost_adv_quote = 0.0
         self.lob = None
         self.realized_pnl_cum = 0.0
         if self.agent_orders_ptr is NULL:
