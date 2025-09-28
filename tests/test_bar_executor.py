@@ -41,6 +41,21 @@ def test_decide_spot_trade_costs_and_net():
     assert metrics.act_now is True
 
 
+def test_decide_spot_trade_safety_margin_blocks_trade():
+    state = PortfolioState(symbol="BTCUSDT", weight=0.2, equity_usd=500.0)
+    cfg = SpotCostConfig(taker_fee_bps=1.0, half_spread_bps=1.0)
+
+    # Incoming payload that would reduce exposure, but with low edge.
+    signal = {"delta_weight": -0.1, "edge_bps": 3.5}
+    metrics = decide_spot_trade(signal, state, cfg, adv_quote=None, safety_margin_bps=5.0)
+
+    assert metrics.turnover_usd == pytest.approx(50.0)
+    # Base cost of 2 bps plus safety margin 5 bps exceeds the edge => net negative
+    assert metrics.cost_bps == pytest.approx(2.0)
+    assert metrics.net_bps == pytest.approx(3.5 - 2.0 - 5.0)
+    assert metrics.act_now is False
+
+
 def test_bar_executor_target_weight_single_instruction():
     executor = BarExecutor(
         run_id="test",
@@ -71,6 +86,36 @@ def test_bar_executor_target_weight_single_instruction():
     positions = executor.get_open_positions()
     pos = positions["BTCUSDT"]
     assert pos.meta["weight"] == 0.5
+
+
+def test_bar_executor_includes_decision_costs():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(taker_fee_bps=2.0, half_spread_bps=3.0),
+        safety_margin_bps=1.5,
+        default_equity_usd=2000.0,
+    )
+
+    order = Order(
+        ts=10,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(10, 20000.0),
+            "adv_quote": 1_000_000.0,
+            "payload": {"target_weight": 0.25, "edge_bps": 20.0},
+        },
+    )
+
+    report = executor.execute(order)
+    decision = report.meta["decision"]
+    assert decision["cost_bps"] == pytest.approx(5.0)
+    assert decision["net_bps"] == pytest.approx(20.0 - 5.0 - 1.5)
+    assert decision["turnover_usd"] == pytest.approx(500.0)
 
 
 def test_bar_executor_delta_weight_twap_and_participation():
@@ -133,4 +178,31 @@ def test_bar_executor_respects_min_rebalance_step():
     assert report.meta["instructions"] == []
     positions = executor.get_open_positions()
     assert positions["BTCUSDT"].meta["weight"] == 0.0
+
+
+def test_bar_executor_skips_when_edge_insufficient():
+    executor = BarExecutor(
+        run_id="test",
+        cost_config=SpotCostConfig(taker_fee_bps=10.0, half_spread_bps=5.0),
+        safety_margin_bps=10.0,
+        default_equity_usd=1000.0,
+    )
+
+    order = Order(
+        ts=4,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(4, 15000.0),
+            "payload": {"target_weight": 0.3, "edge_bps": 10.0},
+        },
+    )
+
+    report = executor.execute(order)
+    assert report.meta["instructions"] == []
+    assert report.meta["decision"]["act_now"] is False
+    assert executor.get_open_positions()["BTCUSDT"].meta["weight"] == 0.0
 
