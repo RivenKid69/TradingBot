@@ -55,13 +55,14 @@ from pipeline import (
     PipelineConfig,
     PipelineStageConfig,
 )
-from services.signal_bus import log_drop
+from services.signal_bus import log_drop, publish_signal as publish_signal_envelope
 from services.event_bus import EventBus
 from services.shutdown import ShutdownManager
 from services.signal_csv_writer import SignalCSVWriter
 from adapters.binance_spot_private import reconcile_state
 
 from sandbox.sim_adapter import SimAdapter  # исп. как TradeExecutor-подобный мост
+from impl_bar_executor import BarExecutor
 from core_models import Bar, Tick
 from core_contracts import FeaturePipe, SignalPolicy
 from services.utils_config import (
@@ -456,6 +457,8 @@ class _Worker:
         monitoring_agg: MonitoringAggregator | None = None,
         worker_id: str | None = None,
         status_callback: Callable[[str, Dict[str, Any]], None] | None = None,
+        execution_mode: str = "order",
+        portfolio_equity: float | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -498,6 +501,15 @@ class _Worker:
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
         self._queue = None
+        self._execution_mode = str(execution_mode or "order").lower()
+        try:
+            self._portfolio_equity = (
+                float(portfolio_equity) if portfolio_equity is not None else None
+            )
+        except (TypeError, ValueError):
+            self._portfolio_equity = None
+        self._weights: Dict[str, float] = {}
+        self._pending_weight: Dict[int, Dict[str, Any]] = {}
         entry_cfg = self._resolve_entry_limiter_config(executor)
         self._entry_limiter = DailyEntryLimiter(
             entry_cfg.limit, entry_cfg.reset_hour
@@ -1006,6 +1018,43 @@ class _Worker:
                     continue
                 self._positions[sym] = qty_val
 
+        if self._execution_mode == "bar":
+            self._weights.clear()
+            if isinstance(stored_state, MappingABC):
+                raw_weights = stored_state.get("weights", {})
+                if isinstance(raw_weights, MappingABC):
+                    for symbol, weight in raw_weights.items():
+                        sym = str(symbol).upper()
+                        if not sym:
+                            continue
+                        try:
+                            weight_val = float(weight)
+                        except (TypeError, ValueError):
+                            continue
+                        if not math.isfinite(weight_val):
+                            continue
+                        if math.isclose(weight_val, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                            continue
+                        self._weights[sym] = weight_val
+                        self._apply_weight_to_positions(sym, weight_val)
+            if not self._weights and self._positions and self._portfolio_equity:
+                equity = float(self._portfolio_equity)
+                if math.isfinite(equity) and equity > 0.0:
+                    for symbol, qty in list(self._positions.items()):
+                        price = self._last_prices.get(symbol)
+                        if price is None or price <= 0.0:
+                            continue
+                        try:
+                            qty_val = float(qty)
+                        except (TypeError, ValueError):
+                            continue
+                        weight_guess = qty_val * float(price) / equity
+                        weight_clamped = self._clamp_weight(weight_guess)
+                        if math.isclose(weight_clamped, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                            continue
+                        self._weights[symbol] = weight_clamped
+                        self._apply_weight_to_positions(symbol, weight_clamped)
+
         pending_summary: Dict[str, Dict[str, float]] = {}
         if isinstance(stored_state, MappingABC):
             raw_pending = stored_state.get("pending", {})
@@ -1141,6 +1190,8 @@ class _Worker:
         if prev is not None and math.isclose(prev, val, rel_tol=1e-9, abs_tol=1e-12):
             return
         self._last_prices[sym] = val
+        if self._execution_mode == "bar" and sym in self._weights:
+            self._apply_weight_to_positions(sym, self._weights.get(sym, 0.0))
         if self._state_enabled:
             try:
                 state_storage.update_state(last_prices=dict(self._last_prices))
@@ -1201,6 +1252,157 @@ class _Worker:
                 side = ""
         return str(side or "").upper()
 
+    @staticmethod
+    def _clamp_weight(value: float) -> float:
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(weight):
+            return 0.0
+        if weight < 0.0:
+            return 0.0
+        if weight > 1.0:
+            return 1.0
+        return weight
+
+    @staticmethod
+    def _materialize_mapping(value: Any) -> Dict[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, MappingABC):
+            return dict(value)
+        for attr in ("model_dump", "dict"):
+            getter = getattr(value, attr, None)
+            if callable(getter):
+                try:
+                    result = getter()
+                except Exception:
+                    continue
+                if isinstance(result, MappingABC):
+                    return dict(result)
+        attrs = getattr(value, "__dict__", None)
+        if isinstance(attrs, MappingABC):
+            return {
+                k: v
+                for k, v in attrs.items()
+                if not callable(v)
+            }
+        return {}
+
+    def _extract_signal_payload(self, order: Any) -> Dict[str, Any]:
+        meta = getattr(order, "meta", None)
+        candidate: Any = None
+        if isinstance(meta, MappingABC):
+            candidate = meta.get("payload")
+            if candidate is None:
+                candidate = meta.get("rebalance")
+            if candidate is None:
+                candidate = meta.get("signal_payload")
+        elif meta is not None:
+            getter = getattr(meta, "get", None)
+            if callable(getter):
+                candidate = getter("payload")
+                if candidate is None:
+                    candidate = getter("rebalance")
+        if candidate is None:
+            candidate = getattr(order, "payload", None)
+        payload = self._materialize_mapping(candidate)
+        return payload
+
+    def _resolve_weight_targets(
+        self, symbol: str, payload: Mapping[str, Any]
+    ) -> tuple[float, float]:
+        current = float(self._weights.get(symbol, 0.0))
+        target = current
+        if "target_weight" in payload or "target" in payload or "weight" in payload:
+            raw = payload.get("target_weight")
+            if raw is None:
+                raw = payload.get("target")
+            if raw is None:
+                raw = payload.get("weight")
+            target = self._clamp_weight(raw)
+        elif "delta_weight" in payload or "delta" in payload:
+            raw_delta = payload.get("delta_weight")
+            if raw_delta is None:
+                raw_delta = payload.get("delta")
+            try:
+                delta_val = float(raw_delta)
+            except (TypeError, ValueError):
+                delta_val = 0.0
+            if math.isfinite(delta_val):
+                target = self._clamp_weight(current + delta_val)
+        delta = target - current
+        return target, delta
+
+    def _resolve_economics(
+        self, payload: Mapping[str, Any], meta: Mapping[str, Any] | None
+    ) -> Dict[str, Any]:
+        economics = payload.get("economics")
+        econ_map: Dict[str, Any] = {}
+        if isinstance(economics, MappingABC):
+            econ_map = dict(economics)
+        else:
+            candidate = None
+            if isinstance(meta, MappingABC):
+                candidate = meta.get("economics") or meta.get("decision")
+            if candidate is None:
+                candidate = economics
+            econ_map = self._materialize_mapping(candidate)
+        def _get_float(key: str, default: float = 0.0) -> float:
+            try:
+                value = float(econ_map.get(key, payload.get(key, default)))
+            except (TypeError, ValueError):
+                value = default
+            if not math.isfinite(value):
+                return default
+            return value
+
+        edge = _get_float("edge_bps", 0.0)
+        cost = _get_float("cost_bps", 0.0)
+        net = _get_float("net_bps", edge - cost)
+        turnover = _get_float("turnover_usd", 0.0)
+        act_now = econ_map.get("act_now")
+        if isinstance(act_now, str):
+            act_now = act_now.strip().lower() in {"1", "true", "yes"}
+        act_flag = bool(act_now) if act_now is not None else bool(payload.get("act_now", True))
+        return {
+            "edge_bps": edge,
+            "cost_bps": cost,
+            "net_bps": net,
+            "turnover_usd": max(0.0, turnover),
+            "act_now": act_flag,
+        }
+
+    def _build_envelope_payload(self, order: Any, symbol: str) -> Dict[str, Any]:
+        payload = self._extract_signal_payload(order)
+        meta_raw = getattr(order, "meta", None)
+        meta = meta_raw if isinstance(meta_raw, MappingABC) else self._materialize_mapping(meta_raw)
+        envelope_payload = dict(payload)
+        economics = self._resolve_economics(envelope_payload, meta)
+        envelope_payload["economics"] = economics
+        kind = envelope_payload.get("kind")
+        if not isinstance(kind, str):
+            if "delta_weight" in envelope_payload or "delta" in envelope_payload:
+                kind = "delta_weight"
+            else:
+                kind = "target_weight"
+        kind = str(kind)
+        if kind not in {"target_weight", "delta_weight"}:
+            kind = "target_weight"
+        envelope_payload["kind"] = kind
+        symbol_key = str(symbol).upper()
+        if kind == "target_weight":
+            if "target_weight" not in envelope_payload:
+                envelope_payload["target_weight"] = self._clamp_weight(
+                    envelope_payload.get("weight", self._weights.get(symbol_key, 0.0))
+                )
+        else:
+            if "delta_weight" not in envelope_payload:
+                _, delta = self._resolve_weight_targets(symbol_key, envelope_payload)
+                envelope_payload["delta_weight"] = delta
+        return envelope_payload
+
     def _persist_exposure_state(self, ts_ms: int | None = None) -> None:
         timestamp = int(ts_ms if ts_ms is not None else clock.now_ms())
         positions_snapshot: Dict[str, float] = {}
@@ -1220,21 +1422,41 @@ class _Worker:
                 continue
             summary = pending_summary.setdefault(symbol, {})
             summary[leg] = summary.get(leg, 0.0) + delta
+        weight_snapshot: Dict[str, float] = {}
+        if self._execution_mode == "bar":
+            for symbol, weight in self._weights.items():
+                try:
+                    weight_val = float(weight)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(weight_val):
+                    continue
+                if math.isclose(weight_val, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                    continue
+                weight_snapshot[symbol] = weight_val
+
         total_notional = 0.0
-        for symbol, qty in positions_snapshot.items():
-            price = self._last_prices.get(symbol)
-            if price is None:
-                continue
-            try:
-                total_notional += abs(float(qty)) * float(price)
-            except Exception:
-                continue
+        if self._execution_mode == "bar":
+            equity = self._portfolio_equity
+            if equity is not None and equity > 0.0:
+                total_notional = sum(abs(val) for val in weight_snapshot.values()) * float(equity)
+        if total_notional <= 0.0:
+            for symbol, qty in positions_snapshot.items():
+                price = self._last_prices.get(symbol)
+                if price is None:
+                    continue
+                try:
+                    total_notional += abs(float(qty)) * float(price)
+                except Exception:
+                    continue
         self._exposure_state = {
             "positions": positions_snapshot,
             "pending": pending_summary,
             "updated_at_ms": timestamp,
             "total_notional": total_notional,
         }
+        if self._execution_mode == "bar":
+            self._exposure_state["weights"] = weight_snapshot
         if self._state_enabled:
             try:
                 state_storage.update_state(
@@ -1262,6 +1484,17 @@ class _Worker:
         return snapshot
 
     def _portfolio_total_notional(self) -> float:
+        if self._execution_mode == "bar":
+            equity = self._portfolio_equity
+            if equity is not None and equity > 0.0:
+                total = 0.0
+                for weight in self._weights.values():
+                    try:
+                        total += abs(float(weight))
+                    except (TypeError, ValueError):
+                        continue
+                if total > 0.0:
+                    return float(equity) * total
         try:
             value = float(self._exposure_state.get("total_notional", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -1283,7 +1516,35 @@ class _Worker:
             return None
         return value
 
+    def _apply_weight_to_positions(self, symbol: str, weight: float) -> None:
+        sym = str(symbol or "").upper()
+        if not sym:
+            return
+        try:
+            weight_val = float(weight)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(weight_val):
+            return
+        if math.isclose(weight_val, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            self._positions.pop(sym, None)
+            return
+        equity = self._portfolio_equity
+        price = self._last_prices.get(sym)
+        if equity is not None and equity > 0.0 and price is not None and price > 0.0:
+            qty = (weight_val * float(equity)) / float(price)
+        elif equity is not None and equity > 0.0:
+            qty = weight_val * float(equity)
+        else:
+            qty = weight_val
+        if math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            self._positions.pop(sym, None)
+        else:
+            self._positions[sym] = qty
+
     def _register_pending_exposure(self, order: Any, ts_ms: int) -> bool:
+        if self._execution_mode == "bar":
+            return False
         key = id(order)
         if key in self._pending_exposure:
             return False
@@ -1320,6 +1581,8 @@ class _Worker:
     ) -> None:
         if not orders:
             return
+        if self._execution_mode == "bar":
+            return
         exit_orders: list[Any] = []
         entry_orders: list[Any] = []
         other_orders: list[Any] = []
@@ -1339,6 +1602,9 @@ class _Worker:
             self._persist_exposure_state(ts_ms)
 
     def _rollback_exposure(self, order: Any) -> None:
+        if self._execution_mode == "bar":
+            self._pending_weight.pop(id(order), None)
+            return
         key = id(order)
         data = self._pending_exposure.pop(key, None)
         if not data:
@@ -1358,6 +1624,20 @@ class _Worker:
         self._persist_exposure_state(clock.now_ms())
 
     def _commit_exposure(self, order: Any) -> None:
+        if self._execution_mode == "bar":
+            symbol = str(getattr(order, "symbol", "") or "").upper()
+            if not symbol:
+                return
+            payload = self._extract_signal_payload(order)
+            target_weight, _ = self._resolve_weight_targets(symbol, payload)
+            if math.isclose(target_weight, 0.0, rel_tol=0.0, abs_tol=1e-12):
+                self._weights.pop(symbol, None)
+            else:
+                self._weights[symbol] = target_weight
+            self._apply_weight_to_positions(symbol, target_weight)
+            self._pending_weight.pop(id(order), None)
+            self._persist_exposure_state(clock.now_ms())
+            return
         key = id(order)
         if key not in self._pending_exposure:
             return
@@ -2260,7 +2540,11 @@ class _Worker:
 
         created_ts = int(getattr(o, "created_ts_ms", 0) or 0)
         now_ms = clock.now_ms()
-        expires_at_ms = 0
+        expires_at_ms = max(created_ts, bar_close_ms)
+        if self._ws_dedup_timeframe_ms > 0:
+            expires_at_ms = max(
+                expires_at_ms, created_ts + self._ws_dedup_timeframe_ms
+            )
         if ttl_enabled:
             try:
                 monitoring.inc_stage(Stage.TTL)
@@ -2332,24 +2616,35 @@ class _Worker:
             self._logger.info("order %s", o)
         except Exception:
             pass
+        payload = self._build_envelope_payload(o, symbol)
+        meta = getattr(o, "meta", None)
+        dedup_key: str | None = None
+        if isinstance(meta, MappingABC):
+            raw_key = meta.get("dedup_key")
+            if raw_key is not None:
+                dedup_key = str(raw_key)
+        published = True
         if getattr(signal_bus, "ENABLED", False):
             try:
-                signal_bus.publish_signal(
-                    ts_ms=bar_close_ms,
-                    symbol=symbol,
-                    side=side,
-                    score=score,
-                    features_hash=fh,
-                    bar_close_ms=bar_close_ms,
+                published = publish_signal_envelope(
+                    symbol,
+                    bar_close_ms,
+                    payload,
+                    lambda _: None,
+                    expires_at_ms=expires_at_ms,
+                    dedup_key=dedup_key,
                 )
             except Exception:
-                pass
-        submit = getattr(self._executor, "submit", None)
-        if callable(submit):
-            try:
-                submit(o)
-            except Exception:
-                pass
+                published = False
+        if not published:
+            return False
+        if self._execution_mode != "bar":
+            submit = getattr(self._executor, "submit", None)
+            if callable(submit):
+                try:
+                    submit(o)
+                except Exception:
+                    pass
         return True
 
     def publish_decision(
@@ -2554,12 +2849,13 @@ class _Worker:
                 except Exception:
                     pass
                 snapshot = self._extract_monitoring_snapshot(self._executor)
-                requested, filled = self._extract_fill_metrics(snapshot)
-                if requested is not None and filled is not None:
-                    try:
-                        runtime_monitoring.record_fill(requested, filled)
-                    except Exception:
-                        pass
+                if self._execution_mode != "bar":
+                    requested, filled = self._extract_fill_metrics(snapshot)
+                    if requested is not None and filled is not None:
+                        try:
+                            runtime_monitoring.record_fill(requested, filled)
+                        except Exception:
+                            pass
                 pnl_value = self._extract_daily_pnl(snapshot)
                 if pnl_value is not None:
                     try:
@@ -3140,6 +3436,11 @@ class ServiceSignalRunner:
         self.shutdown_cfg = shutdown_cfg or {}
         self.monitoring_cfg = monitoring_cfg or MonitoringConfig()
         self._run_config = run_config
+        exec_cfg = getattr(run_config, "execution", None) if run_config is not None else None
+        mode = "order"
+        if exec_cfg is not None:
+            mode = str(getattr(exec_cfg, "mode", mode) or mode)
+        self._execution_mode = mode.lower()
         self.alerts: AlertManager | None = None
         self.monitoring_agg: MonitoringAggregator | None = None
         self._clock_safe_mode = False
@@ -3312,22 +3613,23 @@ class ServiceSignalRunner:
         else:
             self.logger.info("dynamic guard: not configured")
 
-        run_id = self.cfg.run_id or "sim"
-        logs_dir = self.cfg.logs_dir or "logs"
-        sim = getattr(self.adapter, "sim", None) or getattr(self.adapter, "_sim", None)
-        if sim is not None:
-            logging_config = {
-                "trades_path": os.path.join(logs_dir, f"log_trades_{run_id}.csv"),
-                "reports_path": os.path.join(logs_dir, f"report_equity_{run_id}.csv"),
-            }
-            try:
-                from sim_logging import LogWriter, LogConfig  # type: ignore
+        if self._execution_mode != "bar":
+            run_id = self.cfg.run_id or "sim"
+            logs_dir = self.cfg.logs_dir or "logs"
+            sim = getattr(self.adapter, "sim", None) or getattr(self.adapter, "_sim", None)
+            if sim is not None:
+                logging_config = {
+                    "trades_path": os.path.join(logs_dir, f"log_trades_{run_id}.csv"),
+                    "reports_path": os.path.join(logs_dir, f"report_equity_{run_id}.csv"),
+                }
+                try:
+                    from sim_logging import LogWriter, LogConfig  # type: ignore
 
-                sim._logger = LogWriter(
-                    LogConfig.from_dict(logging_config), run_id=run_id
-                )
-            except Exception:
-                pass
+                    sim._logger = LogWriter(
+                        LogConfig.from_dict(logging_config), run_id=run_id
+                    )
+                except Exception:
+                    pass
 
         self._setup_market_regime_bridge()
 
@@ -4532,11 +4834,53 @@ def clear_dirty_restart(
             getattr(self.adapter, "rest", None),
         ]
 
+        executor_for_worker = self.adapter
+        portfolio_equity = None
+        if self._execution_mode == "bar":
+            exec_cfg = getattr(self._run_config, "execution", None)
+            bar_price = "close"
+            min_step = 0.0
+            cost_cfg = getattr(self._run_config, "costs", None)
+            safety_margin = 0.0
+            default_equity = None
+            if exec_cfg is not None:
+                bar_price = getattr(exec_cfg, "bar_price", bar_price) or bar_price
+                try:
+                    min_step = float(getattr(exec_cfg, "min_rebalance_step", min_step) or min_step)
+                except (TypeError, ValueError):
+                    min_step = 0.0
+                cost_cfg = getattr(exec_cfg, "costs", cost_cfg)
+                try:
+                    safety_margin = float(getattr(exec_cfg, "safety_margin_bps", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    safety_margin = 0.0
+                portfolio_cfg = getattr(exec_cfg, "portfolio", None)
+                if portfolio_cfg is None:
+                    portfolio_cfg = getattr(self._run_config, "portfolio", None)
+                if portfolio_cfg is not None:
+                    default_equity = getattr(portfolio_cfg, "equity_usd", None)
+            if default_equity is None:
+                portfolio_cfg = getattr(self._run_config, "portfolio", None)
+                if portfolio_cfg is not None:
+                    default_equity = getattr(portfolio_cfg, "equity_usd", None)
+            try:
+                portfolio_equity = float(default_equity) if default_equity is not None else None
+            except (TypeError, ValueError):
+                portfolio_equity = None
+            executor_for_worker = BarExecutor(
+                run_id=self.cfg.run_id or "bar",
+                bar_price=bar_price,
+                min_rebalance_step=min_step,
+                cost_config=cost_cfg,
+                safety_margin_bps=safety_margin,
+                default_equity_usd=portfolio_equity or 0.0,
+            )
+
         worker = _Worker(
             self.feature_pipe,
             self.policy,
             self.logger,
-            self.adapter,
+            executor_for_worker,
             self.risk_guards,
             lambda: self._clock_safe_mode
             or monitoring.kill_switch_triggered()
@@ -4559,6 +4903,8 @@ def clear_dirty_restart(
             monitoring_agg=self.monitoring_agg,
             worker_id="worker-0",
             status_callback=self._update_runner_status,
+            execution_mode=self._execution_mode,
+            portfolio_equity=portfolio_equity,
         )
         self._worker_ref = worker
         self._write_runner_status()
