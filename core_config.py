@@ -388,6 +388,16 @@ class SpotImpactConfig(BaseModel):
         default=0.0,
         description="Coefficient applied to the linear participation term (bps).",
     )
+    power_coefficient: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="General power-law coefficient applied to participation (bps).",
+    )
+    power_exponent: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="Exponent for the power-law impact component.",
+    )
 
     class Config:
         extra = "allow"

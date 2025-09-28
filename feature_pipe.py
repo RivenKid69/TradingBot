@@ -13,14 +13,36 @@ from collections import deque
 from dataclasses import dataclass, field
 from decimal import InvalidOperation, Decimal
 from math import sqrt, isfinite
-from typing import Iterable, Mapping, Optional, Any, Deque, Dict, Union
+from typing import Iterable, Mapping, Optional, Any, Deque, Dict, Union, Sequence
 import copy
 
+import numpy as np
 import pandas as pd
 
 from transformers import FeatureSpec, OnlineFeatureTransformer, apply_offline_features
 from core_models import Bar
 from core_contracts import FeaturePipe as FeaturePipeProtocol  # noqa: F401
+from core_config import SpotCostConfig, ExecutionRuntimeConfig
+
+
+_TURNOVER_COLUMNS: Sequence[str] = (
+    "turnover_usd",
+    "turnover",
+    "notional_usd",
+    "notional",
+    "delta_notional_usd",
+    "delta_usd",
+    "executed_notional",
+)
+
+_ADV_COLUMNS: Sequence[str] = (
+    "adv_quote_1h",
+    "adv_usd_1h",
+    "adv_quote",
+    "adv_usd",
+    "adv_1h",
+    "adv",
+)
 
 
 @dataclass(frozen=True)
@@ -243,6 +265,8 @@ class FeaturePipe:
     sigma_window: int = 120
     min_sigma_periods: int = 2
     spread_ttl_ms: int = 60_000
+    execution: Optional[ExecutionRuntimeConfig] = None
+    costs: Optional[SpotCostConfig] = None
     signal_quality: Dict[str, SignalQualitySnapshot] = field(
         init=False, default_factory=dict
     )
@@ -260,6 +284,11 @@ class FeaturePipe:
             self._min_sigma_periods = self._sigma_window
         self._spread_ttl_ms = max(0, int(self.spread_ttl_ms))
         self._symbol_state: Dict[str, _FeatureStatsState] = {}
+        self._cost_config = self._resolve_cost_config()
+        exec_mode = getattr(self.execution, "mode", None)
+        self._bar_mode_active = (
+            isinstance(exec_mode, str) and exec_mode.lower() == "bar"
+        )
 
     # ------------------------------------------------------------------
     # Streaming API
@@ -733,7 +762,120 @@ class FeaturePipe:
         price = df[self.price_col].astype(float)
         future_price = df.groupby("symbol")[self.price_col].shift(-1)
         target = future_price.div(price) - 1.0
-        return target.rename("target")
+
+        if not self._bar_mode_active:
+            return target.rename("target")
+
+        cost_series = self._compute_bar_mode_costs(df)
+        if cost_series is None:
+            return target.rename("target")
+
+        adjusted = target - cost_series
+        adjusted.name = "target"
+        return adjusted
+
+    # ------------------------------------------------------------------
+    def _resolve_cost_config(self) -> SpotCostConfig:
+        if isinstance(self.costs, SpotCostConfig):
+            return self.costs
+        if isinstance(self.costs, Mapping):
+            try:
+                return SpotCostConfig.parse_obj(self.costs)
+            except Exception:
+                pass
+        runtime_costs = getattr(self.execution, "costs", None)
+        if isinstance(runtime_costs, SpotCostConfig):
+            return runtime_costs
+        if isinstance(runtime_costs, Mapping):
+            try:
+                return SpotCostConfig.parse_obj(runtime_costs)
+            except Exception:
+                pass
+        return SpotCostConfig()
+
+    def _select_numeric_series(
+        self, df: pd.DataFrame, candidates: Sequence[str]
+    ) -> Optional[pd.Series]:
+        for column in candidates:
+            if column in df.columns:
+                series = pd.to_numeric(df[column], errors="coerce")
+                if series.notna().any():
+                    return series.astype(float)
+        return None
+
+    def _compute_bar_mode_costs(self, df: pd.DataFrame) -> Optional[pd.Series]:
+        cost_cfg = self._cost_config
+        taker_fee_bps = float(getattr(cost_cfg, "taker_fee_bps", 0.0) or 0.0)
+        half_spread_bps = float(getattr(cost_cfg, "half_spread_bps", 0.0) or 0.0)
+        base_cost_bps = max(0.0, taker_fee_bps + half_spread_bps)
+
+        turnover_series = self._select_numeric_series(df, _TURNOVER_COLUMNS)
+        adv_series = self._select_numeric_series(df, _ADV_COLUMNS)
+
+        n_rows = len(df)
+        if n_rows == 0:
+            return None
+
+        turnover_values: Optional[np.ndarray]
+        if turnover_series is not None:
+            turnover_values = turnover_series.to_numpy(dtype=float)
+            turnover_values = np.where(
+                np.isfinite(turnover_values), np.abs(turnover_values), 0.0
+            )
+            trade_mask = turnover_values > 0.0
+        else:
+            turnover_values = None
+            trade_mask = np.ones(n_rows, dtype=bool)
+
+        costs_decimal = np.zeros(n_rows, dtype=float)
+        if base_cost_bps > 0.0:
+            base_fraction = base_cost_bps * 1e-4
+            costs_decimal += base_fraction * trade_mask.astype(float)
+
+        if turnover_values is not None and adv_series is not None:
+            adv_values = adv_series.to_numpy(dtype=float)
+            adv_values = np.where(np.isfinite(adv_values), adv_values, 0.0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                participation = np.divide(
+                    turnover_values,
+                    adv_values,
+                    out=np.zeros_like(turnover_values),
+                    where=(adv_values > 0.0),
+                )
+            participation = np.where(np.isfinite(participation), participation, 0.0)
+            impact_bps = self._impact_bps(participation)
+            if impact_bps is not None:
+                costs_decimal += impact_bps * 1e-4
+
+        if not np.any(costs_decimal):
+            return None
+
+        return pd.Series(costs_decimal, index=df.index, dtype=float)
+
+    def _impact_bps(self, participation: np.ndarray) -> Optional[np.ndarray]:
+        if participation.size == 0:
+            return None
+        impact_cfg = getattr(self._cost_config, "impact", None)
+        if impact_cfg is None:
+            return None
+        part = np.clip(participation, a_min=0.0, a_max=None)
+        impact = np.zeros_like(part, dtype=float)
+
+        sqrt_coeff = float(getattr(impact_cfg, "sqrt_coeff", 0.0) or 0.0)
+        if sqrt_coeff > 0.0:
+            impact += sqrt_coeff * np.sqrt(part)
+
+        linear_coeff = float(getattr(impact_cfg, "linear_coeff", 0.0) or 0.0)
+        if linear_coeff > 0.0:
+            impact += linear_coeff * part
+
+        power_coeff = float(getattr(impact_cfg, "power_coefficient", 0.0) or 0.0)
+        power_exponent = float(getattr(impact_cfg, "power_exponent", 1.0) or 1.0)
+        if power_coeff > 0.0 and np.any(part > 0.0):
+            exp_val = power_exponent if power_exponent > 0.0 else 1.0
+            impact += power_coeff * np.power(part, exp_val)
+
+        return impact
 
 
 __all__ = [

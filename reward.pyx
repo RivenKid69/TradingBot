@@ -92,6 +92,11 @@ cdef double compute_reward_view(
     int trades_count,
     double trade_frequency_penalty,
     double last_executed_notional,
+    double spot_cost_taker_fee_bps,
+    double spot_cost_half_spread_bps,
+    double spot_cost_impact_coeff,
+    double spot_cost_impact_exponent,
+    double spot_cost_adv_quote,
     double turnover_penalty_coef,
     double profit_close_bonus,
     double loss_close_penalty,
@@ -128,6 +133,18 @@ cdef double compute_reward_view(
 
     reward -= trade_frequency_penalty_fn(trade_frequency_penalty, trades_count)
 
+    cdef double trade_notional = fabs(last_executed_notional)
+    if trade_notional > 0.0:
+        cdef double base_cost_bps = spot_cost_taker_fee_bps + spot_cost_half_spread_bps
+        cdef double total_cost_bps = base_cost_bps if base_cost_bps > 0.0 else 0.0
+        if spot_cost_impact_coeff > 0.0 and spot_cost_adv_quote > 0.0:
+            cdef double participation = trade_notional / spot_cost_adv_quote
+            if participation > 0.0:
+                cdef double impact_exp = spot_cost_impact_exponent if spot_cost_impact_exponent > 0.0 else 1.0
+                total_cost_bps += spot_cost_impact_coeff * participation ** impact_exp
+        if total_cost_bps > 0.0:
+            reward -= trade_notional * total_cost_bps * 1e-4
+
     if turnover_penalty_coef > 0.0 and last_executed_notional > 0.0:
         reward -= turnover_penalty_coef * last_executed_notional
 
@@ -162,6 +179,11 @@ cpdef double compute_reward(EnvState state, ClosedReason closed_reason, int trad
         trades_count,
         state.trade_frequency_penalty,
         state.last_executed_notional,
+        state.spot_cost_taker_fee_bps,
+        state.spot_cost_half_spread_bps,
+        state.spot_cost_impact_coeff,
+        state.spot_cost_impact_exponent,
+        state.spot_cost_adv_quote,
         state.turnover_penalty_coef,
         state.profit_close_bonus,
         state.loss_close_penalty,

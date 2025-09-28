@@ -168,6 +168,12 @@ def decide_spot_trade(
         linear_coeff = float(cost_config.impact.linear_coeff)
         impact += sqrt_coeff * math.sqrt(participation)
         impact += linear_coeff * participation
+        power_coeff = float(getattr(cost_config.impact, "power_coefficient", 0.0) or 0.0)
+        power_exp = float(getattr(cost_config.impact, "power_exponent", 1.0) or 1.0)
+        if power_coeff > 0.0 and participation > 0.0:
+            if power_exp <= 0.0:
+                power_exp = 1.0
+            impact += power_coeff * participation ** power_exp
 
     cost_bps = base_cost + impact
     net_bps = edge_bps - cost_bps - float(safety_margin_bps)
