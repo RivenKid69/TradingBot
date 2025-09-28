@@ -1484,13 +1484,94 @@ class _Worker:
             "act_now": act_flag,
         }
 
-    def _build_envelope_payload(self, order: Any, symbol: str) -> Dict[str, Any]:
+    @staticmethod
+    def _coerce_timestamp_ms(value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        elif hasattr(value, "to_pydatetime"):
+            try:
+                dt = value.to_pydatetime()
+            except Exception:
+                dt = None
+            if dt is None:
+                return None
+            if not isinstance(dt, datetime):
+                return None
+        else:
+            dt = None
+
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return int(round(dt.timestamp() * 1000.0))
+
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            if not math.isfinite(value):
+                return None
+            return int(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return int(text)
+            except ValueError:
+                try:
+                    return int(float(text))
+                except ValueError:
+                    normalized = text
+                    if text.endswith("Z") or text.endswith("z"):
+                        normalized = text[:-1] + "+00:00"
+                    try:
+                        dt = datetime.fromisoformat(normalized)
+                    except ValueError:
+                        return None
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                    return int(round(dt.timestamp() * 1000.0))
+        timestamp = getattr(value, "timestamp", None)
+        if callable(timestamp):
+            try:
+                ts = float(timestamp())
+            except Exception:
+                return None
+            if not math.isfinite(ts):
+                return None
+            return int(round(ts * 1000.0))
+        return None
+
+    def _build_envelope_payload(self, order: Any, symbol: str) -> tuple[Dict[str, Any], int | None]:
         payload = self._extract_signal_payload(order)
         meta_raw = getattr(order, "meta", None)
         meta = meta_raw if isinstance(meta_raw, MappingABC) else self._materialize_mapping(meta_raw)
         envelope_payload = dict(payload)
         economics = self._resolve_economics(envelope_payload, meta)
         envelope_payload["economics"] = economics
+        valid_until_ms: int | None = None
+
+        def _extract_valid_until(mapping: Mapping[str, Any]) -> int | None:
+            for key in ("valid_until_ms", "valid_until"):
+                if key not in mapping:
+                    continue
+                ms = self._coerce_timestamp_ms(mapping.get(key))
+                if ms is not None:
+                    return ms
+            return None
+
+        if isinstance(envelope_payload, MappingABC):
+            valid_until_ms = _extract_valid_until(envelope_payload)
+        if valid_until_ms is None and isinstance(meta, MappingABC):
+            valid_until_ms = _extract_valid_until(meta)
+        if valid_until_ms is not None:
+            envelope_payload["valid_until_ms"] = valid_until_ms
         kind = envelope_payload.get("kind")
         if not isinstance(kind, str):
             if "delta_weight" in envelope_payload or "delta" in envelope_payload:
@@ -1511,7 +1592,7 @@ class _Worker:
             if "delta_weight" not in envelope_payload:
                 _, delta = self._resolve_weight_targets(symbol_key, envelope_payload)
                 envelope_payload["delta_weight"] = delta
-        return envelope_payload
+        return envelope_payload, valid_until_ms
 
     def _persist_exposure_state(self, ts_ms: int | None = None) -> None:
         timestamp = int(ts_ms if ts_ms is not None else clock.now_ms())
@@ -2885,13 +2966,21 @@ class _Worker:
             self._logger.info("order %s", o)
         except Exception:
             pass
-        payload = self._build_envelope_payload(o, symbol)
+        payload, payload_valid_until_ms = self._build_envelope_payload(o, symbol)
         meta = getattr(o, "meta", None)
         dedup_key: str | None = None
         if isinstance(meta, MappingABC):
             raw_key = meta.get("dedup_key")
             if raw_key is not None:
                 dedup_key = str(raw_key)
+        valid_until_ms_int: int | None = None
+        if payload_valid_until_ms is not None:
+            try:
+                valid_until_ms_int = int(payload_valid_until_ms)
+            except (TypeError, ValueError):
+                valid_until_ms_int = None
+        if valid_until_ms_int is not None:
+            expires_at_ms = min(expires_at_ms, valid_until_ms_int)
         published = True
         if getattr(signal_bus, "ENABLED", False):
             try:
@@ -2902,6 +2991,7 @@ class _Worker:
                     lambda _: None,
                     expires_at_ms=expires_at_ms,
                     dedup_key=dedup_key,
+                    valid_until_ms=valid_until_ms_int,
                 )
             except Exception:
                 published = False
