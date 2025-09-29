@@ -288,6 +288,11 @@ class DailyEntryLimiter:
         value = value.strip()
         return value.upper()
 
+
+class MixedQuoteError(RuntimeError):
+    """Raised when configured symbols reference multiple quote assets."""
+
+
 class _ScheduleNoTradeChecker:
     """Evaluate maintenance-based no-trade windows for individual bars."""
 
@@ -3952,6 +3957,11 @@ class ServiceSignalRunner:
         self._ops_pipeline_cfg = PipelineConfig()
         self._runtime_pipeline_cfg = PipelineConfig()
         self._slippage_regime_listener: Callable[[Any], None] | None = None
+        self._symbol_quote_assets: Dict[str, str] = {}
+        self._symbol_quote_missing: list[str] = []
+        self._resolved_quote_asset: str | None = None
+        self._init_failure_reason: str | None = None
+        self._init_failure_details: Dict[str, Any] = {}
 
         monitoring.clear_runtime_aggregator()
         if self.monitoring_cfg.enabled:
@@ -4105,6 +4115,7 @@ class ServiceSignalRunner:
                     pass
 
         self._setup_market_regime_bridge()
+        self._validate_symbol_quotes()
 
     def _iter_market_regime_sources(self) -> Iterator[Any]:
         adapter = getattr(self, "adapter", None)
@@ -4268,6 +4279,363 @@ class ServiceSignalRunner:
         else:
             self._slippage_regime_listener = _listener
 
+    @staticmethod
+    def _to_jsonable(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, MappingABC):
+            return {
+                str(key): ServiceSignalRunner._to_jsonable(val)
+                for key, val in value.items()
+                if val is not None
+            }
+        if isinstance(value, (set, tuple, list)):
+            return [
+                ServiceSignalRunner._to_jsonable(item)
+                for item in value
+                if item is not None
+            ]
+        try:
+            return str(value)
+        except Exception:
+            return repr(value)
+
+    def _record_init_failure(
+        self, reason: str, details: Mapping[str, Any] | None = None
+    ) -> None:
+        self._init_failure_reason = reason
+        if isinstance(details, MappingABC):
+            sanitized = {
+                str(key): self._to_jsonable(val)
+                for key, val in details.items()
+                if val is not None
+            }
+        elif details is not None:
+            sanitized = {"detail": self._to_jsonable(details)}
+        else:
+            sanitized = {}
+        self._init_failure_details = sanitized
+        self._resolved_quote_asset = None
+        try:
+            self.logger.error(
+                "runner initialisation aborted: reason=%s details=%s",
+                reason,
+                sanitized or {},
+            )
+        except Exception:
+            pass
+        self._write_runner_status()
+
+    def _collect_configured_symbols(self) -> set[str]:
+        run_cfg = self._run_config
+        symbols: set[str] = set()
+        if run_cfg is None:
+            return symbols
+
+        def _add(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, str):
+                text = value.strip().upper()
+                if text:
+                    symbols.add(text)
+                return
+            if isinstance(value, MappingABC):
+                if "symbol" in value:
+                    _add(value.get("symbol"))
+                if "symbols" in value:
+                    _add(value.get("symbols"))
+                return
+            if isinstance(value, SequenceABC) and not isinstance(
+                value, (str, bytes, bytearray)
+            ):
+                for item in value:
+                    _add(item)
+
+        _add(getattr(run_cfg, "symbol", None))
+        _add(getattr(run_cfg, "symbols", None))
+
+        data_cfg = getattr(run_cfg, "data", None)
+        if data_cfg is not None:
+            _add(getattr(data_cfg, "symbol", None))
+            _add(getattr(data_cfg, "symbols", None))
+
+        exec_cfg = getattr(run_cfg, "execution", None)
+        if exec_cfg is not None:
+            _add(getattr(exec_cfg, "symbol", None))
+            _add(getattr(exec_cfg, "symbols", None))
+
+        portfolio_cfg = getattr(run_cfg, "portfolio", None)
+        if portfolio_cfg is not None:
+            _add(getattr(portfolio_cfg, "symbol", None))
+            _add(getattr(portfolio_cfg, "symbols", None))
+
+        components = getattr(run_cfg, "components", None)
+        component_names = (
+            "market_data",
+            "executor",
+            "feature_pipe",
+            "policy",
+            "risk_guards",
+            "backtest_engine",
+        )
+        for name in component_names:
+            comp = getattr(components, name, None)
+            params = getattr(comp, "params", None) if comp is not None else None
+            if isinstance(params, MappingABC):
+                _add(params.get("symbol"))
+                _add(params.get("symbols"))
+
+        return symbols
+
+    def _load_symbol_metadata(self) -> dict[str, str]:
+        run_cfg = self._run_config
+        quotes: dict[str, str] = {}
+        if run_cfg is None:
+            return quotes
+
+        candidate_payloads: list[Mapping[str, Any]] = []
+        candidate_paths: list[str] = []
+
+        def _push_payload(payload: Any) -> None:
+            if isinstance(payload, MappingABC) and payload:
+                candidate_payloads.append(payload)
+
+        def _push_path(path_value: Any) -> None:
+            if not path_value:
+                return
+            text = str(path_value).strip()
+            if text:
+                candidate_paths.append(text)
+
+        _push_payload(getattr(run_cfg, "symbol_specs", None))
+        _push_path(getattr(run_cfg, "symbol_specs_path", None))
+
+        exec_cfg = getattr(run_cfg, "execution", None)
+        if exec_cfg is not None:
+            _push_payload(getattr(exec_cfg, "symbol_specs", None))
+            _push_path(getattr(exec_cfg, "symbol_specs_path", None))
+
+        portfolio_cfg = getattr(run_cfg, "portfolio", None)
+        if portfolio_cfg is not None:
+            _push_payload(getattr(portfolio_cfg, "symbol_specs", None))
+            _push_path(getattr(portfolio_cfg, "symbol_specs_path", None))
+
+        components = getattr(run_cfg, "components", None)
+        component_names = (
+            "market_data",
+            "executor",
+            "feature_pipe",
+            "policy",
+            "risk_guards",
+            "backtest_engine",
+        )
+        for name in component_names:
+            comp = getattr(components, name, None)
+            params = getattr(comp, "params", None) if comp is not None else None
+            if not isinstance(params, MappingABC):
+                continue
+            _push_payload(params.get("symbol_specs"))
+            for key in ("symbol_specs_path", "exchange_specs_path"):
+                if key in params:
+                    _push_path(params.get(key))
+
+        default_paths = [
+            "configs/symbol_specs.yaml",
+            "configs/symbol_specs.yml",
+            "configs/symbol_specs.json",
+            "data/symbol_specs.yaml",
+            "data/symbol_specs.yml",
+            "data/symbol_specs.json",
+        ]
+
+        ordered_paths: list[Path] = []
+        seen_paths: set[str] = set()
+        for raw in candidate_paths:
+            path_obj = Path(raw).expanduser()
+            key = str(path_obj)
+            if key in seen_paths or not path_obj.exists():
+                continue
+            ordered_paths.append(path_obj)
+            seen_paths.add(key)
+        for raw in default_paths:
+            path_obj = Path(raw)
+            key = str(path_obj)
+            if key in seen_paths or not path_obj.exists():
+                continue
+            ordered_paths.append(path_obj)
+            seen_paths.add(key)
+
+        for path_obj in ordered_paths:
+            try:
+                with path_obj.open("r", encoding="utf-8") as fh:
+                    if path_obj.suffix.lower() in {".yaml", ".yml"}:
+                        payload = yaml.safe_load(fh) or {}
+                    else:
+                        payload = json.load(fh)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                self.logger.exception(
+                    "failed to load symbol specs: path=%s", path_obj
+                )
+                continue
+            if isinstance(payload, MappingABC):
+                candidate_payloads.append(payload)
+            else:
+                self.logger.warning(
+                    "symbol specs path %s did not contain a mapping; ignoring",
+                    path_obj,
+                )
+
+        reserved_keys = {
+            "META",
+            "METADATA",
+            "INFO",
+            "NOTES",
+            "SYMBOLS",
+            "SPECS",
+            "DATA",
+        }
+
+        def _extract_quote(value: Any, depth: int = 0) -> str | None:
+            if depth > 6 or value is None:
+                return None
+            if isinstance(value, str):
+                text = value.strip().upper()
+                return text or None
+            if isinstance(value, MappingABC):
+                keys = (
+                    "quote_asset",
+                    "quoteAsset",
+                    "quote_currency",
+                    "quoteCurrency",
+                    "quote",
+                    "quote_symbol",
+                    "quoteSymbol",
+                )
+                for key in keys:
+                    if key in value:
+                        found = _extract_quote(value.get(key), depth + 1)
+                        if found:
+                            return found
+                for nested_key in (
+                    "metadata",
+                    "info",
+                    "symbol",
+                    "spec",
+                    "specs",
+                    "data",
+                ):
+                    if nested_key in value:
+                        found = _extract_quote(value.get(nested_key), depth + 1)
+                        if found:
+                            return found
+                for nested_value in value.values():
+                    if isinstance(nested_value, MappingABC):
+                        found = _extract_quote(nested_value, depth + 1)
+                        if found:
+                            return found
+            return None
+
+        def _merge_payload(payload: Mapping[str, Any], depth: int = 0) -> None:
+            if depth > 6:
+                return
+            for raw_key, raw_value in payload.items():
+                key_text = str(raw_key).strip()
+                if not key_text:
+                    if isinstance(raw_value, MappingABC):
+                        _merge_payload(raw_value, depth + 1)
+                    continue
+                upper_key = key_text.upper()
+                if upper_key in reserved_keys and isinstance(raw_value, MappingABC):
+                    _merge_payload(raw_value, depth + 1)
+                    continue
+                quote = _extract_quote(raw_value, depth + 1)
+                if quote and upper_key and upper_key not in reserved_keys:
+                    quotes[upper_key] = quote
+                    continue
+                if isinstance(raw_value, MappingABC):
+                    _merge_payload(raw_value, depth + 1)
+
+        for payload in candidate_payloads:
+            _merge_payload(payload)
+
+        return quotes
+
+    def _validate_symbol_quotes(self) -> None:
+        run_cfg = self._run_config
+        if run_cfg is None:
+            return
+
+        symbols = sorted(self._collect_configured_symbols())
+        if not symbols:
+            return
+
+        quotes_map = self._load_symbol_metadata()
+        if not quotes_map:
+            try:
+                self.logger.warning(
+                    "symbol quote metadata unavailable; skipping quote guard"
+                )
+            except Exception:
+                pass
+            self._symbol_quote_assets = {}
+            self._symbol_quote_missing = []
+            return
+
+        resolved: dict[str, str] = {}
+        missing: list[str] = []
+        for sym in symbols:
+            quote = quotes_map.get(sym)
+            if not quote:
+                missing.append(sym)
+                continue
+            resolved[sym] = quote
+
+        self._symbol_quote_assets = resolved
+        self._symbol_quote_missing = missing
+
+        if missing:
+            try:
+                self.logger.warning(
+                    "quote metadata missing for symbols: %s",
+                    ", ".join(missing),
+                )
+            except Exception:
+                pass
+
+        unique_quotes = sorted({quote for quote in resolved.values()})
+        if len(unique_quotes) > 1:
+            details: Dict[str, Any] = {
+                "quotes": resolved,
+                "unique_quotes": unique_quotes,
+            }
+            if missing:
+                details["missing"] = missing
+            self._record_init_failure("mixed_quote", details)
+            raise MixedQuoteError(
+                "configured symbols reference multiple quote assets: "
+                + ", ".join(unique_quotes)
+            )
+
+        if unique_quotes:
+            self._resolved_quote_asset = unique_quotes[0]
+            try:
+                self.logger.info(
+                    "quote guard resolved quote asset=%s symbols=%d",
+                    self._resolved_quote_asset,
+                    len(resolved),
+                )
+            except Exception:
+                pass
+        else:
+            self._resolved_quote_asset = None
+
+        self._init_failure_reason = None
+        self._init_failure_details = {}
+        self._write_runner_status()
+
     def _current_safe_mode_state(self) -> Dict[str, bool]:
         clock_safe = bool(self._clock_safe_mode)
         try:
@@ -4319,6 +4687,19 @@ class ServiceSignalRunner:
             status["last_reload"] = dict(self._last_reload_event)
         if self._reload_history:
             status["reloads"] = list(self._reload_history)
+        init_payload: Dict[str, Any] = {"state": "ok"}
+        if self._resolved_quote_asset:
+            init_payload["quote_asset"] = self._resolved_quote_asset
+        if self._symbol_quote_assets:
+            init_payload["quotes"] = dict(self._symbol_quote_assets)
+        if self._symbol_quote_missing:
+            init_payload["missing"] = list(self._symbol_quote_missing)
+        if self._init_failure_reason:
+            init_payload["state"] = "failed"
+            init_payload["reason"] = self._init_failure_reason
+            if self._init_failure_details:
+                init_payload["details"] = dict(self._init_failure_details)
+        status["init"] = init_payload
         return status
 
     def _write_runner_status_unlocked(self) -> None:
@@ -6676,6 +7057,7 @@ __all__ = [
     "SignalRunnerConfig",
     "RunnerConfig",
     "ServiceSignalRunner",
+    "MixedQuoteError",
     "clear_dirty_restart",
     "from_config",
 ]
