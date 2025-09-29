@@ -302,6 +302,12 @@ signal_published_count = Counter(
     ["symbol"],
 )
 
+signal_idempotency_skipped_count = Counter(
+    "signal_idempotency_skipped_count",
+    "Signals skipped because of idempotency cache",
+    ["symbol"],
+)
+
 # Age of signals at publish time
 age_at_publish_ms = Histogram(
     "age_at_publish_ms",
