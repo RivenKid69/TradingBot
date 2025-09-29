@@ -747,6 +747,14 @@ class CommonRunConfig(BaseModel):
         description="Forward market regime updates to the slippage component for calibrated overrides.",
     )
     components: Components
+    symbol_specs_path: Optional[str] = Field(
+        default=None,
+        description="Optional path to symbol metadata containing quote assets.",
+    )
+    symbol_specs: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Inline symbol metadata mapping keyed by symbol.",
+    )
 
     @model_validator(mode="after")
     def _sync_runtime_sections(cls, values: "CommonRunConfig") -> "CommonRunConfig":
