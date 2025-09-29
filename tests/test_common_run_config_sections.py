@@ -1,6 +1,7 @@
 import sys
 import pathlib
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core_config import load_config_from_str, PortfolioConfig, SpotCostConfig
+from runtime_trade_defaults import (
+    load_runtime_trade_defaults,
+    merge_runtime_trade_defaults,
+)
+from script_live import _apply_runtime_overrides
 
 
 def _wrap_payload(payload: str) -> str:
@@ -127,3 +133,47 @@ def test_execution_runtime_config_serializes_new_fields():
     turnover_caps = dumped["costs"]["turnover_caps"]
     assert turnover_caps["per_symbol"]["bps"] == 250
     assert turnover_caps["portfolio"]["usd"] == 50_000.0
+
+
+@pytest.mark.parametrize("cli_equity", [None, 2_500_000.0])
+def test_runtime_trade_defaults_precedence(tmp_path, cli_equity):
+    runtime_trade_path = tmp_path / "runtime_trade.yaml"
+    runtime_trade_path.write_text(
+        textwrap.dedent(
+            """
+            portfolio:
+              equity_usd: 1_000_000.0
+            """
+        ).strip()
+        + "\n"
+    )
+
+    cfg = load_config_from_str(_wrap_payload(""))
+    cfg_dict = cfg.dict()
+
+    defaults = load_runtime_trade_defaults(str(runtime_trade_path))
+    merge_runtime_trade_defaults(cfg_dict, defaults)
+
+    args = SimpleNamespace(
+        execution_mode=None,
+        execution_bar_price=None,
+        execution_min_step=None,
+        execution_safety_margin_bps=None,
+        execution_max_participation=None,
+        portfolio_equity_usd=cli_equity,
+        costs_taker_fee_bps=None,
+        costs_half_spread_bps=None,
+        costs_impact_sqrt=None,
+        costs_impact_linear=None,
+        costs_turnover_cap_symbol_bps=None,
+        costs_turnover_cap_symbol_usd=None,
+        costs_turnover_cap_portfolio_bps=None,
+        costs_turnover_cap_portfolio_usd=None,
+    )
+
+    merged = _apply_runtime_overrides(cfg_dict, args)
+    parsed = cfg.__class__.parse_obj(merged)
+
+    expected_equity = cli_equity if cli_equity is not None else 1_000_000.0
+    assert parsed.portfolio.equity_usd == expected_equity
+    assert parsed.execution.portfolio.equity_usd == expected_equity

@@ -13,6 +13,11 @@ from pydantic import BaseModel
 from services.universe import get_symbols
 from core_config import StateConfig, load_config
 from service_signal_runner import from_config
+from runtime_trade_defaults import (
+    DEFAULT_RUNTIME_TRADE_PATH,
+    load_runtime_trade_defaults,
+    merge_runtime_trade_defaults,
+)
 
 try:
     from box import Box  # type: ignore
@@ -346,6 +351,11 @@ def main() -> None:
         type=float,
         help="Override costs.turnover_caps.portfolio.usd (>=0)",
     )
+    p.add_argument(
+        "--runtime-trade-config",
+        default=DEFAULT_RUNTIME_TRADE_PATH,
+        help="Путь к runtime_trade.yaml с дефолтами исполнения",
+    )
     args = p.parse_args()
     symbols = (
         [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -379,6 +389,8 @@ def main() -> None:
         _ensure_state_dir(state_cfg)
 
     cfg_dict = cfg.dict()
+    runtime_trade_defaults = load_runtime_trade_defaults(args.runtime_trade_config)
+    cfg_dict = merge_runtime_trade_defaults(cfg_dict, runtime_trade_defaults)
     cfg_dict = _apply_runtime_overrides(cfg_dict, args)
     cfg = cfg.__class__.parse_obj(cfg_dict)
     cfg.data.symbols = symbols
