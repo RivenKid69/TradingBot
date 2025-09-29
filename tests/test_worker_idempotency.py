@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import types
+from typing import Callable
 
 import clock
 import service_signal_runner
@@ -50,7 +51,13 @@ def _make_order(signal_id: str, created_ts_ms: int) -> types.SimpleNamespace:
     )
 
 
-def _make_worker(monkeypatch):
+def _make_worker(
+    monkeypatch,
+    *,
+    execution_mode: str = "order",
+    now_ms: int | Callable[[], int] = 5000,
+    throttle_cfg: types.SimpleNamespace | None = None,
+):
     fp = types.SimpleNamespace(spread_ttl_ms=0)
     policy = types.SimpleNamespace()
     logger = DummyLogger()
@@ -65,7 +72,10 @@ def _make_worker(monkeypatch):
     age_metric = DummyMetric()
     skipped_metric = DummyMetric()
 
-    monkeypatch.setattr(clock, "now_ms", lambda: 5000)
+    if callable(now_ms):
+        monkeypatch.setattr(clock, "now_ms", now_ms)
+    else:
+        monkeypatch.setattr(clock, "now_ms", lambda: now_ms)
     monkeypatch.setattr(
         service_signal_runner.monitoring, "signal_published_count", published_metric
     )
@@ -92,6 +102,8 @@ def _make_worker(monkeypatch):
         enforce_closed_bars=False,
         ws_dedup_timeframe_ms=60_000,
         idempotency_cache_size=4,
+        execution_mode=execution_mode,
+        throttle_cfg=throttle_cfg,
     )
 
     return worker, logger, publish_calls, executor_calls, {
@@ -133,3 +145,56 @@ def test_emit_accepts_new_idempotency_key(monkeypatch) -> None:
     assert len(publish_calls) == 2
     assert metrics["published"].count == 2
     assert metrics["skipped"].count == 0
+
+
+def test_bar_queue_order_expires_after_bar_ttl(monkeypatch) -> None:
+    bar_close_ms = 1_000_000
+    late_created_ms = bar_close_ms + 50_000
+    now_value = {"ms": late_created_ms}
+
+    def _now_ms() -> int:
+        return now_value["ms"]
+
+    queue_cfg = types.SimpleNamespace(ttl_ms=3_600_000, max_items=10)
+    throttle_cfg = types.SimpleNamespace(
+        enabled=True,
+        global_=types.SimpleNamespace(rps=0.0, burst=1.0),
+        symbol=types.SimpleNamespace(rps=0.0, burst=1.0),
+        mode="queue",
+        queue=queue_cfg,
+    )
+
+    worker, logger, publish_calls, _executor_calls, metrics = _make_worker(
+        monkeypatch, execution_mode="bar", now_ms=_now_ms, throttle_cfg=throttle_cfg
+    )
+
+    absolute_metric = DummyMetric()
+    drop_metric = DummyMetric()
+
+    monkeypatch.setattr(service_signal_runner.monitoring, "inc_stage", lambda *a, **k: None)
+    monkeypatch.setattr(
+        service_signal_runner.monitoring, "signal_absolute_count", absolute_metric
+    )
+    monkeypatch.setattr(service_signal_runner, "pipeline_stage_drop_count", drop_metric)
+    monkeypatch.setattr(service_signal_runner, "log_drop", lambda *a, **k: None)
+
+    order = _make_order("sig-ttl", created_ts_ms=late_created_ms)
+    result = worker.publish_decision(order, "BTCUSDT", bar_close_ms)
+    assert result.action == "queue"
+    assert worker._queue is not None and len(worker._queue) == 1
+    assert len(publish_calls) == 0
+    assert metrics["published"].count == 0
+
+    now_value["ms"] = bar_close_ms + 70_000
+
+    worker._global_bucket.tokens = worker._global_bucket.burst
+    symbol_bucket = worker._symbol_buckets["BTCUSDT"]
+    symbol_bucket.tokens = symbol_bucket.burst
+
+    emitted = worker._drain_queue()
+    assert emitted == []
+    assert worker._queue is not None and len(worker._queue) == 0
+    assert len(publish_calls) == 0
+    assert absolute_metric.count == 1
+    assert drop_metric.count == 1
+    assert any("TTL_EXPIRED_PUBLISH" in msg for msg, *_ in logger.messages)

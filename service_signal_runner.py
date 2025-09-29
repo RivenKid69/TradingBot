@@ -3820,20 +3820,22 @@ class _Worker:
         created_ts = int(getattr(o, "created_ts_ms", 0) or 0)
         now_ms = clock.now_ms()
         expires_at_ms = max(created_ts, bar_close_ms)
+        dedup_expires_at_ms: int | None = None
         if self._ws_dedup_timeframe_ms > 0:
-            expires_at_ms = max(
-                expires_at_ms, created_ts + self._ws_dedup_timeframe_ms
-            )
+            dedup_expires_at_ms = created_ts + self._ws_dedup_timeframe_ms
+            expires_at_ms = max(expires_at_ms, dedup_expires_at_ms)
+        ttl_expires_at_ms: int | None = None
         if ttl_enabled:
             try:
                 monitoring.inc_stage(Stage.TTL)
             except Exception:
                 pass
             ok, expires_at_ms, _ = check_ttl(
-                bar_close_ms=created_ts,
+                bar_close_ms=bar_close_ms,
                 now_ms=now_ms,
                 timeframe_ms=self._ws_dedup_timeframe_ms,
             )
+            ttl_expires_at_ms = expires_at_ms
             if not ok:
                 try:
                     self._logger.info(
@@ -3841,6 +3843,7 @@ class _Worker:
                         {
                             "symbol": symbol,
                             "created_ts_ms": created_ts,
+                            "bar_close_ms": bar_close_ms,
                             "now_ms": now_ms,
                             "expires_at_ms": expires_at_ms,
                         },
@@ -3858,6 +3861,8 @@ class _Worker:
                 except Exception:
                     pass
                 return False
+        if ttl_expires_at_ms is not None:
+            expires_at_ms = min(expires_at_ms, ttl_expires_at_ms)
         try:
             age_ms = now_ms - created_ts
             if self._execution_mode != "bar":
