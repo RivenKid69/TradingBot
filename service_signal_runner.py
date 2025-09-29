@@ -994,6 +994,17 @@ class _Worker:
             )
         if cap_value is not None and cap_value <= 0.0:
             cap_value = None
+        impact_mode_val = self._find_in_mapping(decision, ("impact_mode",))
+        if impact_mode_val is None and snapshot is not None:
+            impact_mode_val = snapshot.get("impact_mode")
+        impact_mode: str | None
+        if impact_mode_val is None:
+            impact_mode = None
+        else:
+            try:
+                impact_mode = str(impact_mode_val)
+            except Exception:
+                impact_mode = None
         normalization_details = self._materialize_mapping(
             self._find_in_mapping(decision, ("normalization",))
         )
@@ -1018,6 +1029,8 @@ class _Worker:
             "cap_usd": cap_value,
             "normalized": bool(normalized_flag),
         }
+        if impact_mode:
+            metrics["impact_mode"] = impact_mode
         if reason_label:
             metrics["reason"] = reason_label
         if normalization_details:
@@ -1490,6 +1503,19 @@ class _Worker:
         cost = _get_float("cost_bps", 0.0)
         net = _get_float("net_bps", edge - cost)
         turnover = _get_float("turnover_usd", 0.0)
+        impact = _get_float("impact", 0.0)
+        impact_mode_val = econ_map.get("impact_mode") or payload.get("impact_mode")
+        impact_mode: str | None
+        if impact_mode_val is None:
+            impact_mode = "model"
+        else:
+            try:
+                impact_mode = str(impact_mode_val)
+            except Exception:
+                impact_mode = "model"
+            else:
+                normalized = impact_mode.strip()
+                impact_mode = normalized if normalized else "model"
         act_now = econ_map.get("act_now")
         if isinstance(act_now, str):
             act_now = act_now.strip().lower() in {"1", "true", "yes"}
@@ -1500,6 +1526,8 @@ class _Worker:
             "net_bps": net,
             "turnover_usd": max(0.0, turnover),
             "act_now": act_flag,
+            "impact": max(0.0, impact),
+            "impact_mode": impact_mode,
         }
 
     @staticmethod
@@ -3307,6 +3335,7 @@ class _Worker:
                                 act_now=int(bar_metrics.get("act_now", 0)),
                                 turnover_usd=float(bar_metrics.get("turnover_usd", 0.0)),
                                 cap_usd=bar_metrics.get("cap_usd"),
+                                impact_mode=bar_metrics.get("impact_mode"),
                             )
                         except Exception:
                             pass

@@ -42,6 +42,8 @@ def test_decide_spot_trade_costs_and_net():
     assert metrics.edge_bps == 50.0
     assert metrics.net_bps == pytest.approx(50.0 - (base_cost + impact) - 3.0)
     assert metrics.act_now is True
+    assert metrics.impact == pytest.approx(impact)
+    assert metrics.impact_mode == "model"
 
 
 def test_decide_spot_trade_safety_margin_blocks_trade():
@@ -57,6 +59,8 @@ def test_decide_spot_trade_safety_margin_blocks_trade():
     assert metrics.cost_bps == pytest.approx(2.0)
     assert metrics.net_bps == pytest.approx(3.5 - 2.0 - 5.0)
     assert metrics.act_now is False
+    assert metrics.impact == pytest.approx(0.0)
+    assert metrics.impact_mode == "none"
 
 
 def test_bar_executor_target_weight_single_instruction():
@@ -118,6 +122,35 @@ def test_bar_executor_includes_decision_costs():
     decision = report.meta["decision"]
     assert decision["cost_bps"] == pytest.approx(5.0)
     assert decision["net_bps"] == pytest.approx(20.0 - 5.0 - 1.5)
+    assert decision["impact_mode"] == "model"
+
+
+def test_bar_executor_missing_adv_sets_impact_mode_none():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(taker_fee_bps=2.0, half_spread_bps=3.0),
+        safety_margin_bps=0.0,
+        default_equity_usd=2000.0,
+    )
+
+    order = Order(
+        ts=11,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(11, 20000.0),
+            "payload": {"target_weight": 0.25, "edge_bps": 20.0},
+        },
+    )
+
+    report = executor.execute(order)
+    decision = report.meta["decision"]
+    assert decision["impact"] == pytest.approx(0.0)
+    assert decision["impact_mode"] == "none"
     assert decision["turnover_usd"] == pytest.approx(500.0)
 
 

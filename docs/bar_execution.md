@@ -65,7 +65,7 @@ net_bps = edge_bps - (taker_fee_bps + half_spread_bps + impact(participation)) -
 The participation-driven impact term applies the coefficients from
 [`SpotCostConfig`](../core_config.py) via the square-root and linear factors in
 [`SpotImpactConfig`](../core_config.py).  The resulting economics bundle exposes
-five fields:
+the following fields:
 
 - `edge_bps`: raw signal edge in basis points.
 - `cost_bps`: estimated execution cost in basis points.
@@ -75,6 +75,12 @@ five fields:
 - `act_now`: boolean gate.  The executor keeps it `True` only when `net_bps > 0`
   and `turnover_usd > 0`.  When the optional `execution.safety_margin_bps`
   override is present, it is subtracted before this check.
+- `impact`: impact estimate (in basis points) contributed by the participation
+  model.  Fallback calculations without ADV keep this at `0`.
+- `impact_mode`: flag describing how the impact estimate was derived.  The
+  default `"model"` indicates the cost model was applied, while `"none"`
+  highlights that ADV or volume inputs were unavailable and the impact term was
+  suppressed.
 
 Downstream services treat `act_now=False` as permission to defer the rebalance
 (e.g. when aggregating multiple signals per bar), while `True` signals must be
