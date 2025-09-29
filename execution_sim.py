@@ -22,6 +22,7 @@ ExecutionSimulator v2
 Важно: этот модуль НЕ добавляет комиссии и слиппедж — они будут подключены отдельными шагами.
 """
 
+import bisect
 import collections
 import copy
 from collections import deque
@@ -533,6 +534,34 @@ if MarketChild is None:
         liquidity_hint: Optional[float] = None
 
 
+def _seed_executor_bar_window(
+    executor: Any,
+    *,
+    timeframe: Optional[int],
+    bar_start: Optional[int],
+    bar_end: Optional[int],
+) -> None:
+    """Attach latest bar window metadata to ``executor`` when possible."""
+
+    if executor is None:
+        return
+    if timeframe is not None and timeframe > 0:
+        try:
+            setattr(executor, "_last_bar_timeframe_ms", int(timeframe))
+        except Exception:
+            pass
+    if bar_start is not None:
+        try:
+            setattr(executor, "_last_bar_start_ts", int(bar_start))
+        except Exception:
+            pass
+    if bar_end is not None:
+        try:
+            setattr(executor, "_last_bar_end_ts", int(bar_end))
+        except Exception:
+            pass
+
+
 try:
     from adv_store import ADVStore
 except Exception:
@@ -580,24 +609,48 @@ if make_executor is None:
     def make_executor(algo: str, cfg: Dict[str, Any] | None = None):  # type: ignore[override]
         a = str(algo).upper()
         cfg = dict(cfg or {})
+        timeframe_meta = cfg.get("_bar_timeframe_ms")
+        bar_start_meta = cfg.get("_bar_start_ts")
+        bar_end_meta = cfg.get("_bar_end_ts")
+        executor_obj: Any
         if a == "TWAP" and TWAPExecutor is not None:
             tw = dict(cfg.get("twap", {}))
             parts = int(tw.get("parts", 6))
             interval = int(tw.get("child_interval_s", 600))
-            return TWAPExecutor(parts=parts, child_interval_s=interval)
-        if a == "POV" and POVExecutor is not None:
+            executor_obj = TWAPExecutor(parts=parts, child_interval_s=interval)
+        elif a == "POV" and POVExecutor is not None:
             pv = dict(cfg.get("pov", {}))
             part = float(pv.get("participation", 0.10))
             interval = int(pv.get("child_interval_s", 60))
             min_not = float(pv.get("min_child_notional", 20.0))
-            return POVExecutor(
+            executor_obj = POVExecutor(
                 participation=part,
                 child_interval_s=interval,
                 min_child_notional=min_not,
             )
-        if a == "VWAP" and VWAPExecutor is not None:
-            return VWAPExecutor()
-        return TakerExecutor()
+        elif a == "VWAP" and VWAPExecutor is not None:
+            executor_obj = VWAPExecutor()
+        else:
+            executor_obj = TakerExecutor()
+        try:
+            timeframe_int = int(timeframe_meta) if timeframe_meta is not None else None
+        except (TypeError, ValueError):
+            timeframe_int = None
+        try:
+            bar_start_int = int(bar_start_meta) if bar_start_meta is not None else None
+        except (TypeError, ValueError):
+            bar_start_int = None
+        try:
+            bar_end_int = int(bar_end_meta) if bar_end_meta is not None else None
+        except (TypeError, ValueError):
+            bar_end_int = None
+        _seed_executor_bar_window(
+            executor_obj,
+            timeframe=timeframe_int,
+            bar_start=bar_start_int,
+            bar_end=bar_end_int,
+        )
+        return executor_obj
 
 
 # --- Импорт модели латентности ---
@@ -1176,6 +1229,8 @@ class ExecutionSimulator:
             reverse=True,
         )
     )
+
+    _CHILD_REMAINDER_EPS = 1e-9
 
     @staticmethod
     def _plain_mapping(obj: Any) -> Dict[str, Any]:
@@ -7044,6 +7099,170 @@ class ExecutionSimulator:
             self._last_liquidity, self._available_intrabar_volume()
         )
 
+    def _current_bar_window(
+        self, ts: int
+    ) -> tuple[Optional[int], Optional[int], Optional[int]]:
+        timeframe_snapshot = self._intrabar_path_timeframe_ms
+        if timeframe_snapshot is None:
+            timeframe_snapshot = self._resolve_intrabar_timeframe(ts)
+        try:
+            timeframe_int = (
+                int(timeframe_snapshot) if timeframe_snapshot is not None else None
+            )
+        except (TypeError, ValueError):
+            timeframe_int = None
+        if timeframe_int is not None and timeframe_int <= 0:
+            timeframe_int = None
+
+        bar_start_ts = getattr(self, "_intrabar_path_start_ts", None)
+        if bar_start_ts is None and timeframe_int is not None:
+            try:
+                base = int(ts // timeframe_int)
+            except Exception:
+                base = None
+            if base is not None:
+                bar_start_ts = base * timeframe_int
+
+        bar_end_ts = getattr(self, "_intrabar_path_bar_ts", None)
+        if bar_end_ts is None and bar_start_ts is not None and timeframe_int is not None:
+            bar_end_ts = bar_start_ts + timeframe_int
+        elif bar_end_ts is not None and timeframe_int is not None and bar_start_ts is None:
+            bar_start_ts = bar_end_ts - timeframe_int
+        if bar_end_ts is None and bar_start_ts is not None and timeframe_int is not None:
+            bar_end_ts = bar_start_ts + timeframe_int
+        return timeframe_int, bar_start_ts, bar_end_ts
+
+    @staticmethod
+    def _child_offset(child: MarketChild) -> int:
+        try:
+            offset = int(getattr(child, "ts_offset_ms", 0))
+        except (TypeError, ValueError):
+            offset = 0
+        if offset < 0:
+            offset = 0
+        return offset
+
+    def _compute_child_plan_cadence(
+        self,
+        plan: List[MarketChild],
+        *,
+        now_ts_ms: int,
+        snapshot: Mapping[str, Any],
+    ) -> tuple[Dict[int, int], Optional[int]]:
+        timeframe_ms = snapshot.get("bar_timeframe_ms")
+        bar_end_ts = snapshot.get("bar_end_ts")
+        try:
+            timeframe_int = int(timeframe_ms) if timeframe_ms is not None else None
+        except (TypeError, ValueError):
+            timeframe_int = None
+        try:
+            bar_end_int = int(bar_end_ts) if bar_end_ts is not None else None
+        except (TypeError, ValueError):
+            bar_end_int = None
+        bar_end_offset: Optional[int] = None
+        if bar_end_int is not None:
+            bar_end_offset = max(0, int(bar_end_int - now_ts_ms))
+        elif timeframe_int is not None and timeframe_int > 0:
+            bar_end_offset = max(0, int(timeframe_int))
+
+        offsets = [self._child_offset(child) for child in plan]
+        cadence_map: Dict[int, int] = {}
+        last_positive = None
+        for idx, child in enumerate(plan):
+            step = 0
+            if idx + 1 < len(plan):
+                step = max(0, offsets[idx + 1] - offsets[idx])
+            elif bar_end_offset is not None:
+                step = max(0, bar_end_offset - offsets[idx])
+            if step <= 0 and last_positive is not None:
+                step = last_positive
+            if step > 0:
+                last_positive = step
+            cadence_map[id(child)] = step
+        return cadence_map, bar_end_offset
+
+    def _insert_child_ordered(
+        self, queue: List[MarketChild], child: MarketChild
+    ) -> None:
+        offset = self._child_offset(child)
+        offsets = [self._child_offset(item) for item in queue]
+        idx = bisect.bisect_right(offsets, offset)
+        queue.insert(idx, child)
+
+    def _schedule_child_remainder(
+        self,
+        queue: List[MarketChild],
+        cadence_map: Dict[int, int],
+        *,
+        child: MarketChild,
+        planned_qty: float,
+        executed_qty: float,
+        original_hint: Any,
+        bar_end_offset: Optional[int],
+        capacity_remaining: Optional[float] = None,
+    ) -> None:
+        if MarketChild is None:
+            return
+        remaining = max(0.0, planned_qty - executed_qty)
+        if remaining <= self._CHILD_REMAINDER_EPS:
+            return
+        if capacity_remaining is not None and capacity_remaining <= self._CHILD_REMAINDER_EPS:
+            return
+        available_volume = self._available_intrabar_volume()
+        if available_volume is not None:
+            try:
+                avail_val = float(available_volume)
+            except (TypeError, ValueError):
+                avail_val = None
+            else:
+                if avail_val <= self._CHILD_REMAINDER_EPS:
+                    return
+        offset = self._child_offset(child)
+        cadence = cadence_map.get(id(child), 0)
+        try:
+            cadence_val = int(cadence)
+        except (TypeError, ValueError):
+            cadence_val = 0
+        if cadence_val <= 0:
+            cadence_val = 1
+        next_offset = offset + cadence_val
+        if bar_end_offset is not None and next_offset > bar_end_offset:
+            next_offset = bar_end_offset
+        if next_offset < offset:
+            next_offset = offset
+        hint_val: Optional[float] = None
+        if original_hint is not None:
+            try:
+                hint_candidate = float(original_hint)
+            except (TypeError, ValueError):
+                hint_candidate = None
+            else:
+                if math.isfinite(hint_candidate):
+                    hint_left = max(0.0, hint_candidate - executed_qty)
+                    if hint_left > self._CHILD_REMAINDER_EPS:
+                        hint_val = hint_left
+        new_child = MarketChild(
+            ts_offset_ms=int(next_offset),
+            qty=float(remaining),
+            liquidity_hint=hint_val,
+        )
+        cadence_map[id(new_child)] = cadence_val
+        if len(queue) < 20000:
+            self._insert_child_ordered(queue, new_child)
+
+    def _prepare_child_queue(
+        self,
+        plan: Sequence[MarketChild],
+        *,
+        now_ts_ms: int,
+        snapshot: Mapping[str, Any],
+    ) -> tuple[List[MarketChild], Dict[int, int], Optional[int]]:
+        queue = sorted(list(plan), key=self._child_offset)
+        cadence_map, bar_end_offset = self._compute_child_plan_cadence(
+            queue, now_ts_ms=now_ts_ms, snapshot=snapshot
+        )
+        return queue, cadence_map, bar_end_offset
+
     def _record_intrabar_reference_applied(self) -> None:
         symbol_label = str(self.symbol).upper() if self.symbol is not None else ""
         try:
@@ -10259,27 +10478,7 @@ class ExecutionSimulator:
                         executor = make_executor(algo, self._execution_cfg)
                     else:
                         executor = TakerExecutor()
-                timeframe_snapshot = self._intrabar_path_timeframe_ms
-                if timeframe_snapshot is None:
-                    timeframe_snapshot = self._resolve_intrabar_timeframe(ts)
-                try:
-                    timeframe_int = int(timeframe_snapshot)
-                except (TypeError, ValueError):
-                    timeframe_int = None
-                if timeframe_int is not None and timeframe_int <= 0:
-                    timeframe_int = None
-
-                bar_start_ts: Optional[int] = self._intrabar_path_start_ts
-                if bar_start_ts is None and timeframe_int is not None:
-                    try:
-                        base = int(ts // timeframe_int)
-                    except Exception:
-                        base = None
-                    if base is not None:
-                        bar_start_ts = base * timeframe_int
-                bar_end_ts: Optional[int] = None
-                if bar_start_ts is not None and timeframe_int is not None:
-                    bar_end_ts = bar_start_ts + timeframe_int
+                timeframe_int, bar_start_ts, bar_end_ts = self._current_bar_window(ts)
 
                 volume_profile_payload: List[Dict[str, float]] = []
                 for item in self._intrabar_volume_profile:
@@ -10312,6 +10511,12 @@ class ExecutionSimulator:
                     "bar_end_ts": bar_end_ts,
                     "intrabar_volume_profile": volume_profile_payload,
                 }
+                _seed_executor_bar_window(
+                    executor,
+                    timeframe=timeframe_int,
+                    bar_start=bar_start_ts,
+                    bar_end=bar_end_ts,
+                )
                 plan = executor.plan_market(
                     now_ts_ms=ts, side=side, target_qty=qty_total, snapshot=snapshot
                 )
@@ -10323,17 +10528,25 @@ class ExecutionSimulator:
                 lat_ms = int(p.lat_ms)
                 _ = bool(p.spike)  # spike flag unused, kept for diagnostics
 
-                for child in plan:
-                    child_offset = int(getattr(child, "ts_offset_ms", 0))
+                child_queue, cadence_map, bar_end_offset = self._prepare_child_queue(
+                    plan, now_ts_ms=ts, snapshot=snapshot
+                )
+
+                while child_queue:
+                    child = child_queue.pop(0)
+                    planned_qty = max(0.0, float(getattr(child, "qty", 0.0)))
+                    if planned_qty <= 0.0:
+                        continue
+                    child_offset = self._child_offset(child)
                     base_ts = int(ts + child_offset)
                     ts_fill = int(base_ts + lat_ms)
-                    q_child = float(child.qty)
+                    q_child = float(planned_qty)
+                    hint_original = getattr(child, "liquidity_hint", None)
                     if q_child <= 0.0:
                         continue
-                    hint_raw = getattr(child, "liquidity_hint", None)
-                    if hint_raw is not None:
+                    if hint_original is not None:
                         try:
-                            hint_val = float(hint_raw)
+                            hint_val = float(hint_original)
                         except (TypeError, ValueError):
                             hint_val = None
                         else:
@@ -10392,6 +10605,15 @@ class ExecutionSimulator:
                                 ts_ms=int(ts_fill),
                             )
                             # не вызываем on_new_order() в этом случае
+                            self._schedule_child_remainder(
+                                child_queue,
+                                cadence_map,
+                                child=child,
+                                planned_qty=planned_qty,
+                                executed_qty=0.0,
+                                original_hint=hint_original,
+                                bar_end_offset=bar_end_offset,
+                            )
                             continue
                         # отметить отправку
                         self.risk.on_new_order(ts_fill)
@@ -10928,6 +11150,21 @@ class ExecutionSimulator:
                             exec_status=exec_status,
                             fill_ratio=float(fill_ratio),
                         )
+                    remaining_capacity: Optional[float] = None
+                    if cap_enforced:
+                        remaining_capacity = max(
+                            0.0, cap_base_per_bar - used_base_after_child
+                        )
+                    self._schedule_child_remainder(
+                        child_queue,
+                        cadence_map,
+                        child=child,
+                        planned_qty=planned_qty,
+                        executed_qty=q_child,
+                        original_hint=hint_original,
+                        bar_end_offset=bar_end_offset,
+                        capacity_remaining=remaining_capacity,
+                    )
                 continue
             if atype == ActionType.LIMIT:
                 is_buy = bool(getattr(proto, "volume_frac", 0.0) > 0.0)
@@ -11252,6 +11489,21 @@ class ExecutionSimulator:
                                 exec_status=exec_status,
                                 fill_ratio=float(fill_ratio),
                             )
+                        remaining_capacity = None
+                        if cap_enforced:
+                            remaining_capacity = max(
+                                0.0, cap_base_per_bar - used_base_after_child
+                            )
+                        self._schedule_child_remainder(
+                            plan_queue,
+                            cadence_map,
+                            child=child,
+                            planned_qty=original_planned_qty,
+                            executed_qty=float(exec_qty),
+                            original_hint=hint_original,
+                            bar_end_offset=bar_end_offset,
+                            capacity_remaining=remaining_capacity,
+                        )
                         if exec_qty + 1e-12 < qty_q:
                             if tif == "IOC":
                                 _cancel(p.client_order_id, "IOC")
@@ -11408,6 +11660,21 @@ class ExecutionSimulator:
                                 exec_status=exec_status,
                                 fill_ratio=float(fill_ratio),
                             )
+                        remaining_capacity = None
+                        if cap_enforced:
+                            remaining_capacity = max(
+                                0.0, cap_base_per_bar - used_base_after
+                            )
+                        self._schedule_child_remainder(
+                            plan_queue,
+                            cadence_map,
+                            child=child,
+                            planned_qty=original_planned_qty,
+                            executed_qty=float(qty_q),
+                            original_hint=hint_original,
+                            bar_end_offset=bar_end_offset,
+                            capacity_remaining=remaining_capacity,
+                        )
                         continue
 
                 if tif in ("IOC", "FOK"):
@@ -12260,6 +12527,7 @@ class ExecutionSimulator:
                 executor = (
                     self._executor if self._executor is not None else TakerExecutor()
                 )
+                timeframe_int, bar_start_ts, bar_end_ts = self._current_bar_window(ts)
                 snapshot = {
                     "bid": self._last_bid,
                     "ask": self._last_ask,
@@ -12272,7 +12540,16 @@ class ExecutionSimulator:
                     "vol_factor": self._last_vol_factor,
                     "liquidity": self._effective_liquidity_cap(),
                     "ref_price": ref_market,
+                    "bar_timeframe_ms": timeframe_int,
+                    "bar_start_ts": bar_start_ts,
+                    "bar_end_ts": bar_end_ts,
                 }
+                _seed_executor_bar_window(
+                    executor,
+                    timeframe=timeframe_int,
+                    bar_start=bar_start_ts,
+                    bar_end=bar_end_ts,
+                )
                 plan = executor.plan_market(
                     now_ts_ms=ts, side=side, target_qty=qty_total, snapshot=snapshot
                 )
@@ -12281,17 +12558,26 @@ class ExecutionSimulator:
                     continue
 
                 # пройтись по детям с учётом латентности/слиппеджа/комиссий/инвентаря/рейт-лимита
-                for child in plan:
-                    child_offset = int(getattr(child, "ts_offset_ms", 0))
+                plan_queue = sorted(list(plan), key=self._child_offset)
+                cadence_map, bar_end_offset = self._compute_child_plan_cadence(
+                    plan_queue, now_ts_ms=ts, snapshot=snapshot
+                )
+                idx = 0
+                while idx < len(plan_queue):
+                    child = plan_queue[idx]
+                    idx += 1
+                    child_offset = self._child_offset(child)
                     base_ts = int(ts + child_offset)
-                    q_child = float(child.qty)
-                    q_child = self._limit_by_intrabar_volume(q_child)
+                    original_planned_qty = max(
+                        0.0, float(getattr(child, "qty", 0.0))
+                    )
+                    q_child = self._limit_by_intrabar_volume(original_planned_qty)
                     if q_child <= 0.0:
                         continue
-                    hint_raw = getattr(child, "liquidity_hint", None)
-                    if hint_raw is not None:
+                    hint_original = getattr(child, "liquidity_hint", None)
+                    if hint_original is not None:
                         try:
-                            hint_val = float(hint_raw)
+                            hint_val = float(hint_original)
                         except (TypeError, ValueError):
                             hint_val = None
                         else:
@@ -12339,6 +12625,15 @@ class ExecutionSimulator:
                                 "THROTTLE",
                                 "order throttled by rate limit",
                                 ts_ms=int(ts_send),
+                            )
+                            self._schedule_child_remainder(
+                                plan_queue,
+                                cadence_map,
+                                child=child,
+                                planned_qty=original_planned_qty,
+                                executed_qty=0.0,
+                                original_hint=hint_original,
+                                bar_end_offset=bar_end_offset,
                             )
                             continue
                         self.risk.on_new_order(ts_send)

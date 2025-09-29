@@ -19,6 +19,7 @@ TWAPExecutor = exec_mod.TWAPExecutor
 POVExecutor = exec_mod.POVExecutor
 VWAPExecutor = exec_mod.VWAPExecutor
 DataDegradationConfig = exec_mod.DataDegradationConfig
+MarketChild = exec_mod.MarketChild
 
 
 latency_cfg = {"base_ms": 0, "jitter_ms": 0, "spike_p": 0.0, "timeout_ms": 1000, "retries": 0}
@@ -117,6 +118,82 @@ def test_pov_determinism():
     trades1 = [(t.ts, t.qty, t.price) for t in rep1.trades]
     trades2 = [(t.ts, t.qty, t.price) for t in rep2.trades]
     assert trades1 == trades2
+
+
+def test_twap_offsets_follow_bar_timeframe():
+    execu = TWAPExecutor(parts=4, child_interval_s=1)
+    snap = {"bar_timeframe_ms": 6_000, "bar_start_ts": 1_000}
+    plan = execu.plan_market(now_ts_ms=1_000, side="BUY", target_qty=8.0, snapshot=snap)
+    offsets = [child.ts_offset_ms for child in plan]
+    assert offsets == [0, 2_000, 4_000, 6_000]
+
+
+def test_pov_offsets_follow_bar_timeframe():
+    execu = POVExecutor(participation=0.5, child_interval_s=1, min_child_notional=1.0)
+    snap = {
+        "liquidity": 10.0,
+        "ref_price": 100.0,
+        "bar_timeframe_ms": 6_000,
+        "bar_start_ts": 0,
+    }
+    plan = execu.plan_market(now_ts_ms=0, side="BUY", target_qty=11.0, snapshot=snap)
+    offsets = [child.ts_offset_ms for child in plan]
+    assert offsets == [0, 3_000, 6_000]
+
+
+def test_schedule_child_remainder_respects_cadence():
+    sim = ExecutionSimulator(
+        execution_config={"algo": "TWAP", "twap": {"parts": 2}},
+        slippage_config=slippage_cfg,
+        latency_config=latency_cfg,
+    )
+
+    first_child = MarketChild(ts_offset_ms=0, qty=2.0, liquidity_hint=2.0)
+    second_child = MarketChild(ts_offset_ms=3_000, qty=2.0, liquidity_hint=2.0)
+    plan = [first_child, second_child]
+    snapshot = {"bar_timeframe_ms": 6_000, "bar_start_ts": 0}
+
+    queue, cadence_map, bar_end = sim._prepare_child_queue(
+        plan, now_ts_ms=0, snapshot=snapshot
+    )
+
+    existing_ids = {id(child) for child in queue}
+    sim._schedule_child_remainder(
+        queue,
+        cadence_map,
+        child=first_child,
+        planned_qty=2.0,
+        executed_qty=0.5,
+        original_hint=first_child.liquidity_hint,
+        bar_end_offset=bar_end,
+    )
+
+    new_children = [child for child in queue if id(child) not in existing_ids]
+    assert len(new_children) == 1
+    follow_up = new_children[0]
+    assert follow_up.ts_offset_ms == 3_000
+    assert follow_up.qty == pytest.approx(1.5)
+    assert follow_up.liquidity_hint == pytest.approx(1.5)
+    assert cadence_map[id(follow_up)] == cadence_map[id(first_child)]
+
+    existing_ids.update({id(follow_up)})
+    sim._schedule_child_remainder(
+        queue,
+        cadence_map,
+        child=second_child,
+        planned_qty=2.0,
+        executed_qty=0.25,
+        original_hint=second_child.liquidity_hint,
+        bar_end_offset=bar_end,
+    )
+
+    trailing = [child for child in queue if id(child) not in existing_ids]
+    assert len(trailing) == 1
+    final_child = trailing[0]
+    assert final_child.ts_offset_ms == 6_000
+    assert final_child.qty == pytest.approx(1.75)
+    assert final_child.liquidity_hint == pytest.approx(1.75)
+    assert cadence_map[id(final_child)] == cadence_map[id(second_child)]
 
 
 def test_vwap_profile_planning():
