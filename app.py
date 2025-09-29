@@ -60,6 +60,10 @@ from service_signal_runner import (
     clear_dirty_restart,
 )
 from service_eval import ServiceEval, EvalConfig
+from runtime_trade_defaults import (
+    DEFAULT_RUNTIME_TRADE_PATH,
+    load_runtime_trade_defaults,
+)
 
 
 _ROOT_DIR = Path(__file__).resolve().parent
@@ -952,7 +956,25 @@ with tabs[6]:
     st.subheader("Realtime сигналер (WebSocket Binance, без ключей)")
 
     runtime_yaml = st.text_input("Runtime YAML", value="configs/runtime.yaml")
-    live_yaml = st.text_input("Основной конфиг (config_live.yaml)", value="configs/config_live.yaml")
+    live_yaml = st.text_input(
+        "Основной конфиг (config_live.yaml)", value="configs/config_live.yaml"
+    )
+    trade_cols = st.columns([3, 1])
+    with trade_cols[0]:
+        runtime_trade_yaml = st.text_input(
+            "Runtime trade config",
+            value=DEFAULT_RUNTIME_TRADE_PATH,
+            help="YAML с дефолтами для execution/portfolio/costs",
+        )
+    with trade_cols[1]:
+        if st.button("Reload trade defaults", type="secondary"):
+            st.experimental_rerun()
+    if runtime_trade_yaml and not Path(runtime_trade_yaml).exists():
+        st.warning(f"Файл {runtime_trade_yaml} не найден")
+    st.caption(f"Текущий runtime trade config: {runtime_trade_yaml}")
+    runtime_trade_defaults = load_runtime_trade_defaults(
+        runtime_trade_yaml, loader=_load_yaml_file
+    )
 
     runner_status = read_json(os.path.join(logs_dir, "runner_status.json"))
     running = background_running(realtime_pid)
@@ -1359,19 +1381,31 @@ with tabs[6]:
     st.divider()
     st.markdown("#### Execution / Costs / Portfolio overrides")
     runtime_exec_cfg = copy.deepcopy(runtime_data.get("execution") or {})
+    runtime_exec_effective = copy.deepcopy(runtime_trade_defaults.get("execution") or {})
+    runtime_exec_effective.update(copy.deepcopy(runtime_exec_cfg))
+
+    runtime_portfolio_defaults = copy.deepcopy(runtime_trade_defaults.get("portfolio") or {})
     runtime_portfolio_cfg = copy.deepcopy(
         runtime_data.get("portfolio") or runtime_exec_cfg.get("portfolio") or {}
     )
+    runtime_portfolio_effective = copy.deepcopy(runtime_portfolio_defaults)
+    runtime_portfolio_effective.update(copy.deepcopy(runtime_exec_cfg.get("portfolio") or {}))
+    runtime_portfolio_effective.update(copy.deepcopy(runtime_data.get("portfolio") or {}))
+
+    runtime_costs_defaults = copy.deepcopy(runtime_trade_defaults.get("costs") or {})
     runtime_costs_cfg = copy.deepcopy(
         runtime_data.get("costs") or runtime_exec_cfg.get("costs") or {}
     )
-    runtime_impact_cfg = copy.deepcopy(runtime_costs_cfg.get("impact") or {})
+    runtime_costs_effective = copy.deepcopy(runtime_costs_defaults)
+    runtime_costs_effective.update(copy.deepcopy(runtime_exec_cfg.get("costs") or {}))
+    runtime_costs_effective.update(copy.deepcopy(runtime_data.get("costs") or {}))
+    runtime_impact_cfg = copy.deepcopy(runtime_costs_effective.get("impact") or {})
 
     mode_options = ["order", "bar"]
-    current_mode = str(runtime_exec_cfg.get("mode", "order") or "order").lower()
+    current_mode = str(runtime_exec_effective.get("mode", "order") or "order").lower()
     if current_mode not in mode_options:
         current_mode = "order"
-    bar_price_default = str(runtime_exec_cfg.get("bar_price") or "")
+    bar_price_default = str(runtime_exec_effective.get("bar_price") or "")
 
     def _format_optional_number(value: Any) -> str:
         if value in (None, ""):
@@ -1379,12 +1413,12 @@ with tabs[6]:
         return str(value)
 
     min_step_default = _format_optional_number(
-        runtime_exec_cfg.get("min_rebalance_step")
+        runtime_exec_effective.get("min_rebalance_step")
     )
-    safety_default = _format_optional_number(runtime_exec_cfg.get("safety_margin_bps"))
-    equity_default = _format_optional_number(runtime_portfolio_cfg.get("equity_usd"))
-    taker_default = _format_optional_number(runtime_costs_cfg.get("taker_fee_bps"))
-    half_default = _format_optional_number(runtime_costs_cfg.get("half_spread_bps"))
+    safety_default = _format_optional_number(runtime_exec_effective.get("safety_margin_bps"))
+    equity_default = _format_optional_number(runtime_portfolio_effective.get("equity_usd"))
+    taker_default = _format_optional_number(runtime_costs_effective.get("taker_fee_bps"))
+    half_default = _format_optional_number(runtime_costs_effective.get("half_spread_bps"))
     impact_sqrt_default = _format_optional_number(runtime_impact_cfg.get("sqrt_coeff"))
     impact_linear_default = _format_optional_number(runtime_impact_cfg.get("linear_coeff"))
 
