@@ -899,6 +899,7 @@ class BarExecutor(TradeExecutor):
         per_weight = delta_weight / float(parts)
         accumulated_weight = float(state.weight)
         total_notional_dec = Decimal("0")
+        weight_tolerance = 1e-9
 
         for idx in range(parts):
             if idx == parts - 1:
@@ -926,17 +927,24 @@ class BarExecutor(TradeExecutor):
             executed_notional = Decimal("0")
             if price > Decimal("0") and quantized_qty > Decimal("0"):
                 executed_notional = quantized_qty * price
-            total_notional_dec += executed_notional
             executed_delta = 0.0
             if equity_dec > Decimal("0") and executed_notional > Decimal("0"):
                 executed_fraction = executed_notional / equity_dec
                 executed_delta = float(executed_fraction)
             if direction < 0:
                 executed_delta = -executed_delta
-            new_weight = accumulated_weight + executed_delta
+            prev_weight = accumulated_weight
+            candidate_weight = prev_weight + executed_delta
+            if candidate_weight < -weight_tolerance:
+                return [], float(state.weight), 0.0, "rounded_weight_below_zero"
+            if candidate_weight > 1.0 + weight_tolerance:
+                return [], float(state.weight), 0.0, "rounded_weight_above_one"
+            new_weight = min(max(candidate_weight, 0.0), 1.0)
+            adjusted_delta = new_weight - prev_weight
             ts = state.ts if bar is None else bar.ts
             if interval_ms and bar is not None:
                 ts = int(bar.ts + idx * interval_ms)
+            total_notional_dec += executed_notional
             instructions.append(
                 RebalanceInstruction(
                     symbol=state.symbol,
@@ -944,7 +952,7 @@ class BarExecutor(TradeExecutor):
                     slice_index=idx,
                     slices_total=parts,
                     target_weight=new_weight,
-                    delta_weight=executed_delta,
+                    delta_weight=adjusted_delta,
                     notional_usd=float(executed_notional),
                     quantity=quantized_qty,
                 )

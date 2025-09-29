@@ -1453,16 +1453,35 @@ class _Worker:
 
     def _resolve_weight_targets(
         self, symbol: str, payload: Mapping[str, Any]
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, str | None]:
         current = float(self._weights.get(symbol, 0.0))
         target = current
+        reason: str | None = None
+        tol = 1e-9
+
         if "target_weight" in payload or "target" in payload or "weight" in payload:
             raw = payload.get("target_weight")
             if raw is None:
                 raw = payload.get("target")
             if raw is None:
                 raw = payload.get("weight")
-            target = self._clamp_weight(raw)
+            try:
+                requested = float(raw)
+            except (TypeError, ValueError):
+                requested = current
+            if math.isfinite(requested):
+                if requested < -tol or requested > 1.0 + tol:
+                    reason = "target_weight_out_of_bounds"
+                    try:
+                        self._logger.warning(
+                            "Rejecting target weight for %s: requested=%s outside [0, 1]",
+                            symbol,
+                            raw,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    target = self._clamp_weight(requested)
         elif "delta_weight" in payload or "delta" in payload:
             raw_delta = payload.get("delta_weight")
             if raw_delta is None:
@@ -1472,9 +1491,25 @@ class _Worker:
             except (TypeError, ValueError):
                 delta_val = 0.0
             if math.isfinite(delta_val):
-                target = self._clamp_weight(current + delta_val)
+                desired = current + delta_val
+                if desired < -tol or desired > 1.0 + tol:
+                    reason = "delta_weight_out_of_bounds"
+                    try:
+                        self._logger.warning(
+                            "Rejecting delta weight for %s: current=%s delta=%s => %s outside [0, 1]",
+                            symbol,
+                            current,
+                            raw_delta,
+                            desired,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    target = self._clamp_weight(desired)
+        if reason is not None:
+            target = current
         delta = target - current
-        return target, delta
+        return target, delta, reason
 
     def _resolve_economics(
         self, payload: Mapping[str, Any], meta: Mapping[str, Any] | None
@@ -1629,15 +1664,21 @@ class _Worker:
             kind = "target_weight"
         envelope_payload["kind"] = kind
         symbol_key = str(symbol).upper()
+        requested_target = envelope_payload.get("target_weight")
+        requested_delta = envelope_payload.get("delta_weight")
+        resolved_target, resolved_delta, weight_reason = self._resolve_weight_targets(
+            symbol_key, envelope_payload
+        )
+        if weight_reason:
+            envelope_payload.setdefault("reject_reason", weight_reason)
+            if requested_target is not None:
+                envelope_payload.setdefault("requested_target_weight", requested_target)
+            if requested_delta is not None:
+                envelope_payload.setdefault("requested_delta_weight", requested_delta)
         if kind == "target_weight":
-            if "target_weight" not in envelope_payload:
-                envelope_payload["target_weight"] = self._clamp_weight(
-                    envelope_payload.get("weight", self._weights.get(symbol_key, 0.0))
-                )
+            envelope_payload["target_weight"] = resolved_target
         else:
-            if "delta_weight" not in envelope_payload:
-                _, delta = self._resolve_weight_targets(symbol_key, envelope_payload)
-                envelope_payload["delta_weight"] = delta
+            envelope_payload["delta_weight"] = resolved_delta
         return envelope_payload, valid_until_ms
 
     def _persist_exposure_state(self, ts_ms: int | None = None) -> None:
@@ -1797,7 +1838,9 @@ class _Worker:
         for order in orders_list:
             symbol = str(getattr(order, "symbol", "") or "").upper()
             payload = self._extract_signal_payload(order)
-            target, _ = self._resolve_weight_targets(symbol, payload)
+            target, _, weight_reason = self._resolve_weight_targets(symbol, payload)
+            if weight_reason:
+                payload.setdefault("reject_reason", weight_reason)
             meta_raw = getattr(order, "meta", None)
             normalized_flag = False
             if payload.get("normalized"):
@@ -2024,7 +2067,7 @@ class _Worker:
             if not symbol:
                 return
             payload = self._extract_signal_payload(order)
-            target_weight, _ = self._resolve_weight_targets(symbol, payload)
+            target_weight, _, _ = self._resolve_weight_targets(symbol, payload)
             if math.isclose(target_weight, 0.0, rel_tol=0.0, abs_tol=1e-12):
                 self._weights.pop(symbol, None)
             else:

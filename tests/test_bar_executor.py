@@ -569,3 +569,65 @@ def test_bar_executor_propagates_normalized_flag():
     assert snapshot["normalized"] is True
     assert snapshot["decision"]["normalized"] is True
 
+
+def test_bar_executor_aborts_when_weight_would_exceed_one():
+    class OvershootExecutor(BarExecutor):
+        def _resolve_target_weight(self, state: PortfolioState, payload: Any):  # type: ignore[override]
+            return 1.2, "target", 0.4
+
+    executor = OvershootExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+        initial_weights={"BTCUSDT": 0.8},
+    )
+    bar = make_bar(200, 20_000.0)
+    order = Order(
+        ts=200,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={"bar": bar, "payload": {"edge_bps": 50.0}},
+    )
+
+    report = executor.execute(order)
+
+    assert report.meta["instructions"] == []
+    assert report.meta.get("reason") == "rounded_weight_above_one"
+    assert report.meta["target_weight"] == pytest.approx(0.8)
+    assert report.meta["decision"]["act_now"] is False
+
+
+def test_bar_executor_aborts_when_weight_would_drop_below_zero():
+    class UndershootExecutor(BarExecutor):
+        def _resolve_target_weight(self, state: PortfolioState, payload: Any):  # type: ignore[override]
+            return -0.2, "target", -0.4
+
+    executor = UndershootExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+        initial_weights={"BTCUSDT": 0.2},
+    )
+    bar = make_bar(210, 19_000.0)
+    order = Order(
+        ts=210,
+        symbol="BTCUSDT",
+        side=Side.SELL,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={"bar": bar, "payload": {"edge_bps": 50.0}},
+    )
+
+    report = executor.execute(order)
+
+    assert report.meta["instructions"] == []
+    assert report.meta.get("reason") == "rounded_weight_below_zero"
+    assert report.meta["target_weight"] == pytest.approx(0.2)
+    assert report.meta["decision"]["act_now"] is False
+
