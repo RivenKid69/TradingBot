@@ -593,7 +593,7 @@ class MonitoringAggregator:
 
         self._bar_interval_ms: Dict[str, int] = {}
         self._execution_mode: str = "order"
-        self._bar_events: Dict[str, deque[tuple[int, int, int, float, Optional[float]]]] = {
+        self._bar_events: Dict[str, deque[tuple[int, int, int, float, Optional[float], Optional[str]]]] = {
             key: deque() for key in self._window_ms
         }
         self._bar_totals: Dict[str, float] = {
@@ -602,6 +602,7 @@ class MonitoringAggregator:
             "turnover_usd": 0.0,
             "cap_usd": 0.0,
         }
+        self._bar_mode_totals: DefaultDict[str, float] = defaultdict(float)
         self.last_ws_reconnect_ms: Optional[int] = None
         self.last_ws_failure_ms: Optional[int] = None
         self.throttle_queue_depth: Dict[str, int] = {"size": 0, "max": 0}
@@ -901,6 +902,7 @@ class MonitoringAggregator:
                 "turnover_usd": 0.0,
                 "cap_usd": 0.0,
             }
+            self._bar_mode_totals = defaultdict(float)
 
     def _bar_window_snapshot(self, window: str) -> Dict[str, Any]:
         dq = self._bar_events.get(window, deque())
@@ -910,6 +912,11 @@ class MonitoringAggregator:
         cap_sum = sum(item[4] for item in dq if item[4] is not None and item[4] > 0)
         rate = float(act_now / decisions) if decisions > 0 else None
         ratio = float(turnover / cap_sum) if cap_sum > 0 else None
+        mode_counts: Dict[str, int] = {}
+        for _, dec_count, _, _, _, mode in dq:
+            if not mode:
+                continue
+            mode_counts[mode] = mode_counts.get(mode, 0) + dec_count
         return {
             "decisions": int(decisions),
             "act_now": int(act_now),
@@ -917,6 +924,7 @@ class MonitoringAggregator:
             "turnover_usd": float(turnover),
             "cap_usd": float(cap_sum) if cap_sum > 0 else None,
             "turnover_vs_cap": ratio,
+            "impact_mode_counts": mode_counts,
         }
 
     def _bar_execution_snapshot(self) -> Dict[str, Any]:
@@ -944,6 +952,11 @@ class MonitoringAggregator:
                 "turnover_usd": cumulative_turnover,
                 "cap_usd": cumulative_cap if cumulative_cap > 0 else None,
                 "turnover_vs_cap": cumulative_ratio,
+                "impact_mode_counts": {
+                    mode: int(count)
+                    for mode, count in self._bar_mode_totals.items()
+                    if count > 0
+                },
             },
         }
 
@@ -955,6 +968,7 @@ class MonitoringAggregator:
         act_now: int,
         turnover_usd: float,
         cap_usd: Optional[float] = None,
+        impact_mode: Optional[str] = None,
     ) -> None:
         if not self.enabled:
             return
@@ -979,15 +993,37 @@ class MonitoringAggregator:
             cap_value = None
         ts_ms = int(time.time() * 1000)
         self._execution_mode = "bar"
+        mode_key: Optional[str]
+        if impact_mode is None:
+            mode_key = None
+        else:
+            try:
+                mode_key = str(impact_mode)
+            except Exception:
+                mode_key = None
+            if mode_key is not None:
+                candidate = mode_key.strip()
+                mode_key = candidate if candidate else None
         for window in self._window_ms:
             dq = self._bar_events.setdefault(window, deque())
-            dq.append((ts_ms, dec, act, turnover, cap_value if cap_value and cap_value > 0 else None))
+            dq.append(
+                (
+                    ts_ms,
+                    dec,
+                    act,
+                    turnover,
+                    cap_value if cap_value and cap_value > 0 else None,
+                    mode_key,
+                )
+            )
             self._prune_bar_events(window, ts_ms)
         self._bar_totals["decisions"] += dec
         self._bar_totals["act_now"] += act
         self._bar_totals["turnover_usd"] += turnover
         if cap_value is not None and cap_value > 0:
             self._bar_totals["cap_usd"] += cap_value
+        if mode_key:
+            self._bar_mode_totals[mode_key] += dec
 
     def _build_metrics(self, now_ms: int, feed_lags: Dict[str, int], stale: list[str]) -> Dict[str, Any]:
         worst_feed = max(feed_lags.items(), key=lambda item: item[1], default=(None, 0))

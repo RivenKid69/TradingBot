@@ -186,20 +186,25 @@ def decide_spot_trade(
     base_cost = float(cost_config.taker_fee_bps) + float(cost_config.half_spread_bps)
 
     participation = 0.0
+    impact = 0.0
+    impact_mode = "model"
     if adv_quote is not None and adv_quote > 0.0:
         participation = turnover_usd / float(adv_quote)
-    impact = 0.0
-    if participation > 0.0:
-        sqrt_coeff = float(cost_config.impact.sqrt_coeff)
-        linear_coeff = float(cost_config.impact.linear_coeff)
-        impact += sqrt_coeff * math.sqrt(participation)
-        impact += linear_coeff * participation
-        power_coeff = float(getattr(cost_config.impact, "power_coefficient", 0.0) or 0.0)
-        power_exp = float(getattr(cost_config.impact, "power_exponent", 1.0) or 1.0)
-        if power_coeff > 0.0 and participation > 0.0:
-            if power_exp <= 0.0:
-                power_exp = 1.0
-            impact += power_coeff * participation ** power_exp
+        if participation > 0.0:
+            sqrt_coeff = float(cost_config.impact.sqrt_coeff)
+            linear_coeff = float(cost_config.impact.linear_coeff)
+            impact += sqrt_coeff * math.sqrt(participation)
+            impact += linear_coeff * participation
+            power_coeff = float(
+                getattr(cost_config.impact, "power_coefficient", 0.0) or 0.0
+            )
+            power_exp = float(getattr(cost_config.impact, "power_exponent", 1.0) or 1.0)
+            if power_coeff > 0.0 and participation > 0.0:
+                if power_exp <= 0.0:
+                    power_exp = 1.0
+                impact += power_coeff * participation ** power_exp
+    else:
+        impact_mode = "none"
 
     cost_bps = base_cost + impact
     net_bps = edge_bps - cost_bps - float(safety_margin_bps)
@@ -211,6 +216,8 @@ def decide_spot_trade(
         net_bps=net_bps,
         turnover_usd=turnover_usd,
         act_now=act_now,
+        impact=impact,
+        impact_mode=impact_mode,
     )
 
 
@@ -488,6 +495,10 @@ class BarExecutor(TradeExecutor):
             "adv_quote": float(adv_quote) if adv_quote is not None else None,
             "min_step_enforced": bool(skip_due_to_step),
         }
+        snapshot["impact"] = float(getattr(metrics, "impact", 0.0))
+        impact_mode_value = getattr(metrics, "impact_mode", None)
+        if impact_mode_value is not None:
+            snapshot["impact_mode"] = impact_mode_value
         snapshot["requested_target_weight"] = requested_target_weight
         snapshot["requested_delta_weight"] = requested_delta_weight
         if instructions:

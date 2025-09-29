@@ -28,6 +28,18 @@
           "minimum": 0.0,
           "title": "Turnover Usd",
           "type": "number"
+        },
+        "impact": {
+          "description": "Estimated participation-driven impact component in basis points.",
+          "minimum": 0.0,
+          "title": "Impact",
+          "type": "number"
+        },
+        "impact_mode": {
+          "default": "model",
+          "description": "Mode describing how the impact estimate was produced.",
+          "title": "Impact Mode",
+          "type": "string"
         }
       },
       "required": [
