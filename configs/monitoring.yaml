@@ -9,6 +9,7 @@ thresholds:
   fill_ratio_min: 0.0         # alert if order fill ratio drops below this; 0 disables
   pnl_min: 0.0                # alert if daily PnL drops below this; 0 disables
   zero_signals: 0             # alert after N consecutive zero-signal bars; 0 disables
+  cost_bias_bps: 0.0          # alert if |cost bias| (bps) over recent bars exceeds this; 0 disables
 alerts:
   enabled: false              # disable external alerting
   command: null               # command to execute when alerts trigger
