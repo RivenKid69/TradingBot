@@ -38,7 +38,7 @@ import math
 import threading
 import signal
 from pathlib import Path
-from collections import deque, defaultdict
+from collections import OrderedDict, deque, defaultdict
 import time
 from datetime import datetime, timezone
 import shlex
@@ -66,7 +66,11 @@ from pipeline import (
     PipelineConfig,
     PipelineStageConfig,
 )
-from services.signal_bus import log_drop, publish_signal as publish_signal_envelope
+from services.signal_bus import (
+    log_drop,
+    publish_signal as publish_signal_envelope,
+    signal_id as envelope_signal_id,
+)
 from services.event_bus import EventBus
 from services.shutdown import ShutdownManager
 from services.signal_csv_writer import SignalCSVWriter
@@ -477,6 +481,7 @@ class _Worker:
         execution_mode: str = "order",
         portfolio_equity: float | None = None,
         max_total_weight: float | None = None,
+        idempotency_cache_size: int = 1024,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -514,6 +519,14 @@ class _Worker:
         self._monitoring: MonitoringAggregator | None = (
             monitoring if monitoring is not None else monitoring_agg
         )
+        try:
+            cache_size = int(idempotency_cache_size)
+        except (TypeError, ValueError):
+            cache_size = 0
+        if cache_size <= 0:
+            cache_size = 1024
+        self._idempotency_cache_size = cache_size
+        self._idempotency_cache: OrderedDict[str, None] = OrderedDict()
         if self._monitoring is not None:
             try:
                 self._monitoring.set_execution_mode(self._execution_mode)
@@ -2860,6 +2873,50 @@ class _Worker:
             reason_label,
         )
 
+    def _should_skip_idempotent(
+        self, key: str | None, symbol: str, bar_close_ms: int
+    ) -> bool:
+        if not key:
+            return False
+        if key in self._idempotency_cache:
+            try:
+                self._idempotency_cache.move_to_end(key)
+            except Exception:
+                pass
+            try:
+                self._logger.info(
+                    "SKIP_DUPLICATE %s",
+                    {
+                        "stage": Stage.PUBLISH.name,
+                        "symbol": symbol,
+                        "bar_close_ms": bar_close_ms,
+                        "idempotency_key": key,
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                monitoring.signal_idempotency_skipped_count.labels(symbol).inc()
+            except Exception:
+                pass
+            return True
+        return False
+
+    def _remember_idempotency_key(self, key: str | None) -> None:
+        if not key:
+            return
+        cache = self._idempotency_cache
+        cache[key] = None
+        try:
+            cache.move_to_end(key)
+        except Exception:
+            pass
+        if len(cache) > self._idempotency_cache_size:
+            try:
+                cache.popitem(last=False)
+            except Exception:
+                pass
+
     def _emit(self, o: Any, symbol: str, bar_close_ms: int) -> bool:
         ttl_stage_cfg = self._pipeline_cfg.get("ttl") if self._pipeline_cfg else None
         ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
@@ -2973,6 +3030,25 @@ class _Worker:
             raw_key = meta.get("dedup_key")
             if raw_key is not None:
                 dedup_key = str(raw_key)
+        idempotency_key: str | None = None
+        if isinstance(meta, MappingABC):
+            for candidate in ("idempotency_key", "signal_id", "dedup_key"):
+                raw_value = meta.get(candidate)
+                if raw_value is None:
+                    continue
+                try:
+                    idempotency_key = str(raw_value)
+                except Exception:
+                    continue
+                if idempotency_key:
+                    break
+        if not idempotency_key:
+            try:
+                idempotency_key = envelope_signal_id(symbol, bar_close_ms)
+            except Exception:
+                idempotency_key = None
+        if self._should_skip_idempotent(idempotency_key, symbol, bar_close_ms):
+            return False
         valid_until_ms_int: int | None = None
         if payload_valid_until_ms is not None:
             try:
@@ -2997,6 +3073,7 @@ class _Worker:
                 published = False
         if not published:
             return False
+        self._remember_idempotency_key(idempotency_key)
         if self._execution_mode != "bar":
             submit = getattr(self._executor, "submit", None)
             if callable(submit):
