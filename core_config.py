@@ -298,6 +298,7 @@ class MonitoringThresholdsConfig:
     fill_ratio_min: float = 0.0
     pnl_min: float = 0.0
     zero_signals: int = 0
+    cost_bias_bps: float = 0.0
 
 
 @dataclass

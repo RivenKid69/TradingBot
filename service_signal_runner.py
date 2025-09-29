@@ -1300,6 +1300,44 @@ class _Worker:
             metrics["impact_mode"] = impact_mode
         if reason_label:
             metrics["reason"] = reason_label
+        cost_estimate = self._coerce_float(
+            self._find_in_mapping(
+                decision,
+                ("modeled_cost_bps", "cost_bps", "expected_cost_bps"),
+            )
+        )
+        if cost_estimate is None and snapshot is not None:
+            cost_estimate = self._coerce_float(
+                self._find_in_mapping(snapshot, ("modeled_cost_bps", "cost_bps"))
+            )
+        realized_cost = self._coerce_float(
+            self._find_in_mapping(
+                decision,
+                ("realized_slippage_bps", "realized_cost_bps"),
+            )
+        )
+        if realized_cost is None and snapshot is not None:
+            realized_cost = self._coerce_float(
+                self._find_in_mapping(
+                    snapshot,
+                    ("realized_slippage_bps", "realized_cost_bps"),
+                )
+            )
+        bias_val = self._coerce_float(
+            self._find_in_mapping(decision, ("cost_bias_bps",))
+        )
+        if bias_val is None and snapshot is not None:
+            bias_val = self._coerce_float(
+                self._find_in_mapping(snapshot, ("cost_bias_bps",))
+            )
+        if bias_val is None and realized_cost is not None and cost_estimate is not None:
+            bias_val = realized_cost - cost_estimate
+        if cost_estimate is not None:
+            metrics["modeled_cost_bps"] = cost_estimate
+        if realized_cost is not None:
+            metrics["realized_slippage_bps"] = realized_cost
+        if bias_val is not None:
+            metrics["cost_bias_bps"] = bias_val
         if normalization_details:
             metrics["normalization"] = normalization_details
         return metrics

@@ -83,6 +83,11 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
     assert row["bar_cap_usd"] == pytest.approx(30_000.0)
     assert row["bar_act_now_rate"] == pytest.approx(0.5)
     assert row["bar_turnover_vs_cap"] == pytest.approx(800.0 / 30_000.0)
+    assert "realized_slippage_bps" in row.index
+    assert "modeled_cost_bps" in row.index
+    assert "cost_bias_bps" in row.index
+    assert pd.isna(row["realized_slippage_bps"])
+    assert pd.isna(row["modeled_cost_bps"])
 
     days = pd.read_csv(out_days)
     assert days.shape[0] == 1
@@ -92,3 +97,4 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
     assert day["bar_turnover_usd"] == pytest.approx(800.0)
     assert day["bar_cap_usd"] == pytest.approx(30_000.0)
     assert day["bar_turnover_vs_cap"] == pytest.approx(800.0 / 30_000.0)
+    assert "cost_bias_bps" in day.index

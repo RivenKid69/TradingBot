@@ -9,6 +9,7 @@ based on feed lag, websocket failures and signal error rates.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from typing import Dict, Tuple, Union, Optional, Any, DefaultDict, Iterable, Mapping
@@ -593,7 +594,7 @@ class MonitoringAggregator:
 
         self._bar_interval_ms: Dict[str, int] = {}
         self._execution_mode: str = "order"
-        self._bar_events: Dict[str, deque[tuple[int, int, int, float, Optional[float], Optional[str]]]] = {
+        self._bar_events: Dict[str, deque[Dict[str, Any]]] = {
             key: deque() for key in self._window_ms
         }
         self._bar_totals: Dict[str, float] = {
@@ -601,6 +602,10 @@ class MonitoringAggregator:
             "act_now": 0.0,
             "turnover_usd": 0.0,
             "cap_usd": 0.0,
+            "realized_cost_weight": 0.0,
+            "realized_cost_wsum": 0.0,
+            "modeled_cost_weight": 0.0,
+            "modeled_cost_wsum": 0.0,
         }
         self._bar_mode_totals: DefaultDict[str, float] = defaultdict(float)
         self.last_ws_reconnect_ms: Optional[int] = None
@@ -613,6 +618,7 @@ class MonitoringAggregator:
         }
         self.zero_signal_streaks: Dict[str, int] = {}
         self.daily_turnover: Dict[str, Any] = {}
+        self._cost_bias_alerted: set[str] = set()
         global _throttle_queue_depth_snapshot, _cooldowns_active_snapshot, _zero_signal_streaks_snapshot
         _throttle_queue_depth_snapshot = dict(self.throttle_queue_depth)
         _cooldowns_active_snapshot = dict(self.cooldowns_active)
@@ -761,7 +767,7 @@ class MonitoringAggregator:
         if dq is None:
             return
         cutoff = now_ms - self._window_ms[window]
-        while dq and dq[0][0] < cutoff:
+        while dq and int(dq[0].get("ts", 0)) < cutoff:
             dq.popleft()
 
     def _prune_signal_window(self, window: str, now_ms: int) -> None:
@@ -930,31 +936,111 @@ class MonitoringAggregator:
                 "act_now": 0.0,
                 "turnover_usd": 0.0,
                 "cap_usd": 0.0,
+                "realized_cost_weight": 0.0,
+                "realized_cost_wsum": 0.0,
+                "modeled_cost_weight": 0.0,
+                "modeled_cost_wsum": 0.0,
             }
             self._bar_mode_totals = defaultdict(float)
+            self._cost_bias_alerted.clear()
 
     def _bar_window_snapshot(self, window: str) -> Dict[str, Any]:
         dq = self._bar_events.get(window, deque())
-        decisions = sum(item[1] for item in dq)
-        act_now = sum(item[2] for item in dq)
-        turnover = sum(item[3] for item in dq)
-        cap_sum = sum(item[4] for item in dq if item[4] is not None and item[4] > 0)
-        rate = float(act_now / decisions) if decisions > 0 else None
-        ratio = float(turnover / cap_sum) if cap_sum > 0 else None
+
+        def _as_float(value: Any) -> float | None:
+            try:
+                result = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(result):
+                return None
+            return result
+
+        def _entry_weight(entry: Mapping[str, Any]) -> float:
+            for key in ("weight", "turnover_usd", "decisions"):
+                candidate = _as_float(entry.get(key))
+                if candidate is not None and candidate > 0:
+                    return candidate
+            return 0.0
+
+        decisions_total = 0.0
+        act_total = 0.0
+        turnover_total = 0.0
+        cap_sum = 0.0
         mode_counts: Dict[str, int] = {}
-        for _, dec_count, _, _, _, mode in dq:
-            if not mode:
-                continue
-            mode_counts[mode] = mode_counts.get(mode, 0) + dec_count
-        return {
-            "decisions": int(decisions),
-            "act_now": int(act_now),
+        realized_sum = 0.0
+        realized_weight = 0.0
+        modeled_sum = 0.0
+        modeled_weight = 0.0
+        bias_sum = 0.0
+        bias_weight = 0.0
+
+        for entry in dq:
+            dec_val = _as_float(entry.get("decisions")) or 0.0
+            act_val = _as_float(entry.get("act_now")) or 0.0
+            turnover_val = _as_float(entry.get("turnover_usd")) or 0.0
+            cap_val = _as_float(entry.get("cap_usd"))
+            decisions_total += dec_val
+            act_total += act_val
+            turnover_total += turnover_val
+            if cap_val is not None and cap_val > 0:
+                cap_sum += cap_val
+            mode_value = entry.get("impact_mode")
+            if mode_value:
+                try:
+                    mode_key = str(mode_value)
+                except Exception:
+                    mode_key = None
+                if mode_key:
+                    mode_counts[mode_key] = mode_counts.get(mode_key, 0) + int(dec_val)
+            weight = _entry_weight(entry)
+            realized_val = _as_float(entry.get("realized_slippage_bps"))
+            if realized_val is not None and weight > 0:
+                realized_sum += realized_val * weight
+                realized_weight += weight
+            modeled_val = _as_float(entry.get("modeled_cost_bps"))
+            if modeled_val is not None and weight > 0:
+                modeled_sum += modeled_val * weight
+                modeled_weight += weight
+            bias_val = _as_float(entry.get("cost_bias_bps"))
+            if bias_val is None and realized_val is not None and modeled_val is not None:
+                bias_val = realized_val - modeled_val
+            if bias_val is not None and weight > 0:
+                bias_sum += bias_val * weight
+                bias_weight += weight
+
+        rate = float(act_total / decisions_total) if decisions_total > 0 else None
+        ratio = float(turnover_total / cap_sum) if cap_sum > 0 else None
+        realized_avg = float(realized_sum / realized_weight) if realized_weight > 0 else None
+        modeled_avg = float(modeled_sum / modeled_weight) if modeled_weight > 0 else None
+        bias_avg = (
+            float(bias_sum / bias_weight) if bias_weight > 0 else (
+                (realized_avg - modeled_avg)
+                if realized_avg is not None and modeled_avg is not None
+                else None
+            )
+        )
+
+        def _maybe(value: float | None) -> float | None:
+            if value is None:
+                return None
+            if not math.isfinite(value):
+                return None
+            return float(value)
+
+        snapshot: Dict[str, Any] = {
+            "decisions": int(decisions_total),
+            "act_now": int(act_total),
             "act_now_rate": rate,
-            "turnover_usd": float(turnover),
+            "turnover_usd": float(turnover_total),
             "cap_usd": float(cap_sum) if cap_sum > 0 else None,
             "turnover_vs_cap": ratio,
             "impact_mode_counts": mode_counts,
         }
+        snapshot["realized_slippage_bps"] = _maybe(realized_avg)
+        snapshot["modeled_cost_bps"] = _maybe(modeled_avg)
+        snapshot["cost_bias_bps"] = _maybe(bias_avg)
+        return snapshot
 
     def _bar_execution_snapshot(self) -> Dict[str, Any]:
         cumulative_decisions = float(self._bar_totals.get("decisions", 0.0))
@@ -971,6 +1057,29 @@ class MonitoringAggregator:
             if cumulative_cap > 0
             else None
         )
+        realized_weight = float(self._bar_totals.get("realized_cost_weight", 0.0))
+        modeled_weight = float(self._bar_totals.get("modeled_cost_weight", 0.0))
+        realized_avg = (
+            float(self._bar_totals.get("realized_cost_wsum", 0.0) / realized_weight)
+            if realized_weight > 0
+            else None
+        )
+        modeled_avg = (
+            float(self._bar_totals.get("modeled_cost_wsum", 0.0) / modeled_weight)
+            if modeled_weight > 0
+            else None
+        )
+        bias_avg = (
+            (realized_avg - modeled_avg)
+            if realized_avg is not None and modeled_avg is not None
+            else None
+        )
+        def _maybe(value: float | None) -> float | None:
+            if value is None:
+                return None
+            if not math.isfinite(value):
+                return None
+            return float(value)
         return {
             "window_1m": self._bar_window_snapshot("1m"),
             "window_5m": self._bar_window_snapshot("5m"),
@@ -986,6 +1095,9 @@ class MonitoringAggregator:
                     for mode, count in self._bar_mode_totals.items()
                     if count > 0
                 },
+                "realized_slippage_bps": _maybe(realized_avg),
+                "modeled_cost_bps": _maybe(modeled_avg),
+                "cost_bias_bps": _maybe(bias_avg),
             },
         }
 
@@ -998,6 +1110,9 @@ class MonitoringAggregator:
         turnover_usd: float,
         cap_usd: Optional[float] = None,
         impact_mode: Optional[str] = None,
+        modeled_cost_bps: Optional[float] = None,
+        realized_slippage_bps: Optional[float] = None,
+        cost_bias_bps: Optional[float] = None,
     ) -> None:
         if not self.enabled:
             return
@@ -1033,18 +1148,64 @@ class MonitoringAggregator:
             if mode_key is not None:
                 candidate = mode_key.strip()
                 mode_key = candidate if candidate else None
+        modeled_value: Optional[float]
+        try:
+            modeled_value = float(modeled_cost_bps) if modeled_cost_bps is not None else None
+        except (TypeError, ValueError):
+            modeled_value = None
+        else:
+            if modeled_value is not None and not math.isfinite(modeled_value):
+                modeled_value = None
+        realized_value: Optional[float]
+        try:
+            realized_value = (
+                float(realized_slippage_bps)
+                if realized_slippage_bps is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            realized_value = None
+        else:
+            if realized_value is not None and not math.isfinite(realized_value):
+                realized_value = None
+        try:
+            bias_value = (
+                float(cost_bias_bps) if cost_bias_bps is not None else None
+            )
+        except (TypeError, ValueError):
+            bias_value = None
+        else:
+            if bias_value is not None and not math.isfinite(bias_value):
+                bias_value = None
+        if bias_value is None and realized_value is not None and modeled_value is not None:
+            bias_value = realized_value - modeled_value
+        weight_value: Optional[float]
+        if turnover > 0:
+            weight_value = float(turnover)
+        elif dec > 0:
+            weight_value = float(dec)
+        else:
+            weight_value = None
         for window in self._window_ms:
             dq = self._bar_events.setdefault(window, deque())
-            dq.append(
-                (
-                    ts_ms,
-                    dec,
-                    act,
-                    turnover,
-                    cap_value if cap_value and cap_value > 0 else None,
-                    mode_key,
-                )
-            )
+            entry: Dict[str, Any] = {
+                "ts": ts_ms,
+                "symbol": str(symbol),
+                "decisions": dec,
+                "act_now": act,
+                "turnover_usd": turnover,
+                "cap_usd": cap_value if cap_value and cap_value > 0 else None,
+                "impact_mode": mode_key,
+            }
+            if modeled_value is not None:
+                entry["modeled_cost_bps"] = modeled_value
+            if realized_value is not None:
+                entry["realized_slippage_bps"] = realized_value
+            if bias_value is not None:
+                entry["cost_bias_bps"] = bias_value
+            if weight_value is not None and weight_value > 0:
+                entry["weight"] = float(weight_value)
+            dq.append(entry)
             self._prune_bar_events(window, ts_ms)
         self._bar_totals["decisions"] += dec
         self._bar_totals["act_now"] += act
@@ -1053,6 +1214,13 @@ class MonitoringAggregator:
             self._bar_totals["cap_usd"] += cap_value
         if mode_key:
             self._bar_mode_totals[mode_key] += dec
+        if weight_value is not None and weight_value > 0:
+            if modeled_value is not None:
+                self._bar_totals["modeled_cost_weight"] += weight_value
+                self._bar_totals["modeled_cost_wsum"] += modeled_value * weight_value
+            if realized_value is not None:
+                self._bar_totals["realized_cost_weight"] += weight_value
+                self._bar_totals["realized_cost_wsum"] += realized_value * weight_value
 
     def _build_metrics(self, now_ms: int, feed_lags: Dict[str, int], stale: list[str]) -> Dict[str, Any]:
         worst_feed = max(feed_lags.items(), key=lambda item: item[1], default=(None, 0))
@@ -1384,6 +1552,70 @@ class MonitoringAggregator:
                     self._signal_alerted.discard(sym)
         else:
             self._signal_alerted.clear()
+
+        cost_threshold = float(getattr(th, "cost_bias_bps", 0.0) or 0.0)
+        if cost_threshold > 0:
+            events = self._bar_events.get("5m", deque())
+            symbol_bias: Dict[str, Dict[str, float]] = {}
+
+            def _as_float(value: Any) -> float | None:
+                try:
+                    result = float(value)
+                except (TypeError, ValueError):
+                    return None
+                if not math.isfinite(result):
+                    return None
+                return result
+
+            for entry in events:
+                weight = 0.0
+                for key in ("weight", "turnover_usd", "decisions"):
+                    candidate = _as_float(entry.get(key))
+                    if candidate is not None and candidate > 0:
+                        weight = candidate
+                        break
+                if weight <= 0:
+                    continue
+                bias_val = _as_float(entry.get("cost_bias_bps"))
+                if bias_val is None:
+                    realized_val = _as_float(entry.get("realized_slippage_bps"))
+                    modeled_val = _as_float(entry.get("modeled_cost_bps"))
+                    if realized_val is None or modeled_val is None:
+                        continue
+                    bias_val = realized_val - modeled_val
+                if bias_val is None or not math.isfinite(bias_val):
+                    continue
+                sym_raw = entry.get("symbol")
+                try:
+                    sym = str(sym_raw) if sym_raw is not None else ""
+                except Exception:
+                    sym = ""
+                sym = sym.strip().upper() or "UNKNOWN"
+                stats = symbol_bias.setdefault(sym, {"sum": 0.0, "weight": 0.0})
+                stats["sum"] += float(bias_val) * weight
+                stats["weight"] += weight
+
+            active_bias: set[str] = set()
+            for sym, data in symbol_bias.items():
+                weight_total = data.get("weight", 0.0)
+                if weight_total <= 0:
+                    continue
+                avg_bias = data["sum"] / weight_total
+                if abs(avg_bias) > cost_threshold:
+                    active_bias.add(sym)
+                    if sym not in self._cost_bias_alerted:
+                        self._notify(
+                            f"cost_bias_{sym}",
+                            f"{sym} cost bias {avg_bias:.3f}bps exceeds {cost_threshold:.3f}",
+                        )
+                        self._cost_bias_alerted.add(sym)
+                elif sym in self._cost_bias_alerted:
+                    self._cost_bias_alerted.discard(sym)
+            for sym in list(self._cost_bias_alerted):
+                if sym not in active_bias:
+                    self._cost_bias_alerted.discard(sym)
+        else:
+            self._cost_bias_alerted.clear()
 
         zero_threshold = int(getattr(th, "zero_signals", 0) or 0)
         if zero_threshold > 0:

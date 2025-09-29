@@ -19,6 +19,7 @@ import argparse
 import json
 import math
 import os
+from collections.abc import Mapping
 from typing import Any, Dict, Tuple
 
 import pandas as pd
@@ -201,6 +202,37 @@ def _parse_meta(value: Any) -> Dict[str, Any]:
         return {}
 
 
+def _extract_nested_float(meta: Dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    """Search ``meta`` recursively for the first numeric value under ``keys``."""
+
+    if not isinstance(meta, Mapping):
+        return None
+
+    stack: list[Mapping[str, Any]] = [meta]
+    visited: set[int] = set()
+
+    while stack:
+        current = stack.pop()
+        ident = id(current)
+        if ident in visited:
+            continue
+        visited.add(ident)
+        for key in keys:
+            if key in current and current[key] is not None:
+                try:
+                    return float(current[key])
+                except (TypeError, ValueError):
+                    continue
+        for value in current.values():
+            if isinstance(value, Mapping):
+                stack.append(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, Mapping):
+                        stack.append(item)
+    return None
+
+
 def _extract_meta_float(meta: Dict[str, Any], keys: tuple[str, ...]) -> float | None:
     for key in keys:
         if key in meta and meta[key] is not None:
@@ -216,6 +248,16 @@ def _extract_meta_float(meta: Dict[str, Any], keys: tuple[str, ...]) -> float | 
                     return float(decision[key])
                 except (TypeError, ValueError):
                     continue
+    economics = meta.get("economics")
+    if isinstance(economics, Mapping):
+        nested = _extract_nested_float(economics, keys)
+        if nested is not None:
+            return nested
+    payload = meta.get("payload")
+    if isinstance(payload, Mapping):
+        nested = _extract_nested_float(payload, keys)
+        if nested is not None:
+            return nested
     return None
 
 
@@ -472,6 +514,30 @@ def aggregate(
     act_now_from_meta = meta_series.apply(
         lambda m: _extract_meta_bool(m, ("act_now", "execute_now"))
     )
+    reference_from_meta = meta_series.apply(
+        lambda m: _extract_nested_float(
+            m,
+            (
+                "reference_price",
+                "ref_price",
+                "mid_price",
+                "mid",
+                "mark_price",
+                "quote_mid",
+            ),
+        )
+    )
+    modeled_cost_from_meta = meta_series.apply(
+        lambda m: _extract_nested_float(
+            m,
+            (
+                "modeled_cost_bps",
+                "cost_bps",
+                "expected_cost_bps",
+                "slippage_bps",
+            ),
+        )
+    )
 
     if "turnover_usd" in trades.columns:
         trades["turnover_usd"] = (
@@ -497,6 +563,32 @@ def aggregate(
     trades.loc[trades["execution_mode"] != "bar", "cap_usd"] = float("nan")
     trades.loc[trades["execution_mode"] != "bar", "act_now_flag"] = None
 
+    # Execution cost diagnostics
+    trades["modeled_cost_bps"] = pd.to_numeric(modeled_cost_from_meta, errors="coerce")
+    reference_prices = pd.to_numeric(reference_from_meta, errors="coerce")
+    trade_prices = pd.to_numeric(trades["price"], errors="coerce")
+    side_sign = trades["side_sign"].astype(float)
+    with pd.option_context("mode.use_inf_as_na", True):
+        realized = pd.Series(index=trades.index, dtype=float)
+        valid_mask = (
+            trade_prices.notna()
+            & reference_prices.notna()
+            & reference_prices.ne(0.0)
+            & side_sign.notna()
+        )
+        realized.loc[valid_mask] = (
+            (trade_prices.loc[valid_mask] - reference_prices.loc[valid_mask])
+            * side_sign.loc[valid_mask]
+            / reference_prices.loc[valid_mask]
+            * 10_000.0
+        )
+    # Fall back to existing slippage column when reference price is unavailable
+    if "slippage_bps" in trades.columns:
+        fallback_slip = pd.to_numeric(trades["slippage_bps"], errors="coerce")
+        realized = realized.where(realized.notna(), fallback_slip)
+    trades["realized_slippage_bps"] = realized
+    trades["cost_bias_bps"] = trades["realized_slippage_bps"] - trades["modeled_cost_bps"]
+
     trades["bar_decision_count"] = trades["execution_mode"].eq("bar").astype(int)
     act_now_mask = trades["act_now_flag"].apply(lambda v: bool(v) if v is not None else False)
     trades["bar_act_now_count"] = (
@@ -508,8 +600,9 @@ def aggregate(
     g = trades.groupby(["symbol","ts_bucket"], as_index=False)
 
     def _agg(df: pd.DataFrame) -> pd.Series:
-        qty_abs = df["quantity"].abs().sum()
-        notional = (df["price"] * df["quantity"].abs()).sum()
+        qty_abs_series = df["quantity"].abs()
+        qty_abs = float(qty_abs_series.sum())
+        notional = (df["price"] * qty_abs_series).sum()
         vwap = float(notional / qty_abs) if qty_abs and math.isfinite(notional) else float("nan")
         buy_qty = df.loc[df["side_sign"]>0, "quantity"].abs().sum()
         sell_qty = df.loc[df["side_sign"]<0, "quantity"].abs().sum()
@@ -523,6 +616,25 @@ def aggregate(
         cap_sum = float(cap_series.dropna().sum())
         ratio = float(turnover_total / cap_sum) if cap_sum > 0 else float("nan")
         act_rate = float(bar_act_now / bar_decisions) if bar_decisions > 0 else float("nan")
+        realized_series = pd.to_numeric(df.get("realized_slippage_bps"), errors="coerce")
+        modeled_series = pd.to_numeric(df.get("modeled_cost_bps"), errors="coerce")
+
+        def _weighted_average(series: pd.Series) -> float:
+            mask = series.notna() & qty_abs_series.notna() & (qty_abs_series > 0)
+            if not mask.any():
+                return float("nan")
+            weights = qty_abs_series.loc[mask].astype(float)
+            total_weight = float(weights.sum())
+            if not total_weight:
+                return float("nan")
+            return float((series.loc[mask].astype(float) * weights).sum() / total_weight)
+
+        realized_avg = _weighted_average(realized_series)
+        modeled_avg = _weighted_average(modeled_series)
+        if math.isfinite(realized_avg) and math.isfinite(modeled_avg):
+            bias_avg = float(realized_avg - modeled_avg)
+        else:
+            bias_avg = float("nan")
         return pd.Series({
             "volume": float(qty_abs),
             "buy_qty": float(buy_qty),
@@ -536,6 +648,9 @@ def aggregate(
             "bar_turnover_usd": turnover_total,
             "bar_cap_usd": float(cap_sum) if cap_sum > 0 else float("nan"),
             "bar_turnover_vs_cap": ratio,
+            "realized_slippage_bps": float(realized_avg),
+            "modeled_cost_bps": float(modeled_avg),
+            "cost_bias_bps": float(bias_avg),
         })
 
     bars = g.apply(_agg)
@@ -547,26 +662,55 @@ def aggregate(
     trades["day"] = (trades["ts"].astype("Int64") // day_ms) * day_ms
     gd = trades.groupby(["symbol","day"], as_index=False)
     def _agg_day(df: pd.DataFrame) -> pd.Series:
+        qty_abs_series = df["quantity"].abs()
+        qty_abs = float(qty_abs_series.sum())
+        buy_qty = float(df.loc[df["side_sign"] > 0, "quantity"].abs().sum())
+        sell_qty = float(df.loc[df["side_sign"] < 0, "quantity"].abs().sum())
+        trades_count = int(len(df))
+        notional = (df["price"] * qty_abs_series).sum()
+        vwap = float(notional / qty_abs) if qty_abs and math.isfinite(notional) else float("nan")
         cap_series = df.get("cap_usd", pd.Series(dtype=float))
         cap_sum = float(cap_series.dropna().sum())
         bar_decisions = float(df.get("bar_decision_count", pd.Series(dtype=float)).sum())
         bar_act_now = float(df.get("bar_act_now_count", pd.Series(dtype=float)).sum())
+        realized_series = pd.to_numeric(df.get("realized_slippage_bps"), errors="coerce")
+        modeled_series = pd.to_numeric(df.get("modeled_cost_bps"), errors="coerce")
+
+        def _weighted_average(series: pd.Series) -> float:
+            mask = series.notna() & qty_abs_series.notna() & (qty_abs_series > 0)
+            if not mask.any():
+                return float("nan")
+            weights = qty_abs_series.loc[mask].astype(float)
+            total_weight = float(weights.sum())
+            if not total_weight:
+                return float("nan")
+            return float((series.loc[mask].astype(float) * weights).sum() / total_weight)
+
+        realized_avg = _weighted_average(realized_series)
+        modeled_avg = _weighted_average(modeled_series)
+        if math.isfinite(realized_avg) and math.isfinite(modeled_avg):
+            bias_avg = float(realized_avg - modeled_avg)
+        else:
+            bias_avg = float("nan")
         return pd.Series({
-            "volume": float(df["quantity"].abs().sum()),
-        "trades": int(len(df)),
-        "buy_qty": float(df.loc[df["side_sign"]>0, "quantity"].abs().sum()),
-        "sell_qty": float(df.loc[df["side_sign"]<0, "quantity"].abs().sum()),
-        "fee_total": float(pd.to_numeric(df["fee"], errors="coerce").fillna(0.0).sum()) if "fee" in df.columns else 0.0,
-        "vwap": float(((df["price"] * df["quantity"].abs()).sum() / df["quantity"].abs().sum())) if df["quantity"].abs().sum() else float("nan"),
-        "bar_decisions": int(bar_decisions),
-        "bar_act_now": int(bar_act_now),
-        "bar_act_now_rate": float(bar_act_now / bar_decisions) if bar_decisions > 0 else float("nan"),
-        "bar_turnover_usd": float(df.get("turnover_usd", pd.Series(dtype=float)).sum()),
-        "bar_cap_usd": float(cap_sum) if cap_sum > 0 else float("nan"),
-        "bar_turnover_vs_cap": float(
-            df.get("turnover_usd", pd.Series(dtype=float)).sum() / cap_sum
-        ) if cap_sum > 0 else float("nan"),
-    })
+            "volume": float(qty_abs),
+            "trades": trades_count,
+            "buy_qty": buy_qty,
+            "sell_qty": sell_qty,
+            "fee_total": float(pd.to_numeric(df["fee"], errors="coerce").fillna(0.0).sum()) if "fee" in df.columns else 0.0,
+            "vwap": float(vwap),
+            "bar_decisions": int(bar_decisions),
+            "bar_act_now": int(bar_act_now),
+            "bar_act_now_rate": float(bar_act_now / bar_decisions) if bar_decisions > 0 else float("nan"),
+            "bar_turnover_usd": float(df.get("turnover_usd", pd.Series(dtype=float)).sum()),
+            "bar_cap_usd": float(cap_sum) if cap_sum > 0 else float("nan"),
+            "bar_turnover_vs_cap": float(
+                df.get("turnover_usd", pd.Series(dtype=float)).sum() / cap_sum
+            ) if cap_sum > 0 else float("nan"),
+            "realized_slippage_bps": float(realized_avg),
+            "modeled_cost_bps": float(modeled_avg),
+            "cost_bias_bps": float(bias_avg),
+        })
 
     days = gd.apply(_agg_day)
     days = days.rename(columns={"day":"ts"})
@@ -600,18 +744,73 @@ def aggregate(
         if equity_png:
             os.makedirs(os.path.dirname(equity_png) or ".", exist_ok=True)
 
+    cost_summary: Dict[str, float] = {}
+    if not trades.empty:
+        weight_series = trades["quantity"].abs().astype(float)
+        realized_series = pd.to_numeric(trades.get("realized_slippage_bps"), errors="coerce")
+        modeled_series = pd.to_numeric(trades.get("modeled_cost_bps"), errors="coerce")
+
+        def _safe_weighted_avg(series: pd.Series) -> float:
+            mask = series.notna() & weight_series.notna() & (weight_series > 0)
+            if not mask.any():
+                return float("nan")
+            weights = weight_series.loc[mask]
+            total_weight = float(weights.sum())
+            if not total_weight:
+                return float("nan")
+            values = series.loc[mask].astype(float)
+            return float((values * weights).sum() / total_weight)
+
+        realized_avg = _safe_weighted_avg(realized_series)
+        modeled_avg = _safe_weighted_avg(modeled_series)
+        if math.isfinite(realized_avg):
+            cost_summary["realized_slippage_bps"] = realized_avg
+        if math.isfinite(modeled_avg):
+            cost_summary["modeled_cost_bps"] = modeled_avg
+        if math.isfinite(realized_avg) and math.isfinite(modeled_avg):
+            cost_summary["cost_bias_bps"] = realized_avg - modeled_avg
+
     if metrics_md:
         trades_for_metrics = trades.rename(columns={"quantity": "qty"})
         metrics = calculate_metrics(trades_for_metrics, reports)
         os.makedirs(os.path.dirname(metrics_md) or ".", exist_ok=True)
+
+        def _iter_metric_blocks(payload: Any) -> list[tuple[str, Dict[str, Any]]]:
+            if isinstance(payload, dict) and "equity" in payload and "trades" in payload:
+                return [("", payload)]
+            if isinstance(payload, dict):
+                blocks: list[tuple[str, Dict[str, Any]]] = []
+                for name, block in payload.items():
+                    if isinstance(block, dict):
+                        blocks.append((str(name), block))
+                if blocks:
+                    return blocks
+            return [("", payload if isinstance(payload, dict) else {})]
+
+        metric_blocks = _iter_metric_blocks(metrics)
         with open(metrics_md, "w", encoding="utf-8") as f:
             f.write("# Performance Metrics\n\n")
-            f.write("## Equity\n")
-            for k, v in metrics["equity"].items():
-                f.write(f"- **{k}**: {v}\n")
-            f.write("\n## Trades\n")
-            for k, v in metrics["trades"].items():
-                f.write(f"- **{k}**: {v}\n")
+            for idx, (profile, payload) in enumerate(metric_blocks):
+                if profile:
+                    f.write(f"## Profile {profile}\n")
+                    equity_heading = "### Equity"
+                    trades_heading = "### Trades"
+                else:
+                    equity_heading = "## Equity"
+                    trades_heading = "## Trades"
+                f.write(f"{equity_heading}\n")
+                for k, v in (payload.get("equity") or {}).items():
+                    f.write(f"- **{k}**: {v}\n")
+                f.write(f"\n{trades_heading}\n")
+                for k, v in (payload.get("trades") or {}).items():
+                    f.write(f"- **{k}**: {v}\n")
+                if idx < len(metric_blocks) - 1:
+                    f.write("\n")
+            if cost_summary:
+                f.write("\n## Execution Costs\n")
+                for key, value in cost_summary.items():
+                    if math.isfinite(value):
+                        f.write(f"- **{key}**: {value:.3f}\n")
 
     os.makedirs(os.path.dirname(out_bars) or ".", exist_ok=True)
     bars.to_csv(out_bars, index=False)
