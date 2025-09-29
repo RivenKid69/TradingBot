@@ -606,6 +606,10 @@ class _Worker:
         self._monitoring: MonitoringAggregator | None = (
             monitoring if monitoring is not None else monitoring_agg
         )
+        execution_mode_normalized = str(execution_mode or "order").lower()
+        if execution_mode_normalized not in {"order", "bar"}:
+            execution_mode_normalized = "order"
+        self._execution_mode = execution_mode_normalized
         try:
             cache_size = int(idempotency_cache_size)
         except (TypeError, ValueError):
@@ -624,7 +628,6 @@ class _Worker:
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
         self._queue = None
-        self._execution_mode = str(execution_mode or "order").lower()
         try:
             self._portfolio_equity = (
                 float(portfolio_equity) if portfolio_equity is not None else None
