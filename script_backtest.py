@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,9 @@ from typing import Any, Dict
 from core_config import load_config
 from service_backtest import from_config
 from scripts.offline_utils import resolve_split_bundle
+
+
+logger = logging.getLogger(__name__)
 
 
 def _apply_runtime_overrides(
@@ -354,6 +358,11 @@ def main() -> None:
             f"Liquidity seasonality file not found: {seasonality_path}. Run offline builders first."
         )
 
+    # Trades are filled against the current bar and their PnL shows up when the
+    # adapter advances to the subsequent bar, matching :class:`BarBacktestSimBridge`.
+    logger.debug(
+        "Running backtest: trades fill on the current bar and PnL applies on the next bar",
+    )
     reports = from_config(cfg, snapshot_config_path=args.config)
     print(f"Produced {len(reports)} reports")
 

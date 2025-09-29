@@ -217,6 +217,9 @@ class BarBacktestSimBridge:
 
         bar_return = 0.0
         pnl_from_price = 0.0
+        # Trades placed in the current step impact the position immediately, while
+        # the resulting mark-to-market PnL is booked once the *next* bar arrives
+        # and we have a subsequent close to compare against ``prev_price``.
         if prev_price is not None and prev_price > 0.0:
             try:
                 bar_return = (close_price / prev_price) - 1.0
@@ -242,6 +245,14 @@ class BarBacktestSimBridge:
             )
         else:
             bar_payload = None
+
+        if orders:
+            logger.debug(
+                "Executing %s order(s) on bar %s for %s; PnL impacts next bar",
+                len(orders),
+                ts_ms,
+                symbol,
+            )
 
         for order in orders:
             meta = getattr(order, "meta", None)
@@ -292,6 +303,9 @@ class BarBacktestSimBridge:
                 weight = self._safe_float(meta.get("weight"))
         self._weights[symbol] = weight
 
+        # ``pnl_from_price`` reflects the return realised between the previous
+        # close and the current one, so the fill that established ``prev_weight``
+        # is recognised here on the bar that follows the trade.
         bar_pnl = pnl_from_price - trade_cost_usd
         cumulative_pnl = self._equity - self._initial_equity
 
