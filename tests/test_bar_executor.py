@@ -218,6 +218,72 @@ def test_bar_executor_turnover_cap_blocks_trade():
     assert report.meta["cap_usd"] == pytest.approx(100.0)
 
 
+def test_bar_executor_rounds_quantities_to_step_size():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+        symbol_specs={"BTCUSDT": {"step_size": 0.2}},
+    )
+    bar = make_bar(50, 200.0)
+    order = Order(
+        ts=50,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "payload": {"target_weight": 0.05, "edge_bps": 25.0},
+        },
+    )
+
+    report = executor.execute(order)
+    instructions = report.meta["instructions"]
+    assert len(instructions) == 1
+    instr = instructions[0]
+    assert instr["quantity"] == pytest.approx(0.2)
+    assert instr["notional_usd"] == pytest.approx(40.0)
+    assert instr["delta_weight"] == pytest.approx(0.04)
+    assert instr["target_weight"] == pytest.approx(0.04)
+    assert report.meta["requested_target_weight"] == pytest.approx(0.05)
+    assert report.meta["target_weight"] == pytest.approx(0.04)
+    assert report.meta["decision"]["turnover_usd"] == pytest.approx(40.0)
+
+
+def test_bar_executor_rejects_below_min_notional_after_rounding():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+        symbol_specs={"BTCUSDT": {"step_size": 0.2, "min_notional": 50.0}},
+    )
+    bar = make_bar(60, 200.0)
+    order = Order(
+        ts=60,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "payload": {"target_weight": 0.05, "edge_bps": 25.0},
+        },
+    )
+
+    report = executor.execute(order)
+    assert report.meta["instructions"] == []
+    assert report.meta.get("reason") == "below_min_notional"
+    assert report.meta["decision"]["act_now"] is False
+    assert report.meta["decision"]["turnover_usd"] == pytest.approx(0.0)
+    assert report.meta["target_weight"] == pytest.approx(0.0)
+    assert report.meta["requested_target_weight"] == pytest.approx(0.05)
+
+
 @pytest.mark.parametrize("price", [0.0, -100.0])
 def test_bar_executor_skips_when_price_invalid(price: float):
     executor = BarExecutor(

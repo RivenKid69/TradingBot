@@ -3960,6 +3960,7 @@ class ServiceSignalRunner:
         self._symbol_quote_assets: Dict[str, str] = {}
         self._symbol_quote_missing: list[str] = []
         self._resolved_quote_asset: str | None = None
+        self._symbol_specs: Dict[str, Dict[str, Any]] = {}
         self._init_failure_reason: str | None = None
         self._init_failure_details: Dict[str, Any] = {}
 
@@ -4388,11 +4389,12 @@ class ServiceSignalRunner:
 
         return symbols
 
-    def _load_symbol_metadata(self) -> dict[str, str]:
+    def _load_symbol_metadata(self) -> tuple[dict[str, Dict[str, Any]], dict[str, str]]:
         run_cfg = self._run_config
+        specs: dict[str, Dict[str, Any]] = {}
         quotes: dict[str, str] = {}
         if run_cfg is None:
-            return quotes
+            return specs, quotes
 
         candidate_payloads: list[Mapping[str, Any]] = []
         candidate_paths: list[str] = []
@@ -4496,7 +4498,79 @@ class ServiceSignalRunner:
             "SYMBOLS",
             "SPECS",
             "DATA",
+            "SYMBOL",
+            "QUOTE_ASSET",
+            "QUOTEASSET",
+            "QUOTE_CURRENCY",
+            "QUOTECURRENCY",
+            "QUOTE",
+            "QUOTE_SYMBOL",
+            "QUOTESYMBOL",
+            "MIN_NOTIONAL",
+            "MINNOTIONAL",
+            "STEP_SIZE",
+            "STEPSIZE",
+            "TICK_SIZE",
+            "TICKSIZE",
         }
+
+        def _merge_spec(symbol: str, payload: Any) -> None:
+            symbol_key = symbol.strip().upper()
+            if not symbol_key:
+                return
+            entry = specs.setdefault(symbol_key, {})
+            if isinstance(payload, MappingABC):
+                for key, value in payload.items():
+                    entry[str(key)] = value
+            elif isinstance(payload, str):
+                text = payload.strip()
+                if text:
+                    entry.setdefault("quote_asset", text)
+
+        def _merge_payload(payload: Any, depth: int = 0) -> None:
+            if depth > 6 or payload is None:
+                return
+            if isinstance(payload, MappingABC):
+                symbol_candidate = None
+                for key in ("symbol", "Symbol", "SYMBOL"):
+                    if key in payload:
+                        raw_symbol = payload.get(key)
+                        if isinstance(raw_symbol, str) and raw_symbol.strip():
+                            symbol_candidate = raw_symbol.strip().upper()
+                            break
+                if symbol_candidate:
+                    _merge_spec(symbol_candidate, payload)
+                for raw_key, raw_value in payload.items():
+                    key_text = str(raw_key).strip()
+                    if not key_text:
+                        _merge_payload(raw_value, depth + 1)
+                        continue
+                    upper_key = key_text.upper()
+                    if upper_key in reserved_keys:
+                        _merge_payload(raw_value, depth + 1)
+                        continue
+                    if isinstance(raw_value, MappingABC):
+                        _merge_spec(upper_key, raw_value)
+                        _merge_payload(raw_value, depth + 1)
+                        continue
+                    if isinstance(raw_value, str):
+                        text = raw_value.strip().upper()
+                        if text:
+                            entry = specs.setdefault(upper_key, {})
+                            entry.setdefault("quote_asset", text)
+                            quotes[upper_key] = text
+                        continue
+                    if isinstance(raw_value, SequenceABC) and not isinstance(
+                        raw_value, (str, bytes, bytearray)
+                    ):
+                        for item in raw_value:
+                            _merge_payload(item, depth + 1)
+                        continue
+            elif isinstance(payload, SequenceABC) and not isinstance(
+                payload, (str, bytes, bytearray)
+            ):
+                for item in payload:
+                    _merge_payload(item, depth + 1)
 
         def _extract_quote(value: Any, depth: int = 0) -> str | None:
             if depth > 6 or value is None:
@@ -4538,30 +4612,16 @@ class ServiceSignalRunner:
                             return found
             return None
 
-        def _merge_payload(payload: Mapping[str, Any], depth: int = 0) -> None:
-            if depth > 6:
-                return
-            for raw_key, raw_value in payload.items():
-                key_text = str(raw_key).strip()
-                if not key_text:
-                    if isinstance(raw_value, MappingABC):
-                        _merge_payload(raw_value, depth + 1)
-                    continue
-                upper_key = key_text.upper()
-                if upper_key in reserved_keys and isinstance(raw_value, MappingABC):
-                    _merge_payload(raw_value, depth + 1)
-                    continue
-                quote = _extract_quote(raw_value, depth + 1)
-                if quote and upper_key and upper_key not in reserved_keys:
-                    quotes[upper_key] = quote
-                    continue
-                if isinstance(raw_value, MappingABC):
-                    _merge_payload(raw_value, depth + 1)
-
         for payload in candidate_payloads:
             _merge_payload(payload)
 
-        return quotes
+        if not quotes:
+            for symbol, payload in specs.items():
+                quote = _extract_quote(payload)
+                if quote:
+                    quotes[symbol] = quote
+
+        return specs, quotes
 
     def _validate_symbol_quotes(self) -> None:
         run_cfg = self._run_config
@@ -4572,7 +4632,11 @@ class ServiceSignalRunner:
         if not symbols:
             return
 
-        quotes_map = self._load_symbol_metadata()
+        specs_map, quotes_map = self._load_symbol_metadata()
+        if specs_map:
+            self._symbol_specs = {str(sym): dict(payload) for sym, payload in specs_map.items()}
+        else:
+            self._symbol_specs = {}
         if not quotes_map:
             try:
                 self.logger.warning(
@@ -5771,6 +5835,7 @@ def clear_dirty_restart(
                 safety_margin_bps=safety_margin,
                 max_participation=max_participation,
                 default_equity_usd=portfolio_equity or 0.0,
+                symbol_specs=self._symbol_specs,
             )
 
         worker = _Worker(

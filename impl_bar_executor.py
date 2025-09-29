@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, replace
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
 from api.spot_signals import SpotSignalEconomics, SpotSignalEnvelope
@@ -103,6 +103,13 @@ class PortfolioState:
 
     def with_bar(self, bar: Bar, price: Decimal) -> "PortfolioState":
         return replace(self, price=price, ts=bar.ts)
+
+
+@dataclass
+class SymbolSpec:
+    min_notional: Decimal = Decimal("0")
+    step_size: Decimal = Decimal("0")
+    tick_size: Decimal = Decimal("0")
 
 
 @dataclass
@@ -222,6 +229,7 @@ class BarExecutor(TradeExecutor):
         turnover_caps: SpotTurnoverCaps | Mapping[str, Any] | None = None,
         default_equity_usd: float = 0.0,
         initial_weights: Optional[Mapping[str, float]] = None,
+        symbol_specs: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> None:
         self.run_id = run_id
         self.bar_price_field = str(bar_price or "close")
@@ -247,6 +255,9 @@ class BarExecutor(TradeExecutor):
         self._last_snapshot: Dict[str, Any] = {}
         self._symbol_turnover: Dict[str, Dict[str, Any]] = {}
         self._portfolio_turnover: Dict[str, Any] = {"ts": None, "total": 0.0}
+        self._symbol_specs: Dict[str, SymbolSpec] = self._normalize_symbol_specs(
+            symbol_specs
+        )
         if initial_weights:
             for symbol, weight in initial_weights.items():
                 self._states[symbol] = PortfolioState(
@@ -293,6 +304,8 @@ class BarExecutor(TradeExecutor):
             state = replace(state, equity_usd=equity_override)
 
         target_weight, mode, delta_weight = self._resolve_target_weight(state, payload)
+        requested_target_weight = target_weight
+        requested_delta_weight = delta_weight
 
         decision_signal: Dict[str, Any] = dict(payload)
         if normalized_flag:
@@ -343,7 +356,12 @@ class BarExecutor(TradeExecutor):
             and not skip_due_to_cap
             and skip_reason is None
         ):
-            instructions = self._build_instructions(
+            (
+                instructions,
+                executed_target_weight,
+                executed_turnover_usd,
+                spec_reason,
+            ) = self._build_instructions(
                 state=state,
                 target_weight=target_weight,
                 delta_weight=delta_weight,
@@ -351,26 +369,48 @@ class BarExecutor(TradeExecutor):
                 bar=bar,
                 adv_quote=adv_quote,
             )
-            final_state = replace(state, weight=target_weight)
-            self._register_turnover(symbol, caps_eval.get("ts"), turnover_usd)
-            if caps_eval.get("symbol_remaining") is not None:
-                caps_eval["symbol_remaining"] = max(
-                    0.0, float(caps_eval["symbol_remaining"]) - turnover_usd
-                )
-            if caps_eval.get("portfolio_remaining") is not None:
-                caps_eval["portfolio_remaining"] = max(
-                    0.0, float(caps_eval["portfolio_remaining"]) - turnover_usd
-                )
-            remaining_candidates = [
-                value
-                for value in (
-                    caps_eval.get("symbol_remaining"),
-                    caps_eval.get("portfolio_remaining"),
-                )
-                if value is not None
-            ]
-            if remaining_candidates:
-                caps_eval["effective_cap"] = min(remaining_candidates)
+            if spec_reason is not None:
+                skip_reason = spec_reason
+                turnover_usd = float(executed_turnover_usd)
+                if hasattr(metrics, "model_copy"):
+                    metrics = metrics.model_copy(
+                        update={"act_now": False, "turnover_usd": turnover_usd}
+                    )
+                else:  # pragma: no cover - compatibility fallback
+                    metrics = metrics.copy(
+                        update={"act_now": False, "turnover_usd": turnover_usd}
+                    )
+                instructions = []
+                target_weight = state.weight
+                delta_weight = 0.0
+            else:
+                turnover_usd = float(executed_turnover_usd)
+                if hasattr(metrics, "model_copy"):
+                    metrics = metrics.model_copy(update={"turnover_usd": turnover_usd})
+                else:  # pragma: no cover - compatibility fallback
+                    metrics = metrics.copy(update={"turnover_usd": turnover_usd})
+                delta_weight = executed_target_weight - state.weight
+                target_weight = executed_target_weight
+                final_state = replace(state, weight=executed_target_weight)
+                self._register_turnover(symbol, caps_eval.get("ts"), turnover_usd)
+                if caps_eval.get("symbol_remaining") is not None:
+                    caps_eval["symbol_remaining"] = max(
+                        0.0, float(caps_eval["symbol_remaining"]) - turnover_usd
+                    )
+                if caps_eval.get("portfolio_remaining") is not None:
+                    caps_eval["portfolio_remaining"] = max(
+                        0.0, float(caps_eval["portfolio_remaining"]) - turnover_usd
+                    )
+                remaining_candidates = [
+                    value
+                    for value in (
+                        caps_eval.get("symbol_remaining"),
+                        caps_eval.get("portfolio_remaining"),
+                    )
+                    if value is not None
+                ]
+                if remaining_candidates:
+                    caps_eval["effective_cap"] = min(remaining_candidates)
         else:
             dump_fn = getattr(metrics, "model_dump", None)
             metrics_data = dump_fn() if callable(dump_fn) else metrics.dict()
@@ -401,6 +441,8 @@ class BarExecutor(TradeExecutor):
             "delta_weight": delta_weight,
             "instructions": [instr.to_dict() for instr in instructions],
         }
+        report_meta["requested_target_weight"] = requested_target_weight
+        report_meta["requested_delta_weight"] = requested_delta_weight
         if skip_due_to_step:
             report_meta["min_step_enforced"] = True
         if skip_due_to_cap:
@@ -446,6 +488,8 @@ class BarExecutor(TradeExecutor):
             "adv_quote": float(adv_quote) if adv_quote is not None else None,
             "min_step_enforced": bool(skip_due_to_step),
         }
+        snapshot["requested_target_weight"] = requested_target_weight
+        snapshot["requested_delta_weight"] = requested_delta_weight
         if instructions:
             snapshot["instructions"] = [instr.to_dict() for instr in instructions]
         if bar is not None:
@@ -576,6 +620,67 @@ class BarExecutor(TradeExecutor):
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    def _normalize_symbol_specs(
+        self, payload: Optional[Mapping[str, Mapping[str, Any]]]
+    ) -> Dict[str, SymbolSpec]:
+        specs: Dict[str, SymbolSpec] = {}
+        if not payload:
+            return specs
+        for raw_symbol, raw_spec in payload.items():
+            symbol_text = str(raw_symbol or "").strip().upper()
+            if not symbol_text:
+                continue
+            spec_payload = self._materialize_mapping(raw_spec)
+            if not spec_payload:
+                continue
+            min_notional = self._extract_spec_decimal(
+                spec_payload,
+                ("min_notional", "minNotional", "MIN_NOTIONAL"),
+            )
+            step_size = self._extract_spec_decimal(
+                spec_payload,
+                ("step_size", "stepSize", "lot_step", "LOT_STEP"),
+            )
+            tick_size = self._extract_spec_decimal(
+                spec_payload,
+                ("tick_size", "tickSize", "price_tick", "PRICE_TICK"),
+            )
+            specs[symbol_text] = SymbolSpec(
+                min_notional=min_notional,
+                step_size=step_size,
+                tick_size=tick_size,
+            )
+        return specs
+
+    def _extract_spec_decimal(
+        self, payload: Mapping[str, Any], keys: Iterable[str], depth: int = 0
+    ) -> Decimal:
+        if depth > 4:
+            return Decimal("0")
+        key_set = {str(key).strip().lower() for key in keys if str(key).strip()}
+        for raw_key, raw_value in payload.items():
+            key_text = str(raw_key).strip().lower()
+            if key_text in key_set and raw_value is not None:
+                try:
+                    value = Decimal(str(raw_value))
+                except Exception:
+                    value = Decimal("0")
+                if value < Decimal("0"):
+                    return Decimal("0")
+                return value
+        for raw_value in payload.values():
+            if isinstance(raw_value, Mapping):
+                value = self._extract_spec_decimal(raw_value, keys, depth + 1)
+                if value != Decimal("0"):
+                    return value
+            elif isinstance(raw_value, (list, tuple, set)):
+                for item in raw_value:
+                    if isinstance(item, Mapping):
+                        value = self._extract_spec_decimal(item, keys, depth + 1)
+                        if value != Decimal("0"):
+                            return value
+        return Decimal("0")
 
     def _evaluate_turnover_caps(
         self, symbol: str, state: PortfolioState, bar: Optional[Bar]
@@ -713,10 +818,14 @@ class BarExecutor(TradeExecutor):
         payload: Mapping[str, Any],
         bar: Optional[Bar],
         adv_quote: Optional[float],
-    ) -> List[RebalanceInstruction]:
-        total_notional = abs(delta_weight) * float(state.equity_usd)
-        if total_notional <= 0.0:
-            return []
+    ) -> tuple[List[RebalanceInstruction], float, float, Optional[str]]:
+        requested_notional = abs(delta_weight) * float(state.equity_usd)
+        if requested_notional <= 0.0:
+            return [], float(state.weight), 0.0, None
+
+        spec = self._symbol_specs.get(state.symbol.upper())
+        min_notional = spec.min_notional if spec is not None else Decimal("0")
+        step_size = spec.step_size if spec is not None else Decimal("0")
 
         twap_cfg: Mapping[str, Any] = {}
         twap_value = payload.get("twap")
@@ -743,7 +852,7 @@ class BarExecutor(TradeExecutor):
         if max_participation is not None and max_participation > 0.0 and adv_quote and adv_quote > 0.0:
             max_slice_notional = adv_quote * max_participation
             if max_slice_notional > 0.0:
-                required_parts = math.ceil(total_notional / max_slice_notional)
+                required_parts = math.ceil(requested_notional / max_slice_notional)
                 parts = max(parts, required_parts)
 
         if parts <= 0:
@@ -775,19 +884,45 @@ class BarExecutor(TradeExecutor):
 
         instructions: List[RebalanceInstruction] = []
         price = state.price if state.price != Decimal("0") else Decimal("0")
+        equity_dec = Decimal(str(state.equity_usd))
         per_weight = delta_weight / float(parts)
-        accumulated_weight = state.weight
+        accumulated_weight = float(state.weight)
+        total_notional_dec = Decimal("0")
+
         for idx in range(parts):
             if idx == parts - 1:
-                slice_delta = target_weight - accumulated_weight
+                desired_delta = target_weight - accumulated_weight
             else:
-                slice_delta = per_weight
-            accumulated_weight += slice_delta
-            slice_notional = abs(slice_delta) * float(state.equity_usd)
-            if price != Decimal("0"):
-                slice_qty = (Decimal(str(abs(slice_delta))) * Decimal(str(state.equity_usd))) / price
+                desired_delta = per_weight
+            direction = 1 if desired_delta >= 0.0 else -1
+            desired_abs = abs(desired_delta)
+            if price != Decimal("0") and desired_abs > 0.0:
+                desired_notional = Decimal(str(desired_abs)) * equity_dec
+                desired_qty = desired_notional / price
             else:
-                slice_qty = Decimal("0")
+                desired_qty = Decimal("0")
+            quantized_qty = desired_qty
+            if step_size > Decimal("0") and desired_qty > Decimal("0"):
+                try:
+                    quantized_qty = (
+                        (desired_qty / step_size).to_integral_value(rounding=ROUND_DOWN)
+                        * step_size
+                    )
+                except Exception:
+                    quantized_qty = Decimal("0")
+                if quantized_qty < Decimal("0"):
+                    quantized_qty = Decimal("0")
+            executed_notional = Decimal("0")
+            if price > Decimal("0") and quantized_qty > Decimal("0"):
+                executed_notional = quantized_qty * price
+            total_notional_dec += executed_notional
+            executed_delta = 0.0
+            if equity_dec > Decimal("0") and executed_notional > Decimal("0"):
+                executed_fraction = executed_notional / equity_dec
+                executed_delta = float(executed_fraction)
+            if direction < 0:
+                executed_delta = -executed_delta
+            new_weight = accumulated_weight + executed_delta
             ts = state.ts if bar is None else bar.ts
             if interval_ms and bar is not None:
                 ts = int(bar.ts + idx * interval_ms)
@@ -797,13 +932,24 @@ class BarExecutor(TradeExecutor):
                     ts=ts,
                     slice_index=idx,
                     slices_total=parts,
-                    target_weight=accumulated_weight,
-                    delta_weight=slice_delta,
-                    notional_usd=slice_notional,
-                    quantity=slice_qty,
+                    target_weight=new_weight,
+                    delta_weight=executed_delta,
+                    notional_usd=float(executed_notional),
+                    quantity=quantized_qty,
                 )
             )
-        return instructions
+            accumulated_weight = new_weight
+
+        total_notional = float(total_notional_dec)
+        if total_notional <= 0.0:
+            return [], float(state.weight), 0.0, None
+
+        if min_notional > Decimal("0"):
+            tolerance = Decimal("1e-9")
+            if total_notional_dec + tolerance < min_notional:
+                return [], float(state.weight), 0.0, "below_min_notional"
+
+        return instructions, accumulated_weight, total_notional, None
 
 
 __all__ = ["BarExecutor", "PortfolioState", "RebalanceInstruction", "decide_spot_trade"]
