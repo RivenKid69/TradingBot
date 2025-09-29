@@ -1,16 +1,19 @@
-import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
+import logging
 
 import pytest
 
-from service_signal_runner import _Worker
+from service_signal_runner import _Worker, CooldownSettings
 
 
 def _make_worker() -> _Worker:
     worker = _Worker.__new__(_Worker)
     worker._weights = {}
     worker._logger = logging.getLogger("test_worker")
+    worker._cooldown_settings = CooldownSettings()
+    worker._symbol_cooldowns = {}
+    worker._symbol_cooldown_set_ts = {}
     return worker
 
 

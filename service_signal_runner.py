@@ -145,6 +145,81 @@ class _EntryLimiterConfig:
     reset_hour: int = 0
 
 
+@dataclass
+class CooldownSettings:
+    """Configuration for per-symbol cooldown handling."""
+
+    bars: int = 0
+    large_trade_threshold: float = 0.0
+    small_delta_threshold: float = 0.0
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(parsed):
+            return None
+        return parsed
+
+    @property
+    def enabled(self) -> bool:
+        return self.bars > 0 and self.large_trade_threshold > 0.0
+
+    @property
+    def suppress_small_deltas(self) -> bool:
+        return self.enabled and self.small_delta_threshold > 0.0
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "CooldownSettings":
+        if isinstance(data, CooldownSettings):
+            return data
+        if not isinstance(data, MappingABC):
+            return cls()
+
+        def _pick_int(*keys: str) -> int:
+            for key in keys:
+                if key not in data:
+                    continue
+                parsed = cls._coerce_int(data.get(key))
+                if parsed is not None and parsed > 0:
+                    return parsed
+            return 0
+
+        def _pick_float(*keys: str) -> float:
+            for key in keys:
+                if key not in data:
+                    continue
+                parsed = cls._coerce_float(data.get(key))
+                if parsed is not None and parsed > 0.0:
+                    return parsed
+            return 0.0
+
+        bars = _pick_int("cooldown_bars", "bars")
+        large_trade = _pick_float(
+            "cooldown_large_trade",
+            "large_trade_threshold",
+            "large_trade",
+            "turnover_cap",
+        )
+        small_delta = _pick_float(
+            "cooldown_small_delta",
+            "small_delta_threshold",
+            "small_delta",
+            "min_rebalance_step",
+        )
+        return cls(bars=bars, large_trade_threshold=large_trade, small_delta_threshold=small_delta)
+
+
 class DailyEntryLimiter:
     """Limit the number of entry transitions within a trading day."""
 
@@ -488,6 +563,7 @@ class _Worker:
         portfolio_equity: float | None = None,
         max_total_weight: float | None = None,
         idempotency_cache_size: int = 1024,
+        cooldown_settings: CooldownSettings | Mapping[str, Any] | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -589,6 +665,9 @@ class _Worker:
         self._daily_portfolio_turnover: Dict[str, Any] = {"day": None, "total": 0.0}
         self._daily_turnover_caps = self._resolve_daily_turnover_caps(executor)
         self._daily_day_key: str | None = None
+        self._cooldown_settings = CooldownSettings.from_mapping(cooldown_settings)
+        self._symbol_cooldowns: Dict[str, int] = {}
+        self._symbol_cooldown_set_ts: Dict[str, int] = {}
         self._configure_throttle(throttle_cfg)
         self._last_bar_ts: Dict[str, int] = {}
         self._dynamic_guard: DynamicNoTradeGuard | None = None
@@ -715,6 +794,34 @@ class _Worker:
         snapshot["count"] = int(len(symbols_unique) + (1 if global_active else 0))
         return snapshot
 
+    def _symbol_cooldown_snapshot(self) -> Dict[str, Any]:
+        settings = self._cooldown_settings
+        if not settings.enabled:
+            return {}
+        active: Dict[str, int] = {}
+        for sym, remaining in self._symbol_cooldowns.items():
+            try:
+                remaining_int = int(remaining)
+            except (TypeError, ValueError):
+                continue
+            if remaining_int <= 0:
+                continue
+            sym_key = str(sym).upper()
+            if not sym_key:
+                continue
+            active[sym_key] = remaining_int
+        if not active:
+            return {}
+        payload: Dict[str, Any] = {
+            "count": len(active),
+            "bars": int(settings.bars),
+            "remaining": dict(sorted(active.items())),
+            "large_trade_threshold": float(settings.large_trade_threshold),
+        }
+        if settings.small_delta_threshold > 0.0:
+            payload["small_delta_threshold"] = float(settings.small_delta_threshold)
+        return payload
+
     def _update_queue_metrics(
         self,
         size: int | None = None,
@@ -759,6 +866,11 @@ class _Worker:
         daily_snapshot = self._daily_turnover_snapshot()
         if daily_snapshot:
             payload["daily_turnover"] = daily_snapshot
+        cooldown_payload = self._symbol_cooldown_snapshot()
+        if cooldown_payload:
+            payload["symbol_cooldowns"] = cooldown_payload
+        else:
+            payload.pop("symbol_cooldowns", None)
         payload["queue"] = {"size": queue_size, "max": queue_max}
         payload["updated_at_ms"] = clock.now_ms()
         self._last_status_payload = payload
@@ -767,6 +879,144 @@ class _Worker:
                 self._status_callback(self._worker_id, payload)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # Cooldown helpers
+    # ------------------------------------------------------------------
+    def _cooldown_remaining(self, symbol: str) -> int:
+        try:
+            remaining = int(self._symbol_cooldowns.get(symbol, 0))
+        except (TypeError, ValueError):
+            return 0
+        return max(0, remaining)
+
+    def _maybe_start_symbol_cooldown(
+        self, symbol: str, executed_delta: float, *, bar_close_ms: int | None = None
+    ) -> None:
+        settings = self._cooldown_settings
+        if not settings.enabled:
+            return
+        try:
+            magnitude = abs(float(executed_delta))
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(magnitude) or magnitude < settings.large_trade_threshold:
+            return
+        sym = str(symbol).upper()
+        if not sym:
+            return
+        bars = int(settings.bars)
+        if bars <= 0:
+            return
+        remaining = self._cooldown_remaining(sym)
+        new_value = max(remaining, bars)
+        self._symbol_cooldowns[sym] = new_value
+        if bar_close_ms is not None:
+            try:
+                self._symbol_cooldown_set_ts[sym] = int(bar_close_ms)
+            except (TypeError, ValueError):
+                self._symbol_cooldown_set_ts[sym] = int(clock.now_ms())
+        else:
+            self._symbol_cooldown_set_ts[sym] = int(clock.now_ms())
+        self._update_queue_metrics()
+        try:
+            self._logger.info(
+                "COOLDOWN_TRIGGER %s",
+                {
+                    "symbol": sym,
+                    "delta": float(magnitude),
+                    "threshold": float(settings.large_trade_threshold),
+                    "bars": bars,
+                    "remaining": new_value,
+                },
+            )
+        except Exception:
+            pass
+
+    def _advance_symbol_cooldown(
+        self, symbol: str, bar_ts: int, *, new_bar: bool
+    ) -> None:
+        if not new_bar or not self._cooldown_settings.enabled:
+            return
+        sym = str(symbol).upper()
+        if not sym:
+            return
+        remaining = self._cooldown_remaining(sym)
+        if remaining <= 0:
+            self._symbol_cooldowns.pop(sym, None)
+            self._symbol_cooldown_set_ts.pop(sym, None)
+            return
+        last_set = self._symbol_cooldown_set_ts.get(sym)
+        try:
+            last_set_int = int(last_set) if last_set is not None else None
+        except (TypeError, ValueError):
+            last_set_int = None
+        try:
+            bar_ts_int = int(bar_ts)
+        except (TypeError, ValueError):
+            bar_ts_int = 0
+        if last_set_int is not None and bar_ts_int == last_set_int:
+            return
+        new_value = remaining - 1
+        if new_value <= 0:
+            self._symbol_cooldowns.pop(sym, None)
+            self._symbol_cooldown_set_ts.pop(sym, None)
+            try:
+                self._logger.info(
+                    "COOLDOWN_RELEASE %s",
+                    {"symbol": sym, "bar_ts": bar_ts_int},
+                )
+            except Exception:
+                pass
+        else:
+            self._symbol_cooldowns[sym] = new_value
+        self._update_queue_metrics()
+
+    def _current_order_delta(self, symbol: str, order: Any) -> float | None:
+        if self._execution_mode != "bar":
+            return None
+        payload = self._extract_signal_payload(order)
+        if not payload:
+            return None
+        _, delta, _ = self._resolve_weight_targets(symbol, payload)
+        return delta
+
+    def _maybe_drop_due_to_cooldown(
+        self, symbol: str, order: Any, bar_close_ms: int
+    ) -> bool:
+        settings = self._cooldown_settings
+        if not settings.suppress_small_deltas:
+            return False
+        sym = str(symbol).upper()
+        if not sym:
+            return False
+        remaining = self._cooldown_remaining(sym)
+        if remaining <= 0:
+            return False
+        delta = self._current_order_delta(sym, order)
+        if delta is None:
+            return False
+        try:
+            magnitude = abs(float(delta))
+        except (TypeError, ValueError):
+            return False
+        threshold = settings.small_delta_threshold
+        if not math.isfinite(magnitude) or magnitude >= threshold:
+            return False
+        try:
+            self._logger.info(
+                "COOLDOWN_SUPPRESS %s",
+                {
+                    "symbol": sym,
+                    "delta": float(magnitude),
+                    "threshold": float(threshold),
+                    "remaining": remaining,
+                    "bar_ts": int(bar_close_ms),
+                },
+            )
+        except Exception:
+            pass
+        return True
 
     def _publish_status(
         self,
@@ -2090,13 +2340,15 @@ class _Worker:
                 self._positions[symbol] = new
         self._persist_exposure_state(clock.now_ms())
 
-    def _commit_exposure(self, order: Any) -> None:
+    def _commit_exposure(self, order: Any, *, bar_close_ms: int | None = None) -> None:
         if self._execution_mode == "bar":
             symbol = str(getattr(order, "symbol", "") or "").upper()
             if not symbol:
                 return
             payload = self._extract_signal_payload(order)
-            target_weight, _, _ = self._resolve_weight_targets(symbol, payload)
+            target_weight, delta_weight, _ = self._resolve_weight_targets(
+                symbol, payload
+            )
             if math.isclose(target_weight, 0.0, rel_tol=0.0, abs_tol=1e-12):
                 self._weights.pop(symbol, None)
             else:
@@ -2105,6 +2357,9 @@ class _Worker:
             self._pending_weight.pop(id(order), None)
             self._record_daily_turnover_execution(order)
             self._persist_exposure_state(clock.now_ms())
+            self._maybe_start_symbol_cooldown(
+                symbol, float(delta_weight), bar_close_ms=bar_close_ms
+            )
             return
         key = id(order)
         if key not in self._pending_exposure:
@@ -3673,8 +3928,13 @@ class _Worker:
     ) -> PipelineResult:
         """Final pipeline stage: throttle and emit order."""
         if stage_cfg is not None and not stage_cfg.enabled:
-            self._commit_exposure(o)
+            self._commit_exposure(o, bar_close_ms=bar_close_ms)
             return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
+        if self._maybe_drop_due_to_cooldown(symbol, o, bar_close_ms):
+            self._rollback_exposure(o)
+            return PipelineResult(
+                action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER
+            )
         throttle_stage_cfg = (
             self._pipeline_cfg.get("throttle") if self._pipeline_cfg else None
         )
@@ -3724,7 +3984,7 @@ class _Worker:
             return PipelineResult(
                 action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER
             )
-        self._commit_exposure(o)
+        self._commit_exposure(o, bar_close_ms=bar_close_ms)
         return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
 
     def _drain_queue(self) -> list[Any]:
@@ -3776,7 +4036,7 @@ class _Worker:
                     pass
             else:
                 emitted.append(order)
-                self._commit_exposure(order)
+                self._commit_exposure(order, bar_close_ms=bar_close_ms)
         self._update_queue_metrics()
         return emitted
 
@@ -3854,6 +4114,8 @@ class _Worker:
         skip_metrics = duplicate_ts
 
         def _finalize() -> list[Any]:
+            new_bar = prev_ts is not None and ts_ms > prev_ts
+            self._advance_symbol_cooldown(bar.symbol, ts_ms, new_bar=new_bar)
             emitted_count = len(emitted)
             runtime_monitoring = self._monitoring
             duplicates_count = duplicates
@@ -4487,6 +4749,7 @@ class ServiceSignalRunner:
         ws_dedup_timeframe_ms: int = 0,
         signal_writer_options: Mapping[str, Any] | None = None,
         signal_bus_config: Mapping[str, Any] | None = None,
+        risk_component_params: Mapping[str, Any] | None = None,
     ) -> None:
         self.adapter = adapter
         self.feature_pipe = feature_pipe
@@ -4539,6 +4802,7 @@ class ServiceSignalRunner:
         self._signal_writer_ref: SignalCSVWriter | None = None
         self._signal_writer_reopen_flag_path = logs_dir / "signal_writer_reopen.flag"
         self._signal_bus_config: Dict[str, Any] = dict(signal_bus_config or {})
+        self._risk_component_params: Dict[str, Any] = dict(risk_component_params or {})
         self._reload_history: deque[Dict[str, Any]] = deque(maxlen=20)
         self._last_reload_event: Dict[str, Any] | None = None
         self._dirty_restart = False
@@ -4892,6 +5156,33 @@ class ServiceSignalRunner:
             return str(value)
         except Exception:
             return repr(value)
+
+    def _resolve_worker_cooldown_settings(self) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        keys = (
+            "cooldown_bars",
+            "cooldown_small_delta",
+            "small_delta_threshold",
+            "small_delta",
+            "cooldown_large_trade",
+            "large_trade_threshold",
+            "large_trade",
+            "turnover_cap",
+        )
+        for key in keys:
+            if key in self._risk_component_params:
+                params[key] = self._risk_component_params[key]
+        if (
+            "cooldown_small_delta" not in params
+            and "small_delta_threshold" not in params
+            and "small_delta" not in params
+        ):
+            exec_cfg = getattr(self._run_config, "execution", None)
+            if exec_cfg is not None:
+                candidate = getattr(exec_cfg, "min_rebalance_step", None)
+                if candidate is not None:
+                    params.setdefault("cooldown_small_delta", candidate)
+        return params
 
     def _record_init_failure(
         self, reason: str, details: Mapping[str, Any] | None = None
@@ -6460,6 +6751,7 @@ def clear_dirty_restart(
             execution_mode=self._execution_mode,
             portfolio_equity=portfolio_equity,
             max_total_weight=portfolio_weight_cap,
+            cooldown_settings=self._resolve_worker_cooldown_settings(),
         )
         self._worker_ref = worker
         self._write_runner_status()
@@ -7640,6 +7932,10 @@ def from_config(
                 pass
 
     risk_limits: Dict[str, Any] = dict(cfg.risk.exposure_limits)
+    try:
+        risk_component_params: Dict[str, Any] = dict(cfg.risk.component_params())
+    except Exception:
+        risk_component_params = {}
     risk_override_path = Path("configs/risk.yaml")
     if risk_override_path.exists():
         try:
@@ -7655,6 +7951,14 @@ def from_config(
             ):
                 if key in override_payload:
                     risk_limits[key] = override_payload.get(key)
+            for key, value in override_payload.items():
+                if key in {
+                    "max_total_notional",
+                    "max_total_exposure_pct",
+                    "exposure_buffer_frac",
+                }:
+                    continue
+                risk_component_params[key] = value
 
     svc_cfg = SignalRunnerConfig(
         snapshot_config_path=snapshot_config_path,
@@ -7704,12 +8008,14 @@ def from_config(
         ws_dedup_timeframe_ms=cfg.timing.timeframe_ms,
         signal_writer_options=signal_writer_options,
         signal_bus_config=signal_bus_config,
+        risk_component_params=risk_component_params,
         run_config=cfg,
     )
     return service.run()
 
 
 __all__ = [
+    "CooldownSettings",
     "SignalQualityConfig",
     "SignalRunnerConfig",
     "RunnerConfig",
