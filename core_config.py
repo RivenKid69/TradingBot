@@ -409,6 +409,8 @@ class ResolvedTurnoverLimit:
 
     bps: Optional[float] = None
     usd: Optional[float] = None
+    daily_bps: Optional[float] = None
+    daily_usd: Optional[float] = None
 
     def limit_for_equity(self, equity_usd: float) -> Optional[float]:
         """Compute the USD cap implied by the specification."""
@@ -420,6 +422,22 @@ class ResolvedTurnoverLimit:
                 values.append(usd_value)
         if self.bps is not None and equity_usd > 0.0:
             bps_value = float(self.bps)
+            if math.isfinite(bps_value) and bps_value > 0.0:
+                values.append(equity_usd * bps_value / 10_000.0)
+        if not values:
+            return None
+        return min(values)
+
+    def daily_limit_for_equity(self, equity_usd: float) -> Optional[float]:
+        """Compute the daily USD cap implied by the specification."""
+
+        values: List[float] = []
+        if self.daily_usd is not None:
+            usd_value = float(self.daily_usd)
+            if math.isfinite(usd_value) and usd_value > 0.0:
+                values.append(usd_value)
+        if self.daily_bps is not None and equity_usd > 0.0:
+            bps_value = float(self.daily_bps)
             if math.isfinite(bps_value) and bps_value > 0.0:
                 values.append(equity_usd * bps_value / 10_000.0)
         if not values:
@@ -448,6 +466,16 @@ class SpotTurnoverLimit(BaseModel):
         ge=0.0,
         description="Absolute turnover cap in USD.",
     )
+    daily_bps: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Maximum daily turnover expressed as basis points of portfolio equity.",
+    )
+    daily_usd: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Absolute daily turnover cap in USD.",
+    )
 
     class Config:
         extra = "allow"
@@ -456,6 +484,8 @@ class SpotTurnoverLimit(BaseModel):
         return ResolvedTurnoverLimit(
             bps=float(self.bps) if self.bps is not None else None,
             usd=float(self.usd) if self.usd is not None else None,
+            daily_bps=float(self.daily_bps) if self.daily_bps is not None else None,
+            daily_usd=float(self.daily_usd) if self.daily_usd is not None else None,
         )
 
 

@@ -100,6 +100,7 @@ from core_config import (
     ExecutionProfile,
     load_timing_profiles,
     resolve_execution_timing,
+    SpotTurnoverCaps,
 )
 from no_trade import (
     _parse_daily_windows_min,
@@ -520,6 +521,11 @@ class _Worker:
             "pending": {},
             "updated_at_ms": 0,
             "total_notional": 0.0,
+            "daily_turnover": {
+                "day_key": None,
+                "per_symbol": {},
+                "portfolio": {"day_key": None, "used_usd": 0.0},
+            },
         }
         self._monitoring: MonitoringAggregator | None = (
             monitoring if monitoring is not None else monitoring_agg
@@ -575,6 +581,14 @@ class _Worker:
                 )
             except Exception:
                 pass
+        try:
+            self._daily_reset_hour = int(entry_cfg.reset_hour)
+        except Exception:
+            self._daily_reset_hour = 0
+        self._daily_symbol_turnover: Dict[str, Dict[str, Any]] = {}
+        self._daily_portfolio_turnover: Dict[str, Any] = {"day": None, "total": 0.0}
+        self._daily_turnover_caps = self._resolve_daily_turnover_caps(executor)
+        self._daily_day_key: str | None = None
         self._configure_throttle(throttle_cfg)
         self._last_bar_ts: Dict[str, int] = {}
         self._dynamic_guard: DynamicNoTradeGuard | None = None
@@ -742,6 +756,9 @@ class _Worker:
             payload = dict(self._last_status_payload)
         else:
             payload = {"id": self._worker_id}
+        daily_snapshot = self._daily_turnover_snapshot()
+        if daily_snapshot:
+            payload["daily_turnover"] = daily_snapshot
         payload["queue"] = {"size": queue_size, "max": queue_max}
         payload["updated_at_ms"] = clock.now_ms()
         self._last_status_payload = payload
@@ -1115,6 +1132,9 @@ class _Worker:
             st = None
         self._positions = {}
         self._pending_exposure = {}
+        self._daily_symbol_turnover = {}
+        self._daily_portfolio_turnover = {"day": None, "total": 0.0}
+        self._daily_day_key = None
         stored_state: Mapping[str, Any] = {}
         if st is not None:
             raw_state = getattr(st, "exposure_state", {}) or {}
@@ -1241,11 +1261,17 @@ class _Worker:
                 total_notional = float(getattr(st, "total_notional", 0.0) or 0.0)
             except (TypeError, ValueError):
                 total_notional = 0.0
+        daily_state_raw = {}
+        if isinstance(stored_state, MappingABC):
+            daily_state_raw = stored_state.get("daily_turnover", {})
+        if isinstance(daily_state_raw, MappingABC):
+            self._restore_daily_turnover_state(daily_state_raw)
         self._exposure_state = {
             "positions": dict(self._positions),
             "pending": pending_summary,
             "updated_at_ms": updated_at_ms,
             "total_notional": total_notional,
+            "daily_turnover": self._daily_turnover_state_payload(),
         }
 
     @staticmethod
@@ -1733,6 +1759,8 @@ class _Worker:
             "updated_at_ms": timestamp,
             "total_notional": total_notional,
         }
+        daily_state = self._daily_turnover_state_payload()
+        self._exposure_state["daily_turnover"] = daily_state
         if self._execution_mode == "bar":
             self._exposure_state["weights"] = weight_snapshot
         if self._state_enabled:
@@ -1740,6 +1768,7 @@ class _Worker:
                 state_storage.update_state(
                     exposure_state=dict(self._exposure_state),
                     total_notional=float(total_notional),
+                    daily_turnover=daily_state,
                 )
             except Exception:
                 pass
@@ -2074,6 +2103,7 @@ class _Worker:
                 self._weights[symbol] = target_weight
             self._apply_weight_to_positions(symbol, target_weight)
             self._pending_weight.pop(id(order), None)
+            self._record_daily_turnover_execution(order)
             self._persist_exposure_state(clock.now_ms())
             return
         key = id(order)
@@ -2172,6 +2202,480 @@ class _Worker:
                     continue
                 stack.append(attr_val)
         return cfg
+
+    def _resolve_daily_turnover_caps(self, executor: Any) -> Any:
+        caps = getattr(executor, "turnover_caps", None)
+        if caps is None:
+            return None
+        if isinstance(caps, SpotTurnoverCaps):
+            try:
+                return caps.resolve()
+            except Exception:
+                return None
+        if isinstance(caps, MappingABC):
+            try:
+                parsed = SpotTurnoverCaps.parse_obj(caps)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                try:
+                    return parsed.resolve()
+                except Exception:
+                    return None
+        resolve = getattr(caps, "resolve", None)
+        if callable(resolve):
+            try:
+                return resolve()
+            except Exception:
+                return None
+        return None
+
+    def _daily_limit_values(self) -> tuple[Optional[float], Optional[float]]:
+        caps = self._daily_turnover_caps
+        if caps is None:
+            return None, None
+        equity = self._portfolio_equity
+        try:
+            equity_val = float(equity) if equity is not None else 0.0
+        except (TypeError, ValueError):
+            equity_val = 0.0
+        symbol_limit: Optional[float]
+        portfolio_limit: Optional[float]
+        try:
+            symbol_limit = caps.per_symbol.daily_limit_for_equity(equity_val)
+        except Exception:
+            symbol_limit = None
+        try:
+            portfolio_limit = caps.portfolio.daily_limit_for_equity(equity_val)
+        except Exception:
+            portfolio_limit = None
+        return symbol_limit, portfolio_limit
+
+    def _current_day_key(self, ts_ms: int) -> str:
+        try:
+            ts_val = int(ts_ms)
+        except (TypeError, ValueError):
+            ts_val = 0
+        return daily_reset_key(ts_val, self._daily_reset_hour)
+
+    def _daily_symbol_tracker(self, symbol: str, day_key: str) -> Dict[str, Any]:
+        tracker = self._daily_symbol_turnover.setdefault(
+            symbol, {"day": day_key, "total": 0.0}
+        )
+        if tracker.get("day") != day_key:
+            tracker["day"] = day_key
+            tracker["total"] = 0.0
+        return tracker
+
+    def _daily_portfolio_tracker(self, day_key: str) -> Dict[str, Any]:
+        tracker = self._daily_portfolio_turnover
+        if tracker.get("day") != day_key:
+            tracker["day"] = day_key
+            tracker["total"] = 0.0
+        return tracker
+
+    def _daily_turnover_state_payload(self) -> Dict[str, Any]:
+        per_symbol: Dict[str, Dict[str, Any]] = {}
+        for sym, tracker in self._daily_symbol_turnover.items():
+            if not sym:
+                continue
+            day = tracker.get("day")
+            if day is not None:
+                try:
+                    day = str(day)
+                except Exception:
+                    day = None
+            try:
+                used = float(tracker.get("total", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                used = 0.0
+            per_symbol[sym] = {"day_key": day, "used_usd": max(0.0, used)}
+        portfolio_day = self._daily_portfolio_turnover.get("day")
+        if portfolio_day is not None:
+            try:
+                portfolio_day = str(portfolio_day)
+            except Exception:
+                portfolio_day = None
+        try:
+            portfolio_used = float(
+                self._daily_portfolio_turnover.get("total", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            portfolio_used = 0.0
+        return {
+            "day_key": self._daily_day_key,
+            "per_symbol": per_symbol,
+            "portfolio": {
+                "day_key": portfolio_day,
+                "used_usd": max(0.0, portfolio_used),
+            },
+        }
+
+    def _daily_turnover_snapshot(self) -> Dict[str, Any]:
+        symbol_limit, portfolio_limit = self._daily_limit_values()
+        snapshot: Dict[str, Any] = {
+            "day_key": self._daily_day_key,
+            "per_symbol": {},
+            "portfolio": {},
+        }
+        portfolio_state = self._daily_turnover_state_payload().get("portfolio", {})
+        portfolio_day = portfolio_state.get("day_key")
+        portfolio_used = float(portfolio_state.get("used_usd", 0.0) or 0.0)
+        remaining_portfolio: Optional[float] = None
+        if portfolio_limit is not None:
+            if portfolio_day is None or portfolio_day == self._daily_day_key:
+                remaining_portfolio = max(0.0, float(portfolio_limit) - portfolio_used)
+            else:
+                remaining_portfolio = float(portfolio_limit)
+        snapshot["portfolio"] = {
+            "day_key": portfolio_day,
+            "used_usd": portfolio_used,
+            "limit_usd": portfolio_limit,
+            "remaining_usd": remaining_portfolio,
+        }
+        per_symbol: Dict[str, Dict[str, Any]] = {}
+        for sym in sorted(self._daily_symbol_turnover.keys()):
+            tracker = self._daily_symbol_turnover.get(sym, {})
+            tracker_day = tracker.get("day")
+            if tracker_day is not None:
+                try:
+                    tracker_day = str(tracker_day)
+                except Exception:
+                    tracker_day = None
+            try:
+                used_val = float(tracker.get("total", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                used_val = 0.0
+            remaining_symbol: Optional[float] = None
+            if symbol_limit is not None:
+                if tracker_day is None or tracker_day == self._daily_day_key:
+                    remaining_symbol = max(0.0, float(symbol_limit) - used_val)
+                else:
+                    remaining_symbol = float(symbol_limit)
+            per_symbol[sym] = {
+                "day_key": tracker_day,
+                "used_usd": used_val,
+                "limit_usd": symbol_limit,
+                "remaining_usd": remaining_symbol,
+            }
+        snapshot["per_symbol"] = per_symbol
+        return snapshot
+
+    def _restore_daily_turnover_state(self, payload: Mapping[str, Any]) -> None:
+        day_key = payload.get("day_key")
+        if day_key is not None:
+            try:
+                self._daily_day_key = str(day_key)
+            except Exception:
+                self._daily_day_key = None
+        per_symbol = payload.get("per_symbol")
+        if isinstance(per_symbol, MappingABC):
+            for sym, data in per_symbol.items():
+                try:
+                    sym_key = str(sym).upper()
+                except Exception:
+                    sym_key = ""
+                if not sym_key or not isinstance(data, MappingABC):
+                    continue
+                tracker_day = data.get("day_key")
+                if tracker_day is not None:
+                    try:
+                        tracker_day = str(tracker_day)
+                    except Exception:
+                        tracker_day = None
+                try:
+                    used_val = float(data.get("used_usd", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    used_val = 0.0
+                self._daily_symbol_turnover[sym_key] = {
+                    "day": tracker_day,
+                    "total": max(0.0, used_val),
+                }
+        portfolio = payload.get("portfolio")
+        if isinstance(portfolio, MappingABC):
+            tracker_day = portfolio.get("day_key")
+            if tracker_day is not None:
+                try:
+                    tracker_day = str(tracker_day)
+                except Exception:
+                    tracker_day = None
+            try:
+                used_val = float(portfolio.get("used_usd", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                used_val = 0.0
+            self._daily_portfolio_turnover = {
+                "day": tracker_day,
+                "total": max(0.0, used_val),
+            }
+
+    def _extract_order_turnover(self, order: Any) -> float:
+        meta = getattr(order, "meta", None)
+        mappings: list[Mapping[str, Any]] = []
+        if isinstance(meta, MappingABC):
+            mappings.append(meta)
+            decision = meta.get("decision")
+            if isinstance(decision, MappingABC):
+                mappings.append(decision)
+        payload = self._extract_signal_payload(order)
+        if payload:
+            mappings.append(payload)
+        for mapping in mappings:
+            if not isinstance(mapping, MappingABC):
+                continue
+            for key in ("turnover_usd", "turnover", "notional_usd"):
+                if key not in mapping:
+                    continue
+                parsed = self._coerce_float(mapping.get(key))
+                if parsed is not None:
+                    return max(0.0, parsed)
+        return 0.0
+
+    def _mutate_order_payload(self, order: Any, updates: Mapping[str, Any]) -> None:
+        if not updates:
+            return
+        meta = getattr(order, "meta", None)
+        if not isinstance(meta, MappingABC):
+            if meta is None:
+                meta_dict: Dict[str, Any] = {}
+            else:
+                try:
+                    meta_dict = dict(meta)
+                except Exception:
+                    meta_dict = {}
+            setattr(order, "meta", meta_dict)
+            meta = meta_dict
+        elif not isinstance(meta, dict):
+            try:
+                meta_dict = dict(meta)
+            except Exception:
+                meta_dict = {}
+            setattr(order, "meta", meta_dict)
+            meta = meta_dict
+        payload = meta.get("payload")
+        if isinstance(payload, MappingABC):
+            payload_dict = dict(payload)
+        else:
+            payload_dict = {}
+        payload_dict.update(updates)
+        meta["payload"] = payload_dict
+
+    def _annotate_order_daily(
+        self,
+        order: Any,
+        *,
+        requested_usd: float,
+        executed_usd: float,
+        day_key: str,
+        clamped: bool,
+        headroom_before: Optional[float],
+    ) -> None:
+        meta = getattr(order, "meta", None)
+        if not isinstance(meta, MappingABC):
+            if meta is None:
+                meta_dict: Dict[str, Any] = {}
+            else:
+                try:
+                    meta_dict = dict(meta)
+                except Exception:
+                    meta_dict = {}
+            setattr(order, "meta", meta_dict)
+            meta = meta_dict
+        elif not isinstance(meta, dict):
+            try:
+                meta_dict = dict(meta)
+            except Exception:
+                meta_dict = {}
+            setattr(order, "meta", meta_dict)
+            meta = meta_dict
+        executed_val = float(max(0.0, executed_usd))
+        requested_val = float(max(0.0, requested_usd))
+        meta["_daily_turnover_usd"] = executed_val
+        meta["_daily_turnover_day"] = day_key
+        daily_info = meta.get("daily_turnover")
+        if isinstance(daily_info, MappingABC):
+            info_dict = dict(daily_info)
+        else:
+            info_dict = {}
+        info_dict.update(
+            {
+                "requested_usd": requested_val,
+                "executed_usd": executed_val,
+                "day_key": day_key,
+                "clamped": bool(clamped),
+            }
+        )
+        if headroom_before is not None:
+            info_dict["headroom_before_usd"] = float(max(0.0, headroom_before))
+        meta["daily_turnover"] = info_dict
+        decision = meta.get("decision")
+        if isinstance(decision, MappingABC):
+            decision_dict = dict(decision)
+        else:
+            decision_dict = {}
+        decision_dict["turnover_usd"] = executed_val
+        if clamped:
+            decision_dict["daily_turnover_clamped"] = True
+        meta["decision"] = decision_dict
+
+    def _scale_order_for_turnover(self, order: Any, symbol: str, scale: float) -> bool:
+        if scale <= 0.0:
+            return False
+        if scale >= 1.0:
+            return True
+        payload = self._extract_signal_payload(order)
+        current = float(self._weights.get(symbol, 0.0))
+        target_weight, delta_weight, _ = self._resolve_weight_targets(symbol, payload)
+        if math.isclose(delta_weight, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            return False
+        new_delta = delta_weight * scale
+        new_target = current + new_delta
+        if not math.isfinite(new_target):
+            return False
+        if new_target < 0.0:
+            new_target = 0.0
+        elif new_target > 1.0:
+            new_target = 1.0
+        updates: Dict[str, Any] = {}
+        for key in ("target_weight", "target", "weight"):
+            if key in payload:
+                updates[key] = new_target
+        for key in ("delta_weight", "delta"):
+            if key in payload:
+                updates[key] = new_delta
+        if not updates:
+            updates["target_weight"] = new_target
+        self._mutate_order_payload(order, updates)
+        return True
+
+    def _apply_daily_turnover_limits(
+        self, orders: Sequence[Any], symbol: str, ts_ms: int
+    ) -> list[Any]:
+        if self._execution_mode != "bar":
+            return list(orders)
+        sym = str(symbol).upper()
+        if not sym:
+            return list(orders)
+        day_key = self._current_day_key(ts_ms)
+        self._daily_day_key = day_key
+        symbol_tracker = self._daily_symbol_tracker(sym, day_key)
+        portfolio_tracker = self._daily_portfolio_tracker(day_key)
+        symbol_limit, portfolio_limit = self._daily_limit_values()
+        try:
+            symbol_used = float(symbol_tracker.get("total", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            symbol_used = 0.0
+        try:
+            portfolio_used = float(portfolio_tracker.get("total", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            portfolio_used = 0.0
+        adjusted: list[Any] = []
+        for order in orders:
+            requested = self._extract_order_turnover(order)
+            headroom_candidates: list[float] = []
+            if symbol_limit is not None:
+                headroom_candidates.append(max(0.0, float(symbol_limit) - symbol_used))
+            if portfolio_limit is not None:
+                headroom_candidates.append(max(0.0, float(portfolio_limit) - portfolio_used))
+            headroom = min(headroom_candidates) if headroom_candidates else None
+            if headroom is not None and headroom <= 1e-9:
+                try:
+                    self._logger.info(
+                        "DAILY_TURNOVER_DEFER %s",
+                        {
+                            "symbol": sym,
+                            "requested_usd": requested,
+                            "day_key": day_key,
+                            "headroom_usd": headroom,
+                        },
+                    )
+                except Exception:
+                    pass
+                continue
+            executed = requested
+            clamped = False
+            if headroom is not None and requested > headroom + 1e-9:
+                if not self._scale_order_for_turnover(order, sym, headroom / requested):
+                    try:
+                        self._logger.info(
+                            "DAILY_TURNOVER_DEFER %s",
+                            {
+                                "symbol": sym,
+                                "requested_usd": requested,
+                                "day_key": day_key,
+                                "headroom_usd": headroom,
+                                "reason": "scale_failed",
+                            },
+                        )
+                    except Exception:
+                        pass
+                    continue
+                executed = headroom
+                clamped = True
+                try:
+                    self._logger.info(
+                        "DAILY_TURNOVER_CLAMP %s",
+                        {
+                            "symbol": sym,
+                            "requested_usd": requested,
+                            "executed_usd": executed,
+                            "day_key": day_key,
+                        },
+                    )
+                except Exception:
+                    pass
+            symbol_used += executed
+            portfolio_used += executed
+            self._annotate_order_daily(
+                order,
+                requested_usd=requested,
+                executed_usd=executed,
+                day_key=day_key,
+                clamped=clamped,
+                headroom_before=headroom,
+            )
+            adjusted.append(order)
+        return adjusted
+
+    def _record_daily_turnover_execution(self, order: Any) -> None:
+        if self._execution_mode != "bar":
+            return
+        meta = getattr(order, "meta", None)
+        if not isinstance(meta, MappingABC):
+            return
+        executed = self._coerce_float(meta.get("_daily_turnover_usd"))
+        if executed is None or executed <= 0.0:
+            return
+        day_key_val = meta.get("_daily_turnover_day")
+        if isinstance(day_key_val, str):
+            day_key = day_key_val
+        else:
+            try:
+                day_key = str(day_key_val)
+            except Exception:
+                day_key = None
+        if not day_key:
+            day_key = self._daily_day_key or self._current_day_key(clock.now_ms())
+        symbol = str(getattr(order, "symbol", "") or "").upper()
+        if not symbol:
+            return
+        tracker = self._daily_symbol_tracker(symbol, day_key)
+        try:
+            tracker_total = float(tracker.get("total", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            tracker_total = 0.0
+        tracker["total"] = tracker_total + float(executed)
+        portfolio_tracker = self._daily_portfolio_tracker(day_key)
+        try:
+            portfolio_total = float(portfolio_tracker.get("total", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            portfolio_total = 0.0
+        portfolio_tracker["total"] = portfolio_total + float(executed)
+        self._daily_day_key = day_key
+        try:
+            meta.pop("_daily_turnover_usd", None)
+            meta.pop("_daily_turnover_day", None)
+        except Exception:
+            pass
 
     @staticmethod
     def _signal_leg(order: Any) -> str:
@@ -3361,6 +3865,17 @@ class _Worker:
                 except Exception:
                     pass
                 snapshot = self._extract_monitoring_snapshot(self._executor)
+                daily_snapshot = self._daily_turnover_snapshot()
+                if daily_snapshot:
+                    try:
+                        runtime_monitoring.update_daily_turnover(daily_snapshot)
+                    except Exception:
+                        pass
+                    if not isinstance(snapshot, MappingABC):
+                        snapshot = {}
+                    else:
+                        snapshot = dict(snapshot)
+                    snapshot["daily_turnover"] = daily_snapshot
                 if self._execution_mode != "bar":
                     requested, filled = self._extract_fill_metrics(snapshot)
                     if requested is not None and filled is not None:
@@ -3775,6 +4290,11 @@ class _Worker:
 
         if not orders:
             return _finalize()
+
+        if self._execution_mode == "bar":
+            orders = self._apply_daily_turnover_limits(orders, bar.symbol, int(bar.ts))
+            if not orders:
+                return _finalize()
 
         created_ts_ms = clock.now_ms()
         self._stage_exposure_adjustments(orders, created_ts_ms)

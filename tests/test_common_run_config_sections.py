@@ -112,8 +112,10 @@ def test_execution_runtime_config_serializes_new_fields():
             turnover_caps:
               per_symbol:
                 bps: 250
+                daily_usd: 2000.0
               portfolio:
                 usd: 50000.0
+                daily_bps: 150
         """
     )
     cfg = load_config_from_str(yaml_cfg)
@@ -124,15 +126,19 @@ def test_execution_runtime_config_serializes_new_fields():
     caps = cfg.execution.costs.turnover_caps
     assert caps.per_symbol is not None
     assert caps.per_symbol.bps == 250
+    assert caps.per_symbol.daily_usd == pytest.approx(2000.0)
     assert caps.portfolio is not None
     assert caps.portfolio.usd == 50_000.0
+    assert caps.portfolio.daily_bps == pytest.approx(150.0)
 
     dumped = cfg.execution.dict()
     assert dumped["safety_margin_bps"] == 7.5
     assert pytest.approx(dumped["max_participation"], rel=1e-9) == 0.05
     turnover_caps = dumped["costs"]["turnover_caps"]
     assert turnover_caps["per_symbol"]["bps"] == 250
+    assert turnover_caps["per_symbol"]["daily_usd"] == 2000.0
     assert turnover_caps["portfolio"]["usd"] == 50_000.0
+    assert turnover_caps["portfolio"]["daily_bps"] == 150
 
 
 @pytest.mark.parametrize("cli_equity", [None, 2_500_000.0])
@@ -169,6 +175,10 @@ def test_runtime_trade_defaults_precedence(tmp_path, cli_equity):
         costs_turnover_cap_symbol_usd=None,
         costs_turnover_cap_portfolio_bps=None,
         costs_turnover_cap_portfolio_usd=None,
+        costs_turnover_cap_symbol_daily_bps=None,
+        costs_turnover_cap_symbol_daily_usd=None,
+        costs_turnover_cap_portfolio_daily_bps=None,
+        costs_turnover_cap_portfolio_daily_usd=None,
     )
 
     merged = _apply_runtime_overrides(cfg_dict, args)

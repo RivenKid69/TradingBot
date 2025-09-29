@@ -612,6 +612,7 @@ class MonitoringAggregator:
             "symbols": [],
         }
         self.zero_signal_streaks: Dict[str, int] = {}
+        self.daily_turnover: Dict[str, Any] = {}
         global _throttle_queue_depth_snapshot, _cooldowns_active_snapshot, _zero_signal_streaks_snapshot
         _throttle_queue_depth_snapshot = dict(self.throttle_queue_depth)
         _cooldowns_active_snapshot = dict(self.cooldowns_active)
@@ -636,6 +637,25 @@ class MonitoringAggregator:
         if interval <= 0:
             interval = 60
         return interval
+
+    @staticmethod
+    def _sanitize_daily_turnover(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): MonitoringAggregator._sanitize_daily_turnover(val)
+                for key, val in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [MonitoringAggregator._sanitize_daily_turnover(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        try:
+            return float(value)
+        except Exception:
+            try:
+                return str(value)
+            except Exception:
+                return None
 
     def register_feed_intervals(
         self, symbols: Iterable[str], interval_ms: int
@@ -887,6 +907,15 @@ class MonitoringAggregator:
         global _zero_signal_streaks_snapshot
         _zero_signal_streaks_snapshot = dict(active)
 
+    def update_daily_turnover(self, payload: Mapping[str, Any]) -> None:
+        if not self.enabled:
+            return
+        cleaned = self._sanitize_daily_turnover(payload)
+        if isinstance(cleaned, Mapping):
+            self.daily_turnover = dict(cleaned)
+        else:
+            self.daily_turnover = cleaned if cleaned is not None else {}
+
     def set_execution_mode(self, mode: str) -> None:
         normalized = str(mode or "order").lower()
         if normalized not in {"order", "bar"}:
@@ -1065,6 +1094,7 @@ class MonitoringAggregator:
             "signals": signal_snapshot,
             "throttle_queue": dict(self.throttle_queue_depth),
             "cooldowns_active": dict(self.cooldowns_active),
+            "daily_turnover": self.daily_turnover,
         }
         return metrics
 
