@@ -32,7 +32,86 @@ class TakerExecutor(BaseExecutor):
         return [MarketChild(ts_offset_ms=0, qty=q, liquidity_hint=None)]
 
 
-class TWAPExecutor(BaseExecutor):
+class _BarWindowAware:
+    """Mixin providing helpers for executors using bar timeframe metadata."""
+
+    def __init__(self) -> None:
+        self._last_bar_timeframe_ms: Optional[int] = None
+        self._last_bar_start_ts: Optional[int] = None
+        self._last_bar_end_ts: Optional[int] = None
+
+    @staticmethod
+    def _coerce_int(value: Any) -> Optional[int]:
+        try:
+            iv = int(value)
+        except (TypeError, ValueError):
+            return None
+        return iv
+
+    def _resolve_bar_window(
+        self, now_ts_ms: int, snapshot: Mapping[str, Any]
+    ) -> tuple[Optional[int], Optional[int], Optional[int]]:
+        timeframe = self._coerce_int(
+            snapshot.get("bar_timeframe_ms")
+            or snapshot.get("timeframe_ms")
+            or snapshot.get("intrabar_timeframe_ms")
+        )
+        if timeframe is not None and timeframe <= 0:
+            timeframe = None
+        if timeframe is not None:
+            self._last_bar_timeframe_ms = timeframe
+        else:
+            timeframe = self._last_bar_timeframe_ms
+
+        start = self._coerce_int(
+            snapshot.get("bar_start_ts")
+            or snapshot.get("intrabar_start_ts")
+            or snapshot.get("bar_start_ts_ms")
+        )
+        if start is not None:
+            self._last_bar_start_ts = start
+        else:
+            start = self._last_bar_start_ts
+
+        end = self._coerce_int(
+            snapshot.get("bar_end_ts")
+            or snapshot.get("intrabar_end_ts")
+            or snapshot.get("bar_end_ts_ms")
+        )
+        if end is not None:
+            self._last_bar_end_ts = end
+        else:
+            end = self._last_bar_end_ts
+
+        if timeframe is not None:
+            if start is None and end is not None:
+                start = end - timeframe
+            if end is None and start is not None:
+                end = start + timeframe
+
+        if timeframe is None and start is not None and end is not None:
+            diff = end - start
+            if diff > 0:
+                timeframe = diff
+
+        if timeframe is not None and timeframe > 0:
+            if start is None:
+                start = (now_ts_ms // timeframe) * timeframe
+            if end is None and start is not None:
+                end = start + timeframe
+        else:
+            timeframe = None
+
+        if timeframe is not None and timeframe > 0:
+            self._last_bar_timeframe_ms = timeframe
+        if start is not None:
+            self._last_bar_start_ts = start
+        if end is not None:
+            self._last_bar_end_ts = end
+        return timeframe, start, end
+
+
+class TWAPExecutor(_BarWindowAware, BaseExecutor):
     """Time-weighted execution with deterministic schedule.
 
     For a given timestamp and target quantity the resulting child orders are
@@ -40,6 +119,7 @@ class TWAPExecutor(BaseExecutor):
     """
 
     def __init__(self, *, parts: int = 6, child_interval_s: int = 600):
+        super().__init__()
         self.parts = max(1, int(parts))
         self.child_interval_ms = int(child_interval_s) * 1000
 
@@ -50,15 +130,38 @@ class TWAPExecutor(BaseExecutor):
         if q_total <= 0.0:
             return []
         per = q_total / float(self.parts)
+        timeframe_ms, bar_start, bar_end = self._resolve_bar_window(
+            now_ts_ms, snapshot
+        )
         plan: List[MarketChild] = []
-        for i in range(self.parts):
-            plan.append(
-                MarketChild(
-                    ts_offset_ms=i * self.child_interval_ms,
-                    qty=per,
-                    liquidity_hint=None,
+        if timeframe_ms is not None and timeframe_ms > 0:
+            denominator = max(1, self.parts - 1)
+            try:
+                anchor = int(bar_start if bar_start is not None else now_ts_ms)
+            except (TypeError, ValueError):
+                anchor = int(now_ts_ms)
+            for i in range(self.parts):
+                frac = float(i) / float(denominator) if denominator else 0.0
+                offset_abs = anchor + int(round(frac * timeframe_ms))
+                if bar_end is not None and offset_abs > bar_end:
+                    offset_abs = int(bar_end)
+                offset = max(0, int(offset_abs - now_ts_ms))
+                plan.append(
+                    MarketChild(
+                        ts_offset_ms=offset,
+                        qty=per,
+                        liquidity_hint=None,
+                    )
                 )
-            )
+        else:
+            for i in range(self.parts):
+                plan.append(
+                    MarketChild(
+                        ts_offset_ms=i * self.child_interval_ms,
+                        qty=per,
+                        liquidity_hint=None,
+                    )
+                )
         # скорректируем последнего из-за накопленных округлений
         if plan:
             acc = sum(c.qty for c in plan[:-1])
@@ -66,7 +169,7 @@ class TWAPExecutor(BaseExecutor):
         return plan
 
 
-class POVExecutor(BaseExecutor):
+class POVExecutor(_BarWindowAware, BaseExecutor):
     """Participation-of-volume execution with deterministic planning.
 
     The plan depends only on the provided timestamp, liquidity hint and target
@@ -81,6 +184,7 @@ class POVExecutor(BaseExecutor):
         child_interval_s: int = 60,
         min_child_notional: float = 20.0,
     ):
+        super().__init__()
         self.participation = max(0.0, float(participation))
         self.child_interval_ms = int(child_interval_s) * 1000
         self.min_child_notional = float(min_child_notional)
@@ -109,18 +213,49 @@ class POVExecutor(BaseExecutor):
 
         plan: List[MarketChild] = []
         produced = 0.0
-        i = 0
-        # ограничим разумно – не более 10k «детей» в план
-        while produced + 1e-12 < q_total and i < 10000:
-            left = q_total - produced
-            q = min(per_child_qty, left)
-            plan.append(
-                MarketChild(
-                    ts_offset_ms=i * self.child_interval_ms, qty=q, liquidity_hint=liq
+        timeframe_ms, bar_start, bar_end = self._resolve_bar_window(
+            now_ts_ms, snapshot
+        )
+        if timeframe_ms is not None and timeframe_ms > 0:
+            total_children = int(math.ceil(q_total / per_child_qty))
+            total_children = max(1, min(total_children, 10000))
+            denominator = max(1, total_children - 1)
+            try:
+                anchor = int(bar_start if bar_start is not None else now_ts_ms)
+            except (TypeError, ValueError):
+                anchor = int(now_ts_ms)
+            offsets: List[int] = []
+            for i in range(total_children):
+                frac = float(i) / float(denominator) if denominator else 0.0
+                offset_abs = anchor + int(round(frac * timeframe_ms))
+                if bar_end is not None and offset_abs > bar_end:
+                    offset_abs = int(bar_end)
+                offsets.append(max(0, int(offset_abs - now_ts_ms)))
+            for offset in offsets:
+                if produced + 1e-12 >= q_total:
+                    break
+                left = q_total - produced
+                q = min(per_child_qty, left)
+                plan.append(
+                    MarketChild(
+                        ts_offset_ms=offset, qty=q, liquidity_hint=liq
+                    )
                 )
-            )
-            produced += q
-            i += 1
+                produced += q
+        else:
+            i = 0
+            while produced + 1e-12 < q_total and i < 10000:
+                left = q_total - produced
+                q = min(per_child_qty, left)
+                plan.append(
+                    MarketChild(
+                        ts_offset_ms=i * self.child_interval_ms,
+                        qty=q,
+                        liquidity_hint=liq,
+                    )
+                )
+                produced += q
+                i += 1
         return plan
 
 
