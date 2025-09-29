@@ -82,6 +82,10 @@ def _apply_runtime_overrides(
             args.costs_turnover_cap_symbol_usd,
             args.costs_turnover_cap_portfolio_bps,
             args.costs_turnover_cap_portfolio_usd,
+            args.costs_turnover_cap_symbol_daily_bps,
+            args.costs_turnover_cap_symbol_daily_usd,
+            args.costs_turnover_cap_portfolio_daily_bps,
+            args.costs_turnover_cap_portfolio_daily_usd,
         )
     ):
         costs_block = dict(cfg_dict.get("costs") or {})
@@ -129,6 +133,20 @@ def _apply_runtime_overrides(
             )
             exec_symbol_caps_block["usd"] = symbol_caps_block["usd"]
 
+        if args.costs_turnover_cap_symbol_daily_bps is not None:
+            symbol_caps_block["daily_bps"] = _require_non_negative(
+                args.costs_turnover_cap_symbol_daily_bps,
+                "costs-turnover-cap-symbol-daily-bps",
+            )
+            exec_symbol_caps_block["daily_bps"] = symbol_caps_block["daily_bps"]
+
+        if args.costs_turnover_cap_symbol_daily_usd is not None:
+            symbol_caps_block["daily_usd"] = _require_non_negative(
+                args.costs_turnover_cap_symbol_daily_usd,
+                "costs-turnover-cap-symbol-daily-usd",
+            )
+            exec_symbol_caps_block["daily_usd"] = symbol_caps_block["daily_usd"]
+
         if args.costs_turnover_cap_portfolio_bps is not None:
             portfolio_caps_block["bps"] = _require_non_negative(
                 args.costs_turnover_cap_portfolio_bps,
@@ -142,6 +160,20 @@ def _apply_runtime_overrides(
                 "costs-turnover-cap-portfolio-usd",
             )
             exec_portfolio_caps_block["usd"] = portfolio_caps_block["usd"]
+
+        if args.costs_turnover_cap_portfolio_daily_bps is not None:
+            portfolio_caps_block["daily_bps"] = _require_non_negative(
+                args.costs_turnover_cap_portfolio_daily_bps,
+                "costs-turnover-cap-portfolio-daily-bps",
+            )
+            exec_portfolio_caps_block["daily_bps"] = portfolio_caps_block["daily_bps"]
+
+        if args.costs_turnover_cap_portfolio_daily_usd is not None:
+            portfolio_caps_block["daily_usd"] = _require_non_negative(
+                args.costs_turnover_cap_portfolio_daily_usd,
+                "costs-turnover-cap-portfolio-daily-usd",
+            )
+            exec_portfolio_caps_block["daily_usd"] = portfolio_caps_block["daily_usd"]
 
         if impact_block:
             costs_block["impact"] = impact_block
@@ -281,6 +313,16 @@ def main() -> None:
         help="Override costs.turnover_caps.per_symbol.usd (>=0)",
     )
     runtime_group.add_argument(
+        "--costs-turnover-cap-symbol-daily-bps",
+        type=float,
+        help="Override costs.turnover_caps.per_symbol.daily_bps (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-turnover-cap-symbol-daily-usd",
+        type=float,
+        help="Override costs.turnover_caps.per_symbol.daily_usd (>=0)",
+    )
+    runtime_group.add_argument(
         "--costs-turnover-cap-portfolio-bps",
         type=float,
         help="Override costs.turnover_caps.portfolio.bps (>=0)",
@@ -289,6 +331,16 @@ def main() -> None:
         "--costs-turnover-cap-portfolio-usd",
         type=float,
         help="Override costs.turnover_caps.portfolio.usd (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-turnover-cap-portfolio-daily-bps",
+        type=float,
+        help="Override costs.turnover_caps.portfolio.daily_bps (>=0)",
+    )
+    runtime_group.add_argument(
+        "--costs-turnover-cap-portfolio-daily-usd",
+        type=float,
+        help="Override costs.turnover_caps.portfolio.daily_usd (>=0)",
     )
     args = p.parse_args()
 

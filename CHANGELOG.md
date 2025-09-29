@@ -22,6 +22,10 @@
   `rounding` умеет использовать `commission_step` из биржевых фильтров и
   таблиц комиссий, а `settlement` описывает расчёт комиссий в альтернативном
   активе (например, BNB) с учётом скидок.
+- **Daily turnover caps**: Added configuration fields, runtime enforcement, and
+  monitoring visibility for daily USD/BPS turnover limits across per-symbol and
+  portfolio aggregates. Includes persistence hooks and targeted pytest coverage
+  ensuring partial/deferred execution when caps bind.
 
 ### Deprecated
 - `LatencyImpl.dump_latency_multipliers` and
