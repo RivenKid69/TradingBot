@@ -4431,6 +4431,11 @@ class _Worker:
                                 turnover_usd=float(bar_metrics.get("turnover_usd", 0.0)),
                                 cap_usd=bar_metrics.get("cap_usd"),
                                 impact_mode=bar_metrics.get("impact_mode"),
+                                modeled_cost_bps=bar_metrics.get("modeled_cost_bps"),
+                                realized_slippage_bps=bar_metrics.get(
+                                    "realized_slippage_bps"
+                                ),
+                                cost_bias_bps=bar_metrics.get("cost_bias_bps"),
                             )
                         except Exception:
                             pass
