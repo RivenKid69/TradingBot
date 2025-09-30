@@ -674,6 +674,7 @@ class _Worker:
         self._max_total_weight: float | None = weight_cap
         self._weights: Dict[str, float] = {}
         self._pending_weight: Dict[int, Dict[str, Any]] = {}
+        self._symbol_equity: Dict[str, float] = {}
         entry_cfg = self._resolve_entry_limiter_config(executor)
         self._entry_limiter = DailyEntryLimiter(
             entry_cfg.limit, entry_cfg.reset_hour
@@ -2092,6 +2093,21 @@ class _Worker:
             equity = self._portfolio_equity
             if equity is not None and equity > 0.0:
                 total_notional = sum(abs(val) for val in weight_snapshot.values()) * float(equity)
+            if total_notional <= 0.0:
+                symbol_total = 0.0
+                for symbol, weight in weight_snapshot.items():
+                    equity_override = self._symbol_equity.get(symbol)
+                    if equity_override is None or equity_override <= 0.0:
+                        continue
+                    try:
+                        weight_abs = abs(float(weight))
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(weight_abs):
+                        continue
+                    symbol_total += weight_abs * float(equity_override)
+                if symbol_total > 0.0:
+                    total_notional = symbol_total
         if total_notional <= 0.0:
             for symbol, qty in positions_snapshot.items():
                 price = self._last_prices.get(symbol)
@@ -2150,6 +2166,20 @@ class _Worker:
                         continue
                 if total > 0.0:
                     return float(equity) * total
+            symbol_total = 0.0
+            for symbol, weight in self._weights.items():
+                equity_override = self._symbol_equity.get(str(symbol).upper())
+                if equity_override is None or equity_override <= 0.0:
+                    continue
+                try:
+                    weight_abs = abs(float(weight))
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(weight_abs):
+                    continue
+                symbol_total += weight_abs * float(equity_override)
+            if symbol_total > 0.0:
+                return symbol_total
         try:
             value = float(self._exposure_state.get("total_notional", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -2171,7 +2201,9 @@ class _Worker:
             return None
         return value
 
-    def _apply_weight_to_positions(self, symbol: str, weight: float) -> None:
+    def _apply_weight_to_positions(
+        self, symbol: str, weight: float, *, equity_override: float | None = None
+    ) -> None:
         sym = str(symbol or "").upper()
         if not sym:
             return
@@ -2184,7 +2216,17 @@ class _Worker:
         if math.isclose(weight_val, 0.0, rel_tol=0.0, abs_tol=1e-12):
             self._positions.pop(sym, None)
             return
-        equity = self._portfolio_equity
+        equity = None
+        if equity_override is not None and equity_override > 0.0:
+            equity = float(equity_override)
+        elif sym in self._symbol_equity:
+            cached_equity = self._symbol_equity.get(sym)
+            if cached_equity is not None and cached_equity > 0.0:
+                equity = float(cached_equity)
+        if equity is None:
+            base_equity = self._portfolio_equity
+            if base_equity is not None and base_equity > 0.0:
+                equity = float(base_equity)
         price = self._last_prices.get(sym)
         if equity is not None and equity > 0.0 and price is not None and price > 0.0:
             qty = (weight_val * float(equity)) / float(price)
@@ -2602,6 +2644,9 @@ class _Worker:
             if not symbol:
                 return
             payload = self._extract_signal_payload(order)
+            equity_override = self._resolve_order_equity(order, payload, symbol)
+            if equity_override is not None and equity_override > 0.0:
+                self._symbol_equity[symbol] = float(equity_override)
             target_weight, delta_weight, _ = self._resolve_weight_targets(
                 symbol, payload
             )
@@ -2609,7 +2654,9 @@ class _Worker:
                 self._weights.pop(symbol, None)
             else:
                 self._weights[symbol] = target_weight
-            self._apply_weight_to_positions(symbol, target_weight)
+            self._apply_weight_to_positions(
+                symbol, target_weight, equity_override=equity_override
+            )
             self._pending_weight.pop(id(order), None)
             self._record_daily_turnover_execution(order)
             self._persist_exposure_state(clock.now_ms())
@@ -2965,8 +3012,21 @@ class _Worker:
         return 0.0
 
     def _resolve_order_equity(
-        self, order: Any, payload: Mapping[str, Any] | None
+        self,
+        order: Any | None,
+        payload: Mapping[str, Any] | None,
+        symbol: str | None = None,
     ) -> float | None:
+        cached_equity: float | None = None
+        if symbol:
+            try:
+                sym_key = str(symbol).upper()
+            except Exception:
+                sym_key = ""
+            if sym_key:
+                cached = self._symbol_equity.get(sym_key)
+                if cached is not None and cached > 0.0:
+                    cached_equity = float(cached)
         equity = self._portfolio_equity
         if equity is not None:
             try:
@@ -2978,7 +3038,7 @@ class _Worker:
                     return equity_val
 
         mappings: list[Mapping[str, Any]] = []
-        meta = getattr(order, "meta", None)
+        meta = getattr(order, "meta", None) if order is not None else None
         if isinstance(meta, MappingABC):
             mappings.append(meta)
             decision = meta.get("decision")
@@ -3006,7 +3066,7 @@ class _Worker:
             if not math.isfinite(parsed) or parsed <= 0.0:
                 continue
             return float(parsed)
-        return None
+        return cached_equity
 
     def _mutate_order_payload(self, order: Any, updates: Mapping[str, Any]) -> None:
         if not updates:
@@ -3154,7 +3214,7 @@ class _Worker:
                 _, delta_weight, _ = self._resolve_weight_targets(sym, payload)
                 delta = abs(float(delta_weight))
                 if delta > 0.0:
-                    equity = self._resolve_order_equity(order, payload)
+                    equity = self._resolve_order_equity(order, payload, sym)
                     if equity is not None and equity > 0.0:
                         requested = delta * float(equity)
             headroom_candidates: list[float] = []
