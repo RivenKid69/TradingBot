@@ -158,14 +158,12 @@ class BarBacktestSimBridge:
             return default
         return out
 
-    def _coerce_price(self, value: Any, fallback: Any) -> float:
-        candidate = self._safe_float(value, default=float("nan"))
-        if math.isfinite(candidate) and candidate > 0.0:
-            return candidate
-        fallback_val = self._safe_float(fallback, default=float("nan"))
-        if math.isfinite(fallback_val) and fallback_val > 0.0:
-            return fallback_val
-        return 0.0
+    def _coerce_price(self, value: Any, fallback: Any) -> Optional[float]:
+        for candidate in (value, fallback):
+            coerced = self._safe_float(candidate, default=float("nan"))
+            if math.isfinite(coerced) and coerced > 0.0:
+                return coerced
+        return None
 
     def _build_bar(
         self,
@@ -221,7 +219,11 @@ class BarBacktestSimBridge:
         # Trades placed in the current step impact the position immediately, while
         # the resulting mark-to-market PnL is booked once the *next* bar arrives
         # and we have a subsequent close to compare against ``prev_price``.
-        if prev_price is not None and prev_price > 0.0:
+        if (
+            close_price is not None
+            and prev_price is not None
+            and prev_price > 0.0
+        ):
             try:
                 bar_return = (close_price / prev_price) - 1.0
             except ZeroDivisionError:
@@ -235,17 +237,20 @@ class BarBacktestSimBridge:
         decisions: List[Mapping[str, Any]] = []
         instructions: List[Mapping[str, Any]] = []
 
+        bar_payload = None
         if orders:
-            bar_payload = self._build_bar(
-                ts_ms=ts_ms,
-                symbol=symbol,
-                open_price=bar_open,
-                high_price=bar_high,
-                low_price=bar_low,
-                close_price=close_price,
-            )
-        else:
-            bar_payload = None
+            payload_close_price: Optional[float] = close_price
+            if payload_close_price is None and prev_price is not None and prev_price > 0.0:
+                payload_close_price = prev_price
+            if payload_close_price is not None:
+                bar_payload = self._build_bar(
+                    ts_ms=ts_ms,
+                    symbol=symbol,
+                    open_price=bar_open,
+                    high_price=bar_high,
+                    low_price=bar_low,
+                    close_price=payload_close_price,
+                )
 
         if orders:
             logger.debug(
@@ -290,7 +295,8 @@ class BarBacktestSimBridge:
 
         self._equity = equity_before_costs - trade_cost_usd
         self._cum_cost_usd += trade_cost_usd
-        self._last_prices[symbol] = close_price
+        if close_price is not None:
+            self._last_prices[symbol] = close_price
 
         weight = 0.0
         positions = self.executor.get_open_positions([symbol])
@@ -317,11 +323,19 @@ class BarBacktestSimBridge:
         bar_pnl = pnl_from_price - trade_cost_usd
         cumulative_pnl = self._equity - self._initial_equity
 
+        report_ref_price = (
+            close_price
+            if close_price is not None
+            else prev_price
+            if prev_price is not None
+            else 0.0
+        )
+
         report: Dict[str, Any] = {
             "ts_ms": int(ts_ms),
             "symbol": symbol,
             "run_id": getattr(self.executor, "run_id", "bar"),
-            "ref_price": close_price,
+            "ref_price": report_ref_price,
             "equity": self._equity,
             "equity_before_costs": equity_before_costs,
             "equity_after_costs": self._equity,
