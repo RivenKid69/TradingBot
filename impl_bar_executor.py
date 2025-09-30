@@ -327,7 +327,24 @@ class BarExecutor(TradeExecutor):
             decision_signal["normalized"] = True
         if normalization_data:
             decision_signal["normalization"] = dict(normalization_data)
-        decision_signal.setdefault("target_weight", target_weight)
+
+        if "target_weight" in decision_signal:
+            coerced_target = self._coerce_float(decision_signal.get("target_weight"))
+            if coerced_target is None:
+                decision_signal.pop("target_weight", None)
+            else:
+                decision_signal["target_weight"] = target_weight
+        else:
+            decision_signal["target_weight"] = target_weight
+
+        if "delta_weight" in decision_signal:
+            coerced_delta = self._coerce_float(decision_signal.get("delta_weight"))
+            if coerced_delta is None:
+                decision_signal.pop("delta_weight", None)
+            else:
+                decision_signal["delta_weight"] = delta_weight
+        else:
+            decision_signal["delta_weight"] = delta_weight
         metrics = decide_spot_trade(
             decision_signal,
             state,
