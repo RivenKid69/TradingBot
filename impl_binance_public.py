@@ -118,6 +118,14 @@ class BinancePublicBarSource(MarketDataSource):
             if "k" not in payload:
                 return
             k = payload["k"]
+            volume_quote = None
+            raw_volume_quote = k.get("q")
+            if raw_volume_quote not in (None, ""):
+                try:
+                    volume_quote = Decimal(raw_volume_quote)
+                except (ArithmeticError, ValueError, TypeError):
+                    volume_quote = None
+
             bar = Bar(
                 ts=int(k["t"]),
                 symbol=str(k["s"]).upper(),
@@ -126,6 +134,7 @@ class BinancePublicBarSource(MarketDataSource):
                 low=Decimal(k["l"]),
                 close=Decimal(k["c"]),
                 volume_base=Decimal(k["v"]),
+                volume_quote=volume_quote,
                 trades=int(k.get("n", 0)),
                 is_final=bool(k.get("x", False)),
             )
