@@ -582,12 +582,52 @@ def test_bar_executor_respects_min_rebalance_step():
     assert report.meta.get("min_step_enforced") is True
     assert report.meta["instructions"] == []
     assert report.meta["decision"]["turnover_usd"] == pytest.approx(0.0)
+    assert report.meta["target_weight"] == pytest.approx(0.0)
+    assert report.meta["delta_weight"] == pytest.approx(0.0)
+    assert report.meta["decision"]["target_weight"] == pytest.approx(0.0)
+    assert report.meta["decision"]["delta_weight"] == pytest.approx(0.0)
     positions = executor.get_open_positions()
     assert positions["BTCUSDT"].meta["weight"] == 0.0
 
     snapshot = executor.monitoring_snapshot()
     assert snapshot["turnover_usd"] == pytest.approx(0.0)
     assert snapshot.get("min_step_enforced") is True
+    assert snapshot["target_weight"] == pytest.approx(0.0)
+    assert snapshot["delta_weight"] == pytest.approx(0.0)
+
+
+def test_bar_executor_skip_reason_preserves_weights():
+    executor = BarExecutor(
+        run_id="test",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1000.0,
+        initial_weights={"BTCUSDT": 0.2},
+    )
+    order = Order(
+        ts=7,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {"target_weight": 0.5, "edge_bps": 50.0},
+        },
+    )
+
+    report = executor.execute(order)
+
+    assert report.meta.get("reason") == "no_price"
+    assert report.meta["instructions"] == []
+    assert report.meta["target_weight"] == pytest.approx(0.2)
+    assert report.meta["delta_weight"] == pytest.approx(0.0)
+    assert report.meta["decision"]["target_weight"] == pytest.approx(0.2)
+    assert report.meta["decision"]["delta_weight"] == pytest.approx(0.0)
+
+    snapshot = executor.monitoring_snapshot()
+    assert snapshot["target_weight"] == pytest.approx(0.2)
+    assert snapshot["delta_weight"] == pytest.approx(0.0)
+    assert snapshot.get("reason") == "no_price"
 
 
 def test_bar_executor_skips_when_edge_insufficient():
