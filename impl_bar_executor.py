@@ -439,6 +439,8 @@ class BarExecutor(TradeExecutor):
                 if remaining_candidates:
                     caps_eval["effective_cap"] = min(remaining_candidates)
         else:
+            target_weight = final_state.weight
+            delta_weight = 0.0
             dump_fn = getattr(metrics, "model_dump", None)
             metrics_data = dump_fn() if callable(dump_fn) else metrics.dict()
             if skip_reason is not None:
@@ -451,6 +453,10 @@ class BarExecutor(TradeExecutor):
                 metrics_data,
             )
 
+        if not instructions:
+            target_weight = final_state.weight
+            delta_weight = 0.0
+
         self._states[symbol] = final_state
 
         dump_fn = getattr(metrics, "model_dump", None)
@@ -461,6 +467,8 @@ class BarExecutor(TradeExecutor):
             decision_data["normalization"] = dict(normalization_data)
         if skip_reason is not None:
             decision_data["reason"] = skip_reason
+        decision_data["target_weight"] = target_weight
+        decision_data["delta_weight"] = delta_weight
         report_meta: Dict[str, Any] = {
             "mode": mode,
             "decision": decision_data,
