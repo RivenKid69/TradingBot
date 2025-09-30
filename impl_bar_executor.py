@@ -336,23 +336,30 @@ class BarExecutor(TradeExecutor):
 
         min_step = self.min_rebalance_step
         skip_due_to_step = False
+        raw_turnover_usd = float(getattr(metrics, "turnover_usd", 0.0))
+        turnover_usd = raw_turnover_usd
         if min_step > 0.0 and abs(delta_weight) < min_step:
             skip_due_to_step = True
             if hasattr(metrics, "model_copy"):
-                metrics = metrics.model_copy(update={"act_now": False})
+                metrics = metrics.model_copy(
+                    update={"act_now": False, "turnover_usd": 0.0}
+                )
             else:  # pragma: no cover - compatibility fallback
-                metrics = metrics.copy(update={"act_now": False})
+                metrics = metrics.copy(update={"act_now": False, "turnover_usd": 0.0})
+            turnover_usd = 0.0
 
         caps_eval = self._evaluate_turnover_caps(symbol, state, bar)
-        turnover_usd = float(getattr(metrics, "turnover_usd", 0.0))
         skip_due_to_cap = False
         effective_cap = caps_eval.get("effective_cap")
-        if effective_cap is not None and turnover_usd > float(effective_cap) + 1e-9:
+        if effective_cap is not None and raw_turnover_usd > float(effective_cap) + 1e-9:
             skip_due_to_cap = True
             if hasattr(metrics, "model_copy"):
-                metrics = metrics.model_copy(update={"act_now": False})
+                metrics = metrics.model_copy(
+                    update={"act_now": False, "turnover_usd": 0.0}
+                )
             else:  # pragma: no cover - compatibility fallback
-                metrics = metrics.copy(update={"act_now": False})
+                metrics = metrics.copy(update={"act_now": False, "turnover_usd": 0.0})
+            turnover_usd = 0.0
 
         instructions: List[RebalanceInstruction] = []
         final_state = state

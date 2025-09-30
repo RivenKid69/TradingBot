@@ -400,6 +400,11 @@ def test_bar_executor_turnover_cap_tracks_portfolio_usage():
     assert second_report.meta["instructions"] == []
     assert second_report.meta.get("turnover_cap_enforced") is True
     assert second_report.meta["cap_usd"] == pytest.approx(100.0)
+    assert second_report.meta["decision"]["turnover_usd"] == pytest.approx(0.0)
+
+    snapshot = executor.monitoring_snapshot()
+    assert snapshot["turnover_usd"] == pytest.approx(0.0)
+    assert snapshot.get("turnover_cap_enforced") is True
 
 def test_bar_executor_respects_min_rebalance_step():
     executor = BarExecutor(
@@ -423,8 +428,13 @@ def test_bar_executor_respects_min_rebalance_step():
     report = executor.execute(order)
     assert report.meta.get("min_step_enforced") is True
     assert report.meta["instructions"] == []
+    assert report.meta["decision"]["turnover_usd"] == pytest.approx(0.0)
     positions = executor.get_open_positions()
     assert positions["BTCUSDT"].meta["weight"] == 0.0
+
+    snapshot = executor.monitoring_snapshot()
+    assert snapshot["turnover_usd"] == pytest.approx(0.0)
+    assert snapshot.get("min_step_enforced") is True
 
 
 def test_bar_executor_skips_when_edge_insufficient():
