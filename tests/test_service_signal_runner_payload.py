@@ -80,3 +80,26 @@ def test_build_envelope_payload_flags_rejected_delta() -> None:
     assert payload["delta_weight"] == pytest.approx(0.0)
     assert payload["reject_reason"] == "delta_weight_out_of_bounds"
     assert payload["requested_delta_weight"] == pytest.approx(-0.5)
+
+
+def test_build_envelope_payload_preserves_nested_economics() -> None:
+    worker = _make_worker()
+    economics = {
+        "edge_bps": 42.0,
+        "cost_bps": 10.0,
+        "net_bps": 32.0,
+        "turnover_usd": 123.0,
+        "act_now": True,
+        "impact": 0.5,
+        "impact_mode": "model",
+    }
+    order_payload = {"target_weight": 0.25, "economics": economics}
+    order = SimpleNamespace(meta={"payload": order_payload})
+
+    payload, _ = worker._build_envelope_payload(order, "BTCUSDT")
+
+    assert "edge_bps" not in payload
+    assert payload["economics"]["edge_bps"] == pytest.approx(economics["edge_bps"])
+    assert payload["economics"]["turnover_usd"] == pytest.approx(
+        economics["turnover_usd"]
+    )
