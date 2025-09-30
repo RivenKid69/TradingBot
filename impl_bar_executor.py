@@ -362,6 +362,7 @@ class BarExecutor(TradeExecutor):
             turnover_usd = 0.0
 
         caps_eval = self._evaluate_turnover_caps(symbol, state, bar)
+        pre_trade_cap = caps_eval.get("effective_cap")
         skip_due_to_cap = False
         effective_cap = caps_eval.get("effective_cap")
         if effective_cap is not None and raw_turnover_usd > float(effective_cap) + 1e-9:
@@ -490,9 +491,9 @@ class BarExecutor(TradeExecutor):
             report_meta["reference_price"] = float(price)
         if adv_quote is not None:
             report_meta["adv_quote"] = adv_quote
-        cap_effective = caps_eval.get("effective_cap")
-        if cap_effective is not None:
-            report_meta["cap_usd"] = float(cap_effective)
+        cap_effective_pre = pre_trade_cap
+        if cap_effective_pre is not None:
+            report_meta["cap_usd"] = float(cap_effective_pre)
         if caps_eval.get("symbol_limit") is not None:
             report_meta["symbol_turnover_cap_usd"] = float(caps_eval["symbol_limit"])
         if caps_eval.get("portfolio_limit") is not None:
@@ -538,8 +539,8 @@ class BarExecutor(TradeExecutor):
             snapshot["normalization"] = dict(normalization_data)
         if skip_reason is not None:
             snapshot["reason"] = skip_reason
-        if cap_effective is not None:
-            snapshot["cap_usd"] = float(cap_effective)
+        if cap_effective_pre is not None:
+            snapshot["cap_usd"] = float(cap_effective_pre)
         if caps_eval.get("symbol_limit") is not None:
             snapshot["symbol_cap_usd"] = float(caps_eval["symbol_limit"])
         if caps_eval.get("portfolio_limit") is not None:

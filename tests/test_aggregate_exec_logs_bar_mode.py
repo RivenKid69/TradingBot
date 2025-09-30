@@ -42,6 +42,7 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
         "target_weight": 0.5,
         "delta_weight": 0.5,
         "adv_quote": 10_000.0,
+        "cap_usd": 12_000.0,
         "bar_ts": 60_000,
     }
     meta_second = {
@@ -56,6 +57,7 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
         "target_weight": 0.2,
         "delta_weight": -0.3,
         "adv_quote": 20_000.0,
+        "cap_usd": 8_000.0,
         "bar_ts": 60_000,
     }
 
@@ -80,9 +82,9 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
     assert row["bar_decisions"] == 2
     assert row["bar_act_now"] == 1
     assert row["bar_turnover_usd"] == pytest.approx(800.0)
-    assert row["bar_cap_usd"] == pytest.approx(30_000.0)
+    assert row["bar_cap_usd"] == pytest.approx(20_000.0)
     assert row["bar_act_now_rate"] == pytest.approx(0.5)
-    assert row["bar_turnover_vs_cap"] == pytest.approx(800.0 / 30_000.0)
+    assert row["bar_turnover_vs_cap"] == pytest.approx(800.0 / 20_000.0)
     assert "realized_slippage_bps" in row.index
     assert "modeled_cost_bps" in row.index
     assert "cost_bias_bps" in row.index
@@ -95,6 +97,6 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
     assert day["bar_decisions"] == 2
     assert day["bar_act_now"] == 1
     assert day["bar_turnover_usd"] == pytest.approx(800.0)
-    assert day["bar_cap_usd"] == pytest.approx(30_000.0)
-    assert day["bar_turnover_vs_cap"] == pytest.approx(800.0 / 30_000.0)
+    assert day["bar_cap_usd"] == pytest.approx(20_000.0)
+    assert day["bar_turnover_vs_cap"] == pytest.approx(800.0 / 20_000.0)
     assert "cost_bias_bps" in day.index
