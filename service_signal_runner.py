@@ -2315,7 +2315,9 @@ class _Worker:
             order = info["order"]
             current_weight = info["current"]
             original_target = max(0.0, info["target"])
-            new_target = self._clamp_weight(original_target * factor)
+            new_target = self._clamp_weight(
+                current_weight + (original_target - current_weight) * factor
+            )
             new_delta = new_target - current_weight
             payload_map = dict(info["payload"])
             payload_map["normalized"] = True
