@@ -185,3 +185,38 @@ def test_missing_price_does_not_book_pnl(bar_bridge_cls: type[Any]) -> None:
     assert pytest.approx(resumed_report["bar_return"], rel=1e-9) == 0.1
     assert pytest.approx(resumed_report["bar_pnl"], rel=1e-9) == 100.0
     assert pytest.approx(resumed_report["equity"], rel=1e-9) == 1_100.0
+
+
+def test_fallback_qty_from_weight(bar_bridge_cls: type[Any]) -> None:
+    symbol = "BTCUSDT"
+    executor = _StubBarExecutor(symbol)
+    executor._weight = 1.0
+    bridge = bar_bridge_cls(
+        executor,
+        symbol=symbol,
+        timeframe_ms=60_000,
+        initial_equity=1_000.0,
+    )
+
+    quiet_report = _run_step(
+        bridge,
+        ts_ms=1,
+        price=100.0,
+        orders=[],
+    )
+
+    assert not executor.executed_orders
+    assert pytest.approx(quiet_report["bar_pnl"], rel=1e-9) == 0.0
+    assert pytest.approx(quiet_report["equity"], rel=1e-9) == 1_000.0
+
+    mark_report = _run_step(
+        bridge,
+        ts_ms=2,
+        price=110.0,
+        orders=[],
+    )
+
+    assert not executor.executed_orders
+    assert pytest.approx(mark_report["bar_return"], rel=1e-9) == 0.1
+    assert pytest.approx(mark_report["bar_pnl"], rel=1e-9) == 100.0
+    assert pytest.approx(mark_report["equity"], rel=1e-9) == 1_100.0
