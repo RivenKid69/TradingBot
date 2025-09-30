@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core_config import ResolvedTurnoverCaps, ResolvedTurnoverLimit
 from service_signal_runner import _Worker
 
 
@@ -76,3 +77,42 @@ def test_small_deltas_suppressed_during_cooldown() -> None:
 
     # Only the initial large trade and the final adjustment should emit
     assert emissions == [(symbol, 1), (symbol, 4)]
+
+
+def test_daily_turnover_limits_infer_missing_turnover() -> None:
+    symbol = "BTCUSDT"
+    caps = ResolvedTurnoverCaps(
+        per_symbol=ResolvedTurnoverLimit(daily_usd=1_000.0),
+        portfolio=ResolvedTurnoverLimit(daily_usd=1_000.0),
+    )
+    executor = SimpleNamespace(turnover_caps=SimpleNamespace(resolve=lambda: caps))
+    worker = _Worker(
+        fp=SimpleNamespace(),
+        policy=SimpleNamespace(),
+        logger=logging.getLogger("test_turnover_fallback"),
+        executor=executor,
+        guards=None,
+        enforce_closed_bars=True,
+        throttle_cfg=None,
+        execution_mode="bar",
+        portfolio_equity=1_000_000.0,
+    )
+
+    order = SimpleNamespace(symbol=symbol, meta={"payload": {"target_weight": 0.5}})
+
+    adjusted = worker._apply_daily_turnover_limits([order], symbol, ts_ms=1)
+    assert adjusted == [order]
+
+    payload = worker._extract_signal_payload(order)
+    assert payload["target_weight"] == pytest.approx(0.001)
+
+    turnover_info = order.meta["daily_turnover"]
+    assert turnover_info["clamped"] is True
+    assert turnover_info["requested_usd"] == pytest.approx(500_000.0)
+    assert turnover_info["executed_usd"] == pytest.approx(1_000.0)
+    assert turnover_info["headroom_before_usd"] == pytest.approx(1_000.0)
+
+    decision_meta = order.meta["decision"]
+    assert decision_meta["turnover_usd"] == pytest.approx(1_000.0)
+    assert decision_meta["daily_turnover_clamped"] is True
+

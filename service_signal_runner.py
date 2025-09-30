@@ -2841,6 +2841,50 @@ class _Worker:
                 return max(0.0, parsed)
         return 0.0
 
+    def _resolve_order_equity(
+        self, order: Any, payload: Mapping[str, Any] | None
+    ) -> float | None:
+        equity = self._portfolio_equity
+        if equity is not None:
+            try:
+                equity_val = float(equity)
+            except (TypeError, ValueError):
+                equity_val = None
+            else:
+                if math.isfinite(equity_val) and equity_val > 0.0:
+                    return equity_val
+
+        mappings: list[Mapping[str, Any]] = []
+        meta = getattr(order, "meta", None)
+        if isinstance(meta, MappingABC):
+            mappings.append(meta)
+            decision = meta.get("decision")
+            if isinstance(decision, MappingABC):
+                mappings.append(decision)
+        elif meta is not None:
+            materialized = self._materialize_mapping(meta)
+            if materialized:
+                mappings.append(materialized)
+                decision = materialized.get("decision")
+                if isinstance(decision, MappingABC):
+                    mappings.append(decision)
+        if isinstance(payload, MappingABC) and payload:
+            mappings.append(payload)
+
+        for mapping in mappings:
+            if not isinstance(mapping, MappingABC):
+                continue
+            candidate = mapping.get("equity_usd")
+            if candidate is None:
+                candidate = self._find_in_mapping(mapping, ("equity_usd",))
+            parsed = self._coerce_float(candidate)
+            if parsed is None:
+                continue
+            if not math.isfinite(parsed) or parsed <= 0.0:
+                continue
+            return float(parsed)
+        return None
+
     def _mutate_order_payload(self, order: Any, updates: Mapping[str, Any]) -> None:
         if not updates:
             return
@@ -2981,7 +3025,15 @@ class _Worker:
             portfolio_used = 0.0
         adjusted: list[Any] = []
         for order in orders:
+            payload = self._extract_signal_payload(order)
             requested = self._extract_order_turnover(order)
+            if requested <= 0.0:
+                _, delta_weight, _ = self._resolve_weight_targets(sym, payload)
+                delta = abs(float(delta_weight))
+                if delta > 0.0:
+                    equity = self._resolve_order_equity(order, payload)
+                    if equity is not None and equity > 0.0:
+                        requested = delta * float(equity)
             headroom_candidates: list[float] = []
             if symbol_limit is not None:
                 headroom_candidates.append(max(0.0, float(symbol_limit) - symbol_used))
