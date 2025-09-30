@@ -283,7 +283,7 @@ class BarExecutor(TradeExecutor):
             state = PortfolioState(symbol=symbol, equity_usd=self.default_equity_usd)
 
         payload = self._extract_payload(order.meta)
-        meta_map = order.meta if isinstance(order.meta, Mapping) else {}
+        meta_map = self._materialize_mapping(order.meta)
         normalized_flag = self._coerce_bool(payload.get("normalized"))
         if not normalized_flag and meta_map:
             normalized_flag = self._coerce_bool(meta_map.get("normalized"))
@@ -292,8 +292,8 @@ class BarExecutor(TradeExecutor):
             normalization_data = self._materialize_mapping(meta_map.get("normalization"))
         if normalization_data:
             normalized_flag = True
-        adv_quote = self._coerce_float(order.meta.get("adv_quote"))
-        bar = self._extract_bar(order.meta)
+        adv_quote = self._coerce_float(meta_map.get("adv_quote"))
+        bar = self._extract_bar(meta_map)
 
         skip_reason: Optional[str] = None
 
@@ -306,7 +306,7 @@ class BarExecutor(TradeExecutor):
         if price is None or price <= Decimal("0"):
             skip_reason = "no_price"
 
-        equity_override = self._coerce_float(order.meta.get("equity_usd"))
+        equity_override = self._coerce_float(meta_map.get("equity_usd"))
         if equity_override is not None:
             state = replace(state, equity_usd=equity_override)
 
@@ -590,46 +590,62 @@ class BarExecutor(TradeExecutor):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-    def _extract_payload(self, meta: Mapping[str, Any]) -> Dict[str, Any]:
-        payload = meta.get("payload")
-        if isinstance(payload, SpotSignalEnvelope):
-            inner = payload.payload
-            dump = getattr(inner, "model_dump", None)
-            if callable(dump):
-                return dict(dump())
-            if hasattr(inner, "dict"):
-                return dict(inner.dict())
-        dump = getattr(payload, "model_dump", None)
-        if callable(dump):
-            try:
-                return dict(dump())
-            except Exception:
-                pass
-        if hasattr(payload, "dict"):
-            try:
-                return dict(payload.dict())
-            except Exception:
-                pass
-        if isinstance(payload, Mapping):
-            return dict(payload)
-        rebalance_payload = meta.get("rebalance")
-        if isinstance(rebalance_payload, Mapping):
-            return dict(rebalance_payload)
+    def _extract_payload(self, meta: Any) -> Dict[str, Any]:
+        if isinstance(meta, SpotSignalEnvelope):
+            return self._materialize_mapping(meta.payload)
+
+        meta_map = self._materialize_mapping(meta)
+        if meta_map:
+            payload_container = meta_map.get("payload")
+            if isinstance(payload_container, SpotSignalEnvelope):
+                return self._materialize_mapping(payload_container.payload)
+            payload_map = self._materialize_mapping(payload_container)
+            if payload_map:
+                return payload_map
+            if isinstance(payload_container, Mapping):
+                return dict(payload_container)
+            rebalance_map = self._materialize_mapping(meta_map.get("rebalance"))
+            if rebalance_map:
+                return rebalance_map
+
+        payload_attr = getattr(meta, "payload", None)
+        if payload_attr is not None and not isinstance(meta, Mapping):
+            payload_map = self._materialize_mapping(payload_attr)
+            if payload_map:
+                return payload_map
+
+        if isinstance(meta, Mapping):
+            rebalance_payload = meta.get("rebalance")
+            if isinstance(rebalance_payload, Mapping):
+                return dict(rebalance_payload)
+
         return {}
 
     def _materialize_mapping(self, value: Any) -> Dict[str, Any]:
         if isinstance(value, Mapping):
             return dict(value)
+
+        materialized: Dict[str, Any] = {}
         for attr in ("model_dump", "dict"):
             getter = getattr(value, attr, None)
-            if callable(getter):
-                try:
-                    data = getter()
-                except Exception:
+            if not callable(getter):
+                continue
+            try:
+                data = getter()
+            except Exception:
+                continue
+            if isinstance(data, Mapping):
+                materialized.update(dict(data))
+                break
+
+        extras = getattr(value, "__dict__", None)
+        if isinstance(extras, Mapping):
+            for key, extra_value in extras.items():
+                if not key or key.startswith("_") or key == "__pydantic_fields_set__":
                     continue
-                if isinstance(data, Mapping):
-                    return dict(data)
-        return {}
+                materialized.setdefault(key, extra_value)
+
+        return materialized
 
     def _coerce_float(self, value: Any) -> Optional[float]:
         if value is None:

@@ -1,9 +1,15 @@
 import logging
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Dict
 
 import pytest
+
+from api.spot_signals import (
+    SpotSignalEconomics,
+    SpotSignalEnvelope,
+    SpotSignalTargetWeightPayload,
+)
 
 from core_config import SpotCostConfig, SpotImpactConfig, SpotTurnoverCaps, SpotTurnoverLimit
 from core_models import Bar, Order, OrderType, Side
@@ -152,6 +158,69 @@ def test_bar_executor_missing_adv_sets_impact_mode_none():
     assert decision["impact"] == pytest.approx(0.0)
     assert decision["impact_mode"] == "none"
     assert decision["turnover_usd"] == pytest.approx(500.0)
+
+
+def test_bar_executor_handles_envelope_meta():
+    class EnvelopePayload(SpotSignalTargetWeightPayload):
+        def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
+            data = super().model_dump(*args, **kwargs)
+            data["edge_bps"] = float(self.economics.edge_bps)
+            return data
+
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=100.0,
+    )
+    bar = make_bar(42, 10_000.0)
+    economics = SpotSignalEconomics(
+        edge_bps=75.0,
+        cost_bps=5.0,
+        net_bps=65.0,
+        turnover_usd=0.0,
+        act_now=True,
+        impact=0.0,
+        impact_mode="model",
+    )
+    payload = EnvelopePayload(economics=economics, target_weight=0.4)
+    expires_at = bar.ts + 60_000
+    envelope = SpotSignalEnvelope(
+        symbol="BTCUSDT",
+        bar_close_ms=bar.ts,
+        expires_at_ms=expires_at,
+        payload=payload,
+    )
+    adv_quote = 50_000.0
+    equity_override = 2_500.0
+    object.__setattr__(envelope, "adv_quote", adv_quote)
+    object.__setattr__(envelope, "equity_usd", equity_override)
+    object.__setattr__(envelope, "bar", bar)
+
+    order = Order(
+        ts=bar.ts,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta=envelope,
+    )
+
+    report = executor.execute(order)
+
+    instructions = report.meta["instructions"]
+    assert len(instructions) == 1
+    instruction = instructions[0]
+    assert instruction["target_weight"] == pytest.approx(payload.target_weight)
+    decision = report.meta["decision"]
+    assert decision["edge_bps"] == pytest.approx(economics.edge_bps)
+    assert decision["turnover_usd"] == pytest.approx(
+        payload.target_weight * equity_override
+    )
+    assert decision["impact_mode"] == "model"
+    assert report.meta["adv_quote"] == pytest.approx(adv_quote)
+    assert report.meta["reference_price"] == pytest.approx(float(bar.close))
 
 
 def test_bar_executor_delta_weight_twap_and_participation():
