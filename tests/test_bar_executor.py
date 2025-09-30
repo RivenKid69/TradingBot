@@ -745,6 +745,55 @@ def test_worker_normalizes_weights_above_cap():
         )
 
 
+def test_worker_normalizes_weights_with_existing_weight_keeps_direction():
+    worker = _make_worker(
+        1.0, existing_weights={"BTCUSDT": 0.5, "ETHUSDT": 0.3}
+    )
+    order_up = Order(
+        ts=1,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {
+                "target_weight": 0.7,
+                "edge_bps": 10.0,
+                "economics": {"turnover_usd": 700.0},
+            }
+        },
+    )
+    order_new = Order(
+        ts=1,
+        symbol="LTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {
+                "target_weight": 0.7,
+                "edge_bps": 12.0,
+                "economics": {"turnover_usd": 500.0},
+            }
+        },
+    )
+
+    normalized_orders, applied = worker._normalize_weight_targets([order_up, order_new])
+    assert applied is True
+
+    payloads: Dict[str, Dict[str, Any]] = {
+        o.symbol: o.meta["payload"] for o in normalized_orders
+    }
+    btc_payload = payloads["BTCUSDT"]
+    assert btc_payload["target_weight"] == pytest.approx(0.6)
+    assert btc_payload["target_weight"] > worker._weights["BTCUSDT"]
+    assert btc_payload["target_weight"] < 0.7
+    assert btc_payload["delta_weight"] == pytest.approx(0.1)
+    assert btc_payload["delta_weight"] > 0.0
+
+
 def test_bar_executor_propagates_normalized_flag():
     executor = BarExecutor(
         run_id="test",
