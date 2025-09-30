@@ -1,10 +1,13 @@
 import math
-import pytest
 from decimal import Decimal
+
+import pandas as pd
+import pytest
 
 from transformers import FeatureSpec
 
 from core_models import Bar
+from core_config import ExecutionRuntimeConfig, SpotCostConfig
 from feature_pipe import FeaturePipe
 
 
@@ -71,3 +74,28 @@ def test_feature_pipe_records_spread_with_ttl_expiry():
     assert snap_after is not None
     assert snap_after.last_bar_ts == 2_000
     assert snap_after.spread_bps is None
+
+
+def test_make_targets_no_turnover_data_leaves_returns_unchanged():
+    df = pd.DataFrame(
+        {
+            "symbol": ["BTCUSDT", "BTCUSDT", "BTCUSDT"],
+            "ts_ms": [0, 60_000, 120_000],
+            "price": [100.0, 101.0, 102.0],
+        }
+    )
+
+    pipe = FeaturePipe(
+        FeatureSpec(lookbacks_prices=[1]),
+        execution=ExecutionRuntimeConfig(mode="bar"),
+        costs=SpotCostConfig(taker_fee_bps=5.0),
+    )
+
+    expected = (
+        df.groupby("symbol")["price"].shift(-1).div(df["price"]) - 1.0
+    ).rename("target")
+
+    result = pipe.make_targets(df)
+
+    assert result is not None
+    pd.testing.assert_series_equal(result, expected)

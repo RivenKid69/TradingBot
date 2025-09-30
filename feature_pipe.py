@@ -825,7 +825,7 @@ class FeaturePipe:
             trade_mask = turnover_values > 0.0
         else:
             turnover_values = None
-            trade_mask = np.ones(n_rows, dtype=bool)
+            trade_mask = np.zeros(n_rows, dtype=bool)
 
         costs_decimal = np.zeros(n_rows, dtype=float)
         if base_cost_bps > 0.0:
