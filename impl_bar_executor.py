@@ -328,15 +328,20 @@ class BarExecutor(TradeExecutor):
             self.safety_margin_bps,
         )
 
+        turnover_override: Optional[float] = None
         if skip_reason is not None:
+            updates = {"act_now": False, "turnover_usd": 0.0}
             if hasattr(metrics, "model_copy"):
-                metrics = metrics.model_copy(update={"act_now": False})
+                metrics = metrics.model_copy(update=updates)
             else:  # pragma: no cover - compatibility fallback
-                metrics = metrics.copy(update={"act_now": False})
+                metrics = metrics.copy(update=updates)
+            turnover_override = 0.0
 
         min_step = self.min_rebalance_step
         skip_due_to_step = False
         raw_turnover_usd = float(getattr(metrics, "turnover_usd", 0.0))
+        if turnover_override is not None:
+            raw_turnover_usd = turnover_override
         turnover_usd = raw_turnover_usd
         if min_step > 0.0 and abs(delta_weight) < min_step:
             skip_due_to_step = True

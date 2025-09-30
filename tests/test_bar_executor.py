@@ -415,6 +415,7 @@ def test_bar_executor_skips_when_price_invalid(price: float):
     decision = report.meta["decision"]
     assert decision["act_now"] is False
     assert decision.get("reason") == "no_price"
+    assert decision["turnover_usd"] == 0.0
 
     snapshot = executor.monitoring_snapshot()
     assert snapshot.get("act_now") is False
