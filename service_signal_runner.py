@@ -533,6 +533,33 @@ def _parse_pipeline_config(data: Mapping[str, Any]) -> PipelineConfig:
     return PipelineConfig(enabled=enabled, stages=stages)
 
 
+def _extract_bar_initial_weights_from_state(state: Any) -> Dict[str, float] | None:
+    try:
+        exposure_state_raw = getattr(state, "exposure_state", {}) or {}
+    except Exception:
+        return None
+    if not isinstance(exposure_state_raw, MappingABC):
+        return None
+    raw_weights = exposure_state_raw.get("weights", {}) or {}
+    if not isinstance(raw_weights, MappingABC):
+        return None
+    sanitized: Dict[str, float] = {}
+    for symbol, weight in raw_weights.items():
+        sym = str(symbol).upper()
+        if not sym:
+            continue
+        try:
+            weight_val = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(weight_val):
+            continue
+        if math.isclose(weight_val, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            continue
+        sanitized[sym] = weight_val
+    return sanitized or None
+
+
 class _Worker:
     def __init__(
         self,
@@ -6407,6 +6434,7 @@ def clear_dirty_restart(
         except Exception:
             pass
         entry_limits_state: Dict[str, Dict[str, Any]] | None = None
+        bar_initial_weights: Dict[str, float] | None = None
         loaded_state: Any | None = None
         if self.cfg.state.enabled:
             state_path = self.cfg.state.path
@@ -6513,6 +6541,12 @@ def clear_dirty_restart(
                         }
                 except Exception:
                     orders_summary = {}
+
+                candidate_weights = _extract_bar_initial_weights_from_state(
+                    loaded_state
+                )
+                if candidate_weights:
+                    bar_initial_weights = candidate_weights
 
                 entry_limits_state = None
                 try:
@@ -6876,6 +6910,7 @@ def clear_dirty_restart(
                 safety_margin_bps=safety_margin,
                 max_participation=max_participation,
                 default_equity_usd=portfolio_equity or 0.0,
+                initial_weights=bar_initial_weights,
                 symbol_specs=self._symbol_specs,
             )
 
