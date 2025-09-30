@@ -315,6 +315,14 @@ class BarExecutor(TradeExecutor):
         requested_delta_weight = delta_weight
 
         decision_signal: Dict[str, Any] = dict(payload)
+        economics_block = self._materialize_mapping(decision_signal.get("economics"))
+        if economics_block:
+            for key in ("edge_bps", "cost_bps", "net_bps", "turnover_usd"):
+                if key in decision_signal and decision_signal.get(key) is not None:
+                    continue
+                value = economics_block.get(key)
+                if value is not None:
+                    decision_signal[key] = value
         if normalized_flag:
             decision_signal["normalized"] = True
         if normalization_data:

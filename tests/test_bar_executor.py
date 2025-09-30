@@ -223,6 +223,52 @@ def test_bar_executor_handles_envelope_meta():
     assert report.meta["reference_price"] == pytest.approx(float(bar.close))
 
 
+def test_bar_executor_falls_back_to_nested_economics() -> None:
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(taker_fee_bps=2.5, half_spread_bps=2.5),
+        default_equity_usd=1000.0,
+    )
+    bar = make_bar(100, 20_000.0)
+    economics = SpotSignalEconomics(
+        edge_bps=55.0,
+        cost_bps=5.0,
+        net_bps=50.0,
+        turnover_usd=321.0,
+        act_now=True,
+        impact=0.0,
+        impact_mode="model",
+    )
+    payload = SpotSignalTargetWeightPayload(
+        economics=economics,
+        target_weight=0.4,
+    )
+    order = Order(
+        ts=bar.ts,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "payload": payload.model_dump(),
+        },
+    )
+
+    report = executor.execute(order)
+
+    decision = report.meta["decision"]
+    assert decision["edge_bps"] == pytest.approx(economics.edge_bps)
+    assert decision["net_bps"] == pytest.approx(
+        economics.edge_bps - economics.cost_bps
+    )
+    assert decision["act_now"] is True
+    expected_turnover = payload.target_weight * executor.default_equity_usd
+    assert decision["turnover_usd"] == pytest.approx(expected_turnover)
+
+
 def test_bar_executor_delta_weight_twap_and_participation():
     executor = BarExecutor(
         run_id="test",
