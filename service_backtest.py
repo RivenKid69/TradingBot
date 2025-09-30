@@ -127,6 +127,7 @@ class BarBacktestSimBridge:
         self._equity = float(initial_equity or 0.0)
         self._initial_equity = float(initial_equity or 0.0)
         self._weights: Dict[str, float] = {}
+        self._position_qtys: Dict[str, float] = {}
         self._last_prices: Dict[str, float] = {}
         self._active_symbol: str = self.symbol
         self._cum_cost_usd = 0.0
@@ -213,7 +214,7 @@ class BarBacktestSimBridge:
         symbol = self._active_symbol or self.symbol
         close_price = self._coerce_price(bar_close, ref_price)
         prev_price = self._last_prices.get(symbol)
-        prev_weight = self._weights.get(symbol, 0.0)
+        prev_qty = self._position_qtys.get(symbol, 0.0)
 
         bar_return = 0.0
         pnl_from_price = 0.0
@@ -225,7 +226,7 @@ class BarBacktestSimBridge:
                 bar_return = (close_price / prev_price) - 1.0
             except ZeroDivisionError:
                 bar_return = 0.0
-            pnl_from_price = self._equity * prev_weight * bar_return
+            pnl_from_price = prev_qty * (close_price - prev_price)
 
         equity_before_costs = self._equity + pnl_from_price
 
@@ -301,6 +302,13 @@ class BarBacktestSimBridge:
             meta = getattr(pos, "meta", None)
             if isinstance(meta, Mapping):
                 weight = self._safe_float(meta.get("weight"))
+            qty = self._safe_float(getattr(pos, "qty", 0.0))
+            if abs(qty) > 1e-12:
+                self._position_qtys[symbol] = qty
+            elif symbol in self._position_qtys:
+                self._position_qtys.pop(symbol, None)
+        elif symbol in self._position_qtys:
+            self._position_qtys.pop(symbol, None)
         self._weights[symbol] = weight
 
         # ``pnl_from_price`` reflects the return realised between the previous
