@@ -89,6 +89,39 @@ def _make_economics_order(
     )
 
 
+def _make_turnover_rich_order(
+    symbol: str, target_weight: float, turnover_usd: float
+) -> Order:
+    return Order(
+        ts=0,
+        symbol=symbol,
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {
+                "target_weight": target_weight,
+                "turnover_usd": turnover_usd,
+                "turnover": turnover_usd,
+                "economics": {
+                    "turnover_usd": turnover_usd,
+                    "notional_usd": turnover_usd,
+                },
+                "decision": {
+                    "turnover_usd": turnover_usd,
+                    "economics": {"turnover_usd": turnover_usd},
+                },
+            },
+            "economics": {"turnover_usd": turnover_usd},
+            "decision": {
+                "turnover_usd": turnover_usd,
+                "economics": {"turnover_usd": turnover_usd},
+            },
+        },
+    )
+
+
 def test_daily_turnover_cap_clamps_and_defers() -> None:
     worker = _make_worker_with_daily_cap(500.0)
 
@@ -161,3 +194,32 @@ def test_daily_turnover_limits_use_sequential_weights_for_orders() -> None:
     assert second_meta.get("_daily_turnover_usd") == pytest.approx(200.0)
     assert second_meta["payload"]["target_weight"] == pytest.approx(0.6)
     assert second_meta["daily_turnover"]["clamped"] is False
+
+
+def test_daily_turnover_scaling_updates_turnover_fields() -> None:
+    worker = _make_worker_with_daily_cap(100.0)
+
+    order = _make_turnover_rich_order("BTCUSDT", 0.5, 250.0)
+    adjusted = worker._apply_daily_turnover_limits([order], "BTCUSDT", 1)
+    assert len(adjusted) == 1
+    result = adjusted[0]
+    factor = 100.0 / 250.0
+
+    meta = result.meta
+    assert meta.get("_daily_turnover_usd") == pytest.approx(100.0)
+
+    payload = meta["payload"]
+    assert payload["turnover_usd"] == pytest.approx(250.0 * factor)
+    assert payload["turnover"] == pytest.approx(250.0 * factor)
+    assert payload["economics"]["turnover_usd"] == pytest.approx(250.0 * factor)
+    assert payload["economics"]["notional_usd"] == pytest.approx(250.0 * factor)
+    assert payload["decision"]["turnover_usd"] == pytest.approx(250.0 * factor)
+    assert payload["decision"]["economics"]["turnover_usd"] == pytest.approx(
+        250.0 * factor
+    )
+
+    assert meta["economics"]["turnover_usd"] == pytest.approx(250.0 * factor)
+    assert meta["decision"]["turnover_usd"] == pytest.approx(250.0 * factor)
+    assert meta["decision"]["economics"]["turnover_usd"] == pytest.approx(
+        250.0 * factor
+    )
