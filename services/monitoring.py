@@ -1113,6 +1113,7 @@ class MonitoringAggregator:
         modeled_cost_bps: Optional[float] = None,
         realized_slippage_bps: Optional[float] = None,
         cost_bias_bps: Optional[float] = None,
+        bar_ts: Optional[int] = None,
     ) -> None:
         if not self.enabled:
             return
@@ -1135,7 +1136,20 @@ class MonitoringAggregator:
             cap_value = float(cap_usd) if cap_usd is not None else None
         except Exception:
             cap_value = None
-        ts_ms = int(time.time() * 1000)
+        ts_ms: int
+        if bar_ts is not None:
+            try:
+                ts_candidate = int(bar_ts)
+            except Exception:
+                try:
+                    ts_candidate = int(float(bar_ts))
+                except Exception:
+                    ts_candidate = int(time.time() * 1000)
+            else:
+                ts_candidate = int(ts_candidate)
+            ts_ms = ts_candidate
+        else:
+            ts_ms = int(time.time() * 1000)
         self._execution_mode = "bar"
         mode_key: Optional[str]
         if impact_mode is None:

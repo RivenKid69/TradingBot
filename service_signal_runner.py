@@ -1331,6 +1331,22 @@ class _Worker:
                 reason_label = str(reason_val)
             except Exception:
                 reason_label = None
+        bar_ts: int | None = None
+        if snapshot is not None:
+            ts_value = snapshot.get("bar_ts")
+            if ts_value is None:
+                ts_value = self._find_in_mapping(snapshot, ("bar_ts",))
+            if ts_value is None and decision is not None:
+                ts_value = self._find_in_mapping(decision, ("bar_ts",))
+            if ts_value is not None:
+                try:
+                    bar_ts = int(ts_value)
+                except Exception:
+                    try:
+                        bar_ts = int(float(ts_value))
+                    except Exception:
+                        bar_ts = None
+
         metrics: Dict[str, Any] = {
             "decisions": 1,
             "act_now": 1 if act_now_flag else 0,
@@ -1338,6 +1354,8 @@ class _Worker:
             "cap_usd": cap_value,
             "normalized": bool(normalized_flag),
         }
+        if bar_ts is not None:
+            metrics["bar_ts"] = bar_ts
         if impact_mode:
             metrics["impact_mode"] = impact_mode
         if reason_label:
@@ -4436,6 +4454,7 @@ class _Worker:
                                     "realized_slippage_bps"
                                 ),
                                 cost_bias_bps=bar_metrics.get("cost_bias_bps"),
+                                bar_ts=bar_metrics.get("bar_ts"),
                             )
                         except Exception:
                             pass

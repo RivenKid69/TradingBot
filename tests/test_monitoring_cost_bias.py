@@ -83,6 +83,7 @@ def test_worker_forwards_cost_metrics_to_monitoring() -> None:
         },
         "turnover_usd": 1_000.0,
         "cap_usd": 5_000.0,
+        "bar_ts": 1_000_000,
     }
 
     worker = _Worker(
@@ -96,6 +97,11 @@ def test_worker_forwards_cost_metrics_to_monitoring() -> None:
         execution_mode="bar",
         rest_candidates=[],
     )
+
+    runtime_snapshot = worker._extract_monitoring_snapshot(worker._executor)
+    extracted_metrics = worker._extract_bar_execution_metrics(runtime_snapshot)
+    assert extracted_metrics is not None
+    assert extracted_metrics.get("bar_ts") == snapshot["bar_ts"]
 
     bar = Bar(
         ts=1_000_000,
@@ -114,8 +120,30 @@ def test_worker_forwards_cost_metrics_to_monitoring() -> None:
     assert entry["modeled_cost_bps"] == pytest.approx(modeled)
     assert entry["realized_slippage_bps"] == pytest.approx(realized)
     assert entry["cost_bias_bps"] == pytest.approx(bias)
+    assert entry["ts"] == bar.ts
 
     window_snapshot = agg._bar_window_snapshot("1m")
     assert window_snapshot["modeled_cost_bps"] == pytest.approx(modeled)
     assert window_snapshot["realized_slippage_bps"] == pytest.approx(realized)
     assert window_snapshot["cost_bias_bps"] == pytest.approx(bias)
+
+
+def test_bar_execution_pruning_uses_bar_timestamp() -> None:
+    thresholds = MonitoringThresholdsConfig()
+    cfg = MonitoringConfig(enabled=True, thresholds=thresholds)
+    agg = MonitoringAggregator(cfg, DummyAlerts())
+
+    agg.set_execution_mode("bar")
+    agg.record_bar_execution(
+        "BTCUSDT",
+        decisions=1,
+        act_now=1,
+        turnover_usd=1_000.0,
+        bar_ts=0,
+    )
+
+    assert len(agg._bar_events["1m"]) == 1
+    agg.tick(180_000)
+    assert not agg._bar_events["1m"]
+    assert agg._bar_events["5m"], "expected longer window to retain event"
+    assert agg._bar_events["5m"][0]["ts"] == 0
