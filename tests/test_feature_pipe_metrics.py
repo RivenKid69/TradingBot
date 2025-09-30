@@ -99,3 +99,44 @@ def test_make_targets_no_turnover_data_leaves_returns_unchanged():
 
     assert result is not None
     pd.testing.assert_series_equal(result, expected)
+
+
+def test_make_targets_scales_costs_with_turnover_fraction():
+    df = pd.DataFrame(
+        {
+            "symbol": ["BTCUSDT", "BTCUSDT", "BTCUSDT", "BTCUSDT"],
+            "ts_ms": [0, 60_000, 120_000, 180_000],
+            "price": [100.0, 105.0, 109.0, 120.0],
+            "turnover_usd": [0.0, 1_000.0, 500.0, 0.0],
+            "equity_usd": [10_000.0, 10_000.0, 10_000.0, 10_000.0],
+            "adv_usd": [50_000.0, 50_000.0, 50_000.0, 50_000.0],
+        }
+    )
+
+    pipe = FeaturePipe(
+        FeatureSpec(lookbacks_prices=[1]),
+        execution=ExecutionRuntimeConfig(mode="bar"),
+        costs=SpotCostConfig(
+            taker_fee_bps=10.0,
+            impact={"linear_coeff": 25.0},
+        ),
+    )
+
+    raw = (
+        df.groupby("symbol")["price"].shift(-1).div(df["price"]) - 1.0
+    ).rename("target")
+    result = pipe.make_targets(df)
+
+    assert result is not None
+
+    turnover_fraction = df["turnover_usd"] / df["equity_usd"]
+    base_component = turnover_fraction * 10.0 * 1e-4
+    participation = df["turnover_usd"] / df["adv_usd"]
+    impact_component = turnover_fraction * participation * 25.0 * 1e-4
+    expected = raw - (base_component + impact_component)
+    expected.name = "target"
+
+    pd.testing.assert_series_equal(result, expected)
+
+    costs = raw - result
+    assert costs.iloc[1] > costs.iloc[2] > 0.0
