@@ -2715,15 +2715,38 @@ class _Worker:
         payload = self._extract_signal_payload(order)
         if payload:
             mappings.append(payload)
+        turnover_keys = ("turnover_usd", "turnover", "notional_usd")
         for mapping in mappings:
             if not isinstance(mapping, MappingABC):
                 continue
-            for key in ("turnover_usd", "turnover", "notional_usd"):
+            for key in turnover_keys:
                 if key not in mapping:
                     continue
                 parsed = self._coerce_float(mapping.get(key))
                 if parsed is not None:
                     return max(0.0, parsed)
+            economics = mapping.get("economics")
+            if isinstance(economics, MappingABC):
+                for key in turnover_keys:
+                    if key not in economics:
+                        continue
+                    parsed = self._coerce_float(economics.get(key))
+                    if parsed is not None:
+                        return max(0.0, parsed)
+                nested_value = self._find_in_mapping(economics, turnover_keys)
+                if nested_value is not None:
+                    parsed = self._coerce_float(nested_value)
+                    if parsed is not None:
+                        return max(0.0, parsed)
+        for mapping in mappings:
+            if not isinstance(mapping, MappingABC):
+                continue
+            nested_value = self._find_in_mapping(mapping, turnover_keys)
+            if nested_value is None:
+                continue
+            parsed = self._coerce_float(nested_value)
+            if parsed is not None:
+                return max(0.0, parsed)
         return 0.0
 
     def _mutate_order_payload(self, order: Any, updates: Mapping[str, Any]) -> None:

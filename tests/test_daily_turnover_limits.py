@@ -70,6 +70,25 @@ def _make_order(symbol: str, target_weight: float, turnover_usd: float) -> Order
     )
 
 
+def _make_economics_order(
+    symbol: str, target_weight: float, turnover_usd: float
+) -> Order:
+    return Order(
+        ts=0,
+        symbol=symbol,
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {
+                "target_weight": target_weight,
+                "economics": {"turnover_usd": turnover_usd},
+            }
+        },
+    )
+
+
 def test_daily_turnover_cap_clamps_and_defers() -> None:
     worker = _make_worker_with_daily_cap(500.0)
 
@@ -91,6 +110,32 @@ def test_daily_turnover_cap_clamps_and_defers() -> None:
 
     third = _make_order("BTCUSDT", 0.6, 100.0)
     adjusted_third = worker._apply_daily_turnover_limits([third], "BTCUSDT", 1)
+    assert adjusted_third == []
+    snapshot = worker._daily_turnover_snapshot()
+    assert snapshot["portfolio"]["remaining_usd"] == pytest.approx(0.0)
+
+
+def test_daily_turnover_cap_uses_economics_payload() -> None:
+    worker = _make_worker_with_daily_cap(200.0)
+
+    first = _make_economics_order("ETHUSDT", 0.5, 150.0)
+    adjusted_first = worker._apply_daily_turnover_limits([first], "ETHUSDT", 1)
+    assert len(adjusted_first) == 1
+    assert adjusted_first[0].meta.get("_daily_turnover_usd") == pytest.approx(150.0)
+    worker._commit_exposure(adjusted_first[0])
+    assert worker._daily_symbol_turnover["ETHUSDT"]["total"] == pytest.approx(150.0)
+
+    second = _make_economics_order("ETHUSDT", 0.9, 100.0)
+    adjusted_second = worker._apply_daily_turnover_limits([second], "ETHUSDT", 1)
+    assert len(adjusted_second) == 1
+    payload = adjusted_second[0].meta["payload"]
+    assert payload["target_weight"] == pytest.approx(0.7)
+    assert adjusted_second[0].meta.get("_daily_turnover_usd") == pytest.approx(50.0)
+    worker._commit_exposure(adjusted_second[0])
+    assert worker._daily_symbol_turnover["ETHUSDT"]["total"] == pytest.approx(200.0)
+
+    third = _make_economics_order("ETHUSDT", 0.8, 10.0)
+    adjusted_third = worker._apply_daily_turnover_limits([third], "ETHUSDT", 1)
     assert adjusted_third == []
     snapshot = worker._daily_turnover_snapshot()
     assert snapshot["portfolio"]["remaining_usd"] == pytest.approx(0.0)
