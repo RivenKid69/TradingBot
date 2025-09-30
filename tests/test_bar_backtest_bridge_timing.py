@@ -25,6 +25,7 @@ class _StubReport:
 @dataclass
 class _StubPosition:
     meta: Mapping[str, Any]
+    qty: float = 0.0
 
 
 class _StubBarExecutor:
@@ -34,6 +35,7 @@ class _StubBarExecutor:
         self.symbol = symbol
         self.run_id = "stub"
         self._weight = 0.0
+        self._qty = 0.0
         self.executed_orders: list[_StubOrder] = []
 
     def execute(self, order: _StubOrder) -> _StubReport:
@@ -44,18 +46,28 @@ class _StubBarExecutor:
         equity_usd = float(getattr(order, "meta", {}).get("equity_usd", 0.0))
         turnover_usd = abs(self._weight - prev_weight) * equity_usd
         decision = {"turnover_usd": turnover_usd, "cost_bps": 0.0}
+        bar = getattr(order, "meta", {}).get("bar")
+        close_price = None
+        if bar is not None:
+            close_raw = getattr(bar, "close", None)
+            try:
+                close_price = float(close_raw)
+            except (TypeError, ValueError):
+                close_price = None
+        if close_price and close_price > 0.0:
+            self._qty = self._weight * equity_usd / close_price
         return _StubReport(meta={"decision": decision})
 
     def get_open_positions(self, symbols: Sequence[str]) -> Dict[str, _StubPosition]:
         symbol = next(iter(symbols), self.symbol)
-        return {symbol: _StubPosition(meta={"weight": self._weight})}
+        return {symbol: _StubPosition(meta={"weight": self._weight}, qty=self._qty)}
 
 
 def _run_step(
     bridge: Any,
     *,
     ts_ms: int,
-    price: float,
+    price: float | None,
     orders: Iterable[_StubOrder],
 ) -> Dict[str, Any]:
     return bridge.step(
@@ -130,3 +142,46 @@ def test_trade_pnl_alignment(bar_bridge_cls: type[Any]) -> None:
     assert pytest.approx(second_report["bar_return"], rel=1e-9) == 0.1
     assert pytest.approx(second_report["bar_pnl"], rel=1e-9) == 100.0
     assert pytest.approx(second_report["equity"], rel=1e-9) == 1_100.0
+
+
+def test_missing_price_does_not_book_pnl(bar_bridge_cls: type[Any]) -> None:
+    symbol = "BTCUSDT"
+    executor = _StubBarExecutor(symbol)
+    bridge = bar_bridge_cls(
+        executor,
+        symbol=symbol,
+        timeframe_ms=60_000,
+        initial_equity=1_000.0,
+    )
+
+    first_report = _run_step(
+        bridge,
+        ts_ms=1,
+        price=100.0,
+        orders=[_StubOrder(desired_weight=1.0)],
+    )
+
+    missing_price_report = _run_step(
+        bridge,
+        ts_ms=2,
+        price=None,
+        orders=[],
+    )
+
+    assert len(executor.executed_orders) == 1
+    assert pytest.approx(missing_price_report["bar_pnl"], rel=1e-9) == 0.0
+    assert missing_price_report["equity"] == pytest.approx(
+        first_report["equity"],
+        rel=1e-9,
+    )
+
+    resumed_report = _run_step(
+        bridge,
+        ts_ms=3,
+        price=110.0,
+        orders=[],
+    )
+
+    assert pytest.approx(resumed_report["bar_return"], rel=1e-9) == 0.1
+    assert pytest.approx(resumed_report["bar_pnl"], rel=1e-9) == 100.0
+    assert pytest.approx(resumed_report["equity"], rel=1e-9) == 1_100.0
