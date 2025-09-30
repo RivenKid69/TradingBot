@@ -2228,6 +2228,32 @@ class _Worker:
         if equity is not None and math.isfinite(equity):
             normalization_payload["cap_usd"] = float(cap) * float(equity)
 
+        turnover_keys = ("turnover_usd", "turnover", "notional_usd")
+
+        def _coerce_dict(value: Any) -> Dict[str, Any] | None:
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, MappingABC):
+                return dict(value)
+            return None
+
+        def _scale_turnover(mapping: Dict[str, Any] | None) -> Dict[str, Any] | None:
+            if mapping is None:
+                return None
+            for key in turnover_keys:
+                if key not in mapping:
+                    continue
+                try:
+                    raw_val = float(mapping[key])
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(raw_val):
+                    continue
+                mapping[key] = raw_val * factor
+            return mapping
+
         def _ensure_meta(order_obj: Any) -> Dict[str, Any]:
             meta_val = getattr(order_obj, "meta", None)
             if isinstance(meta_val, dict):
@@ -2260,12 +2286,37 @@ class _Worker:
             payload_map["weight"] = new_target
             payload_map["delta_weight"] = new_delta
             payload_map["delta"] = new_delta
+            _scale_turnover(payload_map)
+            economics_map = _coerce_dict(payload_map.get("economics"))
+            if economics_map is not None:
+                payload_map["economics"] = _scale_turnover(economics_map) or economics_map
+            decision_map = _coerce_dict(payload_map.get("decision"))
+            if decision_map is not None:
+                payload_map["decision"] = decision_map
+                _scale_turnover(decision_map)
+                decision_econ = _coerce_dict(decision_map.get("economics"))
+                if decision_econ is not None:
+                    decision_map["economics"] = (
+                        _scale_turnover(decision_econ) or decision_econ
+                    )
             info["payload"] = payload_map
             info["target"] = new_target
             meta_map = _ensure_meta(order)
             meta_map["payload"] = payload_map
             meta_map["normalized"] = True
             meta_map["normalization"] = dict(normalization_payload)
+            meta_economics = _coerce_dict(meta_map.get("economics"))
+            if meta_economics is not None:
+                meta_map["economics"] = _scale_turnover(meta_economics) or meta_economics
+            meta_decision = _coerce_dict(meta_map.get("decision"))
+            if meta_decision is not None:
+                _scale_turnover(meta_decision)
+                decision_econ = _coerce_dict(meta_decision.get("economics"))
+                if decision_econ is not None:
+                    meta_decision["economics"] = (
+                        _scale_turnover(decision_econ) or decision_econ
+                    )
+                meta_map["decision"] = meta_decision
             self._pending_weight[id(order)] = {
                 "symbol": symbol,
                 "target_weight": new_target,
