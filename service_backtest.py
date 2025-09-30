@@ -268,7 +268,7 @@ class BarBacktestSimBridge:
                 payload = {}
             payload.setdefault("payload", {})
             if bar_payload is not None:
-                payload.setdefault("bar", bar_payload)
+                payload["bar"] = bar_payload
             payload["equity_usd"] = equity_before_costs
             order.meta = payload
 
