@@ -366,6 +366,37 @@ def test_bar_executor_turnover_cap_blocks_trade():
     assert report.meta["cap_usd"] == pytest.approx(100.0)
 
 
+def test_bar_executor_invalid_target_weight_skips_trade():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+    )
+
+    bar = make_bar(55, 10_000.0)
+    order = Order(
+        ts=bar.ts,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "payload": {"target_weight": "bad", "edge_bps": 50.0},
+        },
+    )
+
+    report = executor.execute(order)
+
+    decision = report.meta["decision"]
+    assert decision["turnover_usd"] == pytest.approx(0.0)
+    assert decision["impact"] == pytest.approx(0.0)
+    assert decision["act_now"] is False
+    assert report.meta["instructions"] == []
+
+
 def test_bar_executor_rounds_quantities_to_step_size():
     executor = BarExecutor(
         run_id="test",
