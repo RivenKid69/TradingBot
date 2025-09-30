@@ -57,6 +57,7 @@ def _make_worker(
     execution_mode: str = "order",
     now_ms: int | Callable[[], int] = 5000,
     throttle_cfg: types.SimpleNamespace | None = None,
+    ws_dedup_timeframe_ms: int = 60_000,
 ):
     fp = types.SimpleNamespace(spread_ttl_ms=0)
     policy = types.SimpleNamespace()
@@ -100,7 +101,7 @@ def _make_worker(
         logger,
         executor,
         enforce_closed_bars=False,
-        ws_dedup_timeframe_ms=60_000,
+        ws_dedup_timeframe_ms=ws_dedup_timeframe_ms,
         idempotency_cache_size=4,
         execution_mode=execution_mode,
         throttle_cfg=throttle_cfg,
@@ -145,6 +146,26 @@ def test_emit_accepts_new_idempotency_key(monkeypatch) -> None:
     assert len(publish_calls) == 2
     assert metrics["published"].count == 2
     assert metrics["skipped"].count == 0
+
+
+def test_emit_bypasses_ttl_when_timeframe_zero(monkeypatch) -> None:
+    worker, logger, publish_calls, _executor_calls, _metrics = _make_worker(
+        monkeypatch, execution_mode="bar", ws_dedup_timeframe_ms=0
+    )
+
+    ttl_stage_calls: list[tuple] = []
+    monkeypatch.setattr(
+        service_signal_runner.monitoring,
+        "inc_stage",
+        lambda *args, **kwargs: ttl_stage_calls.append(args),
+    )
+
+    order = _make_order("sig-zero", created_ts_ms=4000)
+    assert worker._emit(order, "BTCUSDT", 3500) is True
+
+    assert len(publish_calls) == 1
+    assert any("TTL_BYPASSED" in msg for msg, *_ in logger.messages)
+    assert ttl_stage_calls == []
 
 
 def test_bar_queue_order_expires_after_bar_ttl(monkeypatch) -> None:

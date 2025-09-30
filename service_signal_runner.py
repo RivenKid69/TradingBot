@@ -578,7 +578,8 @@ class _Worker:
             self._close_lag_ms = 0
         self._ws_dedup_enabled = ws_dedup_enabled
         self._ws_dedup_log_skips = ws_dedup_log_skips
-        self._ws_dedup_timeframe_ms = ws_dedup_timeframe_ms
+        self._ws_dedup_timeframe_ms = self._coerce_timeframe_ms(ws_dedup_timeframe_ms)
+        self._last_invalid_ttl_timeframe: Any | None = None
         self._throttle_cfg: ThrottleConfig | None = None
         self._throttle_lock = threading.RLock()
         self._no_trade_cfg = no_trade_cfg
@@ -756,8 +757,9 @@ class _Worker:
             self._ws_dedup_enabled = bool(enabled)
         if log_skips is not None:
             self._ws_dedup_log_skips = bool(log_skips)
-        if timeframe_ms is not None and timeframe_ms > 0:
-            self._ws_dedup_timeframe_ms = int(timeframe_ms)
+        if timeframe_ms is not None:
+            self._ws_dedup_timeframe_ms = self._coerce_timeframe_ms(timeframe_ms)
+            self._last_invalid_ttl_timeframe = None
 
     def _queue_snapshot(self) -> tuple[int, int]:
         with self._throttle_lock:
@@ -796,6 +798,16 @@ class _Worker:
         snapshot["symbols"] = symbols_unique
         snapshot["count"] = int(len(symbols_unique) + (1 if global_active else 0))
         return snapshot
+
+    @staticmethod
+    def _coerce_timeframe_ms(value: Any) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        if parsed <= 0:
+            return 0
+        return parsed
 
     def _symbol_cooldown_snapshot(self) -> Dict[str, Any]:
         settings = self._cooldown_settings
@@ -3867,6 +3879,30 @@ class _Worker:
             except Exception:
                 pass
 
+    def _resolve_ttl_timeframe_ms(self, *, log_if_invalid: bool) -> int | None:
+        timeframe_raw: Any = self._ws_dedup_timeframe_ms
+        try:
+            timeframe_ms = int(timeframe_raw)
+        except (TypeError, ValueError):
+            timeframe_ms = 0
+        if timeframe_ms <= 0:
+            if log_if_invalid and self._last_invalid_ttl_timeframe != timeframe_raw:
+                self._last_invalid_ttl_timeframe = timeframe_raw
+                try:
+                    self._logger.info(
+                        "TTL_BYPASSED %s",
+                        {
+                            "stage": Stage.TTL.name,
+                            "timeframe_ms": timeframe_raw,
+                            "execution_mode": self._execution_mode,
+                        },
+                    )
+                except Exception:
+                    pass
+            return None
+        self._last_invalid_ttl_timeframe = None
+        return timeframe_ms
+
     def _emit(self, o: Any, symbol: str, bar_close_ms: int) -> bool:
         ttl_stage_cfg = self._pipeline_cfg.get("ttl") if self._pipeline_cfg else None
         ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
@@ -3902,7 +3938,8 @@ class _Worker:
             dedup_expires_at_ms = created_ts + self._ws_dedup_timeframe_ms
             expires_at_ms = max(expires_at_ms, dedup_expires_at_ms)
         ttl_expires_at_ms: int | None = None
-        if ttl_enabled:
+        ttl_timeframe_ms = self._resolve_ttl_timeframe_ms(log_if_invalid=ttl_enabled)
+        if ttl_enabled and ttl_timeframe_ms is not None:
             try:
                 monitoring.inc_stage(Stage.TTL)
             except Exception:
@@ -3910,7 +3947,7 @@ class _Worker:
             ok, expires_at_ms, _ = check_ttl(
                 bar_close_ms=bar_close_ms,
                 now_ms=now_ms,
-                timeframe_ms=self._ws_dedup_timeframe_ms,
+                timeframe_ms=ttl_timeframe_ms,
             )
             ttl_expires_at_ms = expires_at_ms
             if not ok:
@@ -4683,9 +4720,10 @@ class _Worker:
         checked_orders = []
         ttl_stage_cfg = self._pipeline_cfg.get("ttl") if self._pipeline_cfg else None
         ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
+        ttl_timeframe_ms = self._resolve_ttl_timeframe_ms(log_if_invalid=ttl_enabled)
 
         for o in orders:
-            if ttl_enabled:
+            if ttl_enabled and ttl_timeframe_ms is not None:
                 try:
                     monitoring.inc_stage(Stage.TTL)
                 except Exception:
@@ -4693,7 +4731,7 @@ class _Worker:
                 ok, expires_at_ms, _ = check_ttl(
                     bar_close_ms=int(bar.ts),
                     now_ms=created_ts_ms,
-                    timeframe_ms=self._ws_dedup_timeframe_ms,
+                    timeframe_ms=ttl_timeframe_ms,
                 )
                 if not ok:
                     try:
