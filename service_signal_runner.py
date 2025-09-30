@@ -2193,6 +2193,8 @@ class _Worker:
         seen_symbols: set[str] = set()
         normalized_total = 0.0
         requested_total = 0.0
+        current_total = 0.0
+        delta_total = 0.0
 
         for order in orders_list:
             symbol = str(getattr(order, "symbol", "") or "").upper()
@@ -2212,25 +2214,44 @@ class _Worker:
                 current_weight = 0.0
             if not math.isfinite(current_weight) or current_weight < 0.0:
                 current_weight = 0.0
+            try:
+                target_weight = float(target)
+            except (TypeError, ValueError):
+                target_weight = 0.0
+            if not math.isfinite(target_weight):
+                target_weight = 0.0
+            if target_weight < 0.0:
+                target_weight = 0.0
             info = {
                 "order": order,
                 "symbol": symbol,
                 "payload": payload,
                 "current": current_weight,
-                "target": float(target),
-                "requested": float(target),
+                "target": target_weight,
+                "requested": target_weight,
                 "normalized": bool(normalized_flag),
             }
             if symbol:
                 seen_symbols.add(symbol)
             if normalized_flag:
-                normalized_total += max(0.0, float(target))
+                normalized_total += max(0.0, target_weight)
             elif symbol:
                 scalable_infos.append(info)
-                requested_total += max(0.0, float(target))
+                requested_total += max(0.0, target_weight)
 
         if not scalable_infos:
             return orders_list, False
+
+        current_total = 0.0
+        delta_total = 0.0
+        for info in scalable_infos:
+            current_weight = max(0.0, float(info.get("current", 0.0)))
+            target_weight = max(0.0, float(info.get("target", 0.0)))
+            if math.isfinite(current_weight):
+                current_total += current_weight
+            delta = max(0.0, target_weight - current_weight)
+            if math.isfinite(delta) and delta > 0.0:
+                delta_total += delta
 
         existing_total = 0.0
         for sym, weight in self._weights.items():
@@ -2245,13 +2266,19 @@ class _Worker:
             existing_total += weight_val
 
         available = float(cap) - existing_total - normalized_total
-        if available >= requested_total and available >= 0.0:
+        if available >= current_total + delta_total and available >= 0.0:
+            return orders_list, False
+        if delta_total <= 0.0:
             return orders_list, False
         available = max(0.0, available)
-        if requested_total <= 0.0:
+        if available <= current_total:
             factor = 0.0
         else:
-            factor = max(0.0, min(1.0, available / requested_total))
+            space_for_delta = available - current_total
+            if space_for_delta <= 0.0 or delta_total <= 0.0:
+                factor = 0.0
+            else:
+                factor = min(1.0, max(0.0, space_for_delta / delta_total))
         if math.isclose(factor, 1.0, rel_tol=1e-9):
             return orders_list, False
 
@@ -2262,7 +2289,11 @@ class _Worker:
             "normalized_total": normalized_total,
             "requested_total": requested_total,
             "available_total": available,
+            "current_total": current_total,
+            "delta_total": delta_total,
+            "desired_total": current_total + delta_total,
         }
+        normalization_payload["available_delta"] = max(0.0, available - current_total)
         equity = self._portfolio_equity
         if equity is not None and math.isfinite(equity):
             normalization_payload["cap_usd"] = float(cap) * float(equity)
@@ -2313,12 +2344,14 @@ class _Worker:
             if not symbol:
                 continue
             order = info["order"]
-            current_weight = info["current"]
-            original_target = max(0.0, info["target"])
-            new_target = self._clamp_weight(
-                current_weight + (original_target - current_weight) * factor
-            )
-            new_delta = new_target - current_weight
+            current_weight = max(0.0, float(info["current"]))
+            original_target = max(0.0, float(info["target"]))
+            delta = max(0.0, original_target - current_weight)
+            if delta <= 0.0:
+                new_target = current_weight
+            else:
+                new_target = self._clamp_weight(current_weight + delta * factor)
+            new_delta = max(0.0, new_target - current_weight)
             payload_map = dict(info["payload"])
             payload_map["normalized"] = True
             payload_map["normalization"] = dict(normalization_payload)
@@ -2381,6 +2414,10 @@ class _Worker:
                     "normalized_total": normalized_total,
                     "requested_total": requested_total,
                     "available_total": available,
+                    "current_total": current_total,
+                    "delta_total": delta_total,
+                    "desired_total": current_total + delta_total,
+                    "available_delta": normalization_payload["available_delta"],
                     "factor": factor,
                     "symbols": symbols_requested,
                 }

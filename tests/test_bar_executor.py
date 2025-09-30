@@ -891,12 +891,100 @@ def test_worker_normalizes_weights_with_existing_weight_keeps_direction():
         o.symbol: o.meta["payload"] for o in normalized_orders
     }
     btc_payload = payloads["BTCUSDT"]
-    assert btc_payload["target_weight"] == pytest.approx(0.6)
-    assert btc_payload["target_weight"] > worker._weights["BTCUSDT"]
-    assert btc_payload["target_weight"] < 0.7
-    assert btc_payload["delta_weight"] == pytest.approx(0.1)
-    assert btc_payload["delta_weight"] > 0.0
+    btc_current = worker._weights["BTCUSDT"]
+    factor = btc_payload["normalization"]["factor"]
+    assert factor == pytest.approx(
+        (btc_payload["normalization"]["available_delta"]) / (
+            btc_payload["normalization"]["delta_total"]
+        )
+    )
+    assert btc_payload["target_weight"] == pytest.approx(
+        btc_current + (0.7 - btc_current) * factor
+    )
+    assert btc_payload["target_weight"] >= btc_current
+    assert btc_payload["target_weight"] <= 0.7
+    assert btc_payload["delta_weight"] == pytest.approx(
+        btc_payload["target_weight"] - btc_current
+    )
+    assert btc_payload["delta_weight"] >= 0.0
+    ltc_payload = payloads["LTCUSDT"]
+    assert ltc_payload["target_weight"] == pytest.approx(0.7 * factor)
+    assert ltc_payload["delta_weight"] == pytest.approx(ltc_payload["target_weight"])
+    total_weight = sum(p["target_weight"] for p in payloads.values())
+    assert total_weight == pytest.approx(
+        btc_payload["normalization"]["available_total"]
+    )
 
+
+def test_worker_normalizes_weights_with_current_exposure_respects_cap():
+    worker = _make_worker(
+        0.8,
+        existing_weights={"BTCUSDT": 0.2, "ETHUSDT": 0.25, "SOLUSDT": 0.1},
+    )
+    current_weights = {sym: worker._weights[sym] for sym in ("BTCUSDT", "ETHUSDT")}
+    btc_target = 0.5
+    order_btc = Order(
+        ts=1,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={"payload": {"target_weight": btc_target, "edge_bps": 20.0}},
+    )
+    eth_target = 0.45
+    order_eth = Order(
+        ts=1,
+        symbol="ETHUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={"payload": {"target_weight": eth_target, "edge_bps": 18.0}},
+    )
+
+    normalized_orders, applied = worker._normalize_weight_targets([order_btc, order_eth])
+    assert applied is True
+    assert len(normalized_orders) == 2
+
+    payloads = {order.symbol: order.meta["payload"] for order in normalized_orders}
+    normalization = payloads["BTCUSDT"]["normalization"]
+
+    expected_current_total = sum(current_weights.values())
+    assert normalization["current_total"] == pytest.approx(expected_current_total)
+    expected_delta_total = sum(
+        max(0.0, target - current_weights[symbol])
+        for symbol, target in (("BTCUSDT", btc_target), ("ETHUSDT", eth_target))
+    )
+    assert normalization["delta_total"] == pytest.approx(expected_delta_total)
+    assert normalization["available_total"] == pytest.approx(
+        worker._max_total_weight - worker._weights["SOLUSDT"]
+    )
+    assert normalization["available_delta"] == pytest.approx(
+        normalization["available_total"] - normalization["current_total"]
+    )
+    expected_factor = normalization["factor"]
+    assert expected_factor == pytest.approx(
+        normalization["available_delta"] / normalization["delta_total"]
+    )
+
+    total_weight = sum(payload["target_weight"] for payload in payloads.values())
+    assert total_weight == pytest.approx(normalization["available_total"])
+    assert total_weight + worker._weights["SOLUSDT"] == pytest.approx(
+        worker._max_total_weight
+    )
+
+    for order in (order_btc, order_eth):
+        payload = payloads[order.symbol]
+        current = current_weights[order.symbol]
+        assert payload["target_weight"] >= current
+        original_target = btc_target if order.symbol == "BTCUSDT" else eth_target
+        expected_target = current + (original_target - current) * expected_factor
+        assert payload["target_weight"] == pytest.approx(expected_target)
+        assert payload["delta_weight"] == pytest.approx(
+            payload["target_weight"] - current
+        )
+        assert payload["delta_weight"] >= 0.0
 
 def test_bar_executor_propagates_normalized_flag():
     executor = BarExecutor(
