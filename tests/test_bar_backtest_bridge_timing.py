@@ -110,6 +110,44 @@ def _bar_bridge_cls(monkeypatch: pytest.MonkeyPatch) -> type[Any]:
     return module.BarBacktestSimBridge
 
 
+def test_step_overwrites_stale_bar_metadata(bar_bridge_cls: type[Any]) -> None:
+    symbol = "BTCUSDT"
+    executor = _StubBarExecutor(symbol)
+    bridge = bar_bridge_cls(
+        executor,
+        symbol=symbol,
+        timeframe_ms=60_000,
+        initial_equity=1_000.0,
+    )
+
+    stale_bar = bridge._build_bar(  # type: ignore[attr-defined]
+        ts_ms=1,
+        symbol=symbol,
+        open_price=90.0,
+        high_price=95.0,
+        low_price=85.0,
+        close_price=90.0,
+    )
+
+    order = _StubOrder(desired_weight=1.0, meta={"bar": stale_bar})
+
+    _run_step(
+        bridge,
+        ts_ms=2,
+        price=100.0,
+        orders=[order],
+    )
+
+    assert len(executor.executed_orders) == 1
+    executed_meta = getattr(executor.executed_orders[0], "meta", {})
+    new_bar = executed_meta.get("bar")
+    assert new_bar is not None, "Bridge should attach a bar payload to the order"
+    assert getattr(new_bar, "ts", None) == 2
+    close_price = getattr(new_bar, "close", None)
+    assert close_price is not None
+    assert float(close_price) == pytest.approx(100.0)
+
+
 def test_trade_pnl_alignment(bar_bridge_cls: type[Any]) -> None:
     symbol = "BTCUSDT"
     executor = _StubBarExecutor(symbol)
