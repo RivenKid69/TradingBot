@@ -96,3 +96,33 @@ def test_entry_limit_refusal_rolls_back_pending(worker_with_state):
     assert worker._positions.get("ETH", 0.0) == pytest.approx(0.0)
     assert worker._pending_exposure == {}
     assert updates[-1]["total_notional"] == pytest.approx(0.0)
+
+
+def test_bar_mode_total_notional_uses_equity_override():
+    policy = SimpleNamespace(
+        revert_signal_state=lambda *args, **kwargs: None,
+        consume_signal_transitions=lambda: [],
+    )
+    worker = _Worker(
+        fp=SimpleNamespace(),
+        policy=policy,
+        logger=logging.getLogger("test_equity_override"),
+        executor=SimpleNamespace(submit=lambda order: None),
+        guards=None,
+        enforce_closed_bars=True,
+        execution_mode="bar",
+        portfolio_equity=None,
+        state_enabled=False,
+    )
+    worker._last_prices["FOO"] = 20.0
+
+    order = SimpleNamespace(
+        symbol="FOO",
+        meta={"payload": {"target_weight": 0.5, "equity_usd": 200.0}},
+    )
+
+    worker._commit_exposure(order)
+
+    assert worker._symbol_equity["FOO"] == pytest.approx(200.0)
+    assert worker._positions["FOO"] == pytest.approx((0.5 * 200.0) / 20.0)
+    assert worker._exposure_state["total_notional"] == pytest.approx(0.5 * 200.0)
