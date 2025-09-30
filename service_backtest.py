@@ -304,6 +304,7 @@ class BarBacktestSimBridge:
             pos = positions.get(symbol)
         else:  # pragma: no cover - defensive fallback
             pos = None
+        fallback_qty_used = False
         if pos is not None:
             meta = getattr(pos, "meta", None)
             if isinstance(meta, Mapping):
@@ -311,9 +312,22 @@ class BarBacktestSimBridge:
             qty = self._safe_float(getattr(pos, "qty", 0.0))
             if abs(qty) > 1e-12:
                 self._position_qtys[symbol] = qty
-            elif symbol in self._position_qtys:
-                self._position_qtys.pop(symbol, None)
-        elif symbol in self._position_qtys:
+            else:
+                price_for_fallback = close_price
+                if price_for_fallback is None:
+                    price_for_fallback = prev_price
+                if (
+                    abs(weight) > 1e-12
+                    and price_for_fallback is not None
+                    and price_for_fallback > 0.0
+                ):
+                    fallback_qty = (weight * self._equity) / price_for_fallback
+                    if abs(fallback_qty) > 1e-12:
+                        self._position_qtys[symbol] = fallback_qty
+                        fallback_qty_used = True
+                if not fallback_qty_used and symbol in self._position_qtys:
+                    self._position_qtys.pop(symbol, None)
+        elif symbol in self._position_qtys and not fallback_qty_used:
             self._position_qtys.pop(symbol, None)
         self._weights[symbol] = weight
 
