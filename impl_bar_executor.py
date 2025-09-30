@@ -397,6 +397,13 @@ class BarExecutor(TradeExecutor):
                 bar=bar,
                 adv_quote=adv_quote,
             )
+            if not instructions and spec_reason is None:
+                turnover_update = float(executed_turnover_usd)
+                updates = {"act_now": False, "turnover_usd": turnover_update}
+                if hasattr(metrics, "model_copy"):
+                    metrics = metrics.model_copy(update=updates)
+                else:  # pragma: no cover - compatibility fallback
+                    metrics = metrics.copy(update=updates)
             if spec_reason is not None:
                 skip_reason = spec_reason
                 turnover_usd = float(executed_turnover_usd)

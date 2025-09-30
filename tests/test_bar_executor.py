@@ -401,6 +401,38 @@ def test_bar_executor_rounds_quantities_to_step_size():
     assert report.meta["decision"]["turnover_usd"] == pytest.approx(40.0)
 
 
+def test_bar_executor_zero_delta_after_rounding_sets_act_now_false():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+        symbol_specs={"BTCUSDT": {"step_size": 0.5}},
+    )
+    bar = make_bar(55, 100.0)
+    order = Order(
+        ts=55,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "payload": {"target_weight": 0.01, "edge_bps": 100.0},
+        },
+    )
+
+    report = executor.execute(order)
+
+    assert report.meta["instructions"] == []
+    decision = report.meta["decision"]
+    assert decision["act_now"] is False
+    assert decision["turnover_usd"] == pytest.approx(0.0)
+    snapshot = executor.monitoring_snapshot()
+    assert snapshot["act_now"] is False
+
+
 def test_bar_executor_rejects_below_min_notional_after_rounding():
     executor = BarExecutor(
         run_id="test",
