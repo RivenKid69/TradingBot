@@ -928,6 +928,7 @@ class BarExecutor(TradeExecutor):
         accumulated_weight = float(state.weight)
         total_notional_dec = Decimal("0")
         weight_tolerance = 1e-9
+        min_notional_tolerance = Decimal("1e-9") if min_notional > Decimal("0") else Decimal("0")
 
         for idx in range(parts):
             if idx == parts - 1:
@@ -955,6 +956,12 @@ class BarExecutor(TradeExecutor):
             executed_notional = Decimal("0")
             if price > Decimal("0") and quantized_qty > Decimal("0"):
                 executed_notional = quantized_qty * price
+            if (
+                min_notional > Decimal("0")
+                and executed_notional + min_notional_tolerance < min_notional
+            ):
+                return [], float(state.weight), 0.0, "below_min_notional"
+
             executed_delta = 0.0
             if equity_dec > Decimal("0") and executed_notional > Decimal("0"):
                 executed_fraction = executed_notional / equity_dec

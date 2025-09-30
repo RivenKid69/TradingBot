@@ -386,6 +386,43 @@ def test_bar_executor_rejects_below_min_notional_after_rounding():
     assert report.meta["requested_target_weight"] == pytest.approx(0.05)
 
 
+def test_bar_executor_rejects_twap_slices_below_min_notional():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+        symbol_specs={"BTCUSDT": {"min_notional": 50.0}},
+    )
+    bar = make_bar(65, 200.0)
+    order = Order(
+        ts=65,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": bar,
+            "payload": {
+                "delta_weight": 0.12,
+                "edge_bps": 25.0,
+                "twap": {"parts": 3},
+            },
+        },
+    )
+
+    report = executor.execute(order)
+
+    assert report.meta["instructions"] == []
+    assert report.meta.get("reason") == "below_min_notional"
+    decision = report.meta["decision"]
+    assert decision["act_now"] is False
+    assert decision["turnover_usd"] == pytest.approx(0.0)
+    assert report.meta["target_weight"] == pytest.approx(0.0)
+    assert report.meta["requested_delta_weight"] == pytest.approx(0.12)
+
+
 @pytest.mark.parametrize("price", [0.0, -100.0])
 def test_bar_executor_skips_when_price_invalid(price: float):
     executor = BarExecutor(
