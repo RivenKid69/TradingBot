@@ -2214,6 +2214,15 @@ class _Worker:
         current_total = 0.0
         delta_total = 0.0
 
+        def _coerce_bool(value: Any) -> bool:
+            if isinstance(value, str):
+                candidate = value.strip().lower()
+                if candidate in {"", "0", "false", "no", "off"}:
+                    return False
+                if candidate in {"1", "true", "yes", "on"}:
+                    return True
+            return bool(value)
+
         for order in orders_list:
             symbol = str(getattr(order, "symbol", "") or "").upper()
             payload = self._extract_signal_payload(order)
@@ -2221,11 +2230,35 @@ class _Worker:
             if weight_reason:
                 payload.setdefault("reject_reason", weight_reason)
             meta_raw = getattr(order, "meta", None)
-            normalized_flag = False
-            if payload.get("normalized"):
-                normalized_flag = True
+            meta_map: Dict[str, Any] | None = None
+            if isinstance(meta_raw, dict):
+                meta_map = meta_raw
             elif isinstance(meta_raw, MappingABC):
-                normalized_flag = bool(meta_raw.get("normalized"))
+                meta_map = dict(meta_raw)
+                try:
+                    setattr(order, "meta", meta_map)
+                except Exception:
+                    pass
+            normalized_source: Any = None
+            if "normalized" in payload:
+                normalized_source = payload.get("normalized")
+            elif meta_map is not None and "normalized" in meta_map:
+                normalized_source = meta_map.get("normalized")
+            elif isinstance(meta_raw, MappingABC) and "normalized" in meta_raw:
+                normalized_source = meta_raw.get("normalized")
+            normalized_flag = _coerce_bool(normalized_source)
+            if "normalized" in payload or normalized_source is not None:
+                payload["normalized"] = normalized_flag
+            if meta_map is None and normalized_source is not None:
+                meta_map = {}
+                try:
+                    setattr(order, "meta", meta_map)
+                except Exception:
+                    meta_map = None
+            if meta_map is not None and (
+                "normalized" in meta_map or normalized_source is not None
+            ):
+                meta_map["normalized"] = normalized_flag
             try:
                 current_weight = float(self._weights.get(symbol, 0.0))
             except (TypeError, ValueError):

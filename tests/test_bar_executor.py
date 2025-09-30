@@ -849,6 +849,59 @@ def test_worker_normalizes_weights_above_cap():
         )
 
 
+def test_worker_normalizes_weights_handles_false_string_flag():
+    worker = _make_worker(1.0, existing_weights={"ETHUSDT": 0.4})
+    order1_turnover = 700.0
+    order1 = Order(
+        ts=1,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {
+                "target_weight": 0.7,
+                "edge_bps": 10.0,
+                "economics": {"turnover_usd": order1_turnover},
+                "normalized": "false",
+            },
+            "normalized": "false",
+        },
+    )
+    order2_turnover = 500.0
+    order2 = Order(
+        ts=1,
+        symbol="LTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {
+                "target_weight": 0.7,
+                "edge_bps": 12.0,
+                "economics": {"turnover_usd": order2_turnover},
+            }
+        },
+    )
+
+    normalized_orders, applied = worker._normalize_weight_targets([order1, order2])
+
+    assert applied is True
+    payloads = [o.meta["payload"] for o in normalized_orders]
+    assert sum(p["target_weight"] for p in payloads) == pytest.approx(0.6)
+    for payload, order in zip(payloads, normalized_orders):
+        assert payload["normalized"] is True
+        assert order.meta["normalized"] is True
+        assert payload["target_weight"] == pytest.approx(0.3)
+
+    pending = worker._pending_weight
+    assert len(pending) == 2
+    for order_obj in normalized_orders:
+        assert pending[id(order_obj)]["normalized"] is True
+
+
 def test_worker_normalizes_weights_with_existing_weight_keeps_direction():
     worker = _make_worker(
         1.0, existing_weights={"BTCUSDT": 0.5, "ETHUSDT": 0.3}
