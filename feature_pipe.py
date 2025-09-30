@@ -35,6 +35,11 @@ _TURNOVER_COLUMNS: Sequence[str] = (
     "executed_notional",
 )
 
+_EQUITY_COLUMNS: Sequence[str] = (
+    "equity_usd",
+    "equity",
+)
+
 _ADV_COLUMNS: Sequence[str] = (
     "adv_quote_1h",
     "adv_usd_1h",
@@ -803,6 +808,36 @@ class FeaturePipe:
                     return series.astype(float)
         return None
 
+    def _compute_turnover_fraction(
+        self, df: pd.DataFrame, turnover_values: np.ndarray
+    ) -> np.ndarray:
+        if turnover_values.size == 0:
+            return np.zeros_like(turnover_values, dtype=float)
+
+        equity_series = self._select_numeric_series(df, _EQUITY_COLUMNS)
+        if equity_series is not None:
+            equity_values = equity_series.to_numpy(dtype=float)
+            equity_values = np.where(
+                np.isfinite(equity_values) & (equity_values > 0.0),
+                equity_values,
+                np.nan,
+            )
+            with np.errstate(divide="ignore", invalid="ignore"):
+                fractions = np.divide(
+                    turnover_values,
+                    equity_values,
+                    out=np.zeros_like(turnover_values),
+                    where=(equity_values > 0.0),
+                )
+            return np.where(
+                np.isfinite(fractions) & (fractions > 0.0), fractions, 0.0
+            )
+
+        normalized = np.where(np.isfinite(turnover_values), turnover_values, 0.0)
+        normalized = np.where(normalized > 0.0, normalized, 0.0)
+        fractions = np.where(normalized <= 1.0, normalized, 1.0)
+        return np.where(np.isfinite(fractions), fractions, 0.0)
+
     def _compute_bar_mode_costs(self, df: pd.DataFrame) -> Optional[pd.Series]:
         cost_cfg = self._cost_config
         taker_fee_bps = float(getattr(cost_cfg, "taker_fee_bps", 0.0) or 0.0)
@@ -817,20 +852,22 @@ class FeaturePipe:
             return None
 
         turnover_values: Optional[np.ndarray]
+        turnover_fraction = np.zeros(n_rows, dtype=float)
         if turnover_series is not None:
             turnover_values = turnover_series.to_numpy(dtype=float)
             turnover_values = np.where(
                 np.isfinite(turnover_values), np.abs(turnover_values), 0.0
             )
-            trade_mask = turnover_values > 0.0
+            turnover_fraction = self._compute_turnover_fraction(
+                df, turnover_values
+            )
         else:
             turnover_values = None
-            trade_mask = np.zeros(n_rows, dtype=bool)
 
         costs_decimal = np.zeros(n_rows, dtype=float)
         if base_cost_bps > 0.0:
             base_fraction = base_cost_bps * 1e-4
-            costs_decimal += base_fraction * trade_mask.astype(float)
+            costs_decimal += base_fraction * turnover_fraction
 
         if turnover_values is not None and adv_series is not None:
             adv_values = adv_series.to_numpy(dtype=float)
@@ -845,7 +882,7 @@ class FeaturePipe:
             participation = np.where(np.isfinite(participation), participation, 0.0)
             impact_bps = self._impact_bps(participation)
             if impact_bps is not None:
-                costs_decimal += impact_bps * 1e-4
+                costs_decimal += (impact_bps * 1e-4) * turnover_fraction
 
         if not np.any(costs_decimal):
             return None
