@@ -535,7 +535,7 @@ def test_bar_executor_turnover_cap_tracks_portfolio_usage():
     assert first_report.meta["instructions"]
     assert first_report.meta.get("turnover_cap_enforced") is None
     assert first_report.meta["portfolio_turnover_cap_usd"] == pytest.approx(150.0)
-    assert first_report.meta["cap_usd"] == pytest.approx(100.0)
+    assert first_report.meta["cap_usd"] == pytest.approx(150.0)
 
     second_order = Order(
         ts=41,
@@ -558,6 +558,7 @@ def test_bar_executor_turnover_cap_tracks_portfolio_usage():
     snapshot = executor.monitoring_snapshot()
     assert snapshot["turnover_usd"] == pytest.approx(0.0)
     assert snapshot.get("turnover_cap_enforced") is True
+    assert snapshot["cap_usd"] == pytest.approx(100.0)
 
 def test_bar_executor_respects_min_rebalance_step():
     executor = BarExecutor(
