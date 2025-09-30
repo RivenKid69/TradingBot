@@ -612,9 +612,12 @@ def aggregate(
         bar_decisions = int(df["bar_decision_count"].sum()) if "bar_decision_count" in df.columns else 0
         bar_act_now = int(df["bar_act_now_count"].sum()) if "bar_act_now_count" in df.columns else 0
         turnover_total = float(df.get("turnover_usd", pd.Series(dtype=float)).sum())
-        cap_series = df.get("cap_usd", pd.Series(dtype=float))
-        cap_sum = float(cap_series.dropna().sum())
-        ratio = float(turnover_total / cap_sum) if cap_sum > 0 else float("nan")
+        cap_series = pd.to_numeric(
+            df.get("cap_usd", pd.Series(dtype=float)), errors="coerce"
+        )
+        cap_values = cap_series.dropna()
+        cap_value = float(cap_values.iloc[0]) if not cap_values.empty else float("nan")
+        ratio = float(turnover_total / cap_value) if cap_value > 0 else float("nan")
         act_rate = float(bar_act_now / bar_decisions) if bar_decisions > 0 else float("nan")
         realized_series = pd.to_numeric(df.get("realized_slippage_bps"), errors="coerce")
         modeled_series = pd.to_numeric(df.get("modeled_cost_bps"), errors="coerce")
@@ -646,7 +649,7 @@ def aggregate(
             "bar_act_now": bar_act_now,
             "bar_act_now_rate": act_rate,
             "bar_turnover_usd": turnover_total,
-            "bar_cap_usd": float(cap_sum) if cap_sum > 0 else float("nan"),
+            "bar_cap_usd": float(cap_value) if cap_value > 0 else float("nan"),
             "bar_turnover_vs_cap": ratio,
             "realized_slippage_bps": float(realized_avg),
             "modeled_cost_bps": float(modeled_avg),
@@ -669,10 +672,14 @@ def aggregate(
         trades_count = int(len(df))
         notional = (df["price"] * qty_abs_series).sum()
         vwap = float(notional / qty_abs) if qty_abs and math.isfinite(notional) else float("nan")
-        cap_series = df.get("cap_usd", pd.Series(dtype=float))
-        cap_sum = float(cap_series.dropna().sum())
+        cap_series = pd.to_numeric(
+            df.get("cap_usd", pd.Series(dtype=float)), errors="coerce"
+        )
+        cap_values = cap_series.dropna()
+        cap_value = float(cap_values.iloc[0]) if not cap_values.empty else float("nan")
         bar_decisions = float(df.get("bar_decision_count", pd.Series(dtype=float)).sum())
         bar_act_now = float(df.get("bar_act_now_count", pd.Series(dtype=float)).sum())
+        turnover_total = float(df.get("turnover_usd", pd.Series(dtype=float)).sum())
         realized_series = pd.to_numeric(df.get("realized_slippage_bps"), errors="coerce")
         modeled_series = pd.to_numeric(df.get("modeled_cost_bps"), errors="coerce")
 
@@ -702,11 +709,11 @@ def aggregate(
             "bar_decisions": int(bar_decisions),
             "bar_act_now": int(bar_act_now),
             "bar_act_now_rate": float(bar_act_now / bar_decisions) if bar_decisions > 0 else float("nan"),
-            "bar_turnover_usd": float(df.get("turnover_usd", pd.Series(dtype=float)).sum()),
-            "bar_cap_usd": float(cap_sum) if cap_sum > 0 else float("nan"),
-            "bar_turnover_vs_cap": float(
-                df.get("turnover_usd", pd.Series(dtype=float)).sum() / cap_sum
-            ) if cap_sum > 0 else float("nan"),
+            "bar_turnover_usd": turnover_total,
+            "bar_cap_usd": float(cap_value) if cap_value > 0 else float("nan"),
+            "bar_turnover_vs_cap": float(turnover_total / cap_value)
+            if cap_value > 0
+            else float("nan"),
             "realized_slippage_bps": float(realized_avg),
             "modeled_cost_bps": float(modeled_avg),
             "cost_bias_bps": float(bias_avg),
