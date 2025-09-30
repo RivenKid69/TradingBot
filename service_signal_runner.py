@@ -2262,14 +2262,31 @@ class _Worker:
 
         current_total = 0.0
         delta_total = 0.0
+        positive_delta_total = 0.0
+        negative_delta_total = 0.0
         for info in scalable_infos:
-            current_weight = max(0.0, float(info.get("current", 0.0)))
-            target_weight = max(0.0, float(info.get("target", 0.0)))
+            try:
+                current_weight = float(info.get("current", 0.0))
+            except (TypeError, ValueError):
+                current_weight = 0.0
+            if not math.isfinite(current_weight) or current_weight < 0.0:
+                current_weight = 0.0
+            try:
+                target_weight = float(info.get("target", 0.0))
+            except (TypeError, ValueError):
+                target_weight = current_weight
+            if not math.isfinite(target_weight):
+                target_weight = current_weight
             if math.isfinite(current_weight):
                 current_total += current_weight
-            delta = max(0.0, target_weight - current_weight)
-            if math.isfinite(delta) and delta > 0.0:
-                delta_total += delta
+            delta = target_weight - current_weight
+            if not math.isfinite(delta):
+                continue
+            delta_total += delta
+            if delta > 0.0:
+                positive_delta_total += delta
+            elif delta < 0.0:
+                negative_delta_total += delta
 
         existing_total = 0.0
         for sym, weight in self._weights.items():
@@ -2284,19 +2301,18 @@ class _Worker:
             existing_total += weight_val
 
         available = float(cap) - existing_total - normalized_total
-        if available >= current_total + delta_total and available >= 0.0:
+        desired_total = current_total + delta_total
+        if available >= desired_total and available >= 0.0:
             return orders_list, False
-        if delta_total <= 0.0:
+        if positive_delta_total <= 0.0:
             return orders_list, False
         available = max(0.0, available)
-        if available <= current_total:
+        base_after_sells = max(0.0, current_total + negative_delta_total)
+        space_for_delta = max(0.0, available - base_after_sells)
+        if space_for_delta <= 0.0:
             factor = 0.0
         else:
-            space_for_delta = available - current_total
-            if space_for_delta <= 0.0 or delta_total <= 0.0:
-                factor = 0.0
-            else:
-                factor = min(1.0, max(0.0, space_for_delta / delta_total))
+            factor = min(1.0, max(0.0, space_for_delta / positive_delta_total))
         if math.isclose(factor, 1.0, rel_tol=1e-9):
             return orders_list, False
 
@@ -2309,9 +2325,11 @@ class _Worker:
             "available_total": available,
             "current_total": current_total,
             "delta_total": delta_total,
-            "desired_total": current_total + delta_total,
+            "desired_total": desired_total,
         }
-        normalization_payload["available_delta"] = max(0.0, available - current_total)
+        normalization_payload["available_delta"] = space_for_delta
+        normalization_payload["delta_positive_total"] = positive_delta_total
+        normalization_payload["delta_negative_total"] = negative_delta_total
         equity = self._portfolio_equity
         if equity is not None and math.isfinite(equity):
             normalization_payload["cap_usd"] = float(cap) * float(equity)
@@ -2327,7 +2345,9 @@ class _Worker:
                 return dict(value)
             return None
 
-        def _scale_turnover(mapping: Dict[str, Any] | None) -> Dict[str, Any] | None:
+        def _scale_turnover(
+            mapping: Dict[str, Any] | None, scale: float
+        ) -> Dict[str, Any] | None:
             if mapping is None:
                 return None
             for key in turnover_keys:
@@ -2339,7 +2359,7 @@ class _Worker:
                     continue
                 if not math.isfinite(raw_val):
                     continue
-                mapping[key] = raw_val * factor
+                mapping[key] = raw_val * scale
             return mapping
 
         def _ensure_meta(order_obj: Any) -> Dict[str, Any]:
@@ -2362,14 +2382,25 @@ class _Worker:
             if not symbol:
                 continue
             order = info["order"]
-            current_weight = max(0.0, float(info["current"]))
-            original_target = max(0.0, float(info["target"]))
-            delta = max(0.0, original_target - current_weight)
+            try:
+                current_weight = float(info["current"])
+            except (TypeError, ValueError):
+                current_weight = 0.0
+            if not math.isfinite(current_weight) or current_weight < 0.0:
+                current_weight = 0.0
+            try:
+                original_target = float(info["target"])
+            except (TypeError, ValueError):
+                original_target = current_weight
+            if not math.isfinite(original_target):
+                original_target = current_weight
+            delta = original_target - current_weight
             if delta <= 0.0:
-                new_target = current_weight
+                new_target = self._clamp_weight(original_target)
             else:
                 new_target = self._clamp_weight(current_weight + delta * factor)
-            new_delta = max(0.0, new_target - current_weight)
+            new_delta = new_target - current_weight
+            order_factor = factor if delta > 0.0 else 1.0
             payload_map = dict(info["payload"])
             payload_map["normalized"] = True
             payload_map["normalization"] = dict(normalization_payload)
@@ -2378,18 +2409,20 @@ class _Worker:
             payload_map["weight"] = new_target
             payload_map["delta_weight"] = new_delta
             payload_map["delta"] = new_delta
-            _scale_turnover(payload_map)
+            _scale_turnover(payload_map, order_factor)
             economics_map = _coerce_dict(payload_map.get("economics"))
             if economics_map is not None:
-                payload_map["economics"] = _scale_turnover(economics_map) or economics_map
+                payload_map["economics"] = (
+                    _scale_turnover(economics_map, order_factor) or economics_map
+                )
             decision_map = _coerce_dict(payload_map.get("decision"))
             if decision_map is not None:
                 payload_map["decision"] = decision_map
-                _scale_turnover(decision_map)
+                _scale_turnover(decision_map, order_factor)
                 decision_econ = _coerce_dict(decision_map.get("economics"))
                 if decision_econ is not None:
                     decision_map["economics"] = (
-                        _scale_turnover(decision_econ) or decision_econ
+                        _scale_turnover(decision_econ, order_factor) or decision_econ
                     )
             info["payload"] = payload_map
             info["target"] = new_target
@@ -2399,14 +2432,16 @@ class _Worker:
             meta_map["normalization"] = dict(normalization_payload)
             meta_economics = _coerce_dict(meta_map.get("economics"))
             if meta_economics is not None:
-                meta_map["economics"] = _scale_turnover(meta_economics) or meta_economics
+                meta_map["economics"] = (
+                    _scale_turnover(meta_economics, order_factor) or meta_economics
+                )
             meta_decision = _coerce_dict(meta_map.get("decision"))
             if meta_decision is not None:
-                _scale_turnover(meta_decision)
+                _scale_turnover(meta_decision, order_factor)
                 decision_econ = _coerce_dict(meta_decision.get("economics"))
                 if decision_econ is not None:
                     meta_decision["economics"] = (
-                        _scale_turnover(decision_econ) or decision_econ
+                        _scale_turnover(decision_econ, order_factor) or decision_econ
                     )
                 meta_map["decision"] = meta_decision
             self._pending_weight[id(order)] = {

@@ -986,6 +986,119 @@ def test_worker_normalizes_weights_with_current_exposure_respects_cap():
         )
         assert payload["delta_weight"] >= 0.0
 
+
+def test_worker_normalizes_weights_mixed_directions_under_cap():
+    worker = _make_worker(
+        0.7,
+        existing_weights={"BTCUSDT": 0.4, "ETHUSDT": 0.2, "SOLUSDT": 0.05},
+    )
+
+    buy_turnover = 800.0
+    btc_order = Order(
+        ts=1,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {
+                "target_weight": 0.6,
+                "edge_bps": 15.0,
+                "economics": {"turnover_usd": buy_turnover},
+            },
+            "economics": {"turnover_usd": buy_turnover},
+            "decision": {
+                "turnover_usd": buy_turnover,
+                "economics": {"turnover_usd": buy_turnover},
+            },
+        },
+    )
+
+    sell_turnover = 500.0
+    eth_order = Order(
+        ts=1,
+        symbol="ETHUSDT",
+        side=Side.SELL,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {
+                "target_weight": 0.05,
+                "edge_bps": 12.0,
+                "economics": {"turnover_usd": sell_turnover},
+            },
+            "economics": {"turnover_usd": sell_turnover},
+            "decision": {
+                "turnover_usd": sell_turnover,
+                "economics": {"turnover_usd": sell_turnover},
+            },
+        },
+    )
+
+    ada_turnover = 400.0
+    ada_order = Order(
+        ts=1,
+        symbol="ADAUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {
+                "target_weight": 0.3,
+                "edge_bps": 18.0,
+                "economics": {"turnover_usd": ada_turnover},
+            },
+            "economics": {"turnover_usd": ada_turnover},
+            "decision": {
+                "turnover_usd": ada_turnover,
+                "economics": {"turnover_usd": ada_turnover},
+            },
+        },
+    )
+
+    orders = [btc_order, eth_order, ada_order]
+    normalized_orders, applied = worker._normalize_weight_targets(orders)
+
+    assert applied is True
+
+    payloads = {order.symbol: order.meta["payload"] for order in normalized_orders}
+    normalization = payloads["BTCUSDT"]["normalization"]
+
+    assert normalization["factor"] == pytest.approx(0.4)
+    assert normalization["available_total"] == pytest.approx(0.65)
+    assert normalization["available_delta"] == pytest.approx(0.2)
+    assert normalization["delta_total"] == pytest.approx(0.35)
+    assert normalization["delta_positive_total"] == pytest.approx(0.5)
+    assert normalization["delta_negative_total"] == pytest.approx(-0.15)
+    assert normalization["desired_total"] == pytest.approx(0.95)
+
+    btc_payload = payloads["BTCUSDT"]
+    assert btc_payload["target_weight"] == pytest.approx(0.48)
+    assert btc_payload["delta_weight"] == pytest.approx(0.08)
+    assert btc_payload["economics"]["turnover_usd"] == pytest.approx(
+        buy_turnover * normalization["factor"]
+    )
+
+    ada_payload = payloads["ADAUSDT"]
+    assert ada_payload["target_weight"] == pytest.approx(0.12)
+    assert ada_payload["delta_weight"] == pytest.approx(0.12)
+    assert ada_payload["economics"]["turnover_usd"] == pytest.approx(
+        ada_turnover * normalization["factor"]
+    )
+
+    eth_payload = payloads["ETHUSDT"]
+    assert eth_payload["target_weight"] == pytest.approx(0.05)
+    assert eth_payload["delta_weight"] == pytest.approx(-0.15)
+    assert eth_payload["economics"]["turnover_usd"] == pytest.approx(sell_turnover)
+
+    total_target = sum(p["target_weight"] for p in payloads.values())
+    assert total_target == pytest.approx(normalization["available_total"])
+    pending = worker._pending_weight
+    assert pending[id(eth_order)]["delta_weight"] == pytest.approx(-0.15)
+
 def test_bar_executor_propagates_normalized_flag():
     executor = BarExecutor(
         run_id="test",
