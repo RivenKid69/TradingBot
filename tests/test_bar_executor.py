@@ -502,6 +502,7 @@ def _make_worker(max_total_weight: float | None, *, existing_weights: dict[str, 
 
 def test_worker_normalizes_weights_above_cap():
     worker = _make_worker(1.0, existing_weights={"ETHUSDT": 0.4})
+    order1_turnover = 700.0
     order1 = Order(
         ts=1,
         symbol="BTCUSDT",
@@ -509,8 +510,20 @@ def test_worker_normalizes_weights_above_cap():
         order_type=OrderType.MARKET,
         quantity=Decimal("0"),
         price=None,
-        meta={"payload": {"target_weight": 0.7, "edge_bps": 10.0}},
+        meta={
+            "payload": {
+                "target_weight": 0.7,
+                "edge_bps": 10.0,
+                "economics": {"turnover_usd": order1_turnover},
+            },
+            "economics": {"turnover_usd": order1_turnover},
+            "decision": {
+                "turnover_usd": order1_turnover,
+                "economics": {"turnover_usd": order1_turnover},
+            },
+        },
     )
+    order2_turnover = 500.0
     order2 = Order(
         ts=1,
         symbol="LTCUSDT",
@@ -518,7 +531,18 @@ def test_worker_normalizes_weights_above_cap():
         order_type=OrderType.MARKET,
         quantity=Decimal("0"),
         price=None,
-        meta={"payload": {"target_weight": 0.7, "edge_bps": 12.0}},
+        meta={
+            "payload": {
+                "target_weight": 0.7,
+                "edge_bps": 12.0,
+                "economics": {"turnover_usd": order2_turnover},
+            },
+            "economics": {"turnover_usd": order2_turnover},
+            "decision": {
+                "turnover_usd": order2_turnover,
+                "economics": {"turnover_usd": order2_turnover},
+            },
+        },
     )
     normalized_orders, applied = worker._normalize_weight_targets([order1, order2])
     assert applied is True
@@ -531,6 +555,31 @@ def test_worker_normalizes_weights_above_cap():
         assert payload["target_weight"] == pytest.approx(0.3)
         assert payload.get("normalization")
         assert payload["normalization"]["factor"] == pytest.approx(0.6 / 1.4)
+    pending = worker._pending_weight
+    assert len(pending) == 2
+    expected_factor = payloads[0]["normalization"]["factor"]
+    for order_obj, payload, original_turnover in (
+        (normalized_orders[0], payloads[0], order1_turnover),
+        (normalized_orders[1], payloads[1], order2_turnover),
+    ):
+        assert pending[id(order_obj)]["target_weight"] == pytest.approx(
+            payload["target_weight"]
+        )
+        assert pending[id(order_obj)]["delta_weight"] == pytest.approx(
+            payload["delta_weight"]
+        )
+        economics = payload["economics"]
+        assert economics["turnover_usd"] == pytest.approx(original_turnover * expected_factor)
+        decision_meta = order_obj.meta["decision"]
+        assert decision_meta["turnover_usd"] == pytest.approx(
+            original_turnover * expected_factor
+        )
+        assert decision_meta["economics"]["turnover_usd"] == pytest.approx(
+            original_turnover * expected_factor
+        )
+        assert order_obj.meta["economics"]["turnover_usd"] == pytest.approx(
+            original_turnover * expected_factor
+        )
 
 
 def test_bar_executor_propagates_normalized_flag():
