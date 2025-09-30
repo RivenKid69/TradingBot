@@ -139,3 +139,25 @@ def test_daily_turnover_cap_uses_economics_payload() -> None:
     assert adjusted_third == []
     snapshot = worker._daily_turnover_snapshot()
     assert snapshot["portfolio"]["remaining_usd"] == pytest.approx(0.0)
+
+
+def test_daily_turnover_limits_use_sequential_weights_for_orders() -> None:
+    worker = _make_worker_with_daily_cap(600.0)
+
+    orders = [
+        _make_order("BTCUSDT", 0.4, 0.0),
+        _make_order("BTCUSDT", 0.6, 0.0),
+    ]
+
+    adjusted = worker._apply_daily_turnover_limits(orders, "BTCUSDT", 1)
+    assert len(adjusted) == 2
+
+    first_meta = adjusted[0].meta
+    assert first_meta.get("_daily_turnover_usd") == pytest.approx(400.0)
+    assert first_meta["payload"]["target_weight"] == pytest.approx(0.4)
+    assert first_meta["daily_turnover"]["clamped"] is False
+
+    second_meta = adjusted[1].meta
+    assert second_meta.get("_daily_turnover_usd") == pytest.approx(200.0)
+    assert second_meta["payload"]["target_weight"] == pytest.approx(0.6)
+    assert second_meta["daily_turnover"]["clamped"] is False

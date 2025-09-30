@@ -1827,9 +1827,21 @@ class _Worker:
         return payload
 
     def _resolve_weight_targets(
-        self, symbol: str, payload: Mapping[str, Any]
+        self,
+        symbol: str,
+        payload: Mapping[str, Any],
+        current_weight: float | None = None,
     ) -> tuple[float, float, str | None]:
-        current = float(self._weights.get(symbol, 0.0))
+        if current_weight is None:
+            base_weight = self._weights.get(symbol, 0.0)
+        else:
+            base_weight = current_weight
+        try:
+            current = float(base_weight)
+        except (TypeError, ValueError):
+            current = 0.0
+        if not math.isfinite(current):
+            current = 0.0
         target = current
         reason: str | None = None
         tol = 1e-9
@@ -3155,14 +3167,32 @@ class _Worker:
             decision_dict["daily_turnover_clamped"] = True
         meta["decision"] = decision_dict
 
-    def _scale_order_for_turnover(self, order: Any, symbol: str, scale: float) -> bool:
+    def _scale_order_for_turnover(
+        self,
+        order: Any,
+        symbol: str,
+        scale: float,
+        *,
+        current_weight: float | None = None,
+    ) -> bool:
         if scale <= 0.0:
             return False
         if scale >= 1.0:
             return True
         payload = self._extract_signal_payload(order)
-        current = float(self._weights.get(symbol, 0.0))
-        target_weight, delta_weight, _ = self._resolve_weight_targets(symbol, payload)
+        if current_weight is None:
+            base_weight = self._weights.get(symbol, 0.0)
+        else:
+            base_weight = current_weight
+        try:
+            current = float(base_weight)
+        except (TypeError, ValueError):
+            current = 0.0
+        if not math.isfinite(current):
+            current = 0.0
+        target_weight, delta_weight, _ = self._resolve_weight_targets(
+            symbol, payload, current_weight=current
+        )
         if math.isclose(delta_weight, 0.0, rel_tol=0.0, abs_tol=1e-12):
             return False
         new_delta = delta_weight * scale
@@ -3206,12 +3236,20 @@ class _Worker:
             portfolio_used = float(portfolio_tracker.get("total", 0.0) or 0.0)
         except (TypeError, ValueError):
             portfolio_used = 0.0
+        try:
+            working_weight = float(self._weights.get(sym, 0.0))
+        except (TypeError, ValueError):
+            working_weight = 0.0
+        if not math.isfinite(working_weight):
+            working_weight = 0.0
         adjusted: list[Any] = []
         for order in orders:
             payload = self._extract_signal_payload(order)
+            target_weight, delta_weight, _ = self._resolve_weight_targets(
+                sym, payload, current_weight=working_weight
+            )
             requested = self._extract_order_turnover(order)
             if requested <= 0.0:
-                _, delta_weight, _ = self._resolve_weight_targets(sym, payload)
                 delta = abs(float(delta_weight))
                 if delta > 0.0:
                     equity = self._resolve_order_equity(order, payload, sym)
@@ -3240,7 +3278,9 @@ class _Worker:
             executed = requested
             clamped = False
             if headroom is not None and requested > headroom + 1e-9:
-                if not self._scale_order_for_turnover(order, sym, headroom / requested):
+                if not self._scale_order_for_turnover(
+                    order, sym, headroom / requested, current_weight=working_weight
+                ):
                     try:
                         self._logger.info(
                             "DAILY_TURNOVER_DEFER %s",
@@ -3257,6 +3297,10 @@ class _Worker:
                     continue
                 executed = headroom
                 clamped = True
+                payload = self._extract_signal_payload(order)
+                target_weight, delta_weight, _ = self._resolve_weight_targets(
+                    sym, payload, current_weight=working_weight
+                )
                 try:
                     self._logger.info(
                         "DAILY_TURNOVER_CLAMP %s",
@@ -3280,6 +3324,7 @@ class _Worker:
                 headroom_before=headroom,
             )
             adjusted.append(order)
+            working_weight = target_weight
         return adjusted
 
     def _record_daily_turnover_execution(self, order: Any) -> None:
