@@ -1,9 +1,12 @@
 import logging
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
 from core_config import ResolvedTurnoverCaps, ResolvedTurnoverLimit
+from core_models import Bar, Order, OrderType, Side
+from impl_bar_executor import BarExecutor
 from service_signal_runner import _Worker
 
 
@@ -164,4 +167,58 @@ def test_order_equity_override_used_for_weight_and_turnover() -> None:
     decision_meta = second_order.meta["decision"]
     assert decision_meta["turnover_usd"] == pytest.approx(60.0)
     assert decision_meta.get("daily_turnover_clamped", False) is True
+
+
+def test_commit_skips_when_bar_executor_refuses_trade() -> None:
+    symbol = "ETHUSDT"
+    executor = BarExecutor(
+        run_id="test",
+        default_equity_usd=1_000.0,
+        min_rebalance_step=0.5,
+        initial_weights={symbol: 0.25},
+    )
+    worker, _ = _make_bar_worker()
+    worker._weights[symbol] = 0.25
+    worker._positions[symbol] = 1.0
+    worker._symbol_cooldowns.clear()
+
+    bar = Bar(
+        ts=1,
+        symbol=symbol,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("99"),
+        close=Decimal("100"),
+    )
+    order = Order(
+        ts=1,
+        symbol=symbol,
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        meta={
+            "payload": {"target_weight": 0.3},
+            "bar": bar.to_dict(),
+            "equity_usd": 1_000.0,
+        },
+    )
+
+    executor.execute(order)
+    exec_meta = order.meta.get("_bar_execution")
+    assert exec_meta is not None
+    assert exec_meta.get("filled") is False
+
+    worker._pending_weight[id(order)] = {
+        "symbol": symbol,
+        "target_weight": 0.3,
+        "delta_weight": 0.05,
+    }
+
+    worker._commit_exposure(order, bar_close_ms=bar.ts)
+
+    assert worker._weights[symbol] == pytest.approx(0.25)
+    assert worker._positions[symbol] == pytest.approx(1.0)
+    assert worker._daily_symbol_turnover == {}
+    assert worker._symbol_cooldowns == {}
+    assert id(order) not in worker._pending_weight
 
