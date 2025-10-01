@@ -661,7 +661,31 @@ class BarExecutor(TradeExecutor):
             )
         if skip_due_to_cap:
             snapshot["turnover_cap_enforced"] = True
+        filled = bool(instructions)
+        executed_turnover = float(turnover_usd)
+        report_meta["filled"] = filled
+        report_meta["executed_turnover_usd"] = executed_turnover
+        snapshot["filled"] = filled
+        snapshot["executed_turnover_usd"] = executed_turnover
         self._last_snapshot = snapshot
+
+        execution_meta: Dict[str, Any] = {
+            "filled": filled,
+            "turnover_usd": executed_turnover,
+            "target_weight": float(target_weight),
+            "delta_weight": float(delta_weight),
+            "requested_target_weight": requested_target_weight,
+            "requested_delta_weight": requested_delta_weight,
+        }
+        if skip_reason is not None:
+            execution_meta["reason"] = skip_reason
+        if instructions:
+            execution_meta["instructions"] = [instr.to_dict() for instr in instructions]
+        if bar is not None and getattr(bar, "ts", None) is not None:
+            execution_meta["bar_ts"] = int(bar.ts)
+
+        self._attach_execution_meta(order, execution_meta)
+        report_meta["execution"] = dict(execution_meta)
 
         return ExecReport(
             ts=bar.ts if bar is not None else order.ts,
@@ -857,6 +881,32 @@ class BarExecutor(TradeExecutor):
                         if value != Decimal("0"):
                             return value
         return Decimal("0")
+
+    def _attach_execution_meta(self, order: Order, meta: Mapping[str, Any]) -> None:
+        try:
+            existing_meta = getattr(order, "meta", None)
+        except Exception:  # pragma: no cover - defensive
+            existing_meta = None
+        if isinstance(existing_meta, dict):
+            container = existing_meta
+        elif isinstance(existing_meta, Mapping):
+            container = dict(existing_meta)
+            try:
+                setattr(order, "meta", container)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        else:
+            container: Dict[str, Any] = {}
+            try:
+                setattr(order, "meta", container)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        if not isinstance(getattr(order, "meta", None), dict):
+            return
+        try:
+            order.meta["_bar_execution"] = dict(meta)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     def _evaluate_turnover_caps(
         self, symbol: str, state: PortfolioState, bar: Optional[Bar]

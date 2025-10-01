@@ -2798,6 +2798,7 @@ class _Worker:
             symbol = str(getattr(order, "symbol", "") or "").upper()
             if not symbol:
                 return
+            meta_map = self._ensure_order_meta(order)
             payload = self._extract_signal_payload(order)
             equity_override = self._resolve_order_equity(order, payload, symbol)
             if equity_override is not None and equity_override > 0.0:
@@ -2805,18 +2806,79 @@ class _Worker:
             target_weight, delta_weight, _ = self._resolve_weight_targets(
                 symbol, payload
             )
-            if math.isclose(target_weight, 0.0, rel_tol=0.0, abs_tol=1e-12):
+            exec_meta = self._coerce_mapping(meta_map.get("_bar_execution"))
+            executed_flag: bool | None = None
+            executed_turnover: float | None = None
+            executed_target: float | None = None
+            executed_delta: float | None = None
+            if exec_meta:
+                executed_turnover = self._coerce_float(exec_meta.get("turnover_usd"))
+                executed_target = self._coerce_float(exec_meta.get("target_weight"))
+                executed_delta = self._coerce_float(exec_meta.get("delta_weight"))
+
+                def _interpret_bool(value: Any) -> bool | None:
+                    if value is None:
+                        return None
+                    if isinstance(value, bool):
+                        return value
+                    if isinstance(value, str):
+                        candidate = value.strip().lower()
+                        if candidate in {"", "0", "false", "no", "off"}:
+                            return False
+                        if candidate in {"1", "true", "yes", "on"}:
+                            return True
+                        return None
+                    if isinstance(value, (int, float)):
+                        return bool(value)
+                    return bool(value)
+
+                executed_flag = _interpret_bool(exec_meta.get("filled"))
+                if executed_flag is None:
+                    executed_flag = _interpret_bool(exec_meta.get("executed"))
+                if executed_flag is None:
+                    instructions_payload = exec_meta.get("instructions")
+                    executed_flag = bool(instructions_payload)
+                if executed_flag is None and executed_turnover is not None:
+                    executed_flag = executed_turnover > 0.0
+            executed = executed_flag if executed_flag is not None else True
+            prev_weight = self._weights.get(symbol, 0.0)
+            self._pending_weight.pop(id(order), None)
+            if not executed:
+                meta_map.pop("_daily_turnover_usd", None)
+                return
+            applied_target = (
+                self._clamp_weight(executed_target)
+                if executed_target is not None
+                else target_weight
+            )
+            if math.isclose(applied_target, 0.0, rel_tol=0.0, abs_tol=1e-12):
                 self._weights.pop(symbol, None)
             else:
-                self._weights[symbol] = target_weight
-            self._apply_weight_to_positions(
-                symbol, target_weight, equity_override=equity_override
+                self._weights[symbol] = applied_target
+            applied_delta = (
+                executed_delta
+                if executed_delta is not None
+                else applied_target - prev_weight
             )
-            self._pending_weight.pop(id(order), None)
+            self._apply_weight_to_positions(
+                symbol, applied_target, equity_override=equity_override
+            )
+            turnover_to_record: float | None = executed_turnover
+            if turnover_to_record is not None:
+                if turnover_to_record <= 0.0:
+                    meta_map.pop("_daily_turnover_usd", None)
+                else:
+                    meta_map["_daily_turnover_usd"] = float(turnover_to_record)
+            decision_meta = self._coerce_mapping(meta_map.get("decision"))
+            if decision_meta is not None and turnover_to_record is not None:
+                decision_meta["turnover_usd"] = float(max(0.0, turnover_to_record))
+                meta_map["decision"] = decision_meta
             self._record_daily_turnover_execution(order)
             self._persist_exposure_state(clock.now_ms())
             self._maybe_start_symbol_cooldown(
-                symbol, float(delta_weight), bar_close_ms=bar_close_ms
+                symbol,
+                float(applied_delta),
+                bar_close_ms=bar_close_ms,
             )
             return
         key = id(order)
@@ -3552,7 +3614,20 @@ class _Worker:
         meta = getattr(order, "meta", None)
         if not isinstance(meta, MappingABC):
             return
+        exec_meta = self._coerce_mapping(meta.get("_bar_execution"))
+        executed_from_exec = None
+        if exec_meta:
+            executed_from_exec = self._coerce_float(exec_meta.get("turnover_usd"))
         executed = self._coerce_float(meta.get("_daily_turnover_usd"))
+        if executed_from_exec is not None:
+            if executed_from_exec <= 0.0:
+                try:
+                    meta.pop("_daily_turnover_usd", None)
+                except Exception:
+                    pass
+                return
+            executed = executed_from_exec
+            meta["_daily_turnover_usd"] = executed_from_exec
         if executed is None or executed <= 0.0:
             return
         day_key_val = meta.get("_daily_turnover_day")
