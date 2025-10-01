@@ -49,6 +49,13 @@ def test_small_deltas_suppressed_during_cooldown() -> None:
     big_order = _make_order(symbol, 0.5)
     result = worker.publish_decision(big_order, symbol, 1)
     assert result.action == "pass"
+    big_order.meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": 0.5,
+        "delta_weight": 0.5,
+        "turnover_usd": 0.0,
+    }
+    worker._replay_pending_weight_entries(big_order)
     assert worker._weights[symbol] == pytest.approx(0.5)
     assert worker._symbol_cooldowns[symbol] == 2
 
@@ -77,6 +84,13 @@ def test_small_deltas_suppressed_during_cooldown() -> None:
     final_order = _make_order(symbol, 0.52)
     res = worker.publish_decision(final_order, symbol, 4)
     assert res.action == "pass"
+    final_order.meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": 0.52,
+        "delta_weight": 0.02,
+        "turnover_usd": 0.0,
+    }
+    worker._replay_pending_weight_entries(final_order)
     assert worker._weights[symbol] == pytest.approx(0.52)
 
     # Only the initial large trade and the final adjustment should emit
@@ -146,6 +160,15 @@ def test_order_equity_override_used_for_weight_and_turnover() -> None:
         meta={"payload": {"target_weight": 0.5, "equity_usd": 1_000.0}},
     )
     worker._commit_exposure(first_order)
+    assert symbol not in worker._symbol_equity
+    assert symbol not in worker._positions
+    first_order.meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": 0.5,
+        "delta_weight": 0.5,
+        "turnover_usd": 500.0,
+    }
+    worker._replay_pending_weight_entries(first_order)
 
     assert worker._positions[symbol] == pytest.approx(500.0)
     assert worker._symbol_equity.get(symbol) == pytest.approx(1_000.0)
@@ -167,6 +190,18 @@ def test_order_equity_override_used_for_weight_and_turnover() -> None:
     decision_meta = second_order.meta["decision"]
     assert decision_meta["turnover_usd"] == pytest.approx(60.0)
     assert decision_meta.get("daily_turnover_clamped", False) is True
+
+    second_order.meta.setdefault("_bar_execution", {})
+    second_order.meta["_bar_execution"].update(
+        {
+            "filled": True,
+            "target_weight": payload["target_weight"],
+            "delta_weight": payload["target_weight"] - 0.5,
+            "turnover_usd": turnover_info["executed_usd"],
+        }
+    )
+    worker._commit_exposure(second_order)
+    worker._replay_pending_weight_entries(second_order)
 
 
 def test_commit_skips_when_bar_executor_refuses_trade() -> None:
@@ -221,4 +256,42 @@ def test_commit_skips_when_bar_executor_refuses_trade() -> None:
     assert worker._daily_symbol_turnover == {}
     assert worker._symbol_cooldowns == {}
     assert id(order) not in worker._pending_weight
+
+
+def test_commit_exposure_waits_for_execution_metadata() -> None:
+    worker, _ = _make_bar_worker()
+    symbol = "BTCUSDT"
+    worker._weights[symbol] = 0.1
+    order = SimpleNamespace(
+        symbol=symbol,
+        meta={
+            "payload": {"target_weight": 0.3, "equity_usd": 2_000.0},
+            "_daily_turnover_usd": 42.0,
+        },
+    )
+
+    worker._commit_exposure(order, bar_close_ms=12345)
+
+    assert worker._weights[symbol] == pytest.approx(0.1)
+    assert worker._symbol_equity.get(symbol) is None
+    assert order.meta.get("_daily_turnover_usd") == pytest.approx(42.0)
+    assert id(order) in worker._pending_weight
+    pending = worker._pending_weight[id(order)]
+    assert pending["symbol"] == symbol
+    assert pending.get("bar_close_ms") == 12345
+
+    order.meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": 0.35,
+        "delta_weight": 0.25,
+        "turnover_usd": 84.0,
+    }
+
+    processed = worker._replay_pending_weight_entries(order)
+
+    assert processed is True
+    assert worker._weights[symbol] == pytest.approx(0.35)
+    assert worker._symbol_equity[symbol] == pytest.approx(2_000.0)
+    assert id(order) not in worker._pending_weight
+    assert order.meta.get("_daily_turnover_usd") is None
 
