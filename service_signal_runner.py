@@ -2353,12 +2353,15 @@ class _Worker:
             if base_equity is not None and base_equity > 0.0:
                 equity = float(base_equity)
         price = self._last_prices.get(sym)
+        qty: float | None = None
         if equity is not None and equity > 0.0 and price is not None and price > 0.0:
             qty = (weight_val * float(equity)) / float(price)
-        elif equity is not None and equity > 0.0:
-            qty = weight_val * float(equity)
-        else:
-            qty = weight_val
+        if qty is None:
+            # Without reliable equity and price information we can't derive a
+            # notional-based quantity.  Drop any cached exposure to avoid
+            # reporting fictitious positions.
+            self._positions.pop(sym, None)
+            return
         if math.isclose(qty, 0.0, rel_tol=0.0, abs_tol=1e-12):
             self._positions.pop(sym, None)
         else:
