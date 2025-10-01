@@ -128,6 +128,76 @@ def test_worker_forwards_cost_metrics_to_monitoring() -> None:
     assert window_snapshot["cost_bias_bps"] == pytest.approx(bias)
 
 
+def test_worker_does_not_substitute_adv_for_cap() -> None:
+    thresholds = MonitoringThresholdsConfig()
+    cfg = MonitoringConfig(enabled=True, thresholds=thresholds)
+    alerts = DummyAlerts()
+    agg = MonitoringAggregator(cfg, alerts)
+
+    class DummyMetrics:
+        def reset_symbol(self, symbol: str) -> None:  # pragma: no cover - noop
+            pass
+
+    class DummyFeaturePipe:
+        def __init__(self) -> None:
+            self.metrics = DummyMetrics()
+            self.signal_quality: dict[str, object] = {}
+
+    class DummyExecutor:
+        def __init__(self, snapshot: dict[str, object]) -> None:
+            self.monitoring_snapshot = snapshot
+
+    adv_quote = 25_000.0
+    turnover = 1_000.0
+    snapshot = {
+        "decision": {
+            "turnover_usd": turnover,
+            "act_now": False,
+        },
+        "turnover_usd": turnover,
+        "adv_quote": adv_quote,
+        "bar_ts": 2_000_000,
+    }
+
+    worker = _Worker(
+        fp=DummyFeaturePipe(),
+        policy=object(),
+        logger=logging.getLogger("test"),
+        executor=DummyExecutor(snapshot),
+        enforce_closed_bars=False,
+        pipeline_cfg=PipelineConfig(enabled=False),
+        monitoring=agg,
+        execution_mode="bar",
+        rest_candidates=[],
+    )
+
+    runtime_snapshot = worker._extract_monitoring_snapshot(worker._executor)
+    metrics = worker._extract_bar_execution_metrics(runtime_snapshot)
+    assert metrics is not None
+    assert metrics.get("cap_usd") is None
+    assert metrics.get("adv_quote") == pytest.approx(adv_quote)
+
+    bar = Bar(
+        ts=2_000_000,
+        symbol="BTCUSDT",
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal("1"),
+    )
+
+    worker.process(bar)
+
+    snapshot = agg._bar_execution_snapshot()
+    for window_key in ("window_1m", "window_5m"):
+        window_snapshot = snapshot[window_key]
+        assert window_snapshot["cap_usd"] is None
+        assert window_snapshot["turnover_vs_cap"] is None
+    cumulative = snapshot["cumulative"]
+    assert cumulative["cap_usd"] is None
+    assert cumulative["turnover_vs_cap"] is None
+
+
 def test_bar_execution_pruning_uses_bar_timestamp() -> None:
     thresholds = MonitoringThresholdsConfig()
     cfg = MonitoringConfig(enabled=True, thresholds=thresholds)

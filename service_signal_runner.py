@@ -1390,13 +1390,24 @@ class _Worker:
                 normalized_flag = False
         cap_value = self._coerce_float(snapshot.get("cap_usd"))
         if cap_value is None:
-            cap_value = self._coerce_float(snapshot.get("adv_quote"))
+            cap_value = self._coerce_float(
+                self._find_in_mapping(decision, ("cap_usd", "cap_quote", "daily_notional_cap"))
+            )
         if cap_value is None:
             cap_value = self._coerce_float(
-                self._find_in_mapping(decision, ("adv_quote", "cap_usd", "cap_quote", "daily_notional_cap"))
+                self._find_in_mapping(snapshot, ("cap_usd", "cap_quote", "daily_notional_cap"))
             )
         if cap_value is not None and cap_value <= 0.0:
             cap_value = None
+        adv_value = self._coerce_float(snapshot.get("adv_quote"))
+        if adv_value is None:
+            adv_value = self._coerce_float(
+                self._find_in_mapping(decision, ("adv_quote",))
+            )
+        if adv_value is None:
+            adv_value = self._coerce_float(self._find_in_mapping(snapshot, ("adv_quote",)))
+        if adv_value is not None and adv_value <= 0.0:
+            adv_value = None
         impact_mode_val = self._find_in_mapping(decision, ("impact_mode",))
         if impact_mode_val is None and snapshot is not None:
             impact_mode_val = snapshot.get("impact_mode")
@@ -1448,6 +1459,8 @@ class _Worker:
             "cap_usd": cap_value,
             "normalized": bool(normalized_flag),
         }
+        if adv_value is not None:
+            metrics["adv_quote"] = adv_value
         if bar_ts is not None:
             metrics["bar_ts"] = bar_ts
         if impact_mode:
