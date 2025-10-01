@@ -105,7 +105,7 @@ def test_build_envelope_payload_preserves_nested_economics() -> None:
     )
 
 
-def test_normalize_weight_targets_deduplicates_symbol_totals() -> None:
+def test_normalize_weight_targets_aggregates_symbol_totals() -> None:
     worker = _make_worker()
     worker._execution_mode = "bar"
     worker._max_total_weight = 0.8
@@ -120,8 +120,23 @@ def test_normalize_weight_targets_deduplicates_symbol_totals() -> None:
 
     normalized_orders, applied = worker._normalize_weight_targets([order1, order2])
 
-    assert applied is False
+    assert applied is True
     assert normalized_orders == [order1, order2]
-    assert worker._pending_weight == {}
+    payload1 = normalized_orders[0].meta["payload"]
+    payload2 = normalized_orders[1].meta["payload"]
+    normalization = payload1["normalization"]
+    assert normalization["delta_positive_total"] == pytest.approx(0.6)
+    assert normalization["delta_negative_total"] == pytest.approx(0.0)
+    assert normalization["delta_total"] == pytest.approx(0.6)
+    assert normalization["requested_total"] == pytest.approx(1.2)
+    assert normalization["current_total"] == pytest.approx(0.3)
+    assert normalization["available_delta"] == pytest.approx(0.5)
+    assert normalization["factor"] == pytest.approx(5.0 / 6.0)
+    assert payload2["normalization"]["factor"] == pytest.approx(normalization["factor"])
+    expected_target = 0.3 + (0.6 - 0.3) * normalization["factor"]
     for order in normalized_orders:
-        assert order.meta["payload"]["target_weight"] == pytest.approx(0.6)
+        payload = order.meta["payload"]
+        assert payload["normalized"] is True
+        assert payload["target_weight"] == pytest.approx(expected_target)
+        assert payload["delta_weight"] == pytest.approx(expected_target - 0.3)
+    assert len(worker._pending_weight) == 2
