@@ -3581,12 +3581,17 @@ class _Worker:
                 sym, payload, current_weight=working_weight
             )
             requested = self._extract_order_turnover(order)
-            if requested <= 0.0:
+            requested_non_finite = not math.isfinite(requested)
+            if requested_non_finite:
+                requested = 0.0
+            if requested <= 0.0 and not requested_non_finite:
                 delta = abs(float(delta_weight))
                 if delta > 0.0:
                     equity = self._resolve_order_equity(order, payload, sym)
                     if equity is not None and equity > 0.0:
                         requested = delta * float(equity)
+                        if not math.isfinite(requested):
+                            requested = 0.0
             headroom_candidates: list[float] = []
             if symbol_limit is not None:
                 headroom_candidates.append(max(0.0, float(symbol_limit) - symbol_used))
@@ -3608,6 +3613,8 @@ class _Worker:
                     pass
                 continue
             executed = requested
+            if not math.isfinite(executed):
+                executed = 0.0
             clamped = False
             if headroom is not None and requested > headroom + 1e-9:
                 if not self._scale_order_for_turnover(
@@ -3633,6 +3640,8 @@ class _Worker:
                 target_weight, delta_weight, _ = self._resolve_weight_targets(
                     sym, payload, current_weight=working_weight
                 )
+                if not math.isfinite(executed):
+                    executed = 0.0
                 try:
                     self._logger.info(
                         "DAILY_TURNOVER_CLAMP %s",
@@ -4795,6 +4804,21 @@ class _Worker:
         if not published:
             return False
         self._remember_idempotency_key(idempotency_key)
+        if (
+            self._execution_mode == "bar"
+            and self._signal_dispatcher is None
+        ):
+            execute = getattr(self._executor, "execute", None)
+            if callable(execute):
+                try:
+                    execute(o)
+                except Exception:
+                    try:
+                        self._logger.exception(
+                            "failed to execute bar order inline", exc_info=True
+                        )
+                    except Exception:
+                        pass
         if self._execution_mode != "bar":
             submit = getattr(self._executor, "submit", None)
             if callable(submit):

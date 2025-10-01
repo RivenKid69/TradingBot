@@ -113,6 +113,129 @@ def test_service_signal_runner_order_mode_instantiation(monkeypatch, tmp_path):
     assert runner._execution_mode == "order"
 
 
+def test_service_signal_runner_bar_mode_inline_execution(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    module = importlib.import_module("service_signal_runner")
+    monkeypatch.setattr(module.signal_bus, "ENABLED", False)
+
+    class DummyAdapter:
+        sim = None
+        source = None
+        market_data = None
+        ws = None
+
+    class DummyFeaturePipe:
+        def warmup(self):  # pragma: no cover - smoke helper
+            return None
+
+        def process(self, *args, **kwargs):  # pragma: no cover - smoke helper
+            return []
+
+    class DummyPolicy:
+        def __call__(self, *args, **kwargs):  # pragma: no cover - smoke helper
+            return []
+
+    class InlineExecutorStub:
+        def __init__(self):
+            self.calls = 0
+            self._snapshot = {"execution_mode": "bar"}
+
+        def execute(self, order):
+            self.calls += 1
+            meta = getattr(order, "meta", None)
+            if not isinstance(meta, dict):
+                meta = dict(meta or {})
+                setattr(order, "meta", meta)
+            execution_meta = {
+                "filled": True,
+                "turnover_usd": 42.0,
+                "target_weight": 0.5,
+                "delta_weight": 0.5,
+            }
+            meta["_bar_execution"] = dict(execution_meta)
+            self._snapshot = {
+                "execution_mode": "bar",
+                "bar_execution": {
+                    "decisions": 1,
+                    "act_now": 1,
+                    "turnover_usd": 42.0,
+                    "bar_ts": 1,
+                },
+            }
+            return SimpleNamespace(meta={"execution": dict(execution_meta)})
+
+        def monitoring_snapshot(self):
+            return self._snapshot
+
+    cfg = module.SignalRunnerConfig(logs_dir=str(tmp_path / "logs"), run_id="test-inline")
+    run_cfg = SimpleNamespace(execution=SimpleNamespace(mode="bar"), slippage_regime_updates=False)
+
+    feature_pipe = DummyFeaturePipe()
+    policy = DummyPolicy()
+    runner = module.ServiceSignalRunner(
+        DummyAdapter(),
+        feature_pipe,
+        policy,
+        cfg=cfg,
+        run_config=run_cfg,
+    )
+
+    executor_stub = InlineExecutorStub()
+    worker = module._Worker(
+        feature_pipe,
+        policy,
+        runner.logger,
+        executor_stub,
+        runner.risk_guards,
+        lambda: False,
+        enforce_closed_bars=runner.enforce_closed_bars,
+        close_lag_ms=runner.close_lag_ms,
+        ws_dedup_enabled=runner.ws_dedup_enabled,
+        ws_dedup_log_skips=runner.ws_dedup_log_skips,
+        ws_dedup_timeframe_ms=runner.ws_dedup_timeframe_ms,
+        bar_timeframe_ms=None,
+        throttle_cfg=runner.throttle_cfg,
+        no_trade_cfg=runner.no_trade_cfg,
+        pipeline_cfg=runner.pipeline_cfg,
+        signal_quality_cfg=runner.signal_quality_cfg,
+        zero_signal_alert=getattr(runner.monitoring_cfg.thresholds, "zero_signals", 0),
+        state_enabled=runner.cfg.state.enabled,
+        rest_candidates=None,
+        monitoring=None,
+        monitoring_agg=None,
+        worker_id="test-worker",
+        status_callback=None,
+        execution_mode=runner._execution_mode,
+        portfolio_equity=None,
+        max_total_weight=None,
+        idempotency_cache_size=1024,
+        cooldown_settings=None,
+        signal_dispatcher=None,
+    )
+
+    bar_open_ms = 1_700_000_000_000
+    order = SimpleNamespace(
+        symbol="BTCUSDT",
+        meta={"payload": {"target_weight": 0.5}, "signal_leg": "entry"},
+        created_ts_ms=bar_open_ms,
+    )
+
+    result = worker.publish_decision(
+        order,
+        "BTCUSDT",
+        bar_open_ms,
+        bar_close_ms=bar_open_ms + 60_000,
+    )
+
+    assert result.action == "pass"
+    assert executor_stub.calls == 1
+    exec_meta = order.meta.get("_bar_execution")
+    assert exec_meta is not None
+    assert exec_meta.get("target_weight") == pytest.approx(0.5)
+    assert worker._weights.get("BTCUSDT") == pytest.approx(0.5)
+
+
 def _make_execution_sim_stub() -> ModuleType:
     mod = ModuleType("execution_sim")
 

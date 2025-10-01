@@ -13,6 +13,7 @@
   выступают точками входа и передают управление сервисам через dependency
   injection; бизнес-логика вынесена в модули `services/`, `execution_*`,
   `impl_*` и др.
+
 - **Выполненные задачи**: большинство скриптов принимают YAML-конфиги и
   используют `core_config` для валидации входных параметров, что упрощает
   повторное использование настроек между оффлайн- и онлайн-режимами.
@@ -27,6 +28,8 @@
 6. **Документация** → обновить эту памятку либо профильные файлы при
    добавлении нового пайплайна/конфига.
 
+
+
 ## 2. Ключевые директории
 - `configs/` — YAML-конфигурации для симуляции, трейдинга и обучения.
 - `data/` — наборы данных и кеши (например, universe символов, seasonality,
@@ -39,6 +42,7 @@
   исполнения ордеров, оценки рисков, работы с латентностью.
 - `tests/` — выборочные сценарии тестирования и примеры (например,
   `run_no_trade_mask_sample.py`).
+
 - `tools/` — вспомогательные скрипты для подготовки данных и интеграции с
   внешними сервисами.
 - `notebooks/` — исследовательские ноутбуки; при переносе логики в продовый
@@ -52,6 +56,7 @@
 - Подробности специфичных пайплайнов смотрите в `docs/pipeline.md` и
   комментариях рядом с соответствующими сервисами.
 
+
 ## 3. Установка зависимостей
 Дополнительные зависимости для скриптов данных и моделей:
 ```bash
@@ -59,6 +64,7 @@ pip install -r requirements_extra.txt
 # либо через extras
 pip install ".[extra]"
 ```
+
 
 ### 3.1 Сборка Cython и C++
 После изменения `.pyx`/`.pxd`/`.cpp` файлов:
@@ -76,6 +82,7 @@ pip install -e .  # пересоберёт расширения
 - При подготовке релизных окружений фиксируйте версии в `requirements_lock.txt`
   (создать при необходимости `pip freeze > requirements_lock.txt`).
 
+
 ## 4. Частые команды
 - Бэктест с симуляцией: `python script_backtest.py --config configs/config_sim.yaml`
 - Тренировка модели: `python train_model_multi_patch.py --config configs/config_train.yaml --regime-config configs/market_regimes.json --liquidity-seasonality data/latency/liquidity_latency_seasonality.json`
@@ -84,11 +91,13 @@ pip install -e .  # пересоберёт расширения
 - Получение биржевых спецификаций: `python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT --out data/exchange_specs.json`
 - Проверка seasonality: `python scripts/validate_seasonality.py --historical path/to/trades.csv --multipliers data/latency/liquidity_latency_seasonality.json`
 
+
 ### 4.1 Диагностика и профилирование
 - Проверка целостности данных: `python data_validation.py --config configs/data_validation.yaml`.
 - Профилирование latency: `python latency_volatility_cache.py --config configs/latency_cache.yaml`.
 - Отладка сигналов без публикации сделок: `python service_signal_runner.py --config configs/config_live.yaml --dry-run`.
 - Агрегация логов исполнения: `python aggregate_exec_logs.py --input reports/latest --out reports/summary.csv`.
+
 
 ## 5. Управление списком символов
 Сервисы читают юниверс символов из `data/universe/symbols.json`. Обновление
@@ -170,6 +179,7 @@ make no-trade-mask-sample  # python tests/run_no_trade_mask_sample.py
 Эта памятка предназначена для быстрого старта и контекстуализации задач.
 При внесении значительных изменений обновляйте соответствующие разделы.
 
+
 ## 11. Частые сценарии и подсказки
 - **Добавление нового сервиса**: создайте модуль в `services/`, подключите его в
   CLI (`script_*.py` или `service_*.py`), опишите конфиг в `configs/` и
@@ -191,3 +201,4 @@ make no-trade-mask-sample  # python tests/run_no_trade_mask_sample.py
 - [ ] Обновлена документация (`docs/` или эта памятка) при изменении публичных API/конфигов.
 - [ ] Проверены пути к данным и права доступа (см. `docs/permissions.md`).
 - [ ] Подготовлено краткое и информативное описание для PR.
+

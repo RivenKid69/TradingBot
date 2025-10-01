@@ -1,6 +1,7 @@
 import logging
+import math
 from decimal import Decimal
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -258,6 +259,8 @@ def test_daily_turnover_scaling_updates_turnover_fields() -> None:
     payload = meta["payload"]
     assert payload["turnover_usd"] == pytest.approx(250.0 * factor)
     assert payload["turnover"] == pytest.approx(250.0 * factor)
+
+
     assert payload["economics"]["turnover_usd"] == pytest.approx(250.0 * factor)
     assert payload["economics"]["notional_usd"] == pytest.approx(250.0 * factor)
     assert payload["decision"]["turnover_usd"] == pytest.approx(250.0 * factor)
@@ -295,3 +298,47 @@ def test_daily_turnover_scaling_updates_turnover_fields() -> None:
     assert pending["normalization"]["available_delta"] == pytest.approx(
         expected_available_delta
     )
+
+
+def test_daily_turnover_non_finite_request_is_sanitized() -> None:
+    worker = _make_worker_with_daily_cap(1000.0)
+
+    order = _make_turnover_rich_order("BTCUSDT", 0.2, float("nan"))
+    payload = order.meta["payload"]
+    payload["turnover_usd"] = "NaN"
+    payload.setdefault("decision", {})["turnover_usd"] = "NaN"
+    order.meta.setdefault("decision", {})["turnover_usd"] = "NaN"
+    payload.setdefault("economics", {})["turnover_usd"] = "NaN"
+    order.meta.setdefault("economics", {})["turnover_usd"] = "NaN"
+    order.meta.setdefault("decision", {}).setdefault("economics", {})["turnover_usd"] = "NaN"
+
+    original_extract = worker._extract_order_turnover
+
+    def _extract_with_nan(self: _Worker, candidate: Order) -> float:
+        payload_map = self._extract_signal_payload(candidate)
+        if isinstance(payload_map, dict):
+            turnover_val = payload_map.get("turnover_usd")
+            if isinstance(turnover_val, str) and turnover_val.lower() == "nan":
+                return float("nan")
+        return original_extract(candidate)
+
+    worker._extract_order_turnover = MethodType(_extract_with_nan, worker)
+
+    adjusted = worker._apply_daily_turnover_limits([order], "BTCUSDT", 1)
+
+    assert len(adjusted) == 1
+    meta = adjusted[0].meta
+    assert meta.get("_daily_turnover_usd") == pytest.approx(0.0)
+
+    daily_info = meta.get("daily_turnover")
+    assert isinstance(daily_info, dict)
+    assert daily_info.get("requested_usd") == pytest.approx(0.0)
+    assert daily_info.get("executed_usd") == pytest.approx(0.0)
+
+    symbol_tracker = worker._daily_symbol_turnover.get("BTCUSDT")
+    assert symbol_tracker is not None
+    assert math.isfinite(symbol_tracker.get("total", float("nan")))
+    assert symbol_tracker.get("total") == pytest.approx(0.0)
+
+    assert math.isfinite(worker._daily_portfolio_turnover.get("total", float("nan")))
+    assert worker._daily_portfolio_turnover.get("total") == pytest.approx(0.0)
