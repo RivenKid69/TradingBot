@@ -2391,6 +2391,9 @@ class _Worker:
                 target_weight = 0.0
             if target_weight < 0.0:
                 target_weight = 0.0
+            delta = target_weight - current_weight
+            if not math.isfinite(delta):
+                delta = 0.0
             info = {
                 "order": order,
                 "symbol": symbol,
@@ -2398,6 +2401,7 @@ class _Worker:
                 "current": current_weight,
                 "target": target_weight,
                 "requested": target_weight,
+                "delta": delta,
                 "normalized": bool(normalized_flag),
             }
             if symbol:
@@ -2412,13 +2416,47 @@ class _Worker:
                 if aggregate is None:
                     scalable_by_symbol[symbol] = {
                         "current": current_weight,
-                        "target": target_weight,
+                        "target": max(0.0, target_weight),
                         "requested": requested_value,
+                        "delta_total": delta,
+                        "positive_delta_total": delta if delta > 0.0 else 0.0,
+                        "negative_delta_total": delta if delta < 0.0 else 0.0,
                     }
                 else:
-                    aggregate.setdefault("current", current_weight)
-                    aggregate["target"] = target_weight
-                    aggregate["requested"] = requested_value
+                    existing_current = aggregate.get("current", 0.0)
+                    try:
+                        existing_current_val = float(existing_current)
+                    except (TypeError, ValueError):
+                        existing_current_val = None
+                    if existing_current_val is None or not math.isfinite(existing_current_val):
+                        aggregate["current"] = current_weight
+                    try:
+                        prev_target_total = float(aggregate.get("target", 0.0))
+                    except (TypeError, ValueError):
+                        prev_target_total = 0.0
+                    aggregate["target"] = max(0.0, prev_target_total + max(0.0, target_weight))
+                    try:
+                        prev_requested_total = float(aggregate.get("requested", 0.0))
+                    except (TypeError, ValueError):
+                        prev_requested_total = 0.0
+                    aggregate["requested"] = prev_requested_total + requested_value
+                    try:
+                        prev_delta_total = float(aggregate.get("delta_total", 0.0))
+                    except (TypeError, ValueError):
+                        prev_delta_total = 0.0
+                    aggregate["delta_total"] = prev_delta_total + delta
+                    if delta > 0.0:
+                        try:
+                            prev_positive = float(aggregate.get("positive_delta_total", 0.0))
+                        except (TypeError, ValueError):
+                            prev_positive = 0.0
+                        aggregate["positive_delta_total"] = prev_positive + delta
+                    elif delta < 0.0:
+                        try:
+                            prev_negative = float(aggregate.get("negative_delta_total", 0.0))
+                        except (TypeError, ValueError):
+                            prev_negative = 0.0
+                        aggregate["negative_delta_total"] = prev_negative + delta
 
         if not scalable_infos:
             return orders_list, False
@@ -2440,21 +2478,40 @@ class _Worker:
                 current_weight = 0.0
             if not math.isfinite(current_weight) or current_weight < 0.0:
                 current_weight = 0.0
-            try:
-                target_weight = float(aggregate.get("target", 0.0))
-            except (TypeError, ValueError):
-                target_weight = current_weight
-            if not math.isfinite(target_weight):
-                target_weight = current_weight
             current_total += current_weight
-            delta = target_weight - current_weight
-            if not math.isfinite(delta):
-                continue
-            delta_total += delta
-            if delta > 0.0:
-                positive_delta_total += delta
-            elif delta < 0.0:
-                negative_delta_total += delta
+
+            agg_delta: float | None
+            try:
+                agg_delta = float(aggregate.get("delta_total", 0.0))
+            except (TypeError, ValueError):
+                agg_delta = None
+            if agg_delta is None or not math.isfinite(agg_delta):
+                try:
+                    target_weight = float(aggregate.get("target", current_weight))
+                except (TypeError, ValueError):
+                    target_weight = current_weight
+                if not math.isfinite(target_weight):
+                    target_weight = current_weight
+                agg_delta = target_weight - current_weight
+                if not math.isfinite(agg_delta):
+                    agg_delta = 0.0
+            delta_total += agg_delta
+
+            try:
+                pos_total = float(aggregate.get("positive_delta_total", 0.0))
+            except (TypeError, ValueError):
+                pos_total = 0.0
+            if not math.isfinite(pos_total) or pos_total < 0.0:
+                pos_total = max(0.0, agg_delta)
+            positive_delta_total += max(0.0, pos_total)
+
+            try:
+                neg_total = float(aggregate.get("negative_delta_total", 0.0))
+            except (TypeError, ValueError):
+                neg_total = 0.0
+            if not math.isfinite(neg_total) or neg_total > 0.0:
+                neg_total = min(0.0, agg_delta)
+            negative_delta_total += min(0.0, neg_total)
 
         existing_total = 0.0
         for sym, weight in self._weights.items():
