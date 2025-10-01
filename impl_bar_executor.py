@@ -67,6 +67,16 @@ def _clamp_01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if candidate in {"", "0", "false", "no", "off"}:
+            return False
+        if candidate in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)
+
+
 def _ensure_cost_config(cost_config: SpotCostConfig | Mapping[str, Any] | None) -> SpotCostConfig:
     if cost_config is None:
         return SpotCostConfig()
@@ -224,7 +234,10 @@ def decide_spot_trade(
 
     cost_bps = base_cost + impact
     net_bps = edge_bps - cost_bps - float(safety_margin_bps)
-    act_now = net_bps > 0.0 and turnover_usd > 0.0
+    act_now_requested = True
+    if "act_now" in signal:
+        act_now_requested = _coerce_bool(signal.get("act_now"))
+    act_now = act_now_requested and net_bps > 0.0 and turnover_usd > 0.0
 
     return SpotSignalEconomics(
         edge_bps=edge_bps,
