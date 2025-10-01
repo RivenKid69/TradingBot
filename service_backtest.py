@@ -261,8 +261,10 @@ class BarBacktestSimBridge:
         decisions: List[Mapping[str, Any]] = []
         instructions: List[Mapping[str, Any]] = []
 
+        price_unavailable = canonical_price is None
+
         bar_payload = None
-        if orders:
+        if orders and not price_unavailable:
             payload_close_price: Optional[float] = canonical_price
             if payload_close_price is None and prev_price is not None and prev_price > 0.0:
                 payload_close_price = prev_price
@@ -276,7 +278,14 @@ class BarBacktestSimBridge:
                     close_price=payload_close_price,
                 )
 
-        if orders:
+        if orders and price_unavailable:
+            logger.warning(
+                "Skipping execution for %s order(s) on bar %s for %s due to missing price",
+                len(orders),
+                ts_ms,
+                symbol,
+            )
+        if orders and not price_unavailable:
             logger.debug(
                 "Executing %s order(s) on bar %s for %s; PnL impacts next bar",
                 len(orders),
@@ -286,7 +295,7 @@ class BarBacktestSimBridge:
 
         running_equity = equity_before_costs
 
-        for order in orders:
+        for order in orders if not price_unavailable else []:
             meta = getattr(order, "meta", None)
             if isinstance(meta, Mapping):
                 payload = dict(meta)
@@ -410,6 +419,10 @@ class BarBacktestSimBridge:
             "decision": decisions[-1] if decisions else None,
             "instructions": instructions,
         }
+
+        if price_unavailable:
+            report["bar_skipped"] = True
+            report["skip_reason"] = "missing_bar_price"
 
         return report
 

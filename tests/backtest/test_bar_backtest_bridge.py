@@ -232,6 +232,54 @@ def test_missing_price_does_not_move_equity(bar_bridge_cls: type[Any]) -> None:
     assert missing_report["ref_price"] == pytest.approx(100.0)
 
 
+def test_missing_price_skips_execution(bar_bridge_cls: type[Any]) -> None:
+    symbol = "SOLUSDT"
+    executor = _StubBarExecutor(symbol)
+    bridge = bar_bridge_cls(
+        executor,
+        symbol=symbol,
+        timeframe_ms=60_000,
+        initial_equity=2_500.0,
+    )
+
+    # Seed the previous price so the bridge has a reference value.
+    executor.queue_position(_StubPosition(meta={"weight": 0.0}, qty=0.0))
+    _run_step(
+        bridge,
+        ts_ms=1,
+        price=50.0,
+        orders=[],
+    )
+
+    order = _StubOrder(desired_weight=0.2, meta={"payload": {"target_weight": 0.2}})
+
+    executor.queue_position(_StubPosition(meta={"weight": 0.0}, qty=0.0))
+    report = bridge.step(
+        ts_ms=2,
+        ref_price=None,
+        bid=None,
+        ask=None,
+        vol_factor=None,
+        liquidity=None,
+        orders=[order],
+        bar_open=None,
+        bar_high=None,
+        bar_low=None,
+        bar_close=None,
+        bar_timeframe_ms=60_000,
+    )
+
+    assert executor.seen_orders == []
+    assert order.meta == {"payload": {"target_weight": 0.2}}
+    assert report["instructions"] == []
+    assert report["turnover_usd"] == pytest.approx(0.0)
+    assert report["bar_cost_usd"] == pytest.approx(0.0)
+    assert report["equity"] == pytest.approx(2_500.0)
+    assert report["equity_before_costs"] == pytest.approx(2_500.0)
+    assert report.get("bar_skipped") is True
+    assert report.get("skip_reason") == "missing_bar_price"
+
+
 @pytest.mark.parametrize(
     "qty_sequence",
     [
