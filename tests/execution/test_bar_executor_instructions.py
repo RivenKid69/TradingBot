@@ -202,3 +202,40 @@ def test_build_instructions_twap_skips_zero_quantity_slices(base_state: Portfoli
     assert total_notional == pytest.approx(float(Decimal("0.7") * bar.close))
     expected_delta = float((Decimal("0.7") * bar.close) / Decimal(str(state.equity_usd)))
     assert final_weight == pytest.approx(state.weight + expected_delta)
+
+
+def test_build_instructions_respects_participation_cap_with_large_step_size(
+    base_state: PortfolioState,
+) -> None:
+    executor = BarExecutor(
+        default_equity_usd=base_state.equity_usd,
+        symbol_specs={"BTCUSDT": {"step_size": "2"}},
+    )
+    bar = make_bar(ts=30, price="100")
+    state = base_state.with_bar(bar, bar.close)
+
+    payload = {
+        "delta_weight": 0.6,
+        "twap": {"parts": 10, "interval_ms": 60000},
+        "max_participation": 0.35,
+    }
+
+    instructions, final_weight, total_notional, _, reason = executor._build_instructions(
+        state=state,
+        target_weight=state.weight + 0.6,
+        delta_weight=0.6,
+        payload=payload,
+        bar=bar,
+        adv_quote=1000.0,
+    )
+
+    cap = 1000.0 * 0.35
+    assert reason is None
+    assert instructions
+    assert all(instr.notional_usd <= cap + 1e-9 for instr in instructions)
+    assert instructions[-1].notional_usd == pytest.approx(200.0)
+    assert instructions[-1].quantity == Decimal("2")
+    executed_notional = sum(instr.notional_usd for instr in instructions)
+    assert total_notional == pytest.approx(executed_notional)
+    expected_final = state.weight + executed_notional / state.equity_usd
+    assert final_weight == pytest.approx(expected_final)
