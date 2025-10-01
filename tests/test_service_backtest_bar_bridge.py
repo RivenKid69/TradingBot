@@ -1,0 +1,177 @@
+"""Integration tests for :class:`service_backtest.BarBacktestSimBridge`."""
+
+from __future__ import annotations
+
+from decimal import Decimal
+import importlib
+import sys
+from types import ModuleType
+from typing import Any
+
+import pytest
+
+from api.spot_signals import (
+    SpotSignalEconomics,
+    SpotSignalEnvelope,
+    SpotSignalTargetWeightPayload,
+)
+from core_config import SpotCostConfig
+from core_models import OrderType, Side
+from impl_bar_executor import BarExecutor
+
+
+class _MutableOrder:
+    def __init__(
+        self,
+        *,
+        ts: int,
+        symbol: str,
+        side: Side,
+        order_type: OrderType,
+        quantity: Decimal,
+        price: Decimal | None,
+        meta: Any,
+    ) -> None:
+        self.ts = ts
+        self.symbol = symbol
+        self.side = side
+        self.order_type = order_type
+        self.quantity = quantity
+        self.price = price
+        self.client_order_id = f"test-{symbol}-{ts}"
+        self.reduce_only = False
+        self.meta = meta
+
+
+@pytest.fixture(name="bar_bridge_cls")
+def _bar_bridge_cls(monkeypatch: pytest.MonkeyPatch) -> type[Any]:
+    """Return ``BarBacktestSimBridge`` with light-weight exchange stubs."""
+
+    exchange_mod = ModuleType("exchange")
+    specs_mod = ModuleType("exchange.specs")
+
+    def _load_specs(*_args: Any, **_kwargs: Any) -> tuple[dict, dict]:  # pragma: no cover - stub
+        return {}, {}
+
+    def _round_price_to_tick(price: float, *_args: Any, **_kwargs: Any) -> float:  # pragma: no cover - stub
+        return float(price)
+
+    specs_mod.load_specs = _load_specs  # type: ignore[attr-defined]
+    specs_mod.round_price_to_tick = _round_price_to_tick  # type: ignore[attr-defined]
+    exchange_mod.specs = specs_mod  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "exchange", exchange_mod)
+    monkeypatch.setitem(sys.modules, "exchange.specs", specs_mod)
+
+    for name in ("service_backtest", "sandbox.backtest_adapter"):
+        sys.modules.pop(name, None)
+
+    module = importlib.import_module("service_backtest")
+    return module.BarBacktestSimBridge
+
+
+def _make_order(symbol: str, meta: Any) -> _MutableOrder:
+    return _MutableOrder(
+        ts=1,
+        symbol=symbol,
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta=meta,
+    )
+
+
+def _run_step(bridge: Any, *, ts_ms: int, price: float, order: _MutableOrder) -> dict[str, Any]:
+    return bridge.step(
+        ts_ms=ts_ms,
+        ref_price=price,
+        bid=price,
+        ask=price,
+        vol_factor=1.0,
+        liquidity=None,
+        orders=[order],
+        bar_open=price,
+        bar_high=price,
+        bar_low=price,
+        bar_close=price,
+        bar_timeframe_ms=60_000,
+    )
+
+
+def test_spot_signal_envelope_payload_passthrough(bar_bridge_cls: type[Any]) -> None:
+    symbol = "BTCUSDT"
+    executor = BarExecutor(
+        run_id="test",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+    )
+    bridge = bar_bridge_cls(
+        executor,
+        symbol=symbol,
+        timeframe_ms=60_000,
+        initial_equity=1_000.0,
+    )
+
+    economics = SpotSignalEconomics(
+        edge_bps=50.0,
+        cost_bps=0.0,
+        net_bps=50.0,
+        turnover_usd=100.0,
+        act_now=True,
+        impact=0.0,
+        impact_mode="none",
+    )
+    payload = SpotSignalTargetWeightPayload(target_weight=0.5, economics=economics)
+    envelope = SpotSignalEnvelope(
+        symbol=symbol,
+        bar_close_ms=60_000,
+        expires_at_ms=120_000,
+        payload=payload,
+    )
+    order = _make_order(symbol, envelope)
+
+    report = _run_step(bridge, ts_ms=60_000, price=100.0, order=order)
+
+    decisions = report.get("decisions") or []
+    assert decisions, "Expected BarExecutor to emit a decision payload"
+    assert decisions[0]["target_weight"] == pytest.approx(0.5)
+    assert report["bar_weight"] == pytest.approx(0.5)
+
+    positions = executor.get_open_positions([symbol])
+    assert positions[symbol].meta["weight"] == pytest.approx(0.5)
+
+
+def test_rebalance_only_payload_preserved(bar_bridge_cls: type[Any]) -> None:
+    symbol = "ETHUSDT"
+    executor = BarExecutor(
+        run_id="test",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=2_000.0,
+    )
+    bridge = bar_bridge_cls(
+        executor,
+        symbol=symbol,
+        timeframe_ms=60_000,
+        initial_equity=2_000.0,
+    )
+
+    rebalance_meta = {
+        "rebalance": {
+            "target_weight": 0.3,
+            "edge_bps": 25.0,
+            "turnover_usd": 600.0,
+            "act_now": True,
+        }
+    }
+    order = _make_order(symbol, rebalance_meta)
+
+    report = _run_step(bridge, ts_ms=120_000, price=200.0, order=order)
+
+    decisions = report.get("decisions") or []
+    assert decisions, "Expected BarExecutor to emit a decision payload"
+    assert decisions[0]["target_weight"] == pytest.approx(0.3)
+    assert report["bar_weight"] == pytest.approx(0.3)
+
+    positions = executor.get_open_positions([symbol])
+    assert positions[symbol].meta["weight"] == pytest.approx(0.3)
