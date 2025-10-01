@@ -595,6 +595,7 @@ class _Worker:
         max_total_weight: float | None = None,
         idempotency_cache_size: int = 1024,
         cooldown_settings: CooldownSettings | Mapping[str, Any] | None = None,
+        signal_dispatcher: Callable[[Any], None] | None = None,
     ) -> None:
         self._fp = fp
         self._policy = policy
@@ -677,6 +678,7 @@ class _Worker:
         self._symbol_bucket_factory = None
         self._symbol_buckets = None
         self._queue = None
+        self._signal_dispatcher: Callable[[Any], None] | None = signal_dispatcher
         try:
             self._portfolio_equity = (
                 float(portfolio_equity) if portfolio_equity is not None else None
@@ -4608,6 +4610,20 @@ class _Worker:
         self._last_invalid_ttl_timeframe = None
         return timeframe_ms
 
+    def _dispatch_signal_envelope(self, envelope: Any) -> None:
+        dispatcher = self._signal_dispatcher
+        if dispatcher is None:
+            return
+        try:
+            dispatcher(envelope)
+        except Exception as exc:
+            try:
+                self._logger.error(
+                    "failed to dispatch signal envelope: %s", exc
+                )
+            except Exception:
+                pass
+
     def _emit(
         self,
         o: Any,
@@ -4769,7 +4785,7 @@ class _Worker:
                     symbol,
                     bar_close_ms,
                     payload,
-                    lambda _: None,
+                    self._dispatch_signal_envelope,
                     expires_at_ms=expires_at_ms,
                     dedup_key=dedup_key,
                     valid_until_ms=valid_until_ms_int,
@@ -6031,6 +6047,71 @@ class ServiceSignalRunner:
             )
         else:
             self._slippage_regime_listener = _listener
+
+    @staticmethod
+    def _coerce_signal_dispatcher(owner: Any) -> Callable[[Any], None] | None:
+        if owner is None:
+            return None
+        explicit = getattr(owner, "signal_dispatcher", None)
+        if callable(explicit):
+            return explicit
+        method_names = (
+            "dispatch_signal_envelope",
+            "on_bar_signal",
+            "on_signal_envelope",
+            "send_signal_envelope",
+            "handle_signal_envelope",
+        )
+        for name in method_names:
+            candidate = getattr(owner, name, None)
+            if callable(candidate):
+                return candidate
+        return None
+
+    def _resolve_signal_dispatcher(self, executor: Any) -> Callable[[Any], None] | None:
+        seen: set[int] = set()
+        stack: list[Any] = []
+
+        adapter = getattr(self, "adapter", None)
+        if adapter is not None:
+            stack.append(adapter)
+        if executor is not None:
+            stack.append(executor)
+
+        nested_attrs = (
+            "adapter",
+            "_adapter",
+            "executor",
+            "_executor",
+            "transport",
+            "_transport",
+            "sim",
+            "_sim",
+        )
+
+        while stack:
+            obj = stack.pop()
+            if obj is None:
+                continue
+            ident = id(obj)
+            if ident in seen:
+                continue
+            seen.add(ident)
+
+            dispatcher = self._coerce_signal_dispatcher(obj)
+            if dispatcher is not None:
+                return dispatcher
+
+            for attr in nested_attrs:
+                try:
+                    nested = getattr(obj, attr)
+                except Exception:
+                    nested = None
+                if nested is None:
+                    continue
+                stack.append(nested)
+
+        return None
 
     @staticmethod
     def _to_jsonable(value: Any) -> Any:
@@ -7670,6 +7751,7 @@ def clear_dirty_restart(
             portfolio_equity=portfolio_equity,
             max_total_weight=portfolio_weight_cap,
             cooldown_settings=self._resolve_worker_cooldown_settings(),
+            signal_dispatcher=self._resolve_signal_dispatcher(executor_for_worker),
         )
         self._worker_ref = worker
         self._write_runner_status()

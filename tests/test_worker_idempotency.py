@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import types
-from typing import Callable
+from typing import Any, Callable
 
 import clock
 import service_signal_runner
@@ -89,10 +89,15 @@ def _make_worker(
     )
 
     publish_calls: list[tuple] = []
+    dispatch_calls: list[Any] = []
 
     def _publish(symbol, bar_close_ms, payload, callback, **kwargs):
         publish_calls.append((symbol, bar_close_ms, payload, kwargs))
+        callback({"symbol": symbol, "bar_close_ms": bar_close_ms, "payload": payload})
         return True
+
+    def _dispatch(payload):
+        dispatch_calls.append(payload)
 
     monkeypatch.setattr(service_signal_runner, "publish_signal_envelope", _publish)
 
@@ -107,17 +112,25 @@ def _make_worker(
         idempotency_cache_size=4,
         execution_mode=execution_mode,
         throttle_cfg=throttle_cfg,
+        signal_dispatcher=_dispatch,
     )
 
     return worker, logger, publish_calls, executor_calls, {
         "published": published_metric,
         "age": age_metric,
         "skipped": skipped_metric,
-    }
+    }, dispatch_calls
 
 
 def test_emit_skips_duplicate_idempotency(monkeypatch) -> None:
-    worker, logger, publish_calls, _executor_calls, metrics = _make_worker(monkeypatch)
+    (
+        worker,
+        logger,
+        publish_calls,
+        _executor_calls,
+        metrics,
+        dispatch_calls,
+    ) = _make_worker(monkeypatch)
 
     first = _make_order("sig-1", created_ts_ms=4000)
     bar_open_ms = 3500
@@ -126,6 +139,7 @@ def test_emit_skips_duplicate_idempotency(monkeypatch) -> None:
     assert len(publish_calls) == 1
     assert metrics["published"].count == 1
     assert metrics["skipped"].count == 0
+    assert len(dispatch_calls) == 1
 
     duplicate = _make_order("sig-1", created_ts_ms=4500)
     assert (
@@ -133,6 +147,7 @@ def test_emit_skips_duplicate_idempotency(monkeypatch) -> None:
     )
     assert len(publish_calls) == 1
     assert metrics["skipped"].count == 1
+    assert len(dispatch_calls) == 1
     assert logger.messages
     last_msg, last_args, _ = logger.messages[-1]
     assert "SKIP_DUPLICATE" in last_msg
@@ -141,7 +156,14 @@ def test_emit_skips_duplicate_idempotency(monkeypatch) -> None:
 
 
 def test_emit_accepts_new_idempotency_key(monkeypatch) -> None:
-    worker, _logger, publish_calls, _executor_calls, metrics = _make_worker(monkeypatch)
+    (
+        worker,
+        _logger,
+        publish_calls,
+        _executor_calls,
+        metrics,
+        dispatch_calls,
+    ) = _make_worker(monkeypatch)
 
     first = _make_order("sig-1", created_ts_ms=4000)
     second = _make_order("sig-2", created_ts_ms=4500)
@@ -155,10 +177,18 @@ def test_emit_accepts_new_idempotency_key(monkeypatch) -> None:
     assert len(publish_calls) == 2
     assert metrics["published"].count == 2
     assert metrics["skipped"].count == 0
+    assert len(dispatch_calls) == 2
 
 
 def test_emit_bypasses_ttl_when_no_timeframe_available(monkeypatch) -> None:
-    worker, logger, publish_calls, _executor_calls, _metrics = _make_worker(
+    (
+        worker,
+        logger,
+        publish_calls,
+        _executor_calls,
+        _metrics,
+        dispatch_calls,
+    ) = _make_worker(
         monkeypatch,
         execution_mode="bar",
         ws_dedup_timeframe_ms=0,
@@ -176,13 +206,21 @@ def test_emit_bypasses_ttl_when_no_timeframe_available(monkeypatch) -> None:
     assert worker._emit(order, "BTCUSDT", 3_500, bar_open_ms=3_500) is True
 
     assert len(publish_calls) == 1
+    assert len(dispatch_calls) == 1
     assert any("TTL_BYPASSED" in msg for msg, *_ in logger.messages)
     assert ttl_stage_calls == []
 
 
 def test_emit_uses_fallback_timeframe_when_ws_timeframe_zero(monkeypatch) -> None:
     fallback_timeframe = 60_000
-    worker, logger, publish_calls, _executor_calls, _metrics = _make_worker(
+    (
+        worker,
+        logger,
+        publish_calls,
+        _executor_calls,
+        _metrics,
+        dispatch_calls,
+    ) = _make_worker(
         monkeypatch,
         execution_mode="bar",
         ws_dedup_timeframe_ms=0,
@@ -204,13 +242,21 @@ def test_emit_uses_fallback_timeframe_when_ws_timeframe_zero(monkeypatch) -> Non
     assert worker._emit(order, "BTCUSDT", bar_close_ms, bar_open_ms=bar_open_ms) is True
 
     assert len(publish_calls) == 1
+    assert len(dispatch_calls) == 1
     assert not any("TTL_BYPASSED" in msg for msg, *_ in logger.messages)
     assert ttl_stage_calls
 
 
 def test_publish_decision_uses_fallback_timeframe_for_close(monkeypatch) -> None:
     fallback_timeframe = 120_000
-    worker, _logger, publish_calls, _executor_calls, _metrics = _make_worker(
+    (
+        worker,
+        _logger,
+        publish_calls,
+        _executor_calls,
+        _metrics,
+        _dispatch_calls,
+    ) = _make_worker(
         monkeypatch,
         execution_mode="bar",
         ws_dedup_timeframe_ms=0,
@@ -253,7 +299,14 @@ def test_bar_queue_order_expires_after_bar_ttl(monkeypatch) -> None:
         queue=queue_cfg,
     )
 
-    worker, logger, publish_calls, _executor_calls, metrics = _make_worker(
+    (
+        worker,
+        logger,
+        publish_calls,
+        _executor_calls,
+        metrics,
+        _dispatch_calls,
+    ) = _make_worker(
         monkeypatch, execution_mode="bar", now_ms=_now_ms, throttle_cfg=throttle_cfg
     )
 
@@ -303,7 +356,14 @@ def test_emit_allows_full_timeframe_after_close(monkeypatch) -> None:
     def _now_ms() -> int:
         return now_state["ms"]
 
-    worker, logger, publish_calls, _executor_calls, metrics = _make_worker(
+    (
+        worker,
+        logger,
+        publish_calls,
+        _executor_calls,
+        metrics,
+        dispatch_calls,
+    ) = _make_worker(
         monkeypatch,
         execution_mode="bar",
         now_ms=_now_ms,
@@ -321,5 +381,6 @@ def test_emit_allows_full_timeframe_after_close(monkeypatch) -> None:
     )
     assert result is True, logger.messages
     assert len(publish_calls) == 1
+    assert len(dispatch_calls) == 1
     assert metrics["published"].count == 1
     assert not any("TTL_EXPIRED" in msg for msg, *_ in logger.messages)
