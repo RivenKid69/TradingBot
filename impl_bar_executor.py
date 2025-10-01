@@ -77,6 +77,27 @@ def _coerce_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _normalize_side(value: Any) -> Side:
+    if isinstance(value, Side):
+        return value
+    if value is None:
+        raise ValueError("side value must not be None")
+    if isinstance(value, str):
+        candidate = value
+    else:
+        candidate = getattr(value, "value", value)
+        if candidate is None:
+            raise ValueError("side value must not be None")
+        candidate = str(candidate)
+    candidate = candidate.strip()
+    if not candidate:
+        raise ValueError("side value must not be empty")
+    try:
+        return Side(candidate.upper())
+    except Exception as exc:
+        raise ValueError(f"Unsupported side value: {value!r}") from exc
+
+
 def _ensure_cost_config(cost_config: SpotCostConfig | Mapping[str, Any] | None) -> SpotCostConfig:
     if cost_config is None:
         return SpotCostConfig()
@@ -637,7 +658,7 @@ class BarExecutor(TradeExecutor):
             ts=bar.ts if bar is not None else order.ts,
             run_id=self.run_id,
             symbol=symbol,
-            side=order.side if isinstance(order.side, Side) else Side.BUY,
+            side=_normalize_side(order.side),
             order_type=order.order_type if isinstance(order.order_type, OrderType) else OrderType.MARKET,
             price=Decimal("0"),
             quantity=Decimal("0"),

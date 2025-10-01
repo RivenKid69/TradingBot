@@ -129,6 +129,39 @@ def test_bar_executor_target_weight_single_instruction():
     assert pos.qty == Decimal("0.05")
 
 
+def test_bar_executor_preserves_sell_side_in_exec_report():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        min_rebalance_step=0.0,
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1000.0,
+        initial_weights={"BTCUSDT": 0.5},
+    )
+    order = Order(
+        ts=2,
+        symbol="BTCUSDT",
+        side="SELL",
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(2, 10000.0),
+            "payload": {"target_weight": 0.0, "edge_bps": 20.0},
+        },
+    )
+
+    report = executor.execute(order)
+
+    assert report.side is Side.SELL
+    instructions = report.meta["instructions"]
+    assert instructions and instructions[0]["delta_weight"] == pytest.approx(-0.5)
+
+    positions = executor.get_open_positions()
+    pos = positions["BTCUSDT"]
+    assert pos.meta["weight"] == pytest.approx(0.0)
+
+
 def test_bar_executor_handles_symbol_case_variants():
     executor = BarExecutor(
         run_id="test",
