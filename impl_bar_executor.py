@@ -952,6 +952,7 @@ class BarExecutor(TradeExecutor):
         decision_data["target_weight"] = target_weight
         decision_data["delta_weight"] = delta_weight
         report_meta: Dict[str, Any] = {
+            "execution_mode": "bar",
             "mode": mode,
             "decision": decision_data,
             "target_weight": target_weight,
@@ -1043,6 +1044,7 @@ class BarExecutor(TradeExecutor):
         self._last_snapshot = snapshot
 
         execution_meta: Dict[str, Any] = {
+            "execution_mode": "bar",
             "filled": filled,
             "turnover_usd": executed_turnover,
             "target_weight": float(target_weight),

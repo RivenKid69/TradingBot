@@ -117,6 +117,8 @@ def test_bar_executor_target_weight_single_instruction():
         },
     )
     report = executor.execute(order)
+    assert report.meta["execution_mode"] == "bar"
+    assert report.meta["execution"]["execution_mode"] == "bar"
     instructions = report.meta["instructions"]
     assert len(instructions) == 1
     instr = instructions[0]
