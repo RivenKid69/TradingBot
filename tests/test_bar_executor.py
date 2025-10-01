@@ -101,6 +101,77 @@ def test_bar_executor_target_weight_single_instruction():
     assert pos.meta["weight"] == 0.5
 
 
+def test_bar_executor_handles_symbol_case_variants():
+    executor = BarExecutor(
+        run_id="test",
+        default_equity_usd=500.0,
+        initial_weights={"ethusdt": 0.2},
+        cost_config=SpotCostConfig(),
+    )
+
+    first_bar = Bar(
+        ts=100,
+        symbol="ETHUSDT",
+        open=Decimal("1000"),
+        high=Decimal("1005"),
+        low=Decimal("995"),
+        close=Decimal("1002"),
+        volume_base=Decimal("1"),
+        volume_quote=Decimal("1002"),
+    )
+    increase_order = Order(
+        ts=100,
+        symbol="ETHUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": first_bar,
+            "payload": {"target_weight": 0.4, "edge_bps": 25.0},
+        },
+    )
+
+    first_report = executor.execute(increase_order)
+    assert first_report.meta["decision"]["target_weight"] == pytest.approx(0.4)
+    assert first_report.meta["decision"]["delta_weight"] == pytest.approx(0.2)
+
+    second_bar = Bar(
+        ts=200,
+        symbol="ETHUSDT",
+        open=Decimal("1100"),
+        high=Decimal("1105"),
+        low=Decimal("1095"),
+        close=Decimal("1102"),
+        volume_base=Decimal("1"),
+        volume_quote=Decimal("1102"),
+    )
+    decrease_order = Order(
+        ts=200,
+        symbol="ethusdt",
+        side=Side.SELL,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": second_bar,
+            "payload": {"target_weight": 0.1, "edge_bps": 25.0},
+        },
+    )
+
+    second_report = executor.execute(decrease_order)
+    assert second_report.meta["decision"]["target_weight"] == pytest.approx(0.1)
+    assert second_report.meta["decision"]["delta_weight"] == pytest.approx(-0.3)
+
+    positions_upper = executor.get_open_positions(symbols=["ETHUSDT"])
+    assert "ETHUSDT" in positions_upper
+    assert positions_upper["ETHUSDT"].meta["weight"] == pytest.approx(0.1)
+
+    positions_lower = executor.get_open_positions(symbols=["ethusdt"])
+    assert "ETHUSDT" in positions_lower
+    assert positions_lower["ETHUSDT"].meta["weight"] == pytest.approx(0.1)
+
+
 def test_bar_executor_includes_decision_costs():
     executor = BarExecutor(
         run_id="test",
