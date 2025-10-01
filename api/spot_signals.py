@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Optional, Union, Literal
 
@@ -83,6 +84,11 @@ class SpotSignalEconomics(BaseModel):
             "Mode describing how the impact estimate was produced (e.g. 'model' or 'none')."
         ),
     )
+    adv_quote: Optional[float] = Field(
+        None,
+        ge=0.0,
+        description="Average daily quote volume used for participation modelling.",
+    )
 
     @field_validator("net_bps")
     @classmethod
@@ -102,6 +108,16 @@ class SpotSignalEconomics(BaseModel):
         if value < 0.0:
             return 0.0
         return float(value)
+
+    @field_validator("adv_quote")
+    @classmethod
+    def _validate_adv(cls, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        coerced = float(value)
+        if coerced <= 0.0 or not math.isfinite(coerced):
+            return None
+        return coerced
 
 
 class SpotSignalTwapConfig(BaseModel):
