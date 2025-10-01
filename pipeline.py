@@ -25,6 +25,7 @@ class Stage(Enum):
     """Pipeline stages for decision making."""
 
     CLOSED_BAR = auto()
+    OPEN_BAR = auto()
     WINDOWS = auto()
     ANOMALY = auto()
     EXTREME = auto()
@@ -142,6 +143,73 @@ def closed_bar_guard(
         )
 
     return PipelineResult(action="pass", stage=Stage.CLOSED_BAR)
+
+
+def open_bar_guard(
+    bar: Bar,
+    now_ms: int,
+    enforce: bool,
+    lag_ms: int,
+    *,
+    stage_cfg: PipelineStageConfig | None = None,
+) -> PipelineResult:
+    """Ensure that websocket bars are sufficiently aged before processing.
+
+    Parameters
+    ----------
+    bar : Bar
+        Incoming bar under consideration.
+    now_ms : int
+        Current timestamp in milliseconds.
+    enforce : bool
+        Whether the guard is active.
+    lag_ms : int
+        Minimum allowed lag between ``bar.ts`` and ``now_ms``.
+
+    Returns
+    -------
+    PipelineResult
+        ``"pass"`` when the bar is considered safe to process. Otherwise
+        ``"drop"`` with :class:`Reason.INCOMPLETE_BAR`.
+    """
+
+    inc_stage(Stage.OPEN_BAR)
+    if stage_cfg is not None and not stage_cfg.enabled:
+        return PipelineResult(action="pass", stage=Stage.OPEN_BAR)
+
+    if not enforce:
+        return PipelineResult(action="pass", stage=Stage.OPEN_BAR)
+
+    ts = getattr(bar, "ts", None)
+    if ts is None:
+        inc_reason(Reason.INCOMPLETE_BAR)
+        return PipelineResult(
+            action="drop", stage=Stage.OPEN_BAR, reason=Reason.INCOMPLETE_BAR
+        )
+
+    if lag_ms <= 0:
+        if not getattr(bar, "is_final", True):
+            inc_reason(Reason.INCOMPLETE_BAR)
+            return PipelineResult(
+                action="drop", stage=Stage.OPEN_BAR, reason=Reason.INCOMPLETE_BAR
+            )
+        return PipelineResult(action="pass", stage=Stage.OPEN_BAR)
+
+    try:
+        ts_ms = int(ts)
+    except (TypeError, ValueError):
+        inc_reason(Reason.INCOMPLETE_BAR)
+        return PipelineResult(
+            action="drop", stage=Stage.OPEN_BAR, reason=Reason.INCOMPLETE_BAR
+        )
+
+    if now_ms < ts_ms + lag_ms:
+        inc_reason(Reason.INCOMPLETE_BAR)
+        return PipelineResult(
+            action="drop", stage=Stage.OPEN_BAR, reason=Reason.INCOMPLETE_BAR
+        )
+
+    return PipelineResult(action="pass", stage=Stage.OPEN_BAR)
 
 
 _NO_TRADE_CACHE: dict[str, tuple[list[tuple[int, int]], int, list[dict[str, int]]]] = {}
@@ -464,6 +532,7 @@ __all__ = [
     "Reason",
     "PipelineResult",
     "closed_bar_guard",
+    "open_bar_guard",
     "apply_no_trade_windows",
     "policy_decide",
     "apply_risk",
