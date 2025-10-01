@@ -2308,11 +2308,9 @@ class _Worker:
 
         orders_list = list(orders)
         scalable_infos: list[Dict[str, Any]] = []
+        scalable_by_symbol: Dict[str, Dict[str, Any]] = {}
+        normalized_by_symbol: Dict[str, float] = {}
         seen_symbols: set[str] = set()
-        normalized_total = 0.0
-        requested_total = 0.0
-        current_total = 0.0
-        delta_total = 0.0
 
         def _coerce_bool(value: Any) -> bool:
             if isinstance(value, str):
@@ -2385,33 +2383,50 @@ class _Worker:
             if symbol:
                 seen_symbols.add(symbol)
             if normalized_flag:
-                normalized_total += max(0.0, target_weight)
+                if symbol:
+                    normalized_by_symbol[symbol] = max(0.0, target_weight)
             elif symbol:
                 scalable_infos.append(info)
-                requested_total += max(0.0, target_weight)
+                requested_value = max(0.0, target_weight)
+                aggregate = scalable_by_symbol.get(symbol)
+                if aggregate is None:
+                    scalable_by_symbol[symbol] = {
+                        "current": current_weight,
+                        "target": target_weight,
+                        "requested": requested_value,
+                    }
+                else:
+                    aggregate.setdefault("current", current_weight)
+                    aggregate["target"] = target_weight
+                    aggregate["requested"] = requested_value
 
         if not scalable_infos:
             return orders_list, False
+
+        normalized_total = sum(normalized_by_symbol.values())
+        requested_total = sum(
+            max(0.0, float(aggregate.get("requested", 0.0)))
+            for aggregate in scalable_by_symbol.values()
+        )
 
         current_total = 0.0
         delta_total = 0.0
         positive_delta_total = 0.0
         negative_delta_total = 0.0
-        for info in scalable_infos:
+        for aggregate in scalable_by_symbol.values():
             try:
-                current_weight = float(info.get("current", 0.0))
+                current_weight = float(aggregate.get("current", 0.0))
             except (TypeError, ValueError):
                 current_weight = 0.0
             if not math.isfinite(current_weight) or current_weight < 0.0:
                 current_weight = 0.0
             try:
-                target_weight = float(info.get("target", 0.0))
+                target_weight = float(aggregate.get("target", 0.0))
             except (TypeError, ValueError):
                 target_weight = current_weight
             if not math.isfinite(target_weight):
                 target_weight = current_weight
-            if math.isfinite(current_weight):
-                current_total += current_weight
+            current_total += current_weight
             delta = target_weight - current_weight
             if not math.isfinite(delta):
                 continue
@@ -2551,11 +2566,6 @@ class _Worker:
 
         if changed:
             try:
-                symbols_requested = {
-                    info["symbol"]: info["requested"]
-                    for info in scalable_infos
-                    if info.get("symbol")
-                }
                 log_payload = {
                     "cap": float(cap),
                     "existing_total": existing_total,
@@ -2567,7 +2577,10 @@ class _Worker:
                     "desired_total": current_total + delta_total,
                     "available_delta": normalization_payload["available_delta"],
                     "factor": factor,
-                    "symbols": symbols_requested,
+                    "symbols": {
+                        symbol: data.get("requested", 0.0)
+                        for symbol, data in scalable_by_symbol.items()
+                    },
                 }
                 if equity is not None and math.isfinite(equity):
                     log_payload["cap_usd"] = float(cap) * float(equity)
