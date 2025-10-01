@@ -1192,26 +1192,53 @@ class BarExecutor(TradeExecutor):
             existing_meta = getattr(order, "meta", None)
         except Exception:  # pragma: no cover - defensive
             existing_meta = None
+
+        materialized_meta: Dict[str, Any] = {}
+        if existing_meta is not None:
+            try:
+                materialized_meta = self._materialize_mapping(existing_meta)
+            except Exception:  # pragma: no cover - defensive
+                materialized_meta = {}
+
+        container: Dict[str, Any]
         if isinstance(existing_meta, dict):
             container = existing_meta
         elif isinstance(existing_meta, Mapping):
             container = dict(existing_meta)
+            if materialized_meta:
+                container.update(materialized_meta)
             try:
-                setattr(order, "meta", container)
+                object.__setattr__(order, "meta", container)
             except Exception:  # pragma: no cover - defensive
                 pass
         else:
-            container: Dict[str, Any] = {}
+            container = dict(materialized_meta)
             try:
-                setattr(order, "meta", container)
+                object.__setattr__(order, "meta", container)
             except Exception:  # pragma: no cover - defensive
                 pass
-        if not isinstance(getattr(order, "meta", None), dict):
+
+        current_meta = getattr(order, "meta", None)
+        if not isinstance(current_meta, dict):
             return
+
+        if materialized_meta:
+            for key, value in materialized_meta.items():
+                if key == "_bar_execution" and key in current_meta:
+                    continue
+                current_meta.setdefault(key, value)
+
+        existing_execution = current_meta.get("_bar_execution")
+        combined_execution: Dict[str, Any]
+        if isinstance(existing_execution, Mapping):
+            combined_execution = dict(existing_execution)
+        else:
+            combined_execution = {}
         try:
-            order.meta["_bar_execution"] = dict(meta)
+            combined_execution.update(dict(meta))
         except Exception:  # pragma: no cover - defensive
-            pass
+            combined_execution = dict(meta)
+        current_meta["_bar_execution"] = combined_execution
 
     def _evaluate_turnover_caps(
         self, symbol: str, state: PortfolioState, bar: Optional[Bar]

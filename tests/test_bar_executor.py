@@ -421,6 +421,13 @@ def test_bar_executor_handles_envelope_meta():
 
     report = executor.execute(order)
 
+    assert isinstance(order.meta, dict)
+    assert set(order.meta.keys()) >= {"payload", "_bar_execution"}
+    payload_meta = order.meta["payload"]
+    assert payload_meta["target_weight"] == pytest.approx(payload.target_weight)
+    economics_meta = payload_meta.get("economics")
+    assert economics_meta["edge_bps"] == pytest.approx(economics.edge_bps)
+
     instructions = report.meta["instructions"]
     assert len(instructions) == 1
     instruction = instructions[0]
