@@ -200,6 +200,27 @@ def test_daily_turnover_scaling_updates_turnover_fields() -> None:
     worker = _make_worker_with_daily_cap(100.0)
 
     order = _make_turnover_rich_order("BTCUSDT", 0.5, 250.0)
+    normalization = {
+        "factor": 0.5,
+        "available_delta": 0.5,
+        "delta_positive_total": 1.0,
+        "delta_negative_total": 0.0,
+    }
+    order.meta["payload"]["normalized"] = True
+    order.meta["payload"]["normalization"] = dict(normalization)
+    order.meta["payload"]["decision"]["normalization"] = dict(normalization)
+    order.meta["normalization"] = dict(normalization)
+    order.meta["normalized"] = True
+    order.meta["decision"]["normalization"] = dict(normalization)
+    worker._pending_weight[id(order)] = {
+        "symbol": "BTCUSDT",
+        "target_weight": 0.5,
+        "delta_weight": 0.5,
+        "normalized": True,
+        "factor": normalization["factor"],
+        "normalization": dict(normalization),
+    }
+
     adjusted = worker._apply_daily_turnover_limits([order], "BTCUSDT", 1)
     assert len(adjusted) == 1
     result = adjusted[0]
@@ -218,8 +239,33 @@ def test_daily_turnover_scaling_updates_turnover_fields() -> None:
         250.0 * factor
     )
 
+    expected_norm_factor = normalization["factor"] * factor
+    expected_available_delta = normalization["available_delta"] * factor
+    payload_norm = payload["normalization"]
+    assert payload_norm["factor"] == pytest.approx(expected_norm_factor)
+    assert payload_norm["available_delta"] == pytest.approx(expected_available_delta)
+    payload_decision_norm = payload["decision"]["normalization"]
+    assert payload_decision_norm["factor"] == pytest.approx(expected_norm_factor)
+    assert payload_decision_norm["available_delta"] == pytest.approx(
+        expected_available_delta
+    )
+
     assert meta["economics"]["turnover_usd"] == pytest.approx(250.0 * factor)
     assert meta["decision"]["turnover_usd"] == pytest.approx(250.0 * factor)
     assert meta["decision"]["economics"]["turnover_usd"] == pytest.approx(
         250.0 * factor
+    )
+    meta_norm = meta["normalization"]
+    assert meta_norm["factor"] == pytest.approx(expected_norm_factor)
+    assert meta_norm["available_delta"] == pytest.approx(expected_available_delta)
+    meta_decision_norm = meta["decision"]["normalization"]
+    assert meta_decision_norm["factor"] == pytest.approx(expected_norm_factor)
+    assert meta_decision_norm["available_delta"] == pytest.approx(
+        expected_available_delta
+    )
+
+    pending = worker._pending_weight[id(result)]
+    assert pending["factor"] == pytest.approx(expected_norm_factor)
+    assert pending["normalization"]["available_delta"] == pytest.approx(
+        expected_available_delta
     )

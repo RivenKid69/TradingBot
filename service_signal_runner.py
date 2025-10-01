@@ -1878,6 +1878,30 @@ class _Worker:
             mapping[key] = raw_val * scale
         return mapping
 
+    @staticmethod
+    def _scale_normalization_metadata(
+        mapping: Dict[str, Any] | None, scale: float
+    ) -> Dict[str, Any] | None:
+        if mapping is None:
+            return None
+        if not math.isfinite(scale) or scale <= 0.0 or scale >= 1.0:
+            return mapping
+        if "factor" in mapping:
+            try:
+                factor_val = float(mapping.get("factor"))
+            except (TypeError, ValueError):
+                factor_val = None
+            if factor_val is not None and math.isfinite(factor_val):
+                mapping["factor"] = max(0.0, factor_val * scale)
+        if "available_delta" in mapping:
+            try:
+                available_delta = float(mapping.get("available_delta"))
+            except (TypeError, ValueError):
+                available_delta = None
+            if available_delta is not None and math.isfinite(available_delta):
+                mapping["available_delta"] = max(0.0, available_delta * scale)
+        return mapping
+
     def _ensure_order_meta(self, order_obj: Any) -> Dict[str, Any]:
         meta_val = getattr(order_obj, "meta", None)
         if isinstance(meta_val, dict):
@@ -3316,6 +3340,12 @@ class _Worker:
             payload_map = {}
             meta_map["payload"] = payload_map
         self._scale_turnover_mapping(payload_map, scale)
+        normalization_payload = self._coerce_mapping(payload_map.get("normalization"))
+        if normalization_payload is not None:
+            payload_map["normalization"] = (
+                self._scale_normalization_metadata(normalization_payload, scale)
+                or normalization_payload
+            )
         economics_map = self._coerce_mapping(payload_map.get("economics"))
         if economics_map is not None:
             payload_map["economics"] = (
@@ -3325,6 +3355,12 @@ class _Worker:
         if decision_map is not None:
             payload_map["decision"] = decision_map
             self._scale_turnover_mapping(decision_map, scale)
+            decision_norm = self._coerce_mapping(decision_map.get("normalization"))
+            if decision_norm is not None:
+                decision_map["normalization"] = (
+                    self._scale_normalization_metadata(decision_norm, scale)
+                    or decision_norm
+                )
             decision_econ = self._coerce_mapping(decision_map.get("economics"))
             if decision_econ is not None:
                 decision_map["economics"] = (
@@ -3339,6 +3375,12 @@ class _Worker:
         meta_decision = self._coerce_mapping(meta_map.get("decision"))
         if meta_decision is not None:
             self._scale_turnover_mapping(meta_decision, scale)
+            meta_decision_norm = self._coerce_mapping(meta_decision.get("normalization"))
+            if meta_decision_norm is not None:
+                meta_decision["normalization"] = (
+                    self._scale_normalization_metadata(meta_decision_norm, scale)
+                    or meta_decision_norm
+                )
             decision_econ = self._coerce_mapping(meta_decision.get("economics"))
             if decision_econ is not None:
                 meta_decision["economics"] = (
@@ -3346,6 +3388,29 @@ class _Worker:
                     or decision_econ
                 )
             meta_map["decision"] = meta_decision
+        meta_normalization = self._coerce_mapping(meta_map.get("normalization"))
+        if meta_normalization is not None:
+            meta_map["normalization"] = (
+                self._scale_normalization_metadata(meta_normalization, scale)
+                or meta_normalization
+            )
+        pending = self._pending_weight.get(id(order))
+        if isinstance(pending, dict):
+            pending["target_weight"] = new_target
+            pending["delta_weight"] = new_delta
+            if "factor" in pending:
+                try:
+                    pending_factor = float(pending.get("factor"))
+                except (TypeError, ValueError):
+                    pending_factor = None
+                if pending_factor is not None and math.isfinite(pending_factor):
+                    pending["factor"] = pending_factor * scale
+            pending_norm = self._coerce_mapping(pending.get("normalization"))
+            if pending_norm is not None:
+                pending["normalization"] = (
+                    self._scale_normalization_metadata(pending_norm, scale)
+                    or pending_norm
+                )
         return True
 
     def _apply_daily_turnover_limits(
