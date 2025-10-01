@@ -7,15 +7,25 @@ import pytest
 from aggregate_exec_logs import aggregate
 
 
-def _make_row(ts: int, meta: dict[str, object]) -> dict[str, object]:
+def _make_row(
+    ts: int,
+    meta: dict[str, object],
+    *,
+    price: float | None = None,
+    quantity: float = 0.0,
+) -> dict[str, object]:
+    if price is None:
+        price_value = float(meta.get("reference_price", 0.0) or 0.0)
+    else:
+        price_value = price
     return {
         "ts": ts,
         "run_id": "bar",
         "symbol": "BTCUSDT",
         "side": "BUY",
         "order_type": "MARKET",
-        "price": 0.0,
-        "quantity": 0.0,
+        "price": price_value,
+        "quantity": quantity,
         "fee": 0.0,
         "fee_asset": "USDT",
         "pnl": 0.0,
@@ -44,6 +54,7 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
         "adv_quote": 10_000.0,
         "cap_usd": 12_000.0,
         "bar_ts": 60_000,
+        "reference_price": 20_000.0,
     }
     meta_second = {
         "mode": "delta",
@@ -59,6 +70,7 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
         "adv_quote": 20_000.0,
         "cap_usd": 8_000.0,
         "bar_ts": 60_000,
+        "reference_price": 19_500.0,
     }
 
     trades_df = pd.DataFrame(
@@ -100,6 +112,39 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
     assert day["bar_cap_usd"] == pytest.approx(12_000.0)
     assert day["bar_turnover_vs_cap"] == pytest.approx(800.0 / 12_000.0)
     assert "cost_bias_bps" in day.index
+
+
+def test_aggregate_skips_slippage_for_zero_notional(tmp_path: Path) -> None:
+    meta = {
+        "mode": "target",
+        "decision": {"turnover_usd": 0.0, "act_now": False},
+        "target_weight": 0.1,
+        "delta_weight": 0.1,
+        "adv_quote": 5_000.0,
+        "cap_usd": 6_000.0,
+        "bar_ts": 30_000,
+        "reference_price": 15_000.0,
+    }
+    trades_df = pd.DataFrame([_make_row(30_000, meta, price=0.0, quantity=0.0)])
+    trades_path = tmp_path / "log_trades.csv"
+    trades_df.to_csv(trades_path, index=False)
+
+    out_bars = tmp_path / "bars.csv"
+    out_days = tmp_path / "days.csv"
+
+    aggregate(str(trades_path), "", str(out_bars), str(out_days), bar_seconds=60)
+
+    bars = pd.read_csv(out_bars)
+    assert bars.shape[0] == 1
+    row = bars.iloc[0]
+    assert pd.isna(row["realized_slippage_bps"])
+    assert pd.isna(row["cost_bias_bps"])
+
+    days = pd.read_csv(out_days)
+    assert days.shape[0] == 1
+    day = days.iloc[0]
+    assert pd.isna(day["realized_slippage_bps"])
+    assert pd.isna(day["cost_bias_bps"])
 
 
 def test_aggregate_uses_single_cap_denominator(tmp_path: Path) -> None:

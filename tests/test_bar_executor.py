@@ -433,6 +433,7 @@ def test_bar_executor_handles_envelope_meta():
     assert decision["impact_mode"] == "model"
     assert report.meta["adv_quote"] == pytest.approx(adv_quote)
     assert report.meta["reference_price"] == pytest.approx(float(bar.close))
+    assert report.price == bar.close
 
 
 def test_bar_executor_falls_back_to_nested_economics() -> None:
