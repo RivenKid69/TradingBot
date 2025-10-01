@@ -267,8 +267,11 @@ class BarExecutor(TradeExecutor):
         )
         if initial_weights:
             for symbol, weight in initial_weights.items():
-                self._states[symbol] = PortfolioState(
-                    symbol=symbol,
+                symbol_key = self._normalize_symbol_key(symbol)
+                if not symbol_key:
+                    continue
+                self._states[symbol_key] = PortfolioState(
+                    symbol=symbol_key,
                     weight=_clamp_01(float(weight)),
                     equity_usd=self.default_equity_usd,
                 )
@@ -278,9 +281,14 @@ class BarExecutor(TradeExecutor):
     # ------------------------------------------------------------------
     def execute(self, order: Order) -> ExecReport:
         symbol = order.symbol
-        state = self._states.get(symbol)
+        symbol_key = self._normalize_symbol_key(symbol)
+        state = self._states.get(symbol_key)
         if state is None:
-            state = PortfolioState(symbol=symbol, equity_usd=self.default_equity_usd)
+            fallback_symbol = symbol_key or str(symbol or "")
+            state = PortfolioState(
+                symbol=fallback_symbol,
+                equity_usd=self.default_equity_usd,
+            )
 
         payload = self._extract_payload(order.meta)
         meta_map = self._materialize_mapping(order.meta)
@@ -378,7 +386,7 @@ class BarExecutor(TradeExecutor):
                 metrics = metrics.copy(update={"act_now": False, "turnover_usd": 0.0})
             turnover_usd = 0.0
 
-        caps_eval = self._evaluate_turnover_caps(symbol, state, bar)
+        caps_eval = self._evaluate_turnover_caps(symbol_key or symbol, state, bar)
         pre_trade_cap = caps_eval.get("effective_cap")
         skip_due_to_cap = False
         effective_cap = caps_eval.get("effective_cap")
@@ -444,7 +452,7 @@ class BarExecutor(TradeExecutor):
                 delta_weight = executed_target_weight - state.weight
                 target_weight = executed_target_weight
                 final_state = replace(state, weight=executed_target_weight)
-                self._register_turnover(symbol, caps_eval.get("ts"), turnover_usd)
+                self._register_turnover(symbol_key or symbol, caps_eval.get("ts"), turnover_usd)
                 if caps_eval.get("symbol_remaining") is not None:
                     caps_eval["symbol_remaining"] = max(
                         0.0, float(caps_eval["symbol_remaining"]) - turnover_usd
@@ -472,7 +480,7 @@ class BarExecutor(TradeExecutor):
                 metrics_data["reason"] = skip_reason
             logger.debug(
                 "Skipping rebalance for %s (mode=%s, delta=%.6f, metrics=%s)",
-                symbol,
+                state.symbol,
                 mode,
                 delta_weight,
                 metrics_data,
@@ -482,7 +490,8 @@ class BarExecutor(TradeExecutor):
             target_weight = final_state.weight
             delta_weight = 0.0
 
-        self._states[symbol] = final_state
+        storage_key = symbol_key or final_state.symbol
+        self._states[storage_key] = final_state
 
         dump_fn = getattr(metrics, "model_dump", None)
         decision_data = dump_fn() if callable(dump_fn) else metrics.dict()
@@ -607,10 +616,14 @@ class BarExecutor(TradeExecutor):
 
     def get_open_positions(self, symbols: Optional[Iterable[str]] = None) -> MutableMapping[str, Position]:
         if symbols is None:
-            symbols = self._states.keys()
+            symbol_keys = list(self._states.keys())
+        else:
+            symbol_keys = [self._normalize_symbol_key(symbol) for symbol in symbols]
         result: Dict[str, Position] = {}
-        for symbol in symbols:
-            state = self._states.get(symbol)
+        for symbol_key in symbol_keys:
+            if not symbol_key:
+                continue
+            state = self._states.get(symbol_key)
             if state is None:
                 continue
             price = state.price if state.price != Decimal("0") else Decimal("0")
@@ -619,7 +632,7 @@ class BarExecutor(TradeExecutor):
             else:
                 qty_value = Decimal("0")
             position = Position(
-                symbol=symbol,
+                symbol=state.symbol,
                 qty=qty_value,
                 avg_entry_price=price if price != Decimal("0") else Decimal("0"),
                 realized_pnl=Decimal("0"),
@@ -630,12 +643,21 @@ class BarExecutor(TradeExecutor):
                     "equity_usd": state.equity_usd,
                 },
             )
-            result[symbol] = position
+            result[state.symbol] = position
         return result
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _normalize_symbol_key(self, symbol: Any) -> str:
+        if symbol is None:
+            return ""
+        try:
+            symbol_text = str(symbol).strip()
+        except Exception:
+            return ""
+        return symbol_text.upper()
+
     def _extract_payload(self, meta: Any) -> Dict[str, Any]:
         if isinstance(meta, SpotSignalEnvelope):
             return self._materialize_mapping(meta.payload)
@@ -774,10 +796,11 @@ class BarExecutor(TradeExecutor):
             current_ts = int(bar.ts)
         else:
             current_ts = int(state.ts) if state.ts is not None else None
-        tracker = self._symbol_turnover.get(symbol)
+        symbol_key = self._normalize_symbol_key(symbol) or state.symbol
+        tracker = self._symbol_turnover.get(symbol_key)
         if tracker is None or tracker.get("ts") != current_ts:
             tracker = {"ts": current_ts, "total": 0.0}
-            self._symbol_turnover[symbol] = tracker
+            self._symbol_turnover[symbol_key] = tracker
         used_symbol = float(tracker.get("total", 0.0) or 0.0)
         symbol_remaining = (
             None if symbol_limit is None else max(0.0, symbol_limit - used_symbol)
@@ -809,8 +832,11 @@ class BarExecutor(TradeExecutor):
     def _register_turnover(self, symbol: str, ts: Optional[int], turnover_usd: float) -> None:
         if turnover_usd <= 0.0:
             return
+        symbol_key = self._normalize_symbol_key(symbol)
+        if not symbol_key:
+            return
         symbol_tracker = self._symbol_turnover.setdefault(
-            symbol, {"ts": ts, "total": 0.0}
+            symbol_key, {"ts": ts, "total": 0.0}
         )
         if symbol_tracker.get("ts") != ts:
             symbol_tracker["ts"] = ts
