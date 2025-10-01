@@ -297,7 +297,14 @@ class BarBacktestSimBridge:
             if bar_payload is not None:
                 payload["bar"] = bar_payload
             payload["equity_usd"] = equity_before_costs
-            order.meta = payload
+
+            if isinstance(meta, dict):
+                meta.update(payload)
+            else:
+                try:
+                    object.__setattr__(order, "meta", payload)
+                except AttributeError:
+                    setattr(order, "meta", payload)
 
             report = self.executor.execute(order)
             report_meta = getattr(report, "meta", {})
