@@ -284,6 +284,8 @@ class BarBacktestSimBridge:
                 symbol,
             )
 
+        running_equity = equity_before_costs
+
         for order in orders:
             meta = getattr(order, "meta", None)
             if isinstance(meta, Mapping):
@@ -296,7 +298,7 @@ class BarBacktestSimBridge:
                 payload = {"payload": {}}
             if bar_payload is not None:
                 payload["bar"] = bar_payload
-            payload["equity_usd"] = equity_before_costs
+            payload["equity_usd"] = max(running_equity, 0.0)
 
             if isinstance(meta, dict):
                 meta.update(payload)
@@ -324,8 +326,11 @@ class BarBacktestSimBridge:
             turnover = self._safe_float(decision.get("turnover_usd"))
             cost_bps = self._safe_float(decision.get("cost_bps"))
             total_turnover += abs(turnover)
+            order_cost = 0.0
             if abs(turnover) > 0.0 and math.isfinite(cost_bps):
-                trade_cost_usd += abs(turnover) * cost_bps / 10_000.0
+                order_cost = abs(turnover) * cost_bps / 10_000.0
+                trade_cost_usd += order_cost
+            running_equity -= order_cost
 
         self._equity = equity_before_costs - trade_cost_usd
         self._cum_cost_usd += trade_cost_usd
