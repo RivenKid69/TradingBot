@@ -4795,6 +4795,21 @@ class _Worker:
         if not published:
             return False
         self._remember_idempotency_key(idempotency_key)
+        if (
+            self._execution_mode == "bar"
+            and self._signal_dispatcher is None
+        ):
+            execute = getattr(self._executor, "execute", None)
+            if callable(execute):
+                try:
+                    execute(o)
+                except Exception:
+                    try:
+                        self._logger.exception(
+                            "failed to execute bar order inline", exc_info=True
+                        )
+                    except Exception:
+                        pass
         if self._execution_mode != "bar":
             submit = getattr(self._executor, "submit", None)
             if callable(submit):
