@@ -316,7 +316,16 @@ class ADVStore:
     def get_bar_capacity_quote(self, symbol: str) -> Optional[float]:
         # For now this mirrors ``get_adv_quote``. Kept separate to allow
         # future extensions (e.g. per-bar aggregation) without changing call sites.
-        return self.get_adv_quote(symbol)
+        quote = self.get_adv_quote(symbol)
+        if quote is None:
+            default_quote = self.default_quote
+            if default_quote is None:
+                return None
+            quote = float(default_quote)
+        floor_quote = self.floor_quote
+        if floor_quote is not None and quote < floor_quote:
+            return float(floor_quote)
+        return float(quote)
 
 
 __all__ = ["ADVStore"]
