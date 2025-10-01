@@ -18,16 +18,18 @@ def _make_enabled_monitoring_aggregator() -> MonitoringAggregator:
 def test_bar_execution_snapshot_filters_modes_and_sanitises_metrics() -> None:
     aggregator = _make_enabled_monitoring_aggregator()
 
-    aggregator._bar_totals = {
-        "decisions": 10.0,
-        "act_now": 4.0,
-        "turnover_usd": 200.0,
-        "cap_usd": 0.0,
-        "realized_cost_weight": 5.0,
-        "realized_cost_wsum": math.nan,
-        "modeled_cost_weight": 2.0,
-        "modeled_cost_wsum": 6.0,
-    }
+    aggregator._bar_totals.update(
+        {
+            "decisions": 10.0,
+            "act_now": 4.0,
+            "turnover_usd": 200.0,
+            "realized_cost_weight": 5.0,
+            "realized_cost_wsum": math.nan,
+            "modeled_cost_weight": 2.0,
+            "modeled_cost_wsum": 6.0,
+        }
+    )
+    aggregator._bar_caps_by_symbol.clear()
 
     aggregator._bar_mode_totals.clear()
     aggregator._bar_mode_totals.update(
@@ -64,3 +66,44 @@ def test_bar_execution_snapshot_filters_modes_and_sanitises_metrics() -> None:
     assert cumulative["modeled_cost_bps"] == pytest.approx(3.0)
     assert cumulative["cost_bias_bps"] is None
     assert cumulative["impact_mode_counts"] == {"aggressive": 3}
+
+
+def test_bar_execution_snapshot_aggregates_unique_caps() -> None:
+    aggregator = _make_enabled_monitoring_aggregator()
+
+    aggregator.record_bar_execution(
+        "BTCUSDT",
+        decisions=10,
+        act_now=5,
+        turnover_usd=1_000.0,
+        cap_usd=10_000.0,
+    )
+    aggregator.record_bar_execution(
+        "BTCUSDT",
+        decisions=5,
+        act_now=2,
+        turnover_usd=500.0,
+        cap_usd=10_000.0,
+    )
+    aggregator.record_bar_execution(
+        "ETHUSDT",
+        decisions=8,
+        act_now=4,
+        turnover_usd=800.0,
+        cap_usd=5_000.0,
+    )
+
+    snapshot = aggregator._bar_execution_snapshot()
+
+    expected_cap = 15_000.0
+    expected_turnover = 2_300.0
+    expected_ratio = expected_turnover / expected_cap
+
+    for window_key in ("window_1m", "window_5m"):
+        window_snapshot = snapshot[window_key]
+        assert window_snapshot["cap_usd"] == pytest.approx(expected_cap)
+        assert window_snapshot["turnover_vs_cap"] == pytest.approx(expected_ratio)
+
+    cumulative = snapshot["cumulative"]
+    assert cumulative["cap_usd"] == pytest.approx(expected_cap)
+    assert cumulative["turnover_vs_cap"] == pytest.approx(expected_ratio)
