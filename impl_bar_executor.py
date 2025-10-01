@@ -358,8 +358,18 @@ class BarExecutor(TradeExecutor):
                 if key in decision_signal and decision_signal.get(key) is not None:
                     continue
                 value = economics_block.get(key)
-                if value is not None:
-                    decision_signal[key] = value
+                if value is None:
+                    continue
+                if key == "turnover_usd":
+                    try:
+                        numeric_value = float(value)
+                    except (TypeError, ValueError):
+                        numeric_value = None
+                    if numeric_value is None or numeric_value <= 0.0:
+                        continue
+                    decision_signal[key] = numeric_value
+                    continue
+                decision_signal[key] = value
         if normalized_flag:
             decision_signal["normalized"] = True
         if normalization_data:

@@ -103,3 +103,25 @@ def test_build_envelope_payload_preserves_nested_economics() -> None:
     assert payload["economics"]["turnover_usd"] == pytest.approx(
         economics["turnover_usd"]
     )
+
+
+def test_normalize_weight_targets_deduplicates_symbol_totals() -> None:
+    worker = _make_worker()
+    worker._execution_mode = "bar"
+    worker._max_total_weight = 0.8
+    worker._portfolio_equity = None
+    worker._pending_weight = {}
+    worker._symbol_equity = {}
+    worker._weights = {"BTCUSDT": 0.3}
+
+    base_payload = {"target_weight": 0.6}
+    order1 = SimpleNamespace(symbol="BTCUSDT", meta={"payload": dict(base_payload)})
+    order2 = SimpleNamespace(symbol="BTCUSDT", meta={"payload": dict(base_payload)})
+
+    normalized_orders, applied = worker._normalize_weight_targets([order1, order2])
+
+    assert applied is False
+    assert normalized_orders == [order1, order2]
+    assert worker._pending_weight == {}
+    for order in normalized_orders:
+        assert order.meta["payload"]["target_weight"] == pytest.approx(0.6)
