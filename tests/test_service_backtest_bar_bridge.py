@@ -177,3 +177,77 @@ def test_rebalance_only_payload_preserved(bar_bridge_cls: type[Any]) -> None:
     positions = executor.get_open_positions([symbol])
     assert positions[symbol].meta["weight"] == pytest.approx(0.3)
     assert positions[symbol].qty == Decimal("3")
+
+
+def test_open_price_field_updates_equity(bar_bridge_cls: type[Any]) -> None:
+    symbol = "BNBUSDT"
+    executor = BarExecutor(
+        run_id="test",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+    )
+    bridge = bar_bridge_cls(
+        executor,
+        symbol=symbol,
+        timeframe_ms=60_000,
+        initial_equity=1_000.0,
+        bar_price_field="open",
+    )
+
+    economics = SpotSignalEconomics(
+        edge_bps=50.0,
+        cost_bps=0.0,
+        net_bps=50.0,
+        turnover_usd=100.0,
+        act_now=True,
+        impact=0.0,
+        impact_mode="none",
+    )
+    payload = SpotSignalTargetWeightPayload(target_weight=0.5, economics=economics)
+    envelope = SpotSignalEnvelope(
+        symbol=symbol,
+        bar_close_ms=60_000,
+        expires_at_ms=120_000,
+        payload=payload,
+    )
+    order = _make_order(symbol, envelope)
+
+    first_report = bridge.step(
+        ts_ms=60_000,
+        ref_price=110.0,
+        bid=110.0,
+        ask=110.0,
+        vol_factor=1.0,
+        liquidity=None,
+        orders=[order],
+        bar_open=100.0,
+        bar_high=115.0,
+        bar_low=95.0,
+        bar_close=110.0,
+        bar_timeframe_ms=60_000,
+    )
+
+    assert first_report["ref_price"] == pytest.approx(100.0)
+    assert float(order.meta["bar"].close) == pytest.approx(100.0)
+    assert bridge._last_prices[symbol] == pytest.approx(100.0)
+
+    second_report = bridge.step(
+        ts_ms=120_000,
+        ref_price=130.0,
+        bid=130.0,
+        ask=130.0,
+        vol_factor=1.0,
+        liquidity=None,
+        orders=[],
+        bar_open=120.0,
+        bar_high=135.0,
+        bar_low=115.0,
+        bar_close=130.0,
+        bar_timeframe_ms=60_000,
+    )
+
+    assert second_report["bar_return"] == pytest.approx(0.2)
+    assert second_report["bar_pnl"] == pytest.approx(100.0)
+    assert second_report["equity"] == pytest.approx(1_100.0)
+    assert bridge._last_prices[symbol] == pytest.approx(120.0)
+    assert second_report["ref_price"] == pytest.approx(120.0)
