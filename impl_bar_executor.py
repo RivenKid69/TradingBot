@@ -1070,6 +1070,8 @@ class BarExecutor(TradeExecutor):
                 if exec_price_candidate > Decimal("0"):
                     exec_price = exec_price_candidate
 
+        exec_status = ExecStatus.FILLED if filled else ExecStatus.CANCELED
+
         return ExecReport(
             ts=bar.ts if bar is not None else order.ts,
             run_id=self.run_id,
@@ -1080,7 +1082,7 @@ class BarExecutor(TradeExecutor):
             quantity=Decimal("0"),
             fee=Decimal("0"),
             fee_asset=None,
-            exec_status=ExecStatus.CANCELED,
+            exec_status=exec_status,
             liquidity=Liquidity.UNKNOWN,
             client_order_id=order.client_order_id,
             meta=report_meta,
