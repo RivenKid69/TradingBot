@@ -1138,6 +1138,9 @@ class MonitoringAggregator:
             turnover = float(turnover_usd)
         except Exception:
             turnover = 0.0
+        else:
+            if not math.isfinite(turnover) or turnover < 0:
+                turnover = 0.0
         cap_value: Optional[float]
         try:
             cap_value = float(cap_usd) if cap_usd is not None else None

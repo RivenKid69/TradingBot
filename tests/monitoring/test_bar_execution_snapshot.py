@@ -107,3 +107,43 @@ def test_bar_execution_snapshot_aggregates_unique_caps() -> None:
     cumulative = snapshot["cumulative"]
     assert cumulative["cap_usd"] == pytest.approx(expected_cap)
     assert cumulative["turnover_vs_cap"] == pytest.approx(expected_ratio)
+
+
+def test_record_bar_execution_sanitises_turnover_values() -> None:
+    aggregator = _make_enabled_monitoring_aggregator()
+
+    aggregator.record_bar_execution(
+        "BTCUSDT",
+        decisions=4,
+        act_now=2,
+        turnover_usd=float("nan"),
+        modeled_cost_bps=10.0,
+        realized_slippage_bps=12.0,
+    )
+    aggregator.record_bar_execution(
+        "ETHUSDT",
+        decisions=6,
+        act_now=3,
+        turnover_usd=float("inf"),
+        modeled_cost_bps=6.0,
+        realized_slippage_bps=3.0,
+    )
+    aggregator.record_bar_execution(
+        "XRPUSDT",
+        decisions=5,
+        act_now=1,
+        turnover_usd=-50.0,
+        modeled_cost_bps=5.0,
+        realized_slippage_bps=7.0,
+    )
+
+    snapshot = aggregator._bar_execution_snapshot()
+    cumulative = snapshot["cumulative"]
+
+    assert cumulative["decisions"] == 15
+    assert cumulative["act_now"] == 6
+    assert cumulative["act_now_rate"] == pytest.approx(6 / 15)
+    assert math.isfinite(cumulative["turnover_usd"])
+    assert cumulative["turnover_usd"] == 0.0
+    assert cumulative["modeled_cost_bps"] == pytest.approx(101 / 15)
+    assert cumulative["realized_slippage_bps"] == pytest.approx(101 / 15)
