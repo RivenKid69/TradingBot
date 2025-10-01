@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 import importlib
 import math
 import sys
@@ -10,6 +11,8 @@ from types import ModuleType
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
 
 import pytest
+
+from core_models import Order, OrderType, Side
 
 
 @dataclass
@@ -189,6 +192,55 @@ def test_orders_attach_bar_payload_and_track_costs(bar_bridge_cls: type[Any]) ->
     assert second_report["instructions"] == [
         {"kind": "twap", "slices_total": 2}
     ]
+
+
+def test_apply_exchange_rules_preserves_side_enum(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("exchange", "exchange.specs", "sandbox.backtest_adapter"):
+        sys.modules.pop(name, None)
+
+    exchange_mod = ModuleType("exchange")
+    specs_mod = ModuleType("exchange.specs")
+
+    def _load_specs(*_args: Any, **_kwargs: Any) -> tuple[dict, dict]:
+        return {}, {}
+
+    def _round_price_to_tick(price: float, *_args: Any, **_kwargs: Any) -> float:
+        return float(price)
+
+    specs_mod.load_specs = _load_specs  # type: ignore[attr-defined]
+    specs_mod.round_price_to_tick = _round_price_to_tick  # type: ignore[attr-defined]
+    exchange_mod.specs = specs_mod  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "exchange", exchange_mod)
+    monkeypatch.setitem(sys.modules, "exchange.specs", specs_mod)
+
+    from sandbox.backtest_adapter import BacktestAdapter
+
+    class _StubPolicy:
+        def decide(self, *_args: Any, **_kwargs: Any) -> List[Order]:
+            return []
+
+    class _StubSim:
+        symbol = "BTCUSDT"
+        interval_ms = 60_000
+        sim = None
+
+    adapter = BacktestAdapter(policy=_StubPolicy(), sim_bridge=_StubSim())
+
+    order = Order(
+        ts=0,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("1"),
+        price=None,
+        meta={"price_offset_ticks": 5},
+    )
+
+    normalised = adapter._apply_exchange_rules_to_orders("BTCUSDT", 100.0, [order])
+
+    assert len(normalised) == 1
+    assert normalised[0].side == Side.BUY
 
 
 def test_missing_price_does_not_move_equity(bar_bridge_cls: type[Any]) -> None:

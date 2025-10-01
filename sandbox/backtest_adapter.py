@@ -404,20 +404,47 @@ class BacktestAdapter:
         """
 
         out: List[Order] = []
+        logger = logging.getLogger(__name__)
         for o in orders:
             try:
                 qty = abs(o.quantity)
-                if qty == 0:
-                    continue
-                side = Side.BUY if str(o.side).upper() == "BUY" else Side.SELL
-                po = 0
-                if isinstance(o.meta, dict) and "price_offset_ticks" in o.meta:
-                    po = int(o.meta.get("price_offset_ticks", 0))
-                meta = dict(o.meta)
-                meta["price_offset_ticks"] = po
-                out.append(replace(o, side=side, quantity=qty, meta=meta))
             except Exception:
+                logger.warning("Failed to normalise order quantity: %s", o, exc_info=True)
                 continue
+
+            if qty == 0:
+                continue
+
+            side_raw = getattr(o.side, "value", o.side)
+            try:
+                side = Side(str(side_raw).upper())
+            except Exception:
+                logger.warning("Unable to determine order side for %s", o, exc_info=True)
+                continue
+
+            po = 0
+            if isinstance(o.meta, dict) and "price_offset_ticks" in o.meta:
+                try:
+                    po = int(o.meta.get("price_offset_ticks", 0))
+                except Exception:
+                    logger.debug("Invalid price_offset_ticks for %s", o, exc_info=True)
+                    po = 0
+
+            try:
+                meta = dict(o.meta)
+            except Exception:
+                logger.debug("Failed to copy order meta for %s", o, exc_info=True)
+                meta = {}
+
+            meta["price_offset_ticks"] = po
+
+            try:
+                normalised = replace(o, side=side, quantity=qty, meta=meta)
+            except Exception:
+                logger.warning("Failed to normalise order %s", o, exc_info=True)
+                continue
+
+            out.append(normalised)
         return out
 
     # --------------------- helpers: guards & cooldown ---------------------
