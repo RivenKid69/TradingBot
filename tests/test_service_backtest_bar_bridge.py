@@ -16,7 +16,7 @@ from api.spot_signals import (
     SpotSignalTargetWeightPayload,
 )
 from core_config import SpotCostConfig
-from core_models import OrderType, Side
+from core_models import Order, OrderType, Side
 from impl_bar_executor import BarExecutor
 
 
@@ -141,6 +141,39 @@ def test_spot_signal_envelope_payload_passthrough(bar_bridge_cls: type[Any]) -> 
     positions = executor.get_open_positions([symbol])
     assert positions[symbol].meta["weight"] == pytest.approx(0.5)
     assert positions[symbol].qty == Decimal("5")
+
+
+def test_frozen_order_meta_enriched_in_place(bar_bridge_cls: type[Any]) -> None:
+    symbol = "SOLUSDT"
+    executor = BarExecutor(
+        run_id="test",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1_000.0,
+    )
+    bridge = bar_bridge_cls(
+        executor,
+        symbol=symbol,
+        timeframe_ms=60_000,
+        initial_equity=1_000.0,
+    )
+
+    order = Order(
+        ts=1,
+        symbol=symbol,
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={"custom": "value"},
+    )
+
+    _run_step(bridge, ts_ms=60_000, price=100.0, order=order)
+
+    assert order.meta["custom"] == "value"
+    assert order.meta["equity_usd"] == pytest.approx(1_000.0)
+    assert isinstance(order.meta.get("payload"), dict)
+    bar_payload = order.meta.get("bar")
+    assert bar_payload is not None and bar_payload.close == Decimal("100")
 
 
 def test_rebalance_only_payload_preserved(bar_bridge_cls: type[Any]) -> None:
