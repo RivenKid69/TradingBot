@@ -2605,13 +2605,30 @@ class _Worker:
             normalization_payload["cap_usd"] = float(cap) * float(equity)
 
         changed = False
+        scaled_current: Dict[str, float] = {}
+        for info in scalable_infos:
+            symbol_init = info.get("symbol")
+            if not symbol_init:
+                continue
+            if symbol_init in scaled_current:
+                continue
+            try:
+                current_weight = float(info.get("current", 0.0))
+            except (TypeError, ValueError):
+                current_weight = 0.0
+            if not math.isfinite(current_weight) or current_weight < 0.0:
+                current_weight = 0.0
+            scaled_current[symbol_init] = current_weight
+
         for info in scalable_infos:
             symbol = info["symbol"]
             if not symbol:
                 continue
             order = info["order"]
             try:
-                current_weight = float(info["current"])
+                current_weight = float(
+                    scaled_current.get(symbol, info.get("current", 0.0))
+                )
             except (TypeError, ValueError):
                 current_weight = 0.0
             if not math.isfinite(current_weight) or current_weight < 0.0:
@@ -2629,6 +2646,7 @@ class _Worker:
                 new_target = self._clamp_weight(current_weight + delta * factor)
             new_delta = new_target - current_weight
             order_factor = factor if delta > 0.0 else 1.0
+            scaled_current[symbol] = new_target
             payload_map = dict(info["payload"])
             payload_map["normalized"] = True
             payload_map["normalization"] = dict(normalization_payload)
