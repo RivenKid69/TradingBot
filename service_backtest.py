@@ -210,7 +210,31 @@ class BarBacktestSimBridge:
         bar_timeframe_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         symbol = self._active_symbol or self.symbol
-        close_price = self._coerce_price(bar_close, ref_price)
+
+        price_field = str(self._bar_price_field or "close").strip().lower()
+        bar_values = {
+            "open": bar_open,
+            "high": bar_high,
+            "low": bar_low,
+            "close": bar_close,
+        }
+
+        def _resolve_price() -> Optional[float]:
+            candidates = []
+            primary_field = price_field if price_field in bar_values else "close"
+            candidates.append(bar_values.get(primary_field))
+            for fallback_field in ("close", "open", "high", "low"):
+                if fallback_field == primary_field:
+                    continue
+                candidates.append(bar_values.get(fallback_field))
+            candidates.append(ref_price)
+            for candidate in candidates:
+                price = self._coerce_price(candidate, None)
+                if price is not None:
+                    return price
+            return None
+
+        canonical_price = _resolve_price()
         prev_price = self._last_prices.get(symbol)
         prev_qty = self._position_qtys.get(symbol, 0.0)
 
@@ -220,15 +244,15 @@ class BarBacktestSimBridge:
         # the resulting mark-to-market PnL is booked once the *next* bar arrives
         # and we have a subsequent close to compare against ``prev_price``.
         if (
-            close_price is not None
+            canonical_price is not None
             and prev_price is not None
             and prev_price > 0.0
         ):
             try:
-                bar_return = (close_price / prev_price) - 1.0
+                bar_return = (canonical_price / prev_price) - 1.0
             except ZeroDivisionError:
                 bar_return = 0.0
-            pnl_from_price = prev_qty * (close_price - prev_price)
+            pnl_from_price = prev_qty * (canonical_price - prev_price)
 
         equity_before_costs = self._equity + pnl_from_price
 
@@ -239,7 +263,7 @@ class BarBacktestSimBridge:
 
         bar_payload = None
         if orders:
-            payload_close_price: Optional[float] = close_price
+            payload_close_price: Optional[float] = canonical_price
             if payload_close_price is None and prev_price is not None and prev_price > 0.0:
                 payload_close_price = prev_price
             if payload_close_price is not None:
@@ -298,8 +322,8 @@ class BarBacktestSimBridge:
 
         self._equity = equity_before_costs - trade_cost_usd
         self._cum_cost_usd += trade_cost_usd
-        if close_price is not None:
-            self._last_prices[symbol] = close_price
+        if canonical_price is not None:
+            self._last_prices[symbol] = canonical_price
 
         weight = 0.0
         positions = self.executor.get_open_positions([symbol])
@@ -316,7 +340,7 @@ class BarBacktestSimBridge:
             if abs(qty) > 1e-12:
                 self._position_qtys[symbol] = qty
             else:
-                price_for_fallback = close_price
+                price_for_fallback = canonical_price
                 if price_for_fallback is None:
                     price_for_fallback = prev_price
                 if (
@@ -341,8 +365,8 @@ class BarBacktestSimBridge:
         cumulative_pnl = self._equity - self._initial_equity
 
         report_ref_price = (
-            close_price
-            if close_price is not None
+            canonical_price
+            if canonical_price is not None
             else prev_price
             if prev_price is not None
             else 0.0
