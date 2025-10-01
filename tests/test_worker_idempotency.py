@@ -118,13 +118,17 @@ def test_emit_skips_duplicate_idempotency(monkeypatch) -> None:
     worker, logger, publish_calls, _executor_calls, metrics = _make_worker(monkeypatch)
 
     first = _make_order("sig-1", created_ts_ms=4000)
-    assert worker._emit(first, "BTCUSDT", 3500) is True
+    bar_open_ms = 3500
+    bar_close_ms = bar_open_ms + worker._ws_dedup_timeframe_ms
+    assert worker._emit(first, "BTCUSDT", bar_close_ms, bar_open_ms=bar_open_ms) is True
     assert len(publish_calls) == 1
     assert metrics["published"].count == 1
     assert metrics["skipped"].count == 0
 
     duplicate = _make_order("sig-1", created_ts_ms=4500)
-    assert worker._emit(duplicate, "BTCUSDT", 3500) is False
+    assert (
+        worker._emit(duplicate, "BTCUSDT", bar_close_ms, bar_open_ms=bar_open_ms) is False
+    )
     assert len(publish_calls) == 1
     assert metrics["skipped"].count == 1
     assert logger.messages
@@ -140,8 +144,11 @@ def test_emit_accepts_new_idempotency_key(monkeypatch) -> None:
     first = _make_order("sig-1", created_ts_ms=4000)
     second = _make_order("sig-2", created_ts_ms=4500)
 
-    assert worker._emit(first, "BTCUSDT", 3500) is True
-    assert worker._emit(second, "BTCUSDT", 3500) is True
+    bar_open_ms = 3500
+    bar_close_ms = bar_open_ms + worker._ws_dedup_timeframe_ms
+
+    assert worker._emit(first, "BTCUSDT", bar_close_ms, bar_open_ms=bar_open_ms) is True
+    assert worker._emit(second, "BTCUSDT", bar_close_ms, bar_open_ms=bar_open_ms) is True
 
     assert len(publish_calls) == 2
     assert metrics["published"].count == 2
@@ -161,7 +168,7 @@ def test_emit_bypasses_ttl_when_timeframe_zero(monkeypatch) -> None:
     )
 
     order = _make_order("sig-zero", created_ts_ms=4000)
-    assert worker._emit(order, "BTCUSDT", 3500) is True
+    assert worker._emit(order, "BTCUSDT", 3500, bar_open_ms=3500) is True
 
     assert len(publish_calls) == 1
     assert any("TTL_BYPASSED" in msg for msg, *_ in logger.messages)
@@ -200,7 +207,12 @@ def test_bar_queue_order_expires_after_bar_ttl(monkeypatch) -> None:
     monkeypatch.setattr(service_signal_runner, "log_drop", lambda *a, **k: None)
 
     order = _make_order("sig-ttl", created_ts_ms=late_created_ms)
-    result = worker.publish_decision(order, "BTCUSDT", bar_close_ms)
+    result = worker.publish_decision(
+        order,
+        "BTCUSDT",
+        bar_close_ms - worker._ws_dedup_timeframe_ms,
+        bar_close_ms=bar_close_ms,
+    )
     assert result.action == "queue"
     assert worker._queue is not None and len(worker._queue) == 1
     assert len(publish_calls) == 0
@@ -219,3 +231,34 @@ def test_bar_queue_order_expires_after_bar_ttl(monkeypatch) -> None:
     assert absolute_metric.count == 1
     assert drop_metric.count == 1
     assert any("TTL_EXPIRED_PUBLISH" in msg for msg, *_ in logger.messages)
+
+
+def test_emit_allows_full_timeframe_after_close(monkeypatch) -> None:
+    timeframe_ms = 60_000
+    bar_open_ms = timeframe_ms * 20
+    bar_close_ms = bar_open_ms + timeframe_ms
+    now_state = {"ms": bar_close_ms + timeframe_ms - 1}
+
+    def _now_ms() -> int:
+        return now_state["ms"]
+
+    worker, logger, publish_calls, _executor_calls, metrics = _make_worker(
+        monkeypatch,
+        execution_mode="bar",
+        now_ms=_now_ms,
+        ws_dedup_timeframe_ms=timeframe_ms,
+    )
+    assert worker._ws_dedup_timeframe_ms == timeframe_ms
+    assert worker._resolve_ttl_timeframe_ms(log_if_invalid=True) == timeframe_ms
+
+    order = _make_order("sig-fresh", created_ts_ms=now_state["ms"])
+    result = worker._emit(
+        order,
+        "BTCUSDT",
+        bar_close_ms,
+        bar_open_ms=bar_open_ms,
+    )
+    assert result is True, logger.messages
+    assert len(publish_calls) == 1
+    assert metrics["published"].count == 1
+    assert not any("TTL_EXPIRED" in msg for msg, *_ in logger.messages)

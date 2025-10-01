@@ -31,7 +31,11 @@ def _make_worker(mode: str) -> _Worker:
 def test_publish_decision_queue_mode():
     worker = _make_worker("queue")
     called = []
-    worker._emit = lambda o, s, b: (called.append(o) or True)  # type: ignore
+    def _emit(order, symbol, bar_close_ms, *, bar_open_ms=None):
+        called.append(order)
+        return True
+
+    worker._emit = _emit  # type: ignore[method-assign]
     order = SimpleNamespace()
     res = worker.publish_decision(order, "BTC", 1)
     assert res.action == "queue"
@@ -42,7 +46,11 @@ def test_publish_decision_queue_mode():
 def test_publish_decision_drop_mode():
     worker = _make_worker("drop")
     called = []
-    worker._emit = lambda o, s, b: (called.append(o) or True)  # type: ignore
+    def _emit(order, symbol, bar_close_ms, *, bar_open_ms=None):
+        called.append(order)
+        return True
+
+    worker._emit = _emit  # type: ignore[method-assign]
     order = SimpleNamespace()
     res = worker.publish_decision(order, "BTC", 1)
     assert res.action == "drop"
