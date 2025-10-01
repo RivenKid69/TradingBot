@@ -1240,6 +1240,50 @@ class _Worker:
         except (TypeError, ValueError):
             return None
 
+    def _extract_adv_quote(
+        self,
+        order: Any,
+        payload: Mapping[str, Any] | None,
+        meta: Mapping[str, Any] | None,
+    ) -> float | None:
+        candidates: list[Any] = []
+
+        def _collect(value: Any) -> None:
+            if value is not None:
+                candidates.append(value)
+
+        if isinstance(payload, MappingABC):
+            _collect(payload.get("adv_quote"))
+            economics_block = payload.get("economics")
+            if isinstance(economics_block, MappingABC):
+                _collect(economics_block.get("adv_quote"))
+            nested_payload_adv = self._find_in_mapping(payload, ("adv_quote",))
+            if nested_payload_adv is not None:
+                _collect(nested_payload_adv)
+
+        if isinstance(meta, MappingABC):
+            _collect(meta.get("adv_quote"))
+            nested_meta_adv = self._find_in_mapping(
+                meta, ("adv_quote", "cap_quote", "cap_usd", "daily_notional_cap")
+            )
+            if nested_meta_adv is not None:
+                _collect(nested_meta_adv)
+
+        if order is not None:
+            _collect(getattr(order, "adv_quote", None))
+            raw_meta = getattr(order, "meta", None)
+            if raw_meta is not None and raw_meta is not meta and isinstance(raw_meta, MappingABC):
+                nested_order_meta = self._find_in_mapping(raw_meta, ("adv_quote",))
+                if nested_order_meta is not None:
+                    _collect(nested_order_meta)
+
+        for value in candidates:
+            candidate = self._coerce_float(value)
+            if candidate is None or not math.isfinite(candidate) or candidate <= 0.0:
+                continue
+            return float(candidate)
+        return None
+
     def _extract_fill_metrics(
         self, snapshot: Mapping[str, Any] | None
     ) -> tuple[float | None, float | None]:
@@ -2133,12 +2177,17 @@ class _Worker:
             return int(round(ts * 1000.0))
         return None
 
-    def _build_envelope_payload(self, order: Any, symbol: str) -> tuple[Dict[str, Any], int | None]:
+    def _build_envelope_payload(
+        self, order: Any, symbol: str
+    ) -> tuple[Dict[str, Any], int | None, float | None]:
         payload = self._extract_signal_payload(order)
         meta_raw = getattr(order, "meta", None)
         meta = meta_raw if isinstance(meta_raw, MappingABC) else self._materialize_mapping(meta_raw)
         envelope_payload = dict(payload)
         economics = self._resolve_economics(envelope_payload, meta)
+        adv_quote = self._extract_adv_quote(order, envelope_payload, meta)
+        if adv_quote is not None:
+            economics["adv_quote"] = adv_quote
         envelope_payload["economics"] = economics
         valid_until_ms: int | None = None
 
@@ -2183,7 +2232,7 @@ class _Worker:
             envelope_payload["target_weight"] = resolved_target
         else:
             envelope_payload["delta_weight"] = resolved_delta
-        return envelope_payload, valid_until_ms
+        return envelope_payload, valid_until_ms, adv_quote
 
     def _persist_exposure_state(self, ts_ms: int | None = None) -> None:
         timestamp = int(ts_ms if ts_ms is not None else clock.now_ms())
@@ -4801,17 +4850,19 @@ class _Worker:
             self._logger.info("order %s", o)
         except Exception:
             pass
-        payload, payload_valid_until_ms = self._build_envelope_payload(o, symbol)
-        meta = getattr(o, "meta", None)
+        meta_map = self._ensure_order_meta(o)
+        payload, payload_valid_until_ms, adv_quote = self._build_envelope_payload(o, symbol)
+        if adv_quote is not None:
+            meta_map["adv_quote"] = adv_quote
         dedup_key: str | None = None
-        if isinstance(meta, MappingABC):
-            raw_key = meta.get("dedup_key")
+        if isinstance(meta_map, MappingABC):
+            raw_key = meta_map.get("dedup_key")
             if raw_key is not None:
                 dedup_key = str(raw_key)
         idempotency_key: str | None = None
-        if isinstance(meta, MappingABC):
+        if isinstance(meta_map, MappingABC):
             for candidate in ("idempotency_key", "signal_id", "dedup_key"):
-                raw_value = meta.get(candidate)
+                raw_value = meta_map.get(candidate)
                 if raw_value is None:
                     continue
                 try:

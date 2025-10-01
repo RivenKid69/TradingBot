@@ -630,6 +630,7 @@ def decide_spot_trade(
         act_now=act_now,
         impact=impact,
         impact_mode=impact_mode,
+        adv_quote=adv_quote,
     )
 
 
