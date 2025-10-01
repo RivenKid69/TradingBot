@@ -1266,11 +1266,31 @@ class _Worker:
             return None
         decision_raw = snapshot.get("decision")
         decision = self._materialize_mapping(decision_raw)
+        has_decision_data = False
+        if decision:
+            has_decision_data = True
+        elif decision_raw is not None:
+            try:
+                has_decision_data = bool(decision_raw)
+            except Exception:
+                has_decision_data = True
+        if not has_decision_data and snapshot is not None:
+            nested_decision = self._find_in_mapping(snapshot, ("decision",))
+            if isinstance(nested_decision, MappingABC):
+                decision = self._materialize_mapping(nested_decision)
+                has_decision_data = bool(decision)
+            elif nested_decision is not None:
+                try:
+                    has_decision_data = bool(nested_decision)
+                except Exception:
+                    has_decision_data = True
         turnover = self._coerce_float(
             self._find_in_mapping(decision, ("turnover_usd", "turnover", "notional_usd"))
         )
         if turnover is None:
             turnover = self._coerce_float(snapshot.get("turnover_usd"))
+        if turnover is None and not has_decision_data:
+            return None
         if turnover is None:
             turnover = 0.0
         act_now_val = self._find_in_mapping(decision, ("act_now", "execute_now"))
