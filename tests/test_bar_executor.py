@@ -292,6 +292,40 @@ def test_bar_executor_missing_adv_sets_impact_mode_none():
     assert decision["turnover_usd"] == pytest.approx(500.0)
 
 
+def test_bar_executor_clears_turnover_when_skipping_execution():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(taker_fee_bps=12.5, half_spread_bps=12.5),
+        default_equity_usd=1000.0,
+        safety_margin_bps=0.0,
+    )
+
+    order = Order(
+        ts=12,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(12, 15000.0),
+            "payload": {"target_weight": 0.2, "edge_bps": 5.0},
+        },
+    )
+
+    report = executor.execute(order)
+
+    decision = report.meta["decision"]
+    assert decision["act_now"] is False
+    assert decision["turnover_usd"] == pytest.approx(0.0)
+    assert report.meta["instructions"] == []
+
+    snapshot = executor.monitoring_snapshot()
+    assert snapshot["act_now"] is False
+    assert snapshot["turnover_usd"] == pytest.approx(0.0)
+
+
 def test_bar_executor_handles_envelope_meta():
     class EnvelopePayload(SpotSignalTargetWeightPayload):
         def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
