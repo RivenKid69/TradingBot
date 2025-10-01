@@ -1421,11 +1421,13 @@ class BarExecutor(TradeExecutor):
         )
         if max_participation is None and self.max_participation is not None:
             max_participation = self.max_participation
+        max_slice_notional_dec: Optional[Decimal] = None
         if max_participation is not None and max_participation > 0.0 and adv_quote and adv_quote > 0.0:
             max_slice_notional = adv_quote * max_participation
             if max_slice_notional > 0.0:
                 required_parts = math.ceil(requested_notional / max_slice_notional)
                 parts = max(parts, required_parts)
+                max_slice_notional_dec = Decimal(str(max_slice_notional))
 
         if parts <= 0:
             parts = 1
@@ -1457,7 +1459,6 @@ class BarExecutor(TradeExecutor):
         instructions: List[RebalanceInstruction] = []
         price = state.price if state.price != Decimal("0") else Decimal("0")
         equity_dec = Decimal(str(state.equity_usd))
-        per_weight = delta_weight / float(parts)
         accumulated_weight = float(state.weight)
         total_notional_dec = Decimal("0")
         accumulated_quantity = current_quantity
@@ -1465,10 +1466,14 @@ class BarExecutor(TradeExecutor):
         min_notional_tolerance = Decimal("1e-9") if min_notional > Decimal("0") else Decimal("0")
 
         for idx in range(parts):
-            if idx == parts - 1:
-                desired_delta = target_weight - accumulated_weight
+            remaining_parts = parts - idx
+            if remaining_parts <= 0:
+                remaining_parts = 1
+            remaining_delta = target_weight - accumulated_weight
+            if remaining_parts == 1:
+                desired_delta = remaining_delta
             else:
-                desired_delta = per_weight
+                desired_delta = remaining_delta / float(remaining_parts)
             direction = 1 if desired_delta >= 0.0 else -1
             desired_abs = abs(desired_delta)
             if price != Decimal("0") and desired_abs > 0.0:
@@ -1490,6 +1495,24 @@ class BarExecutor(TradeExecutor):
             executed_notional = Decimal("0")
             if price > Decimal("0") and quantized_qty > Decimal("0"):
                 executed_notional = quantized_qty * price
+                if (
+                    max_slice_notional_dec is not None
+                    and executed_notional > max_slice_notional_dec
+                ):
+                    capped_qty = max_slice_notional_dec / price
+                    if step_size > Decimal("0"):
+                        try:
+                            capped_steps = (
+                                (capped_qty / step_size).to_integral_value(rounding=ROUND_DOWN)
+                            )
+                            capped_qty = capped_steps * step_size
+                        except Exception:
+                            capped_qty = Decimal("0")
+                    quantized_qty = min(quantized_qty, capped_qty)
+                    if quantized_qty > Decimal("0"):
+                        executed_notional = quantized_qty * price
+                    else:
+                        executed_notional = Decimal("0")
             if (
                 min_notional > Decimal("0")
                 and executed_notional + min_notional_tolerance < min_notional
