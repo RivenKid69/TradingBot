@@ -4024,6 +4024,7 @@ class ExecutionSimulator:
     ) -> Tuple[Dict[str, float], Dict[str, Any]]:
         dataset: Dict[str, float] = {}
         meta: Dict[str, Any] = {}
+        floors_map: Dict[str, float] = {}
         if not path:
             return dataset, meta
         try:
@@ -4072,6 +4073,21 @@ class ExecutionSimulator:
                     return dict(obj)
             return {}
 
+        def _coerce_floor(value: Any) -> Optional[float]:
+            try:
+                floor_val = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(floor_val) or floor_val < 0.0:
+                return None
+            return floor_val
+
+        def _record_floor(symbol: str, value: Any) -> None:
+            floor_val = _coerce_floor(value)
+            if floor_val is None:
+                return
+            floors_map[symbol] = floor_val
+
         candidates: List[Dict[str, Any]] = []
         top_mapping = _as_mapping(payload)
         if top_mapping:
@@ -4080,6 +4096,17 @@ class ExecutionSimulator:
                 sub_mapping = _as_mapping(top_mapping.get(key))
                 if sub_mapping:
                     candidates.append(sub_mapping)
+            for floor_key in ("floors", "floor_map", "floors_map"):
+                floor_mapping = _as_mapping(top_mapping.get(floor_key))
+                if floor_mapping:
+                    for raw_key, raw_value in floor_mapping.items():
+                        try:
+                            floor_symbol = str(raw_key).strip().upper()
+                        except Exception:
+                            continue
+                        if not floor_symbol:
+                            continue
+                        _record_floor(floor_symbol, raw_value)
         if isinstance(payload, Sequence) and not isinstance(
             payload, (str, bytes, bytearray)
         ):
@@ -4099,6 +4126,15 @@ class ExecutionSimulator:
             "capacity",
         )
 
+        meta_key_names = {
+            "floors",
+            "floor",
+            "floor_map",
+            "floors_map",
+            "metadata",
+            "meta",
+        }
+
         for candidate_map in candidates:
             for raw_key, raw_value in candidate_map.items():
                 try:
@@ -4107,9 +4143,22 @@ class ExecutionSimulator:
                     continue
                 if not symbol_key:
                     continue
+                key_lower = symbol_key.lower()
+                if key_lower in meta_key_names:
+                    if isinstance(raw_value, Mapping):
+                        for nested_key, nested_value in raw_value.items():
+                            try:
+                                nested_symbol = str(nested_key).strip().upper()
+                            except Exception:
+                                continue
+                            if not nested_symbol:
+                                continue
+                            _record_floor(nested_symbol, nested_value)
+                    continue
                 numeric_val: Optional[float] = None
                 value = raw_value
                 if isinstance(value, Mapping):
+                    floor_candidate = None
                     for pref_key in preferred_keys:
                         if pref_key in value:
                             try:
@@ -4120,6 +4169,14 @@ class ExecutionSimulator:
                                 if math.isfinite(numeric_val):
                                     break
                                 numeric_val = None
+                    if floor_candidate is None:
+                        for floor_key in ("floor", "floor_quote", "floor_daily", "floor_base"):
+                            if floor_key in value:
+                                floor_candidate = _coerce_floor(value[floor_key])
+                                if floor_candidate is not None:
+                                    break
+                    if floor_candidate is not None:
+                        _record_floor(symbol_key, floor_candidate)
                     if numeric_val is None:
                         for nested_val in value.values():
                             try:
@@ -4142,6 +4199,8 @@ class ExecutionSimulator:
                 if numeric_val < 0.0:
                     numeric_val = 0.0
                 dataset[symbol_key] = numeric_val
+        if floors_map:
+            meta["floors"] = floors_map
         return dataset, meta
 
     def _resolve_cap_base_per_bar(
@@ -4232,6 +4291,20 @@ class ExecutionSimulator:
             cache_empty = not dataset
 
         dataset_map = self._bar_cap_base_cache
+        meta = self._bar_cap_base_meta or {}
+        floors_meta = meta.get("floors")
+        floor_map: Dict[str, float] = {}
+        if isinstance(floors_meta, Mapping):
+            for raw_key, raw_value in floors_meta.items():
+                try:
+                    floor_symbol = str(raw_key).strip().upper()
+                except Exception:
+                    continue
+                if not floor_symbol:
+                    continue
+                floor_val = self._non_negative_float(raw_value)
+                if floor_val is not None:
+                    floor_map[floor_symbol] = floor_val
         try:
             sym_key = str(symbol if symbol is not None else self.symbol or "").upper()
         except Exception:
@@ -4257,6 +4330,7 @@ class ExecutionSimulator:
         floor_daily = self._bar_cap_base_floor
         if base_daily_val is None:
             fallback_val: Optional[float] = None
+            fallback_source: Optional[str] = None
             if floor_daily is not None:
                 try:
                     fallback_val = float(floor_daily)
@@ -4265,6 +4339,13 @@ class ExecutionSimulator:
                 else:
                     if not math.isfinite(fallback_val) or fallback_val < 0.0:
                         fallback_val = None
+                    else:
+                        fallback_source = "config"
+            dataset_floor = floor_map.get(sym_key)
+            if dataset_floor is not None:
+                if fallback_val is None or dataset_floor > fallback_val:
+                    fallback_val = dataset_floor
+                    fallback_source = "dataset"
             if fallback_val is None:
                 if sym_key and sym_key not in self._bar_cap_base_warned_symbols:
                     logger.warning(
@@ -4275,14 +4356,22 @@ class ExecutionSimulator:
                 return None
             base_daily_val = fallback_val
             if sym_key and sym_key not in self._bar_cap_base_warned_symbols:
-                logger.warning(
-                    "ADV base dataset missing symbol %s; using floor %.6g",
-                    sym_key,
-                    base_daily_val,
-                )
+                if fallback_source == "dataset":
+                    logger.warning(
+                        "ADV base dataset missing symbol %s; using dataset floor %.6g",
+                        sym_key,
+                        base_daily_val,
+                    )
+                else:
+                    logger.warning(
+                        "ADV base dataset missing symbol %s; using floor %.6g",
+                        sym_key,
+                        base_daily_val,
+                    )
                 self._bar_cap_base_warned_symbols.add(sym_key)
         else:
             self._bar_cap_base_warned_symbols.discard(sym_key)
+            floor_candidates: List[float] = []
             if floor_daily is not None:
                 try:
                     floor_val = float(floor_daily)
@@ -4292,8 +4381,14 @@ class ExecutionSimulator:
                     if math.isfinite(floor_val):
                         if floor_val < 0.0:
                             floor_val = 0.0
-                        if base_daily_val < floor_val:
-                            base_daily_val = floor_val
+                        floor_candidates.append(floor_val)
+            dataset_floor_present = floor_map.get(sym_key)
+            if dataset_floor_present is not None:
+                floor_candidates.append(dataset_floor_present)
+            if floor_candidates:
+                floor_limit = max(floor_candidates)
+                if base_daily_val < floor_limit:
+                    base_daily_val = floor_limit
 
         frac_val = self._bar_cap_base_frac
         if frac_val is None:
