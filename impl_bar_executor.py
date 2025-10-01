@@ -108,6 +108,7 @@ class PortfolioState:
     symbol: str
     weight: float = 0.0
     equity_usd: float = 0.0
+    quantity: Decimal = Decimal("0")
     price: Decimal = Decimal("0")
     ts: int = 0
 
@@ -452,6 +453,7 @@ class BarExecutor(TradeExecutor):
                 instructions,
                 executed_target_weight,
                 executed_turnover_usd,
+                executed_quantity,
                 spec_reason,
             ) = self._build_instructions(
                 state=state,
@@ -490,7 +492,11 @@ class BarExecutor(TradeExecutor):
                     metrics = metrics.copy(update={"turnover_usd": turnover_usd})
                 delta_weight = executed_target_weight - state.weight
                 target_weight = executed_target_weight
-                final_state = replace(state, weight=executed_target_weight)
+                final_state = replace(
+                    state,
+                    weight=executed_target_weight,
+                    quantity=executed_quantity,
+                )
                 self._register_turnover(symbol_key or symbol, caps_eval.get("ts"), turnover_usd)
                 if caps_eval.get("symbol_remaining") is not None:
                     caps_eval["symbol_remaining"] = max(
@@ -666,10 +672,9 @@ class BarExecutor(TradeExecutor):
             if state is None:
                 continue
             price = state.price if state.price != Decimal("0") else Decimal("0")
-            if price != Decimal("0"):
-                qty_value = (Decimal(str(state.weight)) * Decimal(str(state.equity_usd))) / price
-            else:
-                qty_value = Decimal("0")
+            qty_value = state.quantity
+            if not isinstance(qty_value, Decimal):
+                qty_value = Decimal(str(qty_value or "0"))
             position = Position(
                 symbol=state.symbol,
                 qty=qty_value,
@@ -963,10 +968,14 @@ class BarExecutor(TradeExecutor):
         payload: Mapping[str, Any],
         bar: Optional[Bar],
         adv_quote: Optional[float],
-    ) -> tuple[List[RebalanceInstruction], float, float, Optional[str]]:
+    ) -> tuple[List[RebalanceInstruction], float, float, Decimal, Optional[str]]:
+        current_quantity = state.quantity
+        if not isinstance(current_quantity, Decimal):
+            current_quantity = Decimal(str(current_quantity or "0"))
+
         requested_notional = abs(delta_weight) * float(state.equity_usd)
         if requested_notional <= 0.0:
-            return [], float(state.weight), 0.0, None
+            return [], float(state.weight), 0.0, current_quantity, None
 
         spec = self._symbol_specs.get(state.symbol.upper())
         min_notional = spec.min_notional if spec is not None else Decimal("0")
@@ -1033,6 +1042,7 @@ class BarExecutor(TradeExecutor):
         per_weight = delta_weight / float(parts)
         accumulated_weight = float(state.weight)
         total_notional_dec = Decimal("0")
+        accumulated_quantity = current_quantity
         weight_tolerance = 1e-9
         min_notional_tolerance = Decimal("1e-9") if min_notional > Decimal("0") else Decimal("0")
 
@@ -1066,7 +1076,7 @@ class BarExecutor(TradeExecutor):
                 min_notional > Decimal("0")
                 and executed_notional + min_notional_tolerance < min_notional
             ):
-                return [], float(state.weight), 0.0, "below_min_notional"
+                return [], float(state.weight), 0.0, current_quantity, "below_min_notional"
 
             executed_delta = 0.0
             if equity_dec > Decimal("0") and executed_notional > Decimal("0"):
@@ -1077,9 +1087,9 @@ class BarExecutor(TradeExecutor):
             prev_weight = accumulated_weight
             candidate_weight = prev_weight + executed_delta
             if candidate_weight < -weight_tolerance:
-                return [], float(state.weight), 0.0, "rounded_weight_below_zero"
+                return [], float(state.weight), 0.0, current_quantity, "rounded_weight_below_zero"
             if candidate_weight > 1.0 + weight_tolerance:
-                return [], float(state.weight), 0.0, "rounded_weight_above_one"
+                return [], float(state.weight), 0.0, current_quantity, "rounded_weight_above_one"
             new_weight = min(max(candidate_weight, 0.0), 1.0)
             adjusted_delta = new_weight - prev_weight
             ts = state.ts if bar is None else bar.ts
@@ -1099,17 +1109,22 @@ class BarExecutor(TradeExecutor):
                 )
             )
             accumulated_weight = new_weight
+            if quantized_qty > Decimal("0"):
+                signed_qty = quantized_qty
+                if direction < 0:
+                    signed_qty = -quantized_qty
+                accumulated_quantity += signed_qty
 
         total_notional = float(total_notional_dec)
         if total_notional <= 0.0:
-            return [], float(state.weight), 0.0, None
+            return [], float(state.weight), 0.0, accumulated_quantity, None
 
         if min_notional > Decimal("0"):
             tolerance = Decimal("1e-9")
             if total_notional_dec + tolerance < min_notional:
-                return [], float(state.weight), 0.0, "below_min_notional"
+                return [], float(state.weight), 0.0, current_quantity, "below_min_notional"
 
-        return instructions, accumulated_weight, total_notional, None
+        return instructions, accumulated_weight, total_notional, accumulated_quantity, None
 
 
 __all__ = ["BarExecutor", "PortfolioState", "RebalanceInstruction", "decide_spot_trade"]

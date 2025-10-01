@@ -126,6 +126,7 @@ def test_bar_executor_target_weight_single_instruction():
     positions = executor.get_open_positions()
     pos = positions["BTCUSDT"]
     assert pos.meta["weight"] == 0.5
+    assert pos.qty == Decimal("0.05")
 
 
 def test_bar_executor_handles_symbol_case_variants():

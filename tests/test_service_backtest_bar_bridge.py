@@ -140,6 +140,7 @@ def test_spot_signal_envelope_payload_passthrough(bar_bridge_cls: type[Any]) -> 
 
     positions = executor.get_open_positions([symbol])
     assert positions[symbol].meta["weight"] == pytest.approx(0.5)
+    assert positions[symbol].qty == Decimal("5")
 
 
 def test_rebalance_only_payload_preserved(bar_bridge_cls: type[Any]) -> None:
@@ -175,3 +176,4 @@ def test_rebalance_only_payload_preserved(bar_bridge_cls: type[Any]) -> None:
 
     positions = executor.get_open_positions([symbol])
     assert positions[symbol].meta["weight"] == pytest.approx(0.3)
+    assert positions[symbol].qty == Decimal("3")
