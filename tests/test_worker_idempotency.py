@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import types
 from typing import Any, Callable
+from decimal import Decimal
+
+from core_models import Bar
 
 import clock
 import service_signal_runner
@@ -384,3 +387,122 @@ def test_emit_allows_full_timeframe_after_close(monkeypatch) -> None:
     assert len(dispatch_calls) == 1
     assert metrics["published"].count == 1
     assert not any("TTL_EXPIRED" in msg for msg, *_ in logger.messages)
+
+
+def test_dispatch_signal_envelope_executes_bar_order(monkeypatch) -> None:
+    (
+        worker,
+        _logger,
+        _publish_calls,
+        _executor_calls,
+        _metrics,
+        dispatch_calls,
+    ) = _make_worker(monkeypatch, execution_mode="bar")
+
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.executed: list[Any] = []
+
+        def execute(self, order: Any) -> None:
+            self.executed.append(order)
+
+    executor = RecordingExecutor()
+    worker._executor = executor
+
+    monkeypatch.setattr(service_signal_runner.signal_bus, "ENABLED", True, raising=False)
+
+    economics = {
+        "edge_bps": 10.0,
+        "cost_bps": 1.0,
+        "net_bps": 9.0,
+        "turnover_usd": 100.0,
+        "act_now": True,
+        "impact": 0.0,
+        "impact_mode": "model",
+    }
+    order_payload = {"target_weight": 0.5, "economics": economics}
+    order = types.SimpleNamespace(
+        symbol="BTCUSDT",
+        meta=None,
+        payload=order_payload,
+        side="BUY",
+        quantity=0.0,
+        created_ts_ms=1,
+    )
+
+    def _closed_guard(**_kwargs: Any) -> service_signal_runner.PipelineResult:
+        return service_signal_runner.PipelineResult(
+            action="pass", stage=service_signal_runner.Stage.CLOSED_BAR
+        )
+
+    def _policy_decide(*_args: Any, **_kwargs: Any) -> service_signal_runner.PipelineResult:
+        return service_signal_runner.PipelineResult(
+            action="pass",
+            stage=service_signal_runner.Stage.POLICY,
+            decision=[order],
+        )
+
+    def _apply_risk(
+        *_args: Any, **_kwargs: Any
+    ) -> service_signal_runner.PipelineResult:
+        return service_signal_runner.PipelineResult(
+            action="pass",
+            stage=service_signal_runner.Stage.RISK,
+            decision=[order],
+        )
+
+    monkeypatch.setattr(service_signal_runner, "closed_bar_guard", _closed_guard)
+    monkeypatch.setattr(service_signal_runner, "policy_decide", _policy_decide)
+    monkeypatch.setattr(service_signal_runner, "apply_risk", _apply_risk)
+
+    def _allow_signal_quality(
+        self: service_signal_runner._Worker,
+        bar: Any,
+        *,
+        skip_metrics: bool = False,
+    ) -> tuple[bool, dict[str, Any]]:
+        return True, {}
+
+    def _allow_windows(
+        self: service_signal_runner._Worker,
+        ts_ms: int,
+        symbol: str,
+        *,
+        stage_cfg: Any = None,
+    ) -> tuple[service_signal_runner.PipelineResult, str | None]:
+        return (
+            service_signal_runner.PipelineResult(
+                action="pass", stage=service_signal_runner.Stage.WINDOWS
+            ),
+            None,
+        )
+
+    worker._apply_signal_quality_filter = types.MethodType(
+        _allow_signal_quality, worker
+    )
+    worker._extract_features = types.MethodType(
+        lambda self, bar, *, skip_metrics=False: {}, worker
+    )
+    worker._evaluate_no_trade_windows = types.MethodType(
+        _allow_windows,
+        worker,
+    )
+
+    bar = Bar(
+        ts=1,
+        symbol="BTCUSDT",
+        open=Decimal("100"),
+        high=Decimal("100"),
+        low=Decimal("100"),
+        close=Decimal("100"),
+        volume_base=Decimal("0"),
+        volume_quote=Decimal("0"),
+    )
+
+    emitted = worker.process(bar)
+
+    assert emitted == [order]
+    assert executor.executed == [order]
+    assert getattr(order, "_bar_dispatched", False) is True
+    assert order.meta["bar"] is bar
+    assert dispatch_calls, "Expected signal dispatcher to receive the envelope"

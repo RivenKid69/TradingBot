@@ -726,6 +726,7 @@ class _Worker:
         self._symbol_cooldown_set_ts: Dict[str, int] = {}
         self._configure_throttle(throttle_cfg)
         self._last_bar_ts: Dict[str, int] = {}
+        self._last_bar_snapshot: Dict[str, Any] = {}
         self._dynamic_guard: DynamicNoTradeGuard | None = None
         dyn_cfg: DynamicGuardConfig | None = None
         if self._no_trade_cfg is not None:
@@ -764,6 +765,7 @@ class _Worker:
         )
         self._rest_backoff_until: Dict[str, float] = {}
         self._rest_backoff_step: Dict[str, float] = {}
+        self._dispatch_stack: list[Any] = []
         if self._state_enabled:
             self._seed_last_prices_from_state()
             self._load_exposure_state()
@@ -4620,16 +4622,63 @@ class _Worker:
         return timeframe_ms
 
     def _dispatch_signal_envelope(self, envelope: Any) -> None:
+        order_obj: Any | None = None
+        if self._execution_mode == "bar" and self._dispatch_stack:
+            try:
+                order_obj = self._dispatch_stack.pop()
+            except IndexError:
+                order_obj = None
+
         dispatcher = self._signal_dispatcher
-        if dispatcher is None:
+        if dispatcher is not None:
+            try:
+                dispatcher(envelope)
+            except Exception as exc:
+                try:
+                    self._logger.error(
+                        "failed to dispatch signal envelope: %s", exc
+                    )
+                except Exception:
+                    pass
+
+        if order_obj is None:
+            return
+
+        symbol_key = str(getattr(order_obj, "symbol", "") or "").upper()
+        if isinstance(envelope, MappingABC):
+            symbol_candidate = envelope.get("symbol")
+            if symbol_candidate:
+                try:
+                    symbol_key = str(symbol_candidate).upper()
+                except Exception:
+                    pass
+
+        meta_map = self._ensure_order_meta(order_obj)
+        bar_value = meta_map.get("bar")
+        if bar_value is None:
+            bar_value = self._last_bar_snapshot.get(symbol_key)
+            if bar_value is not None:
+                meta_map["bar"] = bar_value
+                payload_map = self._coerce_mapping(meta_map.get("payload"))
+                if payload_map is not None:
+                    payload_map.setdefault("bar", bar_value)
+                    meta_map["payload"] = payload_map
+
+        execute = getattr(self._executor, "execute", None)
+        if not callable(execute):
             return
         try:
-            dispatcher(envelope)
-        except Exception as exc:
+            execute(order_obj)
+        except Exception:
             try:
-                self._logger.error(
-                    "failed to dispatch signal envelope: %s", exc
+                self._logger.exception(
+                    "failed to execute bar order from envelope", exc_info=True
                 )
+            except Exception:
+                pass
+        else:
+            try:
+                setattr(order_obj, "_bar_dispatched", True)
             except Exception:
                 pass
 
@@ -4788,7 +4837,11 @@ class _Worker:
         if valid_until_ms_int is not None:
             expires_at_ms = min(expires_at_ms, valid_until_ms_int)
         published = True
+        stack_pushed = False
         if getattr(signal_bus, "ENABLED", False):
+            if self._execution_mode == "bar":
+                self._dispatch_stack.append(o)
+                stack_pushed = True
             try:
                 published = publish_signal_envelope(
                     symbol,
@@ -4801,12 +4854,26 @@ class _Worker:
                 )
             except Exception:
                 published = False
+            finally:
+                if stack_pushed and (
+                    not published
+                    or (
+                        self._dispatch_stack
+                        and self._dispatch_stack[-1] is o
+                    )
+                ):
+                    try:
+                        self._dispatch_stack.pop()
+                    except IndexError:
+                        pass
         if not published:
             return False
         self._remember_idempotency_key(idempotency_key)
+        dispatched_inline = bool(getattr(o, "_bar_dispatched", False))
         if (
             self._execution_mode == "bar"
             and self._signal_dispatcher is None
+            and not dispatched_inline
         ):
             execute = getattr(self._executor, "execute", None)
             if callable(execute):
@@ -4975,6 +5042,7 @@ class _Worker:
         symbol = bar.symbol.upper()
         ts_ms = int(bar.ts)
         bar_open_ms = ts_ms
+        self._last_bar_snapshot[symbol] = bar
         close_val = self._coerce_price(getattr(bar, "close", None))
         if close_val is not None:
             self._set_last_price(symbol, close_val)
@@ -5490,10 +5558,30 @@ class _Worker:
         if not orders:
             return _finalize()
 
+        bar_snapshot = bar if self._execution_mode == "bar" else None
+        bar_payload_snapshot: Any | None = None
+        if bar_snapshot is not None:
+            to_dict = getattr(bar_snapshot, "to_dict", None)
+            if callable(to_dict):
+                try:
+                    bar_payload_snapshot = to_dict()
+                except Exception:
+                    bar_payload_snapshot = None
         if self._execution_mode == "bar":
             orders = self._apply_daily_turnover_limits(orders, bar.symbol, int(bar.ts))
             if not orders:
                 return _finalize()
+            for order_candidate in orders:
+                meta_map = self._ensure_order_meta(order_candidate)
+                meta_map["bar"] = bar_snapshot if bar_snapshot is not None else bar
+                payload_map = self._coerce_mapping(meta_map.get("payload"))
+                if payload_map is not None:
+                    payload_map["bar"] = (
+                        bar_payload_snapshot
+                        if bar_payload_snapshot is not None
+                        else bar_snapshot
+                    )
+                    meta_map["payload"] = payload_map
 
         created_ts_ms = clock.now_ms()
         self._stage_exposure_adjustments(orders, created_ts_ms)
