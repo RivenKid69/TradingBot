@@ -601,12 +601,12 @@ class MonitoringAggregator:
             "decisions": 0.0,
             "act_now": 0.0,
             "turnover_usd": 0.0,
-            "cap_usd": 0.0,
             "realized_cost_weight": 0.0,
             "realized_cost_wsum": 0.0,
             "modeled_cost_weight": 0.0,
             "modeled_cost_wsum": 0.0,
         }
+        self._bar_caps_by_symbol: Dict[str, float] = {}
         self._bar_mode_totals: DefaultDict[str, float] = defaultdict(float)
         self.last_ws_reconnect_ms: Optional[int] = None
         self.last_ws_failure_ms: Optional[int] = None
@@ -935,12 +935,12 @@ class MonitoringAggregator:
                 "decisions": 0.0,
                 "act_now": 0.0,
                 "turnover_usd": 0.0,
-                "cap_usd": 0.0,
                 "realized_cost_weight": 0.0,
                 "realized_cost_wsum": 0.0,
                 "modeled_cost_weight": 0.0,
                 "modeled_cost_wsum": 0.0,
             }
+            self._bar_caps_by_symbol = {}
             self._bar_mode_totals = defaultdict(float)
             self._cost_bias_alerted.clear()
 
@@ -966,7 +966,7 @@ class MonitoringAggregator:
         decisions_total = 0.0
         act_total = 0.0
         turnover_total = 0.0
-        cap_sum = 0.0
+        caps_by_symbol: Dict[str, float] = {}
         mode_counts: Dict[str, int] = {}
         realized_sum = 0.0
         realized_weight = 0.0
@@ -984,7 +984,13 @@ class MonitoringAggregator:
             act_total += act_val
             turnover_total += turnover_val
             if cap_val is not None and cap_val > 0:
-                cap_sum += cap_val
+                symbol_val = entry.get("symbol")
+                try:
+                    symbol_key = str(symbol_val)
+                except Exception:
+                    symbol_key = None
+                if symbol_key:
+                    caps_by_symbol[symbol_key] = cap_val
             mode_value = entry.get("impact_mode")
             if mode_value:
                 try:
@@ -1009,6 +1015,7 @@ class MonitoringAggregator:
                 bias_sum += bias_val * weight
                 bias_weight += weight
 
+        cap_sum = float(sum(caps_by_symbol.values())) if caps_by_symbol else 0.0
         rate = float(act_total / decisions_total) if decisions_total > 0 else None
         ratio = float(turnover_total / cap_sum) if cap_sum > 0 else None
         realized_avg = float(realized_sum / realized_weight) if realized_weight > 0 else None
@@ -1046,7 +1053,7 @@ class MonitoringAggregator:
         cumulative_decisions = float(self._bar_totals.get("decisions", 0.0))
         cumulative_act = float(self._bar_totals.get("act_now", 0.0))
         cumulative_turnover = float(self._bar_totals.get("turnover_usd", 0.0))
-        cumulative_cap = float(self._bar_totals.get("cap_usd", 0.0))
+        cumulative_cap = float(sum(self._bar_caps_by_symbol.values()))
         cumulative_rate = (
             float(cumulative_act / cumulative_decisions)
             if cumulative_decisions > 0
@@ -1136,6 +1143,10 @@ class MonitoringAggregator:
             cap_value = float(cap_usd) if cap_usd is not None else None
         except Exception:
             cap_value = None
+        try:
+            symbol_text = str(symbol)
+        except Exception:
+            symbol_text = ""
         ts_ms: int
         if bar_ts is not None:
             try:
@@ -1204,7 +1215,7 @@ class MonitoringAggregator:
             dq = self._bar_events.setdefault(window, deque())
             entry: Dict[str, Any] = {
                 "ts": ts_ms,
-                "symbol": str(symbol),
+                "symbol": symbol_text,
                 "decisions": dec,
                 "act_now": act,
                 "turnover_usd": turnover,
@@ -1224,8 +1235,8 @@ class MonitoringAggregator:
         self._bar_totals["decisions"] += dec
         self._bar_totals["act_now"] += act
         self._bar_totals["turnover_usd"] += turnover
-        if cap_value is not None and cap_value > 0:
-            self._bar_totals["cap_usd"] += cap_value
+        if cap_value is not None and cap_value > 0 and symbol_text:
+            self._bar_caps_by_symbol[symbol_text] = cap_value
         if mode_key:
             self._bar_mode_totals[mode_key] += dec
         if weight_value is not None and weight_value > 0:
