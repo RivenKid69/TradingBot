@@ -464,12 +464,14 @@ class BarExecutor(TradeExecutor):
         instructions: List[RebalanceInstruction] = []
         final_state = state
 
-        if (
-            metrics.act_now
+        execute_branch = (
+            bool(getattr(metrics, "act_now", False))
             and not skip_due_to_step
             and not skip_due_to_cap
             and skip_reason is None
-        ):
+        )
+
+        if execute_branch:
             (
                 instructions,
                 executed_target_weight,
@@ -551,6 +553,13 @@ class BarExecutor(TradeExecutor):
                 delta_weight,
                 metrics_data,
             )
+            turnover_updates = {"turnover_usd": 0.0}
+            if getattr(metrics, "act_now", None):
+                turnover_updates["act_now"] = False
+            if hasattr(metrics, "model_copy"):
+                metrics = metrics.model_copy(update=turnover_updates)
+            else:  # pragma: no cover - compatibility fallback
+                metrics = metrics.copy(update=turnover_updates)
 
         if not instructions:
             target_weight = final_state.weight
