@@ -264,9 +264,12 @@ class BarBacktestSimBridge:
             meta = getattr(order, "meta", None)
             if isinstance(meta, Mapping):
                 payload = dict(meta)
+                if "payload" not in payload and "rebalance" not in payload:
+                    payload["payload"] = {}
+            elif meta is not None:
+                payload = {"payload": meta}
             else:
-                payload = {}
-            payload.setdefault("payload", {})
+                payload = {"payload": {}}
             if bar_payload is not None:
                 payload["bar"] = bar_payload
             payload["equity_usd"] = equity_before_costs
