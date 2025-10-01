@@ -25,8 +25,9 @@ def _make_bar_worker() -> _Worker:
     )
     emissions: list[tuple[str, int]] = []
 
-    def _emit(order: object, symbol: str, bar_ts: int) -> bool:
-        emissions.append((symbol, bar_ts))
+    def _emit(order: object, symbol: str, bar_close_ms: int, *, bar_open_ms: int | None = None) -> bool:
+        recorded_ts = bar_open_ms if bar_open_ms is not None else bar_close_ms
+        emissions.append((symbol, recorded_ts))
         return True
 
     worker._emit = _emit  # type: ignore[method-assign]

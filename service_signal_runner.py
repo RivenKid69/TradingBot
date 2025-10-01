@@ -1027,7 +1027,7 @@ class _Worker:
         return delta
 
     def _maybe_drop_due_to_cooldown(
-        self, symbol: str, order: Any, bar_close_ms: int
+        self, symbol: str, order: Any, bar_ts_ms: int
     ) -> bool:
         settings = self._cooldown_settings
         if not settings.suppress_small_deltas:
@@ -1056,7 +1056,7 @@ class _Worker:
                     "delta": float(magnitude),
                     "threshold": float(threshold),
                     "remaining": remaining,
-                    "bar_ts": int(bar_close_ms),
+                    "bar_ts": int(bar_ts_ms),
                 },
             )
         except Exception:
@@ -4278,7 +4278,7 @@ class _Worker:
         )
 
     def _should_skip_idempotent(
-        self, key: str | None, symbol: str, bar_close_ms: int
+        self, key: str | None, symbol: str, bar_ts_ms: int
     ) -> bool:
         if not key:
             return False
@@ -4293,7 +4293,7 @@ class _Worker:
                     {
                         "stage": Stage.PUBLISH.name,
                         "symbol": symbol,
-                        "bar_close_ms": bar_close_ms,
+                        "bar_close_ms": bar_ts_ms,
                         "idempotency_key": key,
                     },
                 )
@@ -4345,7 +4345,14 @@ class _Worker:
         self._last_invalid_ttl_timeframe = None
         return timeframe_ms
 
-    def _emit(self, o: Any, symbol: str, bar_close_ms: int) -> bool:
+    def _emit(
+        self,
+        o: Any,
+        symbol: str,
+        bar_close_ms: int,
+        *,
+        bar_open_ms: int | None = None,
+    ) -> bool:
         ttl_stage_cfg = self._pipeline_cfg.get("ttl") if self._pipeline_cfg else None
         ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
 
@@ -4476,12 +4483,13 @@ class _Worker:
                     continue
                 if idempotency_key:
                     break
+        idempotency_ts_ms = bar_open_ms if bar_open_ms is not None else bar_close_ms
         if not idempotency_key:
             try:
-                idempotency_key = envelope_signal_id(symbol, bar_close_ms)
+                idempotency_key = envelope_signal_id(symbol, idempotency_ts_ms)
             except Exception:
                 idempotency_key = None
-        if self._should_skip_idempotent(idempotency_key, symbol, bar_close_ms):
+        if self._should_skip_idempotent(idempotency_key, symbol, idempotency_ts_ms):
             return False
         valid_until_ms_int: int | None = None
         if payload_valid_until_ms is not None:
@@ -4521,15 +4529,18 @@ class _Worker:
         self,
         o: Any,
         symbol: str,
-        bar_close_ms: int,
+        bar_open_ms: int,
         *,
+        bar_close_ms: int | None = None,
         stage_cfg: PipelineStageConfig | None = None,
     ) -> PipelineResult:
         """Final pipeline stage: throttle and emit order."""
+        if bar_close_ms is None:
+            bar_close_ms = bar_open_ms
         if stage_cfg is not None and not stage_cfg.enabled:
             self._commit_exposure(o, bar_close_ms=bar_close_ms)
             return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
-        if self._maybe_drop_due_to_cooldown(symbol, o, bar_close_ms):
+        if self._maybe_drop_due_to_cooldown(symbol, o, bar_open_ms):
             self._rollback_exposure(o)
             return PipelineResult(
                 action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER
@@ -4551,7 +4562,7 @@ class _Worker:
             if not ok:
                 if self._throttle_cfg.mode == "queue" and self._queue is not None:
                     exp = time.monotonic() + self._throttle_cfg.queue.ttl_ms / 1000.0
-                    self._queue.append((exp, symbol, bar_close_ms, o))
+                    self._queue.append((exp, symbol, bar_close_ms, bar_open_ms, o))
                     self._update_queue_metrics()
                     try:
                         monitoring.throttle_enqueued_count.labels(
@@ -4577,7 +4588,7 @@ class _Worker:
                 return PipelineResult(
                     action="drop", stage=Stage.PUBLISH, reason=Reason.OTHER
                 )
-        if not self._emit(o, symbol, bar_close_ms):
+        if not self._emit(o, symbol, bar_close_ms, bar_open_ms=bar_open_ms):
             self._refund_tokens(symbol)
             self._rollback_exposure(o)
             return PipelineResult(
@@ -4594,7 +4605,7 @@ class _Worker:
             with self._throttle_lock:
                 if self._queue is None or not self._queue:
                     break
-                exp, symbol, bar_close_ms, order = self._queue[0]
+                exp, symbol, bar_close_ms, bar_open_ms, order = self._queue[0]
                 now = time.monotonic()
                 if exp <= now:
                     self._queue.popleft()
@@ -4627,7 +4638,7 @@ class _Worker:
                 except IndexError:
                     self._refund_tokens(symbol)
                     break
-            if not self._emit(order, symbol, bar_close_ms):
+            if not self._emit(order, symbol, bar_close_ms, bar_open_ms=bar_open_ms):
                 self._refund_tokens(symbol)
                 try:
                     self._rollback_exposure(order)
@@ -4654,6 +4665,7 @@ class _Worker:
 
         symbol = bar.symbol.upper()
         ts_ms = int(bar.ts)
+        bar_open_ms = ts_ms
         close_val = self._coerce_price(getattr(bar, "close", None))
         if close_val is not None:
             self._set_last_price(symbol, close_val)
@@ -4832,6 +4844,15 @@ class _Worker:
 
         if self._queue is not None:
             emitted.extend(self._drain_queue())
+
+        ttl_stage_cfg = (
+            self._pipeline_cfg.get("ttl") if self._pipeline_cfg else None
+        )
+        ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
+        ttl_timeframe_ms = self._resolve_ttl_timeframe_ms(log_if_invalid=ttl_enabled)
+        bar_close_for_ttl = bar_open_ms
+        if ttl_timeframe_ms is not None:
+            bar_close_for_ttl = bar_open_ms + ttl_timeframe_ms
 
         close_ms: int | None = None
         dedup_stage_cfg = self._pipeline_cfg.get("dedup") if self._pipeline_cfg else None
@@ -5166,9 +5187,6 @@ class _Worker:
         created_ts_ms = clock.now_ms()
         self._stage_exposure_adjustments(orders, created_ts_ms)
         checked_orders = []
-        ttl_stage_cfg = self._pipeline_cfg.get("ttl") if self._pipeline_cfg else None
-        ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
-        ttl_timeframe_ms = self._resolve_ttl_timeframe_ms(log_if_invalid=ttl_enabled)
 
         for o in orders:
             if ttl_enabled and ttl_timeframe_ms is not None:
@@ -5177,7 +5195,7 @@ class _Worker:
                 except Exception:
                     pass
                 ok, expires_at_ms, _ = check_ttl(
-                    bar_close_ms=int(bar.ts),
+                    bar_close_ms=bar_close_for_ttl,
                     now_ms=created_ts_ms,
                     timeframe_ms=ttl_timeframe_ms,
                 )
@@ -5187,7 +5205,7 @@ class _Worker:
                             "TTL_EXPIRED_BOUNDARY %s",
                             {
                                 "symbol": bar.symbol,
-                                "bar_close_ms": int(bar.ts),
+                                "bar_close_ms": bar_close_for_ttl,
                                 "now_ms": created_ts_ms,
                                 "expires_at_ms": expires_at_ms,
                             },
@@ -5218,7 +5236,8 @@ class _Worker:
             res = self.publish_decision(
                 o,
                 bar.symbol,
-                int(bar.ts),
+                bar_open_ms,
+                bar_close_ms=bar_close_for_ttl,
                 stage_cfg=(
                     self._pipeline_cfg.get("publish") if self._pipeline_cfg else None
                 ),
