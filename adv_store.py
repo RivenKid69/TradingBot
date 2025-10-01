@@ -72,6 +72,11 @@ class ADVStore:
         self._stale = False
         self._lock = threading.Lock()
         self._missing_logged: set[str] = set()
+        self._bar_cache: dict[str, dict[str, Any]] = {}
+        self._bar_meta_cache: dict[str, dict[str, Any]] = {}
+        self._bar_cache_mtime: dict[str, float] = {}
+        self._bar_cache_order: list[str] = []
+        self._bar_cache_limit = _safe_positive_int(_cfg_attr(cfg, "bar_cache_limit"))
 
     # ------------------------------------------------------------------
     # Properties
@@ -326,6 +331,120 @@ class ADVStore:
         if floor_quote is not None and quote < floor_quote:
             return float(floor_quote)
         return float(quote)
+
+    # ------------------------------------------------------------------
+    # Bar dataset helpers
+    # ------------------------------------------------------------------
+    def _bar_cache_key(self, symbol: Any) -> str:
+        try:
+            text = str(symbol).strip().upper()
+        except Exception:
+            return ""
+        return text
+
+    def _extract_bar_meta(
+        self, payload: Mapping[str, Any] | None, path: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not isinstance(payload, Mapping):
+            return {}, {"path": path, "symbol_count": 0}
+        data_raw = payload.get("bars")
+        if not isinstance(data_raw, Mapping):
+            data_raw = payload.get("data") if isinstance(payload.get("data"), Mapping) else {}
+        dataset: dict[str, Any] = {}
+        for key, value in data_raw.items():
+            symbol = self._bar_cache_key(key)
+            if not symbol:
+                continue
+            dataset[symbol] = value
+        meta_raw = payload.get("meta")
+        meta: dict[str, Any] = dict(meta_raw) if isinstance(meta_raw, Mapping) else {}
+        meta.setdefault("path", path)
+        meta["symbol_count"] = len(dataset)
+        return dataset, meta
+
+    def _drop_bar_cache_entry(self, cache_key: str) -> None:
+        self._bar_cache.pop(cache_key, None)
+        self._bar_meta_cache.pop(cache_key, None)
+        self._bar_cache_mtime.pop(cache_key, None)
+        try:
+            self._bar_cache_order.remove(cache_key)
+        except ValueError:
+            pass
+
+    def _trim_bar_cache(self) -> None:
+        limit = self._bar_cache_limit
+        if not limit:
+            return
+        while len(self._bar_cache_order) > limit:
+            oldest = self._bar_cache_order.pop(0)
+            self._drop_bar_cache_entry(oldest)
+
+    def _maybe_reset_bar_cache(self, path: str) -> None:
+        cache_key = os.path.abspath(path)
+        if cache_key not in self._bar_cache:
+            return
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            self._drop_bar_cache_entry(cache_key)
+            return
+        cached_mtime = self._bar_cache_mtime.get(cache_key)
+        if cached_mtime is None or mtime != cached_mtime:
+            self._drop_bar_cache_entry(cache_key)
+
+    def _read_bar_payload(self, path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except FileNotFoundError:
+            logger.warning("Bar dataset %s not found", path)
+            return {}, {"path": path, "symbol_count": 0}
+        except Exception:
+            logger.exception("Failed to read bar dataset from %s", path)
+            return {}, {"path": path, "symbol_count": 0}
+        return self._extract_bar_meta(payload, path)
+
+    def _load_bar_dataset_locked(
+        self, path: str
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        if not path:
+            return {}, {}
+        cache_key = os.path.abspath(path)
+        self._maybe_reset_bar_cache(path)
+        dataset = self._bar_cache.get(cache_key)
+        if dataset is not None:
+            # Refresh order to behave like LRU.
+            try:
+                self._bar_cache_order.remove(cache_key)
+            except ValueError:
+                pass
+            self._bar_cache_order.append(cache_key)
+            meta = self._bar_meta_cache.get(cache_key, {})
+            return dataset, dict(meta)
+        dataset, meta = self._read_bar_payload(path)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = time.time()
+        cache_copy = dict(dataset)
+        meta_copy = dict(meta)
+        self._bar_cache[cache_key] = cache_copy
+        self._bar_meta_cache[cache_key] = meta_copy
+        self._bar_cache_mtime[cache_key] = mtime
+        self._bar_cache_order.append(cache_key)
+        self._trim_bar_cache()
+        return dict(cache_copy), dict(meta_copy)
+
+    def load_bar_dataset(self, path: str) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        with self._lock:
+            return self._load_bar_dataset_locked(path)
+
+    def get_bar_entry(self, path: str, symbol: Any) -> Any:
+        dataset, _ = self.load_bar_dataset(path)
+        key = self._bar_cache_key(symbol)
+        if not key:
+            return None
+        return dataset.get(key)
 
 
 __all__ = ["ADVStore"]
