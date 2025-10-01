@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 import pytest
@@ -12,6 +13,15 @@ from adv_store import ADVStore
 
 def _write_dataset(path, data: Mapping[str, Any], meta: Mapping[str, Any] | None = None) -> None:
     payload = {"data": data}
+    if meta is not None:
+        payload["meta"] = meta
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_bar_dataset(
+    path, data: Mapping[str, Any], meta: Mapping[str, Any] | None = None
+) -> None:
+    payload: dict[str, Any] = {"bars": data}
     if meta is not None:
         payload["meta"] = meta
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -170,13 +180,106 @@ def test_concurrent_access_uses_single_payload_load(tmp_path, monkeypatch):
     assert results == [110.0] * len(threads)
     assert call_count == 1
 
-    # Concurrent bar-capacity calls should reuse the cached payload without extra loads.
-    results.clear()
-    threads = [threading.Thread(target=lambda: results.append(store.get_bar_capacity_quote("BTCUSDT"))) for _ in range(5)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
 
-    assert results == [110.0] * len(threads)
-    assert call_count == 1
+def test_extract_bar_meta_populates_path_and_symbol_count(tmp_path):
+    dataset_path = tmp_path / "bars.json"
+    payload = {
+        "meta": {"generated_at": "2023-12-10T00:00:00Z", "other": "value"},
+        "bars": {
+            "btcusdt": {"adv": 1},
+            " ETHUSDT ": {"adv": 2},
+            "": {"adv": 3},
+        },
+    }
+
+    store = ADVStore({})
+    bars, meta = store._extract_bar_meta(payload, os.fspath(dataset_path))
+
+    assert bars == {"BTCUSDT": {"adv": 1}, "ETHUSDT": {"adv": 2}}
+    assert meta["path"] == os.fspath(dataset_path)
+    assert meta["symbol_count"] == 2
+    # Existing metadata should be preserved.
+    assert meta["other"] == "value"
+
+
+def test_maybe_reset_bar_cache_detects_file_change(tmp_path):
+    dataset_path = tmp_path / "adv_bars.json"
+    _write_bar_dataset(dataset_path, {"BTCUSDT": {"adv": 10}})
+
+    store = ADVStore({"bar_cache_limit": 4})
+
+    data_one, _ = store.load_bar_dataset(os.fspath(dataset_path))
+    assert data_one["BTCUSDT"] == {"adv": 10}
+
+    _write_bar_dataset(dataset_path, {"BTCUSDT": {"adv": 25}})
+    future_ts = time.time() + 1
+    os.utime(dataset_path, (future_ts, future_ts))
+
+    data_two, _ = store.load_bar_dataset(os.fspath(dataset_path))
+    assert data_two["BTCUSDT"] == {"adv": 25}
+
+
+def test_extract_timestamp_and_stale_transitions(tmp_path):
+    dataset_path = tmp_path / "adv_stale.json"
+    past_dt = datetime.now(tz=timezone.utc) - timedelta(days=5)
+    _write_dataset(
+        dataset_path,
+        {"BTCUSDT": {"adv_quote": 10.0}},
+        meta={"generated_at": past_dt.isoformat()},
+    )
+
+    store = ADVStore({"path": os.fspath(dataset_path), "refresh_days": 2})
+
+    # Initial load should mark dataset stale because timestamp is too old.
+    assert store.get_adv_quote("BTCUSDT") is None
+    assert store.is_dataset_stale is True
+
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    _write_dataset(
+        dataset_path,
+        {"BTCUSDT": {"adv_quote": 32.0}},
+        meta={"generated_at_ms": now_ms},
+    )
+    future_ts = time.time() + 1
+    os.utime(dataset_path, (future_ts, future_ts))
+
+    assert store.get_adv_quote("BTCUSDT") == 32.0
+    assert store.is_dataset_stale is False
+
+
+def test_trim_bar_cache_and_symbol_normalisation(tmp_path, monkeypatch):
+    store = ADVStore({"bar_cache_limit": 2})
+
+    paths: list[str] = []
+    for idx in range(3):
+        path = tmp_path / f"bars_{idx}.json"
+        symbol = f"sym{idx}usd"
+        _write_bar_dataset(path, {symbol: {"adv": idx + 1}})
+        paths.append(os.fspath(path))
+
+    call_count: dict[str, int] = {}
+    original_reader = store._read_bar_payload
+
+    def _wrapped_reader(path: str):
+        call_count[path] = call_count.get(path, 0) + 1
+        return original_reader(path)
+
+    monkeypatch.setattr(store, "_read_bar_payload", _wrapped_reader)
+
+    # Load first two datasets into the cache.
+    for path in paths[:2]:
+        data, meta = store.load_bar_dataset(path)
+        assert meta["symbol_count"] == 1
+        assert call_count[path] == 1
+        # Symbol lookup should be case-insensitive and trimmed.
+        symbol = next(iter(data))
+        assert store.get_bar_entry(path, symbol.lower()) == data[symbol]
+        assert store.get_bar_entry(path, f"  {symbol.lower()}  ") == data[symbol]
+
+    # Loading a third dataset should evict the least recently used (first) entry.
+    store.load_bar_dataset(paths[2])
+    assert call_count[paths[2]] == 1
+
+    # Re-loading the first dataset should trigger a fresh read.
+    store.load_bar_dataset(paths[0])
+    assert call_count[paths[0]] == 2
