@@ -2434,6 +2434,7 @@ class _Worker:
         scalable_by_symbol: Dict[str, Dict[str, Any]] = {}
         normalized_by_symbol: Dict[str, float] = {}
         seen_symbols: set[str] = set()
+        running_weights: Dict[str, float] = {}
 
         def _coerce_bool(value: Any) -> bool:
             if isinstance(value, str):
@@ -2480,12 +2481,16 @@ class _Worker:
                 "normalized" in meta_map or normalized_source is not None
             ):
                 meta_map["normalized"] = normalized_flag
-            try:
-                current_weight = float(self._weights.get(symbol, 0.0))
-            except (TypeError, ValueError):
-                current_weight = 0.0
-            if not math.isfinite(current_weight) or current_weight < 0.0:
-                current_weight = 0.0
+            if symbol in running_weights:
+                current_weight = running_weights[symbol]
+            else:
+                try:
+                    current_weight = float(self._weights.get(symbol, 0.0))
+                except (TypeError, ValueError):
+                    current_weight = 0.0
+                if not math.isfinite(current_weight) or current_weight < 0.0:
+                    current_weight = 0.0
+                running_weights[symbol] = current_weight
             try:
                 target_weight = float(target)
             except (TypeError, ValueError):
@@ -2511,16 +2516,18 @@ class _Worker:
                 seen_symbols.add(symbol)
             if normalized_flag:
                 if symbol:
-                    normalized_by_symbol[symbol] = max(0.0, target_weight)
+                    post_weight = max(0.0, target_weight)
+                    normalized_by_symbol[symbol] = post_weight
+                    running_weights[symbol] = post_weight
             elif symbol:
                 scalable_infos.append(info)
-                requested_value = max(0.0, target_weight)
+                post_weight = max(0.0, target_weight)
                 aggregate = scalable_by_symbol.get(symbol)
                 if aggregate is None:
                     scalable_by_symbol[symbol] = {
                         "current": current_weight,
-                        "target": max(0.0, target_weight),
-                        "requested": requested_value,
+                        "target": post_weight,
+                        "requested": post_weight,
                         "delta_total": delta,
                         "positive_delta_total": delta if delta > 0.0 else 0.0,
                         "negative_delta_total": delta if delta < 0.0 else 0.0,
@@ -2533,16 +2540,8 @@ class _Worker:
                         existing_current_val = None
                     if existing_current_val is None or not math.isfinite(existing_current_val):
                         aggregate["current"] = current_weight
-                    try:
-                        prev_target_total = float(aggregate.get("target", 0.0))
-                    except (TypeError, ValueError):
-                        prev_target_total = 0.0
-                    aggregate["target"] = max(0.0, prev_target_total + max(0.0, target_weight))
-                    try:
-                        prev_requested_total = float(aggregate.get("requested", 0.0))
-                    except (TypeError, ValueError):
-                        prev_requested_total = 0.0
-                    aggregate["requested"] = prev_requested_total + requested_value
+                    aggregate["target"] = post_weight
+                    aggregate["requested"] = post_weight
                     try:
                         prev_delta_total = float(aggregate.get("delta_total", 0.0))
                     except (TypeError, ValueError):
@@ -2560,6 +2559,7 @@ class _Worker:
                         except (TypeError, ValueError):
                             prev_negative = 0.0
                         aggregate["negative_delta_total"] = prev_negative + delta
+                running_weights[symbol] = post_weight
 
         if not scalable_infos:
             return orders_list, False
@@ -2697,13 +2697,20 @@ class _Worker:
                 original_target = current_weight
             if not math.isfinite(original_target):
                 original_target = current_weight
-            delta = original_target - current_weight
-            if delta <= 0.0:
+            try:
+                requested_delta = float(info.get("delta", 0.0))
+            except (TypeError, ValueError):
+                requested_delta = 0.0
+            if not math.isfinite(requested_delta):
+                requested_delta = 0.0
+            if requested_delta < 0.0:
                 new_target = self._clamp_weight(original_target)
+            elif requested_delta <= 0.0:
+                new_target = self._clamp_weight(current_weight)
             else:
-                new_target = self._clamp_weight(current_weight + delta * factor)
+                new_target = self._clamp_weight(current_weight + requested_delta * factor)
             new_delta = new_target - current_weight
-            order_factor = factor if delta > 0.0 else 1.0
+            order_factor = factor if requested_delta > 0.0 else 1.0
             scaled_current[symbol] = new_target
             payload_map = dict(info["payload"])
             payload_map["normalized"] = True
