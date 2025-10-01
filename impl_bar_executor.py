@@ -811,16 +811,6 @@ class BarExecutor(TradeExecutor):
         caps_eval = self._evaluate_turnover_caps(symbol_key or symbol, state, bar)
         pre_trade_cap = caps_eval.get("effective_cap")
         skip_due_to_cap = False
-        effective_cap = caps_eval.get("effective_cap")
-        if effective_cap is not None and raw_turnover_usd > float(effective_cap) + 1e-9:
-            skip_due_to_cap = True
-            if hasattr(metrics, "model_copy"):
-                metrics = metrics.model_copy(
-                    update={"act_now": False, "turnover_usd": 0.0}
-                )
-            else:  # pragma: no cover - compatibility fallback
-                metrics = metrics.copy(update={"act_now": False, "turnover_usd": 0.0})
-            turnover_usd = 0.0
 
         instructions: List[RebalanceInstruction] = []
         final_state = state
@@ -828,7 +818,6 @@ class BarExecutor(TradeExecutor):
         execute_branch = (
             bool(getattr(metrics, "act_now", False))
             and not skip_due_to_step
-            and not skip_due_to_cap
             and skip_reason is None
         )
 
@@ -847,16 +836,14 @@ class BarExecutor(TradeExecutor):
                 bar=bar,
                 adv_quote=adv_quote,
             )
-            if not instructions and spec_reason is None:
-                turnover_update = float(executed_turnover_usd)
-                updates = {"act_now": False, "turnover_usd": turnover_update}
-                if hasattr(metrics, "model_copy"):
-                    metrics = metrics.model_copy(update=updates)
-                else:  # pragma: no cover - compatibility fallback
-                    metrics = metrics.copy(update=updates)
+            executed_turnover = float(executed_turnover_usd)
+            cap_limit = caps_eval.get("effective_cap")
+            cap_breached_post = (
+                cap_limit is not None and executed_turnover > float(cap_limit) + 1e-9
+            )
             if spec_reason is not None:
                 skip_reason = spec_reason
-                turnover_usd = float(executed_turnover_usd)
+                turnover_usd = executed_turnover
                 if hasattr(metrics, "model_copy"):
                     metrics = metrics.model_copy(
                         update={"act_now": False, "turnover_usd": turnover_usd}
@@ -868,8 +855,28 @@ class BarExecutor(TradeExecutor):
                 instructions = []
                 target_weight = state.weight
                 delta_weight = 0.0
+            elif cap_breached_post:
+                skip_due_to_cap = True
+                turnover_usd = 0.0
+                if hasattr(metrics, "model_copy"):
+                    metrics = metrics.model_copy(
+                        update={"act_now": False, "turnover_usd": 0.0}
+                    )
+                else:  # pragma: no cover - compatibility fallback
+                    metrics = metrics.copy(update={"act_now": False, "turnover_usd": 0.0})
+                instructions = []
+                target_weight = state.weight
+                delta_weight = 0.0
+                final_state = state
+            elif not instructions:
+                turnover_usd = executed_turnover
+                updates = {"act_now": False, "turnover_usd": turnover_usd}
+                if hasattr(metrics, "model_copy"):
+                    metrics = metrics.model_copy(update=updates)
+                else:  # pragma: no cover - compatibility fallback
+                    metrics = metrics.copy(update=updates)
             else:
-                turnover_usd = float(executed_turnover_usd)
+                turnover_usd = executed_turnover
                 if hasattr(metrics, "model_copy"):
                     metrics = metrics.model_copy(update={"turnover_usd": turnover_usd})
                 else:  # pragma: no cover - compatibility fallback

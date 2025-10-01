@@ -326,6 +326,52 @@ def test_bar_executor_clears_turnover_when_skipping_execution():
     assert snapshot["turnover_usd"] == pytest.approx(0.0)
 
 
+def test_bar_executor_turnover_cap_allows_quantized_trade():
+    caps = SpotTurnoverCaps(per_symbol=SpotTurnoverLimit(usd=70.0))
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1000.0,
+        turnover_caps=caps,
+        symbol_specs={"BTCUSDT": {"step_size": Decimal("0.6")}},
+    )
+
+    order = Order(
+        ts=20,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(20, 100.0),
+            "payload": {"target_weight": 0.1, "edge_bps": 50.0},
+        },
+    )
+
+    report = executor.execute(order)
+
+    instructions = report.meta["instructions"]
+    assert len(instructions) == 1
+    instr = instructions[0]
+    assert instr["notional_usd"] == pytest.approx(60.0)
+    assert instr["target_weight"] == pytest.approx(0.06)
+
+    decision = report.meta["decision"]
+    assert decision["turnover_usd"] == pytest.approx(60.0)
+    assert decision["target_weight"] == pytest.approx(0.06)
+    assert decision["delta_weight"] == pytest.approx(0.06)
+
+    assert report.meta["executed_turnover_usd"] == pytest.approx(60.0)
+    assert report.meta["cap_usd"] == pytest.approx(70.0)
+    assert report.meta.get("turnover_cap_enforced") is None
+    assert report.meta["requested_target_weight"] == pytest.approx(0.1)
+
+    positions = executor.get_open_positions()
+    assert positions["BTCUSDT"].meta["weight"] == pytest.approx(0.06)
+
+
 def test_bar_executor_handles_envelope_meta():
     class EnvelopePayload(SpotSignalTargetWeightPayload):
         def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
