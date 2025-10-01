@@ -2,8 +2,10 @@ import math
 import random
 from typing import Any, Optional
 
+import logging
 import pytest
 
+import execution_sim
 from execution_sim import ExecutionSimulator
 
 
@@ -262,4 +264,114 @@ def test_compute_intrabar_price_reference_and_fallback(bare_sim: ExecutionSimula
     )
     assert price_fallback == pytest.approx(99.0)
     assert clipped_fallback is False
+
+
+def test_current_bar_window_cache_and_recompute(bare_sim: ExecutionSimulator) -> None:
+    ts = 1_005_500
+
+    bare_sim._intrabar_path_timeframe_ms = None
+    bare_sim._intrabar_path_start_ts = None
+    bare_sim._intrabar_path_bar_ts = None
+
+    timeframe, start_ts, end_ts = bare_sim._current_bar_window(ts)
+    assert timeframe == 1_000
+    assert start_ts == 1_005_000
+    assert end_ts == 1_006_000
+
+    bare_sim._intrabar_path_timeframe_ms = 2_000
+    bare_sim._intrabar_path_start_ts = 1_004_000
+    bare_sim._intrabar_path_bar_ts = None
+
+    timeframe_cached, start_cached, end_cached = bare_sim._current_bar_window(ts)
+    assert timeframe_cached == 2_000
+    assert start_cached == 1_004_000
+    assert end_cached == 1_006_000
+
+    bare_sim._intrabar_path_start_ts = None
+    bare_sim._intrabar_path_bar_ts = None
+    ts_jump = ts + 3_000
+
+    timeframe_jump, start_jump, end_jump = bare_sim._current_bar_window(ts_jump)
+    assert timeframe_jump == 2_000
+    assert start_jump == 1_008_000
+    assert end_jump == 1_010_000
+
+    bare_sim._intrabar_path_timeframe_ms = -50
+    bare_sim._intrabar_path_start_ts = 1_000_000
+    bare_sim._intrabar_path_bar_ts = 1_000_900
+
+    timeframe_invalid, start_invalid, end_invalid = bare_sim._current_bar_window(1_000_123)
+    assert timeframe_invalid is None
+    assert start_invalid == 1_000_000
+    assert end_invalid == 1_000_900
+
+
+def test_intrabar_debug_counter_reset_and_logging_gate(
+    bare_sim: ExecutionSimulator, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("DEBUG", logger="execution_sim")
+
+    bare_sim._intrabar_debug_max_logs = 1
+    bare_sim._intrabar_debug_logged = 7
+    bare_sim._intrabar_reference_debug_logged = 3
+
+    bare_sim._reset_intrabar_debug_counter()
+    assert bare_sim._intrabar_debug_logged == 0
+    assert bare_sim._intrabar_reference_debug_logged == 0
+
+    bar_ts = bare_sim._last_bar_close_ts + bare_sim._intrabar_timeframe_ms
+    path = [
+        {"fraction": 0.0, "price": 100.0},
+        {"fraction": 0.5, "price": 105.0},
+        {"fraction": 1.0, "price": 110.0},
+    ]
+
+    caplog.clear()
+    bare_sim.set_intrabar_reference(bar_ts, path)
+    assert bare_sim._intrabar_reference_debug_logged == 1
+    assert sum("set intrabar reference" in record.message for record in caplog.records) == 1
+
+    caplog.clear()
+    bare_sim.set_intrabar_reference(bar_ts, path)
+    assert bare_sim._intrabar_reference_debug_logged == 1
+    assert not any("set intrabar reference" in record.message for record in caplog.records)
+
+    caplog.clear()
+
+    def emit_intrabar_debug() -> None:
+        if execution_sim.logger.isEnabledFor(logging.DEBUG):
+            limit = int(bare_sim._intrabar_debug_max_logs)
+            if limit <= 0 or bare_sim._intrabar_debug_logged < limit:
+                execution_sim.logger.debug("generic intrabar debug gate test")
+                bare_sim._intrabar_debug_logged += 1
+
+    emit_intrabar_debug()
+    emit_intrabar_debug()
+
+    assert bare_sim._intrabar_debug_logged == 1
+    assert sum("generic intrabar debug gate test" in record.message for record in caplog.records) == 1
+
+    bare_sim._reset_intrabar_debug_counter()
+    assert bare_sim._intrabar_debug_logged == 0
+    assert bare_sim._intrabar_reference_debug_logged == 0
+
+    caplog.clear()
+    emit_intrabar_debug()
+    assert bare_sim._intrabar_debug_logged == 1
+    assert sum("generic intrabar debug gate test" in record.message for record in caplog.records) == 1
+
+    bare_sim._reset_intrabar_debug_counter()
+    caplog.clear()
+
+    if bare_sim._intrabar_path_start_ts is not None:
+        bare_sim._intrabar_path_start_ts += 123
+    next_bar_ts = bar_ts + bare_sim._intrabar_timeframe_ms
+    bare_sim._maybe_reset_intrabar_reference(next_bar_ts)
+
+    assert bare_sim._intrabar_reference_debug_logged == 1
+    assert any("reset intrabar reference path" in record.message for record in caplog.records)
+    assert bare_sim._intrabar_path == []
+    assert bare_sim._intrabar_path_start_ts is None
+    assert bare_sim._intrabar_path_bar_ts is None
+    assert bare_sim._intrabar_path_timeframe_ms is None
 
