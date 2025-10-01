@@ -120,6 +120,12 @@ def test_bar_mode_total_notional_uses_equity_override():
         symbol="FOO",
         meta={"payload": {"target_weight": 0.5, "equity_usd": 200.0}},
     )
+    order.meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": 0.5,
+        "delta_weight": 0.5,
+        "turnover_usd": 100.0,
+    }
 
     worker._commit_exposure(order)
 

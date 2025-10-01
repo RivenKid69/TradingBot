@@ -129,6 +129,13 @@ def test_daily_turnover_cap_clamps_and_defers() -> None:
     adjusted_first = worker._apply_daily_turnover_limits([first], "BTCUSDT", 1)
     assert len(adjusted_first) == 1
     assert adjusted_first[0].meta.get("_daily_turnover_usd") == pytest.approx(400.0)
+    payload_first = worker._extract_signal_payload(adjusted_first[0])
+    adjusted_first[0].meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": payload_first["target_weight"],
+        "delta_weight": payload_first["target_weight"],
+        "turnover_usd": adjusted_first[0].meta.get("_daily_turnover_usd"),
+    }
     worker._commit_exposure(adjusted_first[0])
     assert worker._daily_symbol_turnover["BTCUSDT"]["total"] == pytest.approx(400.0)
 
@@ -138,6 +145,12 @@ def test_daily_turnover_cap_clamps_and_defers() -> None:
     payload = adjusted_second[0].meta["payload"]
     assert payload["target_weight"] == pytest.approx(0.5)
     assert adjusted_second[0].meta.get("_daily_turnover_usd") == pytest.approx(100.0)
+    adjusted_second[0].meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": payload["target_weight"],
+        "delta_weight": payload["target_weight"] - 0.4,
+        "turnover_usd": adjusted_second[0].meta.get("_daily_turnover_usd"),
+    }
     worker._commit_exposure(adjusted_second[0])
     assert worker._daily_symbol_turnover["BTCUSDT"]["total"] == pytest.approx(500.0)
 
@@ -155,6 +168,13 @@ def test_daily_turnover_cap_uses_economics_payload() -> None:
     adjusted_first = worker._apply_daily_turnover_limits([first], "ETHUSDT", 1)
     assert len(adjusted_first) == 1
     assert adjusted_first[0].meta.get("_daily_turnover_usd") == pytest.approx(150.0)
+    payload_first = worker._extract_signal_payload(adjusted_first[0])
+    adjusted_first[0].meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": payload_first["target_weight"],
+        "delta_weight": payload_first["target_weight"],
+        "turnover_usd": adjusted_first[0].meta.get("_daily_turnover_usd"),
+    }
     worker._commit_exposure(adjusted_first[0])
     assert worker._daily_symbol_turnover["ETHUSDT"]["total"] == pytest.approx(150.0)
 
@@ -164,6 +184,12 @@ def test_daily_turnover_cap_uses_economics_payload() -> None:
     payload = adjusted_second[0].meta["payload"]
     assert payload["target_weight"] == pytest.approx(0.7)
     assert adjusted_second[0].meta.get("_daily_turnover_usd") == pytest.approx(50.0)
+    adjusted_second[0].meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": payload["target_weight"],
+        "delta_weight": payload["target_weight"] - 0.5,
+        "turnover_usd": adjusted_second[0].meta.get("_daily_turnover_usd"),
+    }
     worker._commit_exposure(adjusted_second[0])
     assert worker._daily_symbol_turnover["ETHUSDT"]["total"] == pytest.approx(200.0)
 

@@ -43,6 +43,7 @@ import time
 from datetime import datetime, timezone
 import shlex
 import subprocess
+import weakref
 
 import json
 import yaml
@@ -694,6 +695,7 @@ class _Worker:
         self._max_total_weight: float | None = weight_cap
         self._weights: Dict[str, float] = {}
         self._pending_weight: Dict[int, Dict[str, Any]] = {}
+        self._pending_weight_refs: Dict[int, Any] = {}
         self._symbol_equity: Dict[str, float] = {}
         entry_cfg = self._resolve_entry_limiter_config(executor)
         self._entry_limiter = DailyEntryLimiter(
@@ -2702,6 +2704,10 @@ class _Worker:
                 "factor": factor,
                 "normalization": dict(normalization_payload),
             }
+            try:
+                self._pending_weight_refs[id(order)] = weakref.ref(order)
+            except TypeError:
+                self._pending_weight_refs[id(order)] = order
             changed = True
 
         if changed:
@@ -2792,6 +2798,7 @@ class _Worker:
     def _rollback_exposure(self, order: Any) -> None:
         if self._execution_mode == "bar":
             self._pending_weight.pop(id(order), None)
+            self._pending_weight_refs.pop(id(order), None)
             return
         key = id(order)
         data = self._pending_exposure.pop(key, None)
@@ -2819,12 +2826,30 @@ class _Worker:
             meta_map = self._ensure_order_meta(order)
             payload = self._extract_signal_payload(order)
             equity_override = self._resolve_order_equity(order, payload, symbol)
-            if equity_override is not None and equity_override > 0.0:
-                self._symbol_equity[symbol] = float(equity_override)
             target_weight, delta_weight, _ = self._resolve_weight_targets(
                 symbol, payload
             )
             exec_meta = self._coerce_mapping(meta_map.get("_bar_execution"))
+            try:
+                self._pending_weight_refs.setdefault(id(order), weakref.ref(order))
+            except TypeError:
+                self._pending_weight_refs[id(order)] = order
+            pending = self._pending_weight.get(id(order))
+            if not isinstance(pending, dict):
+                pending = {"symbol": symbol}
+                self._pending_weight[id(order)] = pending
+            pending.setdefault("symbol", symbol)
+            if "target_weight" not in pending:
+                pending["target_weight"] = target_weight
+            if "delta_weight" not in pending:
+                pending["delta_weight"] = delta_weight
+            if bar_close_ms is not None:
+                try:
+                    pending["bar_close_ms"] = int(bar_close_ms)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            if not exec_meta:
+                return
             executed_flag: bool | None = None
             executed_turnover: float | None = None
             executed_target: float | None = None
@@ -2861,6 +2886,7 @@ class _Worker:
             executed = executed_flag if executed_flag is not None else True
             prev_weight = self._weights.get(symbol, 0.0)
             self._pending_weight.pop(id(order), None)
+            self._pending_weight_refs.pop(id(order), None)
             if not executed:
                 meta_map.pop("_daily_turnover_usd", None)
                 return
@@ -2878,6 +2904,8 @@ class _Worker:
                 if executed_delta is not None
                 else applied_target - prev_weight
             )
+            if equity_override is not None and equity_override > 0.0:
+                self._symbol_equity[symbol] = float(equity_override)
             self._apply_weight_to_positions(
                 symbol, applied_target, equity_override=equity_override
             )
@@ -3626,6 +3654,55 @@ class _Worker:
             working_weight = target_weight
         return adjusted
 
+    def _replay_pending_weight_entries(
+        self,
+        order: Any | None = None,
+        *,
+        exclude: set[int] | None = None,
+    ) -> bool:
+        if self._execution_mode != "bar":
+            return False
+        exclude_ids: set[int] = set(exclude or ())
+        if order is not None:
+            candidate_ids = [id(order)]
+        else:
+            candidate_ids = [
+                key for key in list(self._pending_weight_refs.keys()) if key not in exclude_ids
+            ]
+        processed = False
+        for key in candidate_ids:
+            if key in exclude_ids:
+                continue
+            order_obj: Any | None
+            if order is not None and key == id(order):
+                order_obj = order
+            else:
+                ref = self._pending_weight_refs.get(key)
+                if ref is None:
+                    self._pending_weight.pop(key, None)
+                    continue
+                order_obj = ref() if callable(ref) else ref
+            if order_obj is None:
+                self._pending_weight.pop(key, None)
+                self._pending_weight_refs.pop(key, None)
+                continue
+            meta_map = self._ensure_order_meta(order_obj)
+            exec_meta = self._coerce_mapping(meta_map.get("_bar_execution"))
+            if not exec_meta:
+                continue
+            pending_payload = self._pending_weight.get(key)
+            bar_close_ms: int | None = None
+            if isinstance(pending_payload, dict):
+                bar_close_candidate = pending_payload.get("bar_close_ms")
+                try:
+                    if bar_close_candidate is not None:
+                        bar_close_ms = int(bar_close_candidate)
+                except (TypeError, ValueError, OverflowError):
+                    bar_close_ms = None
+            self._commit_exposure(order_obj, bar_close_ms=bar_close_ms)
+            processed = True
+        return processed
+
     def _record_daily_turnover_execution(self, order: Any) -> None:
         if self._execution_mode != "bar":
             return
@@ -3679,6 +3756,8 @@ class _Worker:
             meta.pop("_daily_turnover_day", None)
         except Exception:
             pass
+        if exec_meta:
+            self._replay_pending_weight_entries(exclude={id(order)})
 
     @staticmethod
     def _signal_leg(order: Any) -> str:
@@ -4858,6 +4937,8 @@ class _Worker:
             self._set_last_price(symbol, close_val)
         else:
             self._maybe_fetch_rest_price(symbol)
+        if self._execution_mode == "bar":
+            self._replay_pending_weight_entries()
         prev_ts = self._last_bar_ts.get(symbol)
         gap_ms: int | None = None
         duplicate_ts = False
