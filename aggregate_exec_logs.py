@@ -567,6 +567,10 @@ def aggregate(
     trades["modeled_cost_bps"] = pd.to_numeric(modeled_cost_from_meta, errors="coerce")
     reference_prices = pd.to_numeric(reference_from_meta, errors="coerce")
     trade_prices = pd.to_numeric(trades["price"], errors="coerce")
+    quantity_source = trades.get("quantity")
+    if quantity_source is None:
+        quantity_source = pd.Series(index=trades.index, dtype=float)
+    quantity_abs = pd.to_numeric(quantity_source, errors="coerce").abs()
     side_sign = trades["side_sign"].astype(float)
     with pd.option_context("mode.use_inf_as_na", True):
         realized = pd.Series(index=trades.index, dtype=float)
@@ -575,6 +579,7 @@ def aggregate(
             & reference_prices.notna()
             & reference_prices.ne(0.0)
             & side_sign.notna()
+            & quantity_abs.gt(0.0)
         )
         realized.loc[valid_mask] = (
             (trade_prices.loc[valid_mask] - reference_prices.loc[valid_mask])

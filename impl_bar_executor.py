@@ -1056,13 +1056,23 @@ class BarExecutor(TradeExecutor):
         self._attach_execution_meta(order, execution_meta)
         report_meta["execution"] = dict(execution_meta)
 
+        exec_price = Decimal("0")
+        if price is not None:
+            try:
+                exec_price_candidate = price if isinstance(price, Decimal) else _as_decimal(price)
+            except Exception:  # pragma: no cover - defensive fallback
+                exec_price_candidate = None
+            else:
+                if exec_price_candidate > Decimal("0"):
+                    exec_price = exec_price_candidate
+
         return ExecReport(
             ts=bar.ts if bar is not None else order.ts,
             run_id=self.run_id,
             symbol=symbol,
             side=_normalize_side(order.side),
             order_type=order.order_type if isinstance(order.order_type, OrderType) else OrderType.MARKET,
-            price=Decimal("0"),
+            price=exec_price,
             quantity=Decimal("0"),
             fee=Decimal("0"),
             fee_asset=None,
