@@ -1077,11 +1077,13 @@ def test_worker_normalizes_weights_accumulates_same_symbol_orders():
     assert payloads[0]["normalization"]["available_delta"] == pytest.approx(0.3)
 
     expected_target1 = 0.1 + (0.3 - 0.1) * factor
-    expected_target2 = 0.1 + (0.4 - 0.1) * factor
+    expected_target2 = expected_target1 + (0.4 - expected_target1) * factor
     assert payloads[0]["target_weight"] == pytest.approx(expected_target1)
     assert payloads[1]["target_weight"] == pytest.approx(expected_target2)
     assert payloads[0]["delta_weight"] == pytest.approx(expected_target1 - 0.1)
-    assert payloads[1]["delta_weight"] == pytest.approx(expected_target2 - 0.1)
+    assert payloads[1]["delta_weight"] == pytest.approx(
+        expected_target2 - expected_target1
+    )
 
     for order_obj, payload, original_turnover in (
         (normalized_orders[0], payloads[0], order1_turnover),
@@ -1100,6 +1102,55 @@ def test_worker_normalizes_weights_accumulates_same_symbol_orders():
         assert order_obj.meta["economics"]["turnover_usd"] == pytest.approx(
             original_turnover * factor
         )
+
+
+def test_worker_normalizes_weights_stacks_symbol_orders_to_cap():
+    worker = _make_worker(0.3)
+
+    order1 = Order(
+        ts=1,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {"target_weight": 0.2, "edge_bps": 15.0},
+        },
+    )
+    order2 = Order(
+        ts=2,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "payload": {"target_weight": 0.25, "edge_bps": 20.0},
+        },
+    )
+
+    requested1 = order1.meta["payload"]["target_weight"]
+    requested2 = order2.meta["payload"]["target_weight"]
+
+    normalized_orders, applied = worker._normalize_weight_targets([order1, order2])
+
+    assert applied is True
+    payloads = [order.meta["payload"] for order in normalized_orders]
+    factor = payloads[0]["normalization"]["factor"]
+
+    expected_first = requested1 * factor
+    expected_second = expected_first + (requested2 - expected_first) * factor
+
+    assert payloads[0]["target_weight"] == pytest.approx(expected_first)
+    assert payloads[1]["target_weight"] == pytest.approx(expected_second)
+
+    initial_weight = worker._weights.get("BTCUSDT", 0.0)
+    total_delta = sum(payload["delta_weight"] for payload in payloads)
+    final_target = payloads[1]["target_weight"]
+
+    assert final_target <= payloads[0]["normalization"]["available_total"]
+    assert final_target - initial_weight == pytest.approx(total_delta)
 
 
 def test_worker_normalizes_weights_handles_false_string_flag():
