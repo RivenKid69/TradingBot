@@ -577,6 +577,7 @@ class _Worker:
         ws_dedup_enabled: bool = False,
         ws_dedup_log_skips: bool = False,
         ws_dedup_timeframe_ms: int = 0,
+        bar_timeframe_ms: int | None = None,
         throttle_cfg: ThrottleConfig | None = None,
         no_trade_cfg: NoTradeConfig | None = None,
         pipeline_cfg: PipelineConfig | None = None,
@@ -608,6 +609,23 @@ class _Worker:
         self._ws_dedup_enabled = ws_dedup_enabled
         self._ws_dedup_log_skips = ws_dedup_log_skips
         self._ws_dedup_timeframe_ms = self._coerce_timeframe_ms(ws_dedup_timeframe_ms)
+        bar_timeframe_candidate: Any = bar_timeframe_ms
+        if bar_timeframe_candidate is None:
+            bar_timeframe_candidate = ws_dedup_timeframe_ms
+        self._bar_timeframe_ms = self._coerce_timeframe_ms(bar_timeframe_candidate)
+        if self._bar_timeframe_ms <= 0:
+            fallback_candidates = (
+                getattr(fp, "timeframe_ms", None),
+                getattr(getattr(fp, "execution", None), "timeframe_ms", None),
+                getattr(policy, "timeframe_ms", None),
+            )
+            for candidate in fallback_candidates:
+                fallback_ms = self._coerce_timeframe_ms(candidate)
+                if fallback_ms > 0:
+                    self._bar_timeframe_ms = fallback_ms
+                    break
+        if self._bar_timeframe_ms <= 0:
+            self._bar_timeframe_ms = self._ws_dedup_timeframe_ms
         self._last_invalid_ttl_timeframe: Any | None = None
         self._throttle_cfg: ThrottleConfig | None = None
         self._throttle_lock = threading.RLock()
@@ -788,7 +806,10 @@ class _Worker:
         if log_skips is not None:
             self._ws_dedup_log_skips = bool(log_skips)
         if timeframe_ms is not None:
-            self._ws_dedup_timeframe_ms = self._coerce_timeframe_ms(timeframe_ms)
+            dedup_timeframe = self._coerce_timeframe_ms(timeframe_ms)
+            self._ws_dedup_timeframe_ms = dedup_timeframe
+            if dedup_timeframe > 0:
+                self._bar_timeframe_ms = dedup_timeframe
             self._last_invalid_ttl_timeframe = None
 
     def _queue_snapshot(self) -> tuple[int, int]:
@@ -4392,6 +4413,8 @@ class _Worker:
             timeframe_ms = int(timeframe_raw)
         except (TypeError, ValueError):
             timeframe_ms = 0
+        if timeframe_ms <= 0 and self._bar_timeframe_ms > 0:
+            timeframe_ms = int(self._bar_timeframe_ms)
         if timeframe_ms <= 0:
             if log_if_invalid and self._last_invalid_ttl_timeframe != timeframe_raw:
                 self._last_invalid_ttl_timeframe = timeframe_raw
@@ -4601,7 +4624,13 @@ class _Worker:
     ) -> PipelineResult:
         """Final pipeline stage: throttle and emit order."""
         if bar_close_ms is None:
-            bar_close_ms = bar_open_ms
+            timeframe_ms = self._ws_dedup_timeframe_ms
+            if timeframe_ms <= 0 and self._bar_timeframe_ms > 0:
+                timeframe_ms = self._bar_timeframe_ms
+            if timeframe_ms > 0:
+                bar_close_ms = bar_open_ms + timeframe_ms
+            else:
+                bar_close_ms = bar_open_ms
         if stage_cfg is not None and not stage_cfg.enabled:
             self._commit_exposure(o, bar_close_ms=bar_close_ms)
             return PipelineResult(action="pass", stage=Stage.PUBLISH, decision=o)
@@ -7419,6 +7448,19 @@ def clear_dirty_restart(
                 symbol_specs=self._symbol_specs,
             )
 
+        bar_timeframe_candidates = (
+            getattr(getattr(self.cfg, "timing", None), "timeframe_ms", None),
+            getattr(getattr(self._run_config, "timing", None), "timeframe_ms", None),
+            getattr(getattr(self._run_config, "execution", None), "timeframe_ms", None),
+            self.ws_dedup_timeframe_ms,
+        )
+        bar_timeframe_ms = 0
+        for candidate in bar_timeframe_candidates:
+            candidate_ms = _Worker._coerce_timeframe_ms(candidate)
+            if candidate_ms > 0:
+                bar_timeframe_ms = candidate_ms
+                break
+
         worker = _Worker(
             self.feature_pipe,
             self.policy,
@@ -7433,6 +7475,7 @@ def clear_dirty_restart(
             ws_dedup_enabled=self.ws_dedup_enabled,
             ws_dedup_log_skips=self.ws_dedup_log_skips,
             ws_dedup_timeframe_ms=self.ws_dedup_timeframe_ms,
+            bar_timeframe_ms=bar_timeframe_ms,
             throttle_cfg=self.throttle_cfg,
             no_trade_cfg=self.no_trade_cfg,
             pipeline_cfg=self.pipeline_cfg,
