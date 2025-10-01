@@ -32,7 +32,7 @@ import logging
 import math
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
 from api.spot_signals import SpotSignalEconomics, SpotSignalEnvelope
 from core_config import (
@@ -61,6 +61,11 @@ def _as_decimal(value: float | Decimal) -> Decimal:
     if isinstance(value, Decimal):
         return value
     return Decimal(str(value))
+
+
+def _round6(value: float | Decimal | int | str) -> Decimal:
+    dec_value = _as_decimal(value)
+    return dec_value.quantize(Decimal("0.000001"))
 
 
 def _clamp_01(value: float) -> float:
@@ -124,6 +129,352 @@ def _ensure_turnover_caps(
         return SpotTurnoverCaps()
 
 
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        result: List[Any] = []
+        for item in value:
+            result.extend(_as_list(item))
+        return result
+    if isinstance(value, tuple):
+        result: List[Any] = []
+        for item in value:
+            result.extend(_as_list(item))
+        return result
+    if isinstance(value, set):
+        result: List[Any] = []
+        for item in value:
+            result.extend(_as_list(item))
+        return result
+    if isinstance(value, Mapping):
+        result: List[Any] = []
+        for item in value.values():
+            result.extend(_as_list(item))
+        return result
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+        if items:
+            return items
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        result: List[Any] = []
+        for item in value:
+            result.extend(_as_list(item))
+        return result
+    return [value]
+
+
+def _as_set(value: Any) -> set[Any]:
+    return set(_as_list(value))
+
+
+def _weights_as_dict(value: Any) -> Dict[str, float]:
+    weights: Dict[str, float] = {}
+    if value is None:
+        return weights
+    if isinstance(value, Mapping):
+        items = value.items()
+    elif isinstance(value, str):
+        tokens = [token.strip() for token in value.split(",") if token.strip()]
+        items_list: List[tuple[str, Any]] = []
+        for token in tokens:
+            if "=" in token:
+                key, raw = token.split("=", 1)
+            elif ":" in token:
+                key, raw = token.split(":", 1)
+            else:
+                continue
+            items_list.append((key.strip(), raw.strip()))
+        items = items_list
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        items_list = []
+        for entry in value:
+            if isinstance(entry, Mapping):
+                items_list.extend(entry.items())
+            elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                items_list.append((entry[0], entry[1]))
+            elif isinstance(entry, str):
+                for key, raw in _weights_as_dict(entry).items():
+                    weights[key] = raw
+        items = items_list
+    else:
+        items = []
+
+    for raw_symbol, raw_weight in items:
+        try:
+            symbol = str(raw_symbol or "").strip().upper()
+        except Exception:
+            continue
+        if not symbol:
+            continue
+        try:
+            numeric_weight = float(raw_weight)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric_weight):
+            continue
+        weights[symbol] = numeric_weight
+    return weights
+
+
+def _normalize_weights(value: Any) -> Dict[str, float]:
+    normalized: Dict[str, float] = {}
+    for symbol, weight in _weights_as_dict(value).items():
+        clamped = _clamp_01(weight)
+        if clamped < 0.0:
+            continue
+        normalized[symbol] = clamped
+    return normalized
+
+
+def _normalize_cli_input(cli_input: Any) -> Dict[str, Dict[str, Any]]:
+    if not cli_input:
+        return {}
+
+    normalized: Dict[str, Dict[str, Any]] = {}
+
+    def _merge(symbol: Any, payload: Mapping[str, Any]) -> None:
+        try:
+            symbol_key = str(symbol or "").strip().upper()
+        except Exception:
+            return
+        if not symbol_key:
+            return
+        target = normalized.setdefault(symbol_key, {})
+        for raw_key, raw_value in payload.items():
+            try:
+                key = str(raw_key or "").strip()
+            except Exception:
+                continue
+            if not key:
+                continue
+            target[key] = raw_value
+
+    def _process(entry: Any) -> None:
+        if isinstance(entry, Mapping):
+            if len(entry) == 0:
+                return
+            for symbol, payload in entry.items():
+                if isinstance(payload, Mapping):
+                    _merge(symbol, payload)
+                else:
+                    _merge(symbol, {"value": payload})
+            return
+        if isinstance(entry, str):
+            text = entry.strip()
+            if not text:
+                return
+            for segment in text.split(";"):
+                segment_text = segment.strip()
+                if not segment_text or ":" not in segment_text:
+                    continue
+                symbol_text, payload_text = segment_text.split(":", 1)
+                symbol_key = symbol_text.strip().upper()
+                if not symbol_key:
+                    continue
+                payload_map: Dict[str, Any] = {}
+                for token in payload_text.split(","):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    if "=" in token:
+                        key, raw_value = token.split("=", 1)
+                    elif ":" in token:
+                        key, raw_value = token.split(":", 1)
+                    else:
+                        key, raw_value = token, ""
+                    key_text = key.strip()
+                    if not key_text:
+                        continue
+                    payload_map[key_text] = raw_value.strip()
+                if payload_map:
+                    normalized.setdefault(symbol_key, {}).update(payload_map)
+            return
+        if isinstance(entry, Sequence) and not isinstance(entry, (bytes, bytearray)):
+            for item in entry:
+                _process(item)
+            return
+
+    _process(cli_input)
+
+    return normalized
+
+
+def _build_symbol_specs(
+    config_specs: Optional[Mapping[str, Mapping[str, Any]]],
+    cli_input: Any = None,
+) -> Dict[str, SymbolSpec]:
+    merged: Dict[str, Mapping[str, Any]] = {}
+    if config_specs:
+        for symbol, payload in config_specs.items():
+            try:
+                symbol_key = str(symbol or "").strip().upper()
+            except Exception:
+                continue
+            if not symbol_key:
+                continue
+            if isinstance(payload, Mapping):
+                merged[symbol_key] = dict(payload)
+    cli_specs = _normalize_cli_input(cli_input)
+    for symbol, payload in cli_specs.items():
+        base = dict(merged.get(symbol, {}))
+        base.update(payload)
+        merged[symbol] = base
+    return _normalize_symbol_specs_payload(merged)
+
+
+def _maybe_enrich_symbol_specs(
+    existing: Mapping[str, SymbolSpec], cli_input: Any
+) -> Dict[str, SymbolSpec]:
+    if not cli_input:
+        return dict(existing)
+    serialized: Dict[str, Dict[str, Any]] = {}
+    for symbol, spec in existing.items():
+        try:
+            symbol_key = str(symbol or "").strip().upper()
+        except Exception:
+            continue
+        if not symbol_key:
+            continue
+        serialized[symbol_key] = {
+            "min_notional": str(spec.min_notional),
+            "step_size": str(spec.step_size),
+            "tick_size": str(spec.tick_size),
+        }
+    enriched = _build_symbol_specs(serialized, cli_input)
+    for symbol, spec in existing.items():
+        try:
+            symbol_key = str(symbol or "").strip().upper()
+        except Exception:
+            continue
+        if not symbol_key or symbol_key in enriched:
+            continue
+        enriched[symbol_key] = spec
+    return enriched
+
+
+def _turnover_caps_block(payload: Any) -> Dict[str, float]:
+    if not isinstance(payload, Mapping):
+        return {}
+    sanitized: Dict[str, float] = {}
+    for key in ("bps", "usd", "daily_bps", "daily_usd"):
+        raw_value = payload.get(key)
+        try:
+            numeric = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric) or numeric < 0.0:
+            numeric = 0.0
+        sanitized[key] = numeric
+    return sanitized
+
+
+def _turnover_caps(payload: Any) -> Dict[str, Dict[str, float]]:
+    if not isinstance(payload, Mapping):
+        return {}
+    result: Dict[str, Dict[str, float]] = {}
+    for key in ("per_symbol", "portfolio"):
+        block = _turnover_caps_block(payload.get(key))
+        if block:
+            result[key] = block
+    return result
+
+
+def _materialize_mapping_static(value: Any) -> Dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+
+    materialized: Dict[str, Any] = {}
+    for attr in ("model_dump", "dict"):
+        getter = getattr(value, attr, None)
+        if not callable(getter):
+            continue
+        try:
+            data = getter()
+        except Exception:
+            continue
+        if isinstance(data, Mapping):
+            materialized.update(dict(data))
+            break
+
+    extras = getattr(value, "__dict__", None)
+    if isinstance(extras, Mapping):
+        for key, extra_value in extras.items():
+            if not key or key.startswith("_") or key == "__pydantic_fields_set__":
+                continue
+            materialized.setdefault(key, extra_value)
+
+    return materialized
+
+
+def _extract_spec_decimal_static(
+    payload: Mapping[str, Any], keys: Iterable[str], depth: int = 0
+) -> Decimal:
+    if depth > 4:
+        return Decimal("0")
+    key_set = {str(key).strip().lower() for key in keys if str(key).strip()}
+    for raw_key, raw_value in payload.items():
+        key_text = str(raw_key).strip().lower()
+        if key_text in key_set and raw_value is not None:
+            try:
+                value = Decimal(str(raw_value))
+            except Exception:
+                value = Decimal("0")
+            if value < Decimal("0"):
+                return Decimal("0")
+            return value
+    for raw_value in payload.values():
+        if isinstance(raw_value, Mapping):
+            value = _extract_spec_decimal_static(raw_value, keys, depth + 1)
+            if value != Decimal("0"):
+                return value
+        elif isinstance(raw_value, (list, tuple, set)):
+            for item in raw_value:
+                if isinstance(item, Mapping):
+                    value = _extract_spec_decimal_static(item, keys, depth + 1)
+                    if value != Decimal("0"):
+                        return value
+    return Decimal("0")
+
+
+def _normalize_symbol_specs_payload(
+    payload: Optional[Mapping[str, Mapping[str, Any]]]
+) -> Dict[str, SymbolSpec]:
+    specs: Dict[str, SymbolSpec] = {}
+    if not payload:
+        return specs
+    for raw_symbol, raw_spec in payload.items():
+        try:
+            symbol_text = str(raw_symbol or "").strip().upper()
+        except Exception:
+            continue
+        if not symbol_text:
+            continue
+        spec_payload = _materialize_mapping_static(raw_spec)
+        if not spec_payload:
+            continue
+        min_notional = _extract_spec_decimal_static(
+            spec_payload,
+            ("min_notional", "minNotional", "MIN_NOTIONAL"),
+        )
+        step_size = _extract_spec_decimal_static(
+            spec_payload,
+            ("step_size", "stepSize", "lot_step", "LOT_STEP"),
+        )
+        tick_size = _extract_spec_decimal_static(
+            spec_payload,
+            ("tick_size", "tickSize", "price_tick", "PRICE_TICK"),
+        )
+        specs[symbol_text] = SymbolSpec(
+            min_notional=min_notional,
+            step_size=step_size,
+            tick_size=tick_size,
+        )
+    return specs
+
+
 @dataclass
 class PortfolioState:
     symbol: str
@@ -135,6 +486,16 @@ class PortfolioState:
 
     def with_bar(self, bar: Bar, price: Decimal) -> "PortfolioState":
         return replace(self, price=price, ts=bar.ts)
+
+    def with_intrabar(
+        self,
+        *,
+        ts: Optional[int] = None,
+        price: float | Decimal | None = None,
+    ) -> "PortfolioState":
+        updated_price = self.price if price is None else _as_decimal(price)
+        updated_ts = self.ts if ts is None else int(ts)
+        return replace(self, price=updated_price, ts=updated_ts)
 
 
 @dataclass
@@ -788,30 +1149,7 @@ class BarExecutor(TradeExecutor):
         return {}
 
     def _materialize_mapping(self, value: Any) -> Dict[str, Any]:
-        if isinstance(value, Mapping):
-            return dict(value)
-
-        materialized: Dict[str, Any] = {}
-        for attr in ("model_dump", "dict"):
-            getter = getattr(value, attr, None)
-            if not callable(getter):
-                continue
-            try:
-                data = getter()
-            except Exception:
-                continue
-            if isinstance(data, Mapping):
-                materialized.update(dict(data))
-                break
-
-        extras = getattr(value, "__dict__", None)
-        if isinstance(extras, Mapping):
-            for key, extra_value in extras.items():
-                if not key or key.startswith("_") or key == "__pydantic_fields_set__":
-                    continue
-                materialized.setdefault(key, extra_value)
-
-        return materialized
+        return _materialize_mapping_static(value)
 
     def _coerce_float(self, value: Any) -> Optional[float]:
         if value is None:
@@ -824,63 +1162,12 @@ class BarExecutor(TradeExecutor):
     def _normalize_symbol_specs(
         self, payload: Optional[Mapping[str, Mapping[str, Any]]]
     ) -> Dict[str, SymbolSpec]:
-        specs: Dict[str, SymbolSpec] = {}
-        if not payload:
-            return specs
-        for raw_symbol, raw_spec in payload.items():
-            symbol_text = str(raw_symbol or "").strip().upper()
-            if not symbol_text:
-                continue
-            spec_payload = self._materialize_mapping(raw_spec)
-            if not spec_payload:
-                continue
-            min_notional = self._extract_spec_decimal(
-                spec_payload,
-                ("min_notional", "minNotional", "MIN_NOTIONAL"),
-            )
-            step_size = self._extract_spec_decimal(
-                spec_payload,
-                ("step_size", "stepSize", "lot_step", "LOT_STEP"),
-            )
-            tick_size = self._extract_spec_decimal(
-                spec_payload,
-                ("tick_size", "tickSize", "price_tick", "PRICE_TICK"),
-            )
-            specs[symbol_text] = SymbolSpec(
-                min_notional=min_notional,
-                step_size=step_size,
-                tick_size=tick_size,
-            )
-        return specs
+        return _normalize_symbol_specs_payload(payload)
 
     def _extract_spec_decimal(
         self, payload: Mapping[str, Any], keys: Iterable[str], depth: int = 0
     ) -> Decimal:
-        if depth > 4:
-            return Decimal("0")
-        key_set = {str(key).strip().lower() for key in keys if str(key).strip()}
-        for raw_key, raw_value in payload.items():
-            key_text = str(raw_key).strip().lower()
-            if key_text in key_set and raw_value is not None:
-                try:
-                    value = Decimal(str(raw_value))
-                except Exception:
-                    value = Decimal("0")
-                if value < Decimal("0"):
-                    return Decimal("0")
-                return value
-        for raw_value in payload.values():
-            if isinstance(raw_value, Mapping):
-                value = self._extract_spec_decimal(raw_value, keys, depth + 1)
-                if value != Decimal("0"):
-                    return value
-            elif isinstance(raw_value, (list, tuple, set)):
-                for item in raw_value:
-                    if isinstance(item, Mapping):
-                        value = self._extract_spec_decimal(item, keys, depth + 1)
-                        if value != Decimal("0"):
-                            return value
-        return Decimal("0")
+        return _extract_spec_decimal_static(payload, keys, depth)
 
     def _attach_execution_meta(self, order: Order, meta: Mapping[str, Any]) -> None:
         try:
