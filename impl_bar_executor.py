@@ -754,6 +754,10 @@ class BarExecutor(TradeExecutor):
                     decision_signal[key] = numeric_value
                     continue
                 decision_signal[key] = value
+            if adv_quote is None:
+                adv_from_economics = self._coerce_float(economics_block.get("adv_quote"))
+                if adv_from_economics is not None:
+                    adv_quote = adv_from_economics
         if normalized_flag:
             decision_signal["normalized"] = True
         if normalization_data:

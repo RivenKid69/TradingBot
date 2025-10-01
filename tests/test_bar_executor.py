@@ -263,6 +263,45 @@ def test_bar_executor_includes_decision_costs():
     assert decision["impact_mode"] == "model"
 
 
+def test_bar_executor_adv_fallback_from_economics():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        cost_config=SpotCostConfig(
+            taker_fee_bps=2.0,
+            half_spread_bps=3.0,
+            impact=SpotImpactConfig(sqrt_coeff=15.0, linear_coeff=2.0),
+        ),
+        safety_margin_bps=0.0,
+        default_equity_usd=2000.0,
+    )
+
+    order = Order(
+        ts=101,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(101, 20000.0),
+            "payload": {
+                "target_weight": 0.25,
+                "edge_bps": 20.0,
+                "economics": {"adv_quote": 1_000_000.0},
+            },
+        },
+    )
+
+    report = executor.execute(order)
+
+    decision = report.meta["decision"]
+    assert decision["adv_quote"] == pytest.approx(1_000_000.0)
+    assert decision["impact_mode"] == "model"
+    assert decision["impact"] > 0.0
+    assert report.meta["adv_quote"] == pytest.approx(1_000_000.0)
+
+
 def test_bar_executor_missing_adv_sets_impact_mode_none():
     executor = BarExecutor(
         run_id="test",
