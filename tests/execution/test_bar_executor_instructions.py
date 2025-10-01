@@ -114,7 +114,8 @@ def test_build_instructions_twap_participation(base_state: PortfolioState) -> No
 
     assert reason is None
     assert len(instructions) == 4  # participation forces additional slices
-    assert all(instr.slices_total == 4 for instr in instructions)
+    assert all(instr.slices_total == len(instructions) for instr in instructions)
+    assert all(instr.slice_index == idx for idx, instr in enumerate(instructions))
     expected_ts = [bar.ts + i * 60000 for i in range(4)]
     assert [instr.ts for instr in instructions] == expected_ts
     assert final_weight == pytest.approx(state.weight + 0.4)
@@ -169,3 +170,35 @@ def test_build_instructions_quantizes_step_size(base_state: PortfolioState) -> N
     expected_notional = float(Decimal("1.2") * price)
     assert final_weight == pytest.approx(state.weight + expected_delta)
     assert total_notional == pytest.approx(expected_notional)
+
+
+def test_build_instructions_twap_skips_zero_quantity_slices(base_state: PortfolioState) -> None:
+    executor = BarExecutor(
+        default_equity_usd=base_state.equity_usd,
+        symbol_specs={"BTCUSDT": {"step_size": "0.7"}},
+    )
+    bar = make_bar(ts=20, price="100")
+    state = base_state.with_bar(bar, bar.close)
+
+    payload = {"delta_weight": 0.1, "twap": {"parts": 3, "interval_ms": 120000}}
+
+    instructions, final_weight, total_notional, _, reason = executor._build_instructions(
+        state=state,
+        target_weight=state.weight + 0.1,
+        delta_weight=0.1,
+        payload=payload,
+        bar=bar,
+        adv_quote=None,
+    )
+
+    assert reason is None
+    # Only the final slice should execute due to rounding
+    assert len(instructions) == 1
+    instruction = instructions[0]
+    assert instruction.slice_index == 0
+    assert instruction.slices_total == 1
+    assert instruction.ts == bar.ts + 2 * 120000
+    assert instruction.quantity == Decimal("0.7")
+    assert total_notional == pytest.approx(float(Decimal("0.7") * bar.close))
+    expected_delta = float((Decimal("0.7") * bar.close) / Decimal(str(state.equity_usd)))
+    assert final_weight == pytest.approx(state.weight + expected_delta)

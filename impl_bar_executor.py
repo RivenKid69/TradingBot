@@ -1463,18 +1463,19 @@ class BarExecutor(TradeExecutor):
             if interval_ms and bar is not None:
                 ts = int(bar.ts + idx * interval_ms)
             total_notional_dec += executed_notional
-            instructions.append(
-                RebalanceInstruction(
-                    symbol=state.symbol,
-                    ts=ts,
-                    slice_index=idx,
-                    slices_total=parts,
-                    target_weight=new_weight,
-                    delta_weight=adjusted_delta,
-                    notional_usd=float(executed_notional),
-                    quantity=quantized_qty,
+            if quantized_qty > Decimal("0"):
+                instructions.append(
+                    RebalanceInstruction(
+                        symbol=state.symbol,
+                        ts=ts,
+                        slice_index=idx,
+                        slices_total=parts,
+                        target_weight=new_weight,
+                        delta_weight=adjusted_delta,
+                        notional_usd=float(executed_notional),
+                        quantity=quantized_qty,
+                    )
                 )
-            )
             accumulated_weight = new_weight
             if quantized_qty > Decimal("0"):
                 signed_qty = quantized_qty
@@ -1490,6 +1491,19 @@ class BarExecutor(TradeExecutor):
             tolerance = Decimal("1e-9")
             if total_notional_dec + tolerance < min_notional:
                 return [], float(state.weight), 0.0, current_quantity, "below_min_notional"
+
+        if instructions:
+            slices_total = len(instructions)
+            normalized_instructions: List[RebalanceInstruction] = []
+            for normalized_idx, instruction in enumerate(instructions):
+                normalized_instructions.append(
+                    replace(
+                        instruction,
+                        slice_index=normalized_idx,
+                        slices_total=slices_total,
+                    )
+                )
+            instructions = normalized_instructions
 
         return instructions, accumulated_weight, total_notional, accumulated_quantity, None
 
