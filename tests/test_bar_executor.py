@@ -69,6 +69,17 @@ def test_decide_spot_trade_safety_margin_blocks_trade():
     assert metrics.impact_mode == "none"
 
 
+def test_decide_spot_trade_prefers_signal_turnover_usd():
+    state = PortfolioState(symbol="BTCUSDT", weight=0.0, equity_usd=0.0)
+    cfg = SpotCostConfig()
+    signal = {"target_weight": 0.5, "edge_bps": 10.0, "turnover_usd": 123.0}
+
+    metrics = decide_spot_trade(signal, state, cfg, adv_quote=None, safety_margin_bps=0.0)
+
+    assert metrics.turnover_usd == pytest.approx(123.0)
+    assert metrics.act_now is True
+
+
 def test_bar_executor_target_weight_single_instruction():
     executor = BarExecutor(
         run_id="test",

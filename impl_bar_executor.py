@@ -181,7 +181,23 @@ def decide_spot_trade(
         target_weight = portfolio_state.weight
 
     delta_weight = target_weight - portfolio_state.weight
-    turnover_usd = abs(delta_weight) * float(portfolio_state.equity_usd)
+
+    turnover_override = signal.get("turnover_usd")
+    turnover_usd: Optional[float] = None
+    if turnover_override is not None:
+        try:
+            candidate = float(turnover_override)
+        except (TypeError, ValueError):
+            candidate = None
+        if (
+            candidate is not None
+            and math.isfinite(candidate)
+            and candidate >= 0.0
+        ):
+            turnover_usd = candidate
+
+    if turnover_usd is None:
+        turnover_usd = abs(delta_weight) * float(portfolio_state.equity_usd)
 
     base_cost = float(cost_config.taker_fee_bps) + float(cost_config.half_spread_bps)
 
