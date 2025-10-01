@@ -959,7 +959,7 @@ def _configure_adv_runtime(
             "%s: ExecutionSimulator lacks set_adv_store(); ADV runtime disabled",
             context,
         )
-        return None
+        return None, bar_capacity_cfg
     capacity_fraction = getattr(adv_cfg, "capacity_fraction", None)
     bars_override = getattr(adv_cfg, "bars_per_day_override", None)
     extra_block = getattr(adv_cfg, "extra", None)
@@ -992,14 +992,17 @@ def _configure_adv_runtime(
             )
         else:
             _log_adv_runtime_warnings(
-                existing_store, getattr(sim, "symbol", None), adv_cfg, context
+                existing_store,
+                getattr(sim, "symbol", None),
+                adv_cfg,
+                context=context,
             )
         return existing_store, bar_capacity_cfg
     try:
         store = ADVStore(adv_cfg)
     except Exception:
         logger.exception("%s: failed to initialise ADV store from config", context)
-        return None
+        return None, bar_capacity_cfg
     try:
         set_store(
             store,
@@ -1010,7 +1013,12 @@ def _configure_adv_runtime(
     except Exception:
         logger.exception("%s: failed to attach ADV store to simulator", context)
         return None, bar_capacity_cfg
-    _log_adv_runtime_warnings(store, getattr(sim, "symbol", None), adv_cfg, context)
+    _log_adv_runtime_warnings(
+        store,
+        getattr(sim, "symbol", None),
+        adv_cfg,
+        context=context,
+    )
     return store, bar_capacity_cfg
 
 
