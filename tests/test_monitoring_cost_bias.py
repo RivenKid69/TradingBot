@@ -147,3 +147,51 @@ def test_bar_execution_pruning_uses_bar_timestamp() -> None:
     assert not agg._bar_events["1m"]
     assert agg._bar_events["5m"], "expected longer window to retain event"
     assert agg._bar_events["5m"][0]["ts"] == 0
+
+
+def test_worker_ignores_empty_bar_snapshot() -> None:
+    thresholds = MonitoringThresholdsConfig()
+    cfg = MonitoringConfig(enabled=True, thresholds=thresholds)
+    alerts = DummyAlerts()
+    agg = MonitoringAggregator(cfg, alerts)
+
+    class DummyMetrics:
+        def reset_symbol(self, symbol: str) -> None:  # pragma: no cover - noop
+            pass
+
+    class DummyFeaturePipe:
+        def __init__(self) -> None:
+            self.metrics = DummyMetrics()
+            self.signal_quality: dict[str, object] = {}
+
+    class DummyExecutor:
+        def __init__(self, snapshot: dict[str, object]) -> None:
+            self.monitoring_snapshot = snapshot
+
+    worker = _Worker(
+        fp=DummyFeaturePipe(),
+        policy=object(),
+        logger=logging.getLogger("test"),
+        executor=DummyExecutor({}),
+        enforce_closed_bars=False,
+        pipeline_cfg=PipelineConfig(enabled=False),
+        monitoring=agg,
+        execution_mode="bar",
+        rest_candidates=[],
+    )
+
+    runtime_snapshot = worker._extract_monitoring_snapshot(worker._executor)
+    assert worker._extract_bar_execution_metrics(runtime_snapshot) is None
+
+    bar = Bar(
+        ts=1_000_000,
+        symbol="BTCUSDT",
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal("1"),
+    )
+
+    worker.process(bar)
+
+    assert not agg._bar_events["1m"], "expected empty snapshot to be ignored"
