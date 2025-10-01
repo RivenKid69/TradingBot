@@ -3047,16 +3047,6 @@ class _Worker:
                 cached = self._symbol_equity.get(sym_key)
                 if cached is not None and cached > 0.0:
                     cached_equity = float(cached)
-        equity = self._portfolio_equity
-        if equity is not None:
-            try:
-                equity_val = float(equity)
-            except (TypeError, ValueError):
-                equity_val = None
-            else:
-                if math.isfinite(equity_val) and equity_val > 0.0:
-                    return equity_val
-
         mappings: list[Mapping[str, Any]] = []
         meta = getattr(order, "meta", None) if order is not None else None
         if isinstance(meta, MappingABC):
@@ -3086,6 +3076,15 @@ class _Worker:
             if not math.isfinite(parsed) or parsed <= 0.0:
                 continue
             return float(parsed)
+        equity = self._portfolio_equity
+        if equity is not None:
+            try:
+                equity_val = float(equity)
+            except (TypeError, ValueError):
+                equity_val = None
+            else:
+                if math.isfinite(equity_val) and equity_val > 0.0:
+                    return equity_val
         return cached_equity
 
     def _mutate_order_payload(self, order: Any, updates: Mapping[str, Any]) -> None:

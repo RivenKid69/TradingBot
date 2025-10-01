@@ -116,3 +116,51 @@ def test_daily_turnover_limits_infer_missing_turnover() -> None:
     assert decision_meta["turnover_usd"] == pytest.approx(1_000.0)
     assert decision_meta["daily_turnover_clamped"] is True
 
+
+def test_order_equity_override_used_for_weight_and_turnover() -> None:
+    symbol = "BTCUSDT"
+    caps = ResolvedTurnoverCaps(
+        per_symbol=ResolvedTurnoverLimit(daily_usd=60.0),
+        portfolio=ResolvedTurnoverLimit(daily_usd=60.0),
+    )
+    executor = SimpleNamespace(turnover_caps=SimpleNamespace(resolve=lambda: caps))
+    worker = _Worker(
+        fp=SimpleNamespace(),
+        policy=SimpleNamespace(),
+        logger=logging.getLogger("test_turnover_equity_override"),
+        executor=executor,
+        guards=None,
+        enforce_closed_bars=True,
+        throttle_cfg=None,
+        execution_mode="bar",
+        portfolio_equity=1_000_000.0,
+    )
+    worker._last_prices[symbol] = 1.0
+
+    first_order = SimpleNamespace(
+        symbol=symbol,
+        meta={"payload": {"target_weight": 0.5, "equity_usd": 1_000.0}},
+    )
+    worker._commit_exposure(first_order)
+
+    assert worker._positions[symbol] == pytest.approx(500.0)
+    assert worker._symbol_equity.get(symbol) == pytest.approx(1_000.0)
+
+    second_order = SimpleNamespace(
+        symbol=symbol,
+        meta={"payload": {"target_weight": 0.6, "equity_usd": 1_000.0}},
+    )
+    adjusted = worker._apply_daily_turnover_limits([second_order], symbol, ts_ms=1)
+    assert adjusted == [second_order]
+
+    payload = worker._extract_signal_payload(second_order)
+    assert payload["target_weight"] == pytest.approx(0.56)
+
+    turnover_info = second_order.meta["daily_turnover"]
+    assert turnover_info["requested_usd"] == pytest.approx(100.0)
+    assert turnover_info["executed_usd"] == pytest.approx(60.0)
+
+    decision_meta = second_order.meta["decision"]
+    assert decision_meta["turnover_usd"] == pytest.approx(60.0)
+    assert decision_meta.get("daily_turnover_clamped", False) is True
+
