@@ -840,6 +840,7 @@ class BarExecutor(TradeExecutor):
                 payload=payload,
                 bar=bar,
                 adv_quote=adv_quote,
+                turnover_override=raw_turnover_usd,
             )
             executed_turnover = float(executed_turnover_usd)
             cap_limit = caps_eval.get("effective_cap")
@@ -1390,14 +1391,41 @@ class BarExecutor(TradeExecutor):
         payload: Mapping[str, Any],
         bar: Optional[Bar],
         adv_quote: Optional[float],
+        turnover_override: Optional[float] = None,
     ) -> tuple[List[RebalanceInstruction], float, float, Decimal, Optional[str]]:
         current_quantity = state.quantity
         if not isinstance(current_quantity, Decimal):
             current_quantity = Decimal(str(current_quantity or "0"))
 
+        base_weight = float(state.weight)
+        target_weight = float(target_weight)
+        delta_weight = float(delta_weight)
         requested_notional = abs(delta_weight) * float(state.equity_usd)
         if requested_notional <= 0.0:
             return [], float(state.weight), 0.0, current_quantity, None
+
+        turnover_limit = None
+        if turnover_override is not None:
+            try:
+                turnover_limit = float(turnover_override)
+            except (TypeError, ValueError):
+                turnover_limit = None
+        if turnover_limit is not None:
+            if not math.isfinite(turnover_limit) or turnover_limit <= 0.0:
+                return [], float(state.weight), 0.0, current_quantity, None
+            if turnover_limit < requested_notional:
+                if requested_notional <= 0.0:
+                    return [], float(state.weight), 0.0, current_quantity, None
+                scale_fraction = turnover_limit / requested_notional
+                scale_fraction = max(0.0, min(1.0, scale_fraction))
+                scaled_delta = delta_weight * scale_fraction
+                scaled_target = base_weight + scaled_delta
+                scaled_target = min(max(scaled_target, 0.0), 1.0)
+                delta_weight = scaled_target - base_weight
+                target_weight = scaled_target
+                requested_notional = abs(delta_weight) * float(state.equity_usd)
+                if requested_notional <= 0.0:
+                    return [], float(state.weight), 0.0, current_quantity, None
 
         spec = self._symbol_specs.get(state.symbol.upper())
         min_notional = spec.min_notional if spec is not None else Decimal("0")
