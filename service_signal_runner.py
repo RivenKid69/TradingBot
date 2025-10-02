@@ -563,6 +563,7 @@ def _extract_bar_initial_weights_from_state(state: Any) -> Dict[str, float] | No
 
 class _Worker:
     _TURNOVER_KEYS = ("turnover_usd", "turnover", "notional_usd")
+    _ADV_KEYS = ("adv_quote", "adv_usd")
 
     def __init__(
         self,
@@ -1252,28 +1253,65 @@ class _Worker:
             if value is not None:
                 candidates.append(value)
 
+        adv_keys = {str(key).lower() for key in self._ADV_KEYS}
+
+        def _collect_from_mapping(candidate: Any) -> None:
+            if candidate is None:
+                return
+            queue: deque[Any] = deque([candidate])
+            visited: set[int] = set()
+            while queue:
+                item = queue.popleft()
+                if isinstance(item, MappingABC):
+                    mapping_item: Mapping[str, Any] = item
+                elif hasattr(item, "__dict__"):
+                    try:
+                        mapping_view = vars(item)
+                    except Exception:
+                        mapping_view = None
+                    if not isinstance(mapping_view, MappingABC):
+                        continue
+                    mapping_item = mapping_view
+                elif isinstance(item, SequenceABC) and not isinstance(item, (str, bytes, bytearray)):
+                    for elem in item:
+                        if elem is not None:
+                            queue.append(elem)
+                    continue
+                else:
+                    continue
+                ident = id(mapping_item)
+                if ident in visited:
+                    continue
+                visited.add(ident)
+                for key, value in mapping_item.items():
+                    key_normalized = str(key).lower()
+                    if key_normalized in adv_keys and value is not None:
+                        _collect(value)
+                    if value is None:
+                        continue
+                    if isinstance(value, MappingABC) or (
+                        isinstance(value, SequenceABC)
+                        and not isinstance(value, (str, bytes, bytearray))
+                    ) or hasattr(value, "__dict__"):
+                        queue.append(value)
+
         if isinstance(payload, MappingABC):
-            _collect(payload.get("adv_quote"))
-            economics_block = payload.get("economics")
-            if isinstance(economics_block, MappingABC):
-                _collect(economics_block.get("adv_quote"))
-            nested_payload_adv = self._find_in_mapping(payload, ("adv_quote",))
-            if nested_payload_adv is not None:
-                _collect(nested_payload_adv)
+            _collect_from_mapping(payload)
 
         if isinstance(meta, MappingABC):
-            _collect(meta.get("adv_quote"))
-            nested_meta_adv = self._find_in_mapping(meta, ("adv_quote",))
-            if nested_meta_adv is not None:
-                _collect(nested_meta_adv)
+            _collect_from_mapping(meta)
 
         if order is not None:
-            _collect(getattr(order, "adv_quote", None))
+            for key in self._ADV_KEYS:
+                _collect(getattr(order, key, None))
             raw_meta = getattr(order, "meta", None)
-            if raw_meta is not None and raw_meta is not meta and isinstance(raw_meta, MappingABC):
-                nested_order_meta = self._find_in_mapping(raw_meta, ("adv_quote",))
-                if nested_order_meta is not None:
-                    _collect(nested_order_meta)
+            if raw_meta is not None and raw_meta is not meta:
+                raw_meta_mapping: Mapping[str, Any] | None
+                if isinstance(raw_meta, MappingABC):
+                    raw_meta_mapping = raw_meta
+                else:
+                    raw_meta_mapping = self._materialize_mapping(raw_meta)
+                _collect_from_mapping(raw_meta_mapping)
 
         for value in candidates:
             candidate = self._coerce_float(value)
