@@ -133,9 +133,10 @@ def test_build_envelope_payload_extracts_adv_quote() -> None:
     assert payload["economics"]["adv_quote"] == pytest.approx(adv_quote)
 
 
-def test_build_envelope_payload_does_not_fall_back_to_cap_usd() -> None:
+def test_build_envelope_payload_meta_cap_only_leaves_adv_none() -> None:
     worker = _make_worker()
-    order = SimpleNamespace(meta={"cap_usd": 1_000.0}, payload={"target_weight": 0.1})
+    order_payload = {"target_weight": 0.1}
+    order = SimpleNamespace(meta={"cap_usd": 1_000.0}, payload=order_payload)
 
     payload, _, adv_quote = worker._build_envelope_payload(order, "BTCUSDT")
 
