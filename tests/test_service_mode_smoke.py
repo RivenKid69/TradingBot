@@ -113,6 +113,31 @@ def test_service_signal_runner_order_mode_instantiation(monkeypatch, tmp_path):
     assert runner._execution_mode == "order"
 
 
+def test_service_signal_runner_execution_mode_normalization(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    module = importlib.import_module("service_signal_runner")
+
+    class DummyAdapter:
+        sim = None
+        source = None
+        market_data = None
+        ws = None
+
+    cfg = module.SignalRunnerConfig(logs_dir=str(tmp_path / "logs"), run_id="test-normalized")
+    run_cfg = SimpleNamespace(execution=SimpleNamespace(mode=" bar "), slippage_regime_updates=False)
+
+    runner = module.ServiceSignalRunner(
+        DummyAdapter(),
+        object(),
+        lambda *args, **kwargs: [],
+        cfg=cfg,
+        run_config=run_cfg,
+    )
+
+    assert runner._execution_mode == "bar"
+
+
 def test_service_signal_runner_bar_mode_inline_execution(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
 
