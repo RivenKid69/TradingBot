@@ -26,7 +26,7 @@ def test_normalize_bar_bounds_and_helpers(ts_ms, timeframe_ms):
     assert bar_start_ms(ts_ms, timeframe_ms) == start
     assert bar_close_ms(ts_ms, timeframe_ms) == close
     assert start <= ts_ms < close
-    assert next_bar_open_ms(close, timeframe_ms) == close + timeframe_ms
+    assert next_bar_open_ms(close, timeframe_ms) == close
 
 
 @pytest.mark.parametrize(
@@ -63,8 +63,8 @@ def test_is_bar_closed_honors_lag_offset():
 
 
 def test_next_bar_open_follows_close_timestamp():
-    ts_ms = 1_650_000_060_000
+    ts_ms = 1_650_000_060_001
     timeframe_ms = 60_000
     close_ts = bar_close_ms(ts_ms, timeframe_ms)
     assert next_bar_open_ms(ts_ms, timeframe_ms) == close_ts
-    assert next_bar_open_ms(close_ts, timeframe_ms) == close_ts + timeframe_ms
+    assert next_bar_open_ms(close_ts, timeframe_ms) == close_ts

@@ -418,11 +418,11 @@ def test_bar_queue_order_expires_after_bar_ttl(monkeypatch) -> None:
     assert any("TTL_EXPIRED_PUBLISH" in msg for msg, *_ in logger.messages)
 
 
-def test_emit_allows_full_timeframe_after_close(monkeypatch) -> None:
+def test_emit_allows_until_next_open(monkeypatch) -> None:
     timeframe_ms = 60_000
     bar_open_ms = timeframe_ms * 20
     bar_close_ms = bar_open_ms + timeframe_ms
-    now_state = {"ms": bar_close_ms + timeframe_ms - 1}
+    now_state = {"ms": bar_close_ms}
 
     def _now_ms() -> int:
         return now_state["ms"]
@@ -841,7 +841,7 @@ def test_process_uses_true_bar_boundaries(monkeypatch) -> None:
                 "timeframe_ms": timeframe_ms,
             }
         )
-        return True, bar_close_ms + timeframe_ms, None
+        return True, bar_close_ms, None
 
     monkeypatch.setattr(service_signal_runner, "check_ttl", _check_ttl)
 

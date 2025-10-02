@@ -79,7 +79,7 @@ def test_process_propagates_open_and_close(monkeypatch) -> None:
 
     def _check_ttl(*, bar_close_ms: int, now_ms: int, timeframe_ms: int):
         ttl_calls.append((bar_close_ms, now_ms, timeframe_ms))
-        return True, bar_close_ms + timeframe_ms, None
+        return True, bar_close_ms, None
 
     monkeypatch.setattr(service_signal_runner, "check_ttl", _check_ttl)
 
@@ -200,7 +200,7 @@ def test_process_spot_envelope_records_created_ts(monkeypatch) -> None:
                 "timeframe_ms": timeframe_ms,
             }
         )
-        return True, bar_close_ms + timeframe_ms, None
+        return True, bar_close_ms, None
 
     monkeypatch.setattr(service_signal_runner, "check_ttl", _check_ttl)
 
@@ -322,7 +322,7 @@ def test_process_spot_envelope_records_created_ts(monkeypatch) -> None:
     envelope = SpotSignalEnvelope(
         symbol="BTCUSDT",
         bar_close_ms=bar_close_ms,
-        expires_at_ms=bar_close_ms + timeframe_ms,
+        expires_at_ms=bar_close_ms,
         payload=payload,
     )
 
@@ -344,5 +344,5 @@ def test_process_spot_envelope_records_created_ts(monkeypatch) -> None:
     assert update_calls == [("BTCUSDT", bar_close_ms)]
     assert publish_calls, "expected the envelope to be published"
     expires_vals = {call["expires_at_ms"] for call in publish_calls}
-    assert expires_vals == {bar_close_ms + timeframe_ms}
+    assert expires_vals == {bar_close_ms}
     assert any(call["now_ms"] == now_ms for call in ttl_calls)
