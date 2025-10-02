@@ -131,6 +131,49 @@ def test_bar_executor_target_weight_single_instruction():
     assert pos.qty == Decimal("0.05")
 
 
+def test_bar_executor_reduces_weight_after_price_increase():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        min_rebalance_step=0.0,
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1000.0,
+    )
+
+    open_order = Order(
+        ts=1,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(1, 10000.0),
+            "payload": {"target_weight": 0.5, "edge_bps": 50.0},
+        },
+    )
+    first_report = executor.execute(open_order)
+    assert first_report.meta["instructions"]
+
+    rebalance_order = Order(
+        ts=2,
+        symbol="BTCUSDT",
+        side=Side.SELL,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(2, 12000.0),
+            "payload": {"target_weight": 0.5, "edge_bps": 50.0},
+        },
+    )
+
+    second_report = executor.execute(rebalance_order)
+    instructions = second_report.meta["instructions"]
+    assert instructions, "expected a sell instruction to maintain target weight"
+    assert instructions[0]["delta_weight"] == pytest.approx(-0.1, rel=1e-6)
+
+
 def test_bar_executor_preserves_sell_side_in_exec_report():
     executor = BarExecutor(
         run_id="test",

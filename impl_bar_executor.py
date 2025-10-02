@@ -724,12 +724,15 @@ class BarExecutor(TradeExecutor):
         else:
             price = state.price
 
+        state = self._mark_to_market_weight(state, price)
+
         if price is None or price <= Decimal("0"):
             skip_reason = "no_price"
 
         equity_override = self._coerce_float(meta_map.get("equity_usd"))
         if equity_override is not None:
             state = replace(state, equity_usd=equity_override)
+            state = self._mark_to_market_weight(state, price)
 
         target_weight, mode, delta_weight = self._resolve_target_weight(state, payload)
         requested_target_weight = target_weight
@@ -1153,6 +1156,46 @@ class BarExecutor(TradeExecutor):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    def _mark_to_market_weight(
+        self, state: PortfolioState, price_value: Decimal | float | None
+    ) -> PortfolioState:
+        if price_value is None:
+            return state
+        try:
+            price = price_value if isinstance(price_value, Decimal) else _as_decimal(price_value)
+        except Exception:
+            return state
+        if price <= Decimal("0"):
+            return state
+
+        quantity_value = state.quantity
+        if not isinstance(quantity_value, Decimal):
+            try:
+                quantity_value = Decimal(str(quantity_value or "0"))
+            except Exception:
+                return state
+
+        if quantity_value == Decimal("0"):
+            if state.weight == 0.0:
+                return state
+            return replace(state, weight=0.0)
+
+        try:
+            equity_dec = _as_decimal(state.equity_usd)
+        except Exception:
+            return state
+        if equity_dec <= Decimal("0"):
+            return state
+
+        notional = quantity_value * price
+        if notional <= Decimal("0"):
+            new_weight = 0.0
+        else:
+            new_weight = _clamp_01(float(notional / equity_dec))
+        if new_weight == state.weight:
+            return state
+        return replace(state, weight=new_weight)
+
     def _normalize_symbol_key(self, symbol: Any) -> str:
         if symbol is None:
             return ""
