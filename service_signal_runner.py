@@ -5418,14 +5418,12 @@ class _Worker:
         open_timeframe_ms = self._bar_timeframe_ms
         if open_timeframe_ms <= 0:
             open_timeframe_ms = self._ws_dedup_timeframe_ms
-        if open_timeframe_ms <= 0 and ttl_timeframe_ms is not None:
+        if open_timeframe_ms <= 0 and ttl_timeframe_ms is not None and ttl_timeframe_ms > 0:
             open_timeframe_ms = ttl_timeframe_ms
         if open_timeframe_ms > 0:
             bar_open_ms = bar_close_ms - open_timeframe_ms
         else:
             bar_open_ms = bar_close_ms
-
-        ttl_bar_close_ms = bar_close_ms
 
         dedup_stage_cfg = self._pipeline_cfg.get("dedup") if self._pipeline_cfg else None
         dedup_enabled = self._ws_dedup_enabled and (
@@ -5786,7 +5784,7 @@ class _Worker:
                 except Exception:
                     pass
                 ok, expires_at_ms, _ = check_ttl(
-                    bar_close_ms=ttl_bar_close_ms,
+                    bar_close_ms=bar_close_ms,
                     now_ms=created_ts_ms,
                     timeframe_ms=ttl_timeframe_ms,
                 )
@@ -5796,7 +5794,7 @@ class _Worker:
                             "TTL_EXPIRED_BOUNDARY %s",
                             {
                                 "symbol": bar.symbol,
-                                "bar_close_ms": ttl_bar_close_ms,
+                                "bar_close_ms": bar_close_ms,
                                 "now_ms": created_ts_ms,
                                 "expires_at_ms": expires_at_ms,
                             },
