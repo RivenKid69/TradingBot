@@ -768,6 +768,10 @@ class _Worker:
         self._rest_backoff_until: Dict[str, float] = {}
         self._rest_backoff_step: Dict[str, float] = {}
         self._dispatch_stack: list[Any] = []
+        self._order_meta_sidecar: "weakref.WeakKeyDictionary[Any, Dict[str, Any]]" = (
+            weakref.WeakKeyDictionary()
+        )
+        self._order_meta_fallback: dict[int, tuple[weakref.ReferenceType[Any] | None, Dict[str, Any]]] = {}
         if self._state_enabled:
             self._seed_last_prices_from_state()
             self._load_exposure_state()
@@ -2023,19 +2027,114 @@ class _Worker:
                 mapping["available_delta"] = max(0.0, available_delta * scale)
         return mapping
 
-    def _ensure_order_meta(self, order_obj: Any) -> Dict[str, Any]:
+    def _order_meta_sidecar_lookup(self, order_obj: Any) -> Dict[str, Any] | None:
+        try:
+            sidecar_meta = self._order_meta_sidecar.get(order_obj)
+        except Exception:
+            sidecar_meta = None
+        if isinstance(sidecar_meta, dict):
+            return sidecar_meta
+        key = id(order_obj)
+        record = self._order_meta_fallback.get(key)
+        if record is None:
+            return None
+        ref, mapping = record
+        if ref is not None:
+            obj = ref()
+            if obj is None:
+                self._order_meta_fallback.pop(key, None)
+                return None
+            if obj is not order_obj:
+                return None
+        return mapping
+
+    def _attach_order_meta_sidecar(
+        self, order_obj: Any, meta_dict: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        try:
+            self._order_meta_sidecar[order_obj] = meta_dict
+            return meta_dict
+        except TypeError:
+            key = id(order_obj)
+            try:
+                self_ref = weakref.ref(self)
+
+                def _callback(ref: weakref.ReferenceType[Any]) -> None:
+                    inst = self_ref()
+                    if inst is not None:
+                        inst._order_meta_fallback.pop(key, None)
+
+                obj_ref: weakref.ReferenceType[Any] | None = weakref.ref(order_obj, _callback)
+            except TypeError:
+                obj_ref = None
+            if obj_ref is None:
+                self._order_meta_fallback[key] = (None, meta_dict)
+            else:
+                self._order_meta_fallback[key] = (obj_ref, meta_dict)
+            return meta_dict
+        except Exception:
+            return meta_dict
+
+    def _lookup_order_meta(self, order_obj: Any) -> Mapping[str, Any] | None:
         meta_val = getattr(order_obj, "meta", None)
-        if isinstance(meta_val, dict):
-            return meta_val
         if isinstance(meta_val, MappingABC):
-            meta_dict: Dict[str, Any] = dict(meta_val)
+            return meta_val
+        return self._order_meta_sidecar_lookup(order_obj)
+
+    def _get_order_meta(self, order_obj: Any) -> Mapping[str, Any] | None:
+        meta_val = self._lookup_order_meta(order_obj)
+        if isinstance(meta_val, MappingABC):
+            return meta_val
+        return None
+
+    def _ensure_order_meta(self, order_obj: Any) -> Dict[str, Any]:
+        existing_meta = self._lookup_order_meta(order_obj)
+        if isinstance(existing_meta, dict):
+            return existing_meta
+        if isinstance(existing_meta, MappingABC):
+            meta_dict = dict(existing_meta)
         else:
             meta_dict = {}
+        attached = False
         try:
             setattr(order_obj, "meta", meta_dict)
+            attached = True
         except Exception:
-            pass
-        return meta_dict if isinstance(meta_dict, dict) else {}
+            attached = False
+        if not attached:
+            meta_dict = self._attach_order_meta_sidecar(order_obj, meta_dict)
+        return meta_dict
+
+    def _store_created_ts(self, order_obj: Any, created_ts_ms: int) -> None:
+        stored = False
+        try:
+            setattr(order_obj, "created_ts_ms", created_ts_ms)
+            stored = True
+        except Exception:
+            stored = False
+        if not stored:
+            meta_map = self._ensure_order_meta(order_obj)
+            try:
+                meta_map["created_ts_ms"] = created_ts_ms
+            except Exception:
+                pass
+
+    def _extract_created_ts_ms(self, order_obj: Any) -> int:
+        candidates: list[Any] = [getattr(order_obj, "created_ts_ms", None)]
+        meta_map = self._get_order_meta(order_obj)
+        if isinstance(meta_map, MappingABC):
+            candidates.append(meta_map.get("created_ts_ms"))
+            candidates.append(meta_map.get("now_ms"))
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                parsed = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        return 0
 
     def _resolve_weight_targets(
         self,
@@ -2299,10 +2398,7 @@ class _Worker:
                 meta_map["adv_quote"] = adv_quote
             except Exception:
                 pass
-        try:
-            created_ts = int(getattr(order, "created_ts_ms", 0) or 0)
-        except (TypeError, ValueError):
-            created_ts = 0
+        created_ts = self._extract_created_ts_ms(order)
         try:
             base_bar_close_ms = int(bar_close_ms)
         except (TypeError, ValueError):
@@ -2572,35 +2668,16 @@ class _Worker:
             target, _, weight_reason = self._resolve_weight_targets(symbol, payload)
             if weight_reason:
                 payload.setdefault("reject_reason", weight_reason)
-            meta_raw = getattr(order, "meta", None)
-            meta_map: Dict[str, Any] | None = None
-            if isinstance(meta_raw, dict):
-                meta_map = meta_raw
-            elif isinstance(meta_raw, MappingABC):
-                meta_map = dict(meta_raw)
-                try:
-                    setattr(order, "meta", meta_map)
-                except Exception:
-                    pass
+            meta_map = self._ensure_order_meta(order)
             normalized_source: Any = None
             if "normalized" in payload:
                 normalized_source = payload.get("normalized")
-            elif meta_map is not None and "normalized" in meta_map:
+            elif "normalized" in meta_map:
                 normalized_source = meta_map.get("normalized")
-            elif isinstance(meta_raw, MappingABC) and "normalized" in meta_raw:
-                normalized_source = meta_raw.get("normalized")
             normalized_flag = _coerce_bool(normalized_source)
             if "normalized" in payload or normalized_source is not None:
                 payload["normalized"] = normalized_flag
-            if meta_map is None and normalized_source is not None:
-                meta_map = {}
-                try:
-                    setattr(order, "meta", meta_map)
-                except Exception:
-                    meta_map = None
-            if meta_map is not None and (
-                "normalized" in meta_map or normalized_source is not None
-            ):
+            if "normalized" in meta_map or normalized_source is not None:
                 meta_map["normalized"] = normalized_flag
             if symbol in running_weights:
                 current_weight = running_weights[symbol]
@@ -3517,24 +3594,7 @@ class _Worker:
     def _mutate_order_payload(self, order: Any, updates: Mapping[str, Any]) -> None:
         if not updates:
             return
-        meta = getattr(order, "meta", None)
-        if not isinstance(meta, MappingABC):
-            if meta is None:
-                meta_dict: Dict[str, Any] = {}
-            else:
-                try:
-                    meta_dict = dict(meta)
-                except Exception:
-                    meta_dict = {}
-            setattr(order, "meta", meta_dict)
-            meta = meta_dict
-        elif not isinstance(meta, dict):
-            try:
-                meta_dict = dict(meta)
-            except Exception:
-                meta_dict = {}
-            setattr(order, "meta", meta_dict)
-            meta = meta_dict
+        meta = self._ensure_order_meta(order)
         payload = meta.get("payload")
         if isinstance(payload, MappingABC):
             payload_dict = dict(payload)
@@ -3553,24 +3613,7 @@ class _Worker:
         clamped: bool,
         headroom_before: Optional[float],
     ) -> None:
-        meta = getattr(order, "meta", None)
-        if not isinstance(meta, MappingABC):
-            if meta is None:
-                meta_dict: Dict[str, Any] = {}
-            else:
-                try:
-                    meta_dict = dict(meta)
-                except Exception:
-                    meta_dict = {}
-            setattr(order, "meta", meta_dict)
-            meta = meta_dict
-        elif not isinstance(meta, dict):
-            try:
-                meta_dict = dict(meta)
-            except Exception:
-                meta_dict = {}
-            setattr(order, "meta", meta_dict)
-            meta = meta_dict
+        meta = self._ensure_order_meta(order)
         executed_val = float(max(0.0, executed_usd))
         requested_val = float(max(0.0, requested_usd))
         meta["_daily_turnover_usd"] = executed_val
@@ -4895,7 +4938,7 @@ class _Worker:
                 return False
             o = list(checked)[0]
 
-        created_ts = int(getattr(o, "created_ts_ms", 0) or 0)
+        created_ts = self._extract_created_ts_ms(o)
         now_ms = clock.now_ms()
         expires_at_ms = max(created_ts, bar_close_ms)
         dedup_expires_at_ms: int | None = None
@@ -5815,7 +5858,7 @@ class _Worker:
                     self._rollback_exposure(o)
                     continue
 
-            setattr(o, "created_ts_ms", created_ts_ms)
+            self._store_created_ts(o, created_ts_ms)
             checked_orders.append(o)
 
         if checked_orders:
