@@ -83,27 +83,28 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
         ]:
             if c not in df.columns:
                 df[c] = None
-        return df[
-            [
-                "ts",
-                "run_id",
-                "symbol",
-                "side",
-                "order_type",
-                "price",
-                "quantity",
-                "fee",
-                "fee_asset",
-                "pnl",
-                "exec_status",
-                "liquidity",
-                "client_order_id",
-                "order_id",
-                "execution_profile",
-                "market_regime",
-                "meta_json",
-            ]
+        columns = [
+            "ts",
+            "run_id",
+            "symbol",
+            "side",
+            "order_type",
+            "price",
+            "quantity",
+            "fee",
+            "fee_asset",
+            "pnl",
+            "exec_status",
+            "liquidity",
+            "client_order_id",
+            "order_id",
+            "execution_profile",
+            "market_regime",
+            "meta_json",
         ]
+        if "act_now" in df.columns:
+            columns.append("act_now")
+        return df[columns]
 
     # Legacy -> map
     if {"ts","price","volume","side"}.issubset(cols):
@@ -156,27 +157,28 @@ def _normalize_trades(df: pd.DataFrame) -> pd.DataFrame:
     ]:
         if c not in df.columns:
             df[c] = None
-    return df[
-        [
-            "ts",
-            "run_id",
-            "symbol",
-            "side",
-            "order_type",
-            "price",
-            "quantity",
-            "fee",
-            "fee_asset",
-            "pnl",
-            "exec_status",
-            "liquidity",
-            "client_order_id",
-            "order_id",
-            "execution_profile",
-            "market_regime",
-            "meta_json",
-        ]
+    columns = [
+        "ts",
+        "run_id",
+        "symbol",
+        "side",
+        "order_type",
+        "price",
+        "quantity",
+        "fee",
+        "fee_asset",
+        "pnl",
+        "exec_status",
+        "liquidity",
+        "client_order_id",
+        "order_id",
+        "execution_profile",
+        "market_regime",
+        "meta_json",
     ]
+    if "act_now" in df.columns:
+        columns.append("act_now")
+    return df[columns]
 
 
 def _parse_meta(value: Any) -> Dict[str, Any]:
@@ -261,24 +263,49 @@ def _extract_meta_float(meta: Dict[str, Any], keys: tuple[str, ...]) -> float | 
     return None
 
 
+def _normalize_bool_like(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        if pd.isna(value):  # type: ignore[arg-type]
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and math.isnan(value):
+            return None
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized in {"1", "true", "yes", "y", "on", "t"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", "f"}:
+            return False
+        try:
+            numeric = float(normalized)
+        except ValueError:
+            pass
+        else:
+            if math.isnan(numeric):
+                return None
+            return numeric != 0
+    try:
+        return bool(value)
+    except Exception:
+        return None
+
+
 def _extract_meta_bool(meta: Dict[str, Any], keys: tuple[str, ...]) -> bool | None:
     for key in keys:
         if key in meta:
             value = meta[key]
-            if value is None:
-                continue
-            if isinstance(value, str):
-                normalized = value.strip().lower()
-                if not normalized:
-                    continue
-                if normalized in {"1", "true", "yes", "y"}:
-                    return True
-                if normalized in {"0", "false", "no", "n"}:
-                    return False
-            try:
-                return bool(value)
-            except Exception:
-                continue
+            normalized = _normalize_bool_like(value)
+            if normalized is not None:
+                return normalized
     decision = meta.get("decision")
     if isinstance(decision, dict):
         return _extract_meta_bool(decision, keys)
@@ -552,9 +579,7 @@ def aggregate(
         trades["cap_usd"] = cap_from_meta
 
     if "act_now" in trades.columns:
-        trades["act_now_flag"] = trades["act_now"].apply(
-            lambda v: bool(v) if pd.notna(v) else None
-        )
+        trades["act_now_flag"] = trades["act_now"].apply(_normalize_bool_like)
     else:
         trades["act_now_flag"] = act_now_from_meta
 
@@ -595,7 +620,9 @@ def aggregate(
     trades["cost_bias_bps"] = trades["realized_slippage_bps"] - trades["modeled_cost_bps"]
 
     trades["bar_decision_count"] = trades["execution_mode"].eq("bar").astype(int)
-    act_now_mask = trades["act_now_flag"].apply(lambda v: bool(v) if v is not None else False)
+    act_now_mask = trades["act_now_flag"].apply(
+        lambda v: _normalize_bool_like(v) is True
+    )
     trades["bar_act_now_count"] = (
         trades["execution_mode"].eq("bar") & act_now_mask
     ).astype(int)
