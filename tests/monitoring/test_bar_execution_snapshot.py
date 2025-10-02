@@ -109,6 +109,44 @@ def test_bar_execution_snapshot_aggregates_unique_caps() -> None:
     assert cumulative["turnover_vs_cap"] == pytest.approx(expected_ratio)
 
 
+def test_bar_execution_snapshot_removes_zero_caps() -> None:
+    aggregator = _make_enabled_monitoring_aggregator()
+
+    aggregator.record_bar_execution(
+        "BTCUSDT",
+        decisions=10,
+        act_now=5,
+        turnover_usd=1_000.0,
+        cap_usd=10_000.0,
+    )
+    aggregator.record_bar_execution(
+        "ETHUSDT",
+        decisions=6,
+        act_now=3,
+        turnover_usd=600.0,
+        cap_usd=5_000.0,
+    )
+
+    aggregator.record_bar_execution(
+        "BTCUSDT",
+        decisions=4,
+        act_now=2,
+        turnover_usd=400.0,
+        cap_usd=0.0,
+    )
+
+    snapshot = aggregator._bar_execution_snapshot()
+    cumulative = snapshot["cumulative"]
+
+    expected_cap = 5_000.0
+    expected_turnover = 1_000.0 + 600.0 + 400.0
+
+    assert cumulative["cap_usd"] == pytest.approx(expected_cap)
+    assert cumulative["turnover_vs_cap"] == pytest.approx(
+        expected_turnover / expected_cap
+    )
+
+
 def test_record_bar_execution_sanitises_turnover_values() -> None:
     aggregator = _make_enabled_monitoring_aggregator()
 

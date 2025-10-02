@@ -1238,8 +1238,11 @@ class MonitoringAggregator:
         self._bar_totals["decisions"] += dec
         self._bar_totals["act_now"] += act
         self._bar_totals["turnover_usd"] += turnover
-        if cap_value is not None and cap_value > 0 and symbol_text:
-            self._bar_caps_by_symbol[symbol_text] = cap_value
+        if symbol_text:
+            if cap_value is not None and cap_value > 0:
+                self._bar_caps_by_symbol[symbol_text] = cap_value
+            else:
+                self._bar_caps_by_symbol.pop(symbol_text, None)
         if mode_key:
             self._bar_mode_totals[mode_key] += dec
         if weight_value is not None and weight_value > 0:
