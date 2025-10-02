@@ -3755,6 +3755,7 @@ class _Worker:
             working_weight = 0.0
         adjusted: list[Any] = []
         for order in orders:
+            order_id = id(order)
             payload = self._extract_signal_payload(order)
             target_weight, delta_weight, _ = self._resolve_weight_targets(
                 sym, payload, current_weight=working_weight
@@ -3778,6 +3779,8 @@ class _Worker:
                 headroom_candidates.append(max(0.0, float(portfolio_limit) - portfolio_used))
             headroom = min(headroom_candidates) if headroom_candidates else None
             if headroom is not None and headroom <= 1e-9:
+                self._pending_weight.pop(order_id, None)
+                self._pending_weight_refs.pop(order_id, None)
                 try:
                     self._logger.info(
                         "DAILY_TURNOVER_DEFER %s",
@@ -3799,6 +3802,8 @@ class _Worker:
                 if not self._scale_order_for_turnover(
                     order, sym, headroom / requested, current_weight=working_weight
                 ):
+                    self._pending_weight.pop(order_id, None)
+                    self._pending_weight_refs.pop(order_id, None)
                     try:
                         self._logger.info(
                             "DAILY_TURNOVER_DEFER %s",

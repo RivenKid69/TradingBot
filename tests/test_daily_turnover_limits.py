@@ -342,3 +342,51 @@ def test_daily_turnover_non_finite_request_is_sanitized() -> None:
 
     assert math.isfinite(worker._daily_portfolio_turnover.get("total", float("nan")))
     assert worker._daily_portfolio_turnover.get("total") == pytest.approx(0.0)
+
+
+def test_daily_turnover_dropped_orders_clear_pending_weight() -> None:
+    worker = _make_worker_with_daily_cap(100.0)
+    symbol = "BTCUSDT"
+    order = _make_turnover_rich_order(symbol, 0.5, 50.0)
+    order_id = id(order)
+    worker._pending_weight[order_id] = {"symbol": symbol}
+    worker._pending_weight_refs[order_id] = order
+
+    day_key = worker._current_day_key(1)
+    worker._daily_symbol_turnover[symbol] = {"day": day_key, "total": 100.0}
+    worker._daily_portfolio_turnover = {"day": day_key, "total": 100.0}
+
+    adjusted = worker._apply_daily_turnover_limits([order], symbol, 1)
+
+    assert adjusted == []
+    assert order_id not in worker._pending_weight
+    assert order_id not in worker._pending_weight_refs
+    assert worker._replay_pending_weight_entries(order) is False
+
+    worker_fail = _make_worker_with_daily_cap(200.0)
+    fail_symbol = "ETHUSDT"
+    fail_order = _make_turnover_rich_order(fail_symbol, 0.6, 150.0)
+    fail_order_id = id(fail_order)
+    worker_fail._pending_weight[fail_order_id] = {"symbol": fail_symbol}
+    worker_fail._pending_weight_refs[fail_order_id] = fail_order
+
+    fail_day_key = worker_fail._current_day_key(1)
+    worker_fail._daily_symbol_turnover[fail_symbol] = {
+        "day": fail_day_key,
+        "total": 150.0,
+    }
+    worker_fail._daily_portfolio_turnover = {"day": fail_day_key, "total": 150.0}
+
+    def _fail_scale(
+        self: _Worker, *_: object, **__: object
+    ) -> bool:  # pragma: no cover - simple stub
+        return False
+
+    worker_fail._scale_order_for_turnover = MethodType(_fail_scale, worker_fail)
+
+    adjusted_fail = worker_fail._apply_daily_turnover_limits([fail_order], fail_symbol, 1)
+
+    assert adjusted_fail == []
+    assert fail_order_id not in worker_fail._pending_weight
+    assert fail_order_id not in worker_fail._pending_weight_refs
+    assert worker_fail._replay_pending_weight_entries(fail_order) is False
