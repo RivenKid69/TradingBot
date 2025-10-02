@@ -243,6 +243,41 @@ def test_apply_exchange_rules_preserves_side_enum(monkeypatch: pytest.MonkeyPatc
     assert normalised[0].side == Side.BUY
 
 
+def test_bar_mode_keeps_zero_quantity_order(bar_bridge_cls: type[Any]) -> None:
+    from sandbox.backtest_adapter import BacktestAdapter
+
+    symbol = "BTCUSDT"
+    executor = _StubBarExecutor(symbol)
+    bridge = bar_bridge_cls(
+        executor,
+        symbol=symbol,
+        timeframe_ms=60_000,
+        initial_equity=1_000.0,
+    )
+
+    class _StubPolicy:
+        def decide(self, *_args: Any, **_kwargs: Any) -> List[Order]:
+            return []
+
+    adapter = BacktestAdapter(policy=_StubPolicy(), sim_bridge=bridge)
+
+    order = Order(
+        ts=0,
+        symbol=symbol,
+        side=Side.SELL,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={},
+    )
+
+    normalised = adapter._apply_exchange_rules_to_orders(symbol, 100.0, [order])
+
+    assert len(normalised) == 1
+    assert normalised[0].quantity == Decimal("0")
+    assert normalised[0].side == Side.SELL
+
+
 def test_missing_price_does_not_move_equity(bar_bridge_cls: type[Any]) -> None:
     symbol = "BTCUSDT"
     executor = _StubBarExecutor(symbol)

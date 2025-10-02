@@ -210,6 +210,7 @@ class BacktestAdapter:
     ) -> None:
         self.policy = policy
         self.sim = sim_bridge
+        self._keep_zero_quantity_orders = self._detect_keep_zero_quantity_orders(sim_bridge)
         sim_obj = getattr(self.sim, "sim", None)
         getter = getattr(sim_obj, "get_spread_bps", None)
         fallback_getter = getattr(sim_obj, "_slippage_get_spread", None)
@@ -237,6 +238,49 @@ class BacktestAdapter:
         self._daily_windows_min: List[tuple] = self._parse_daily_windows(self._no_trade.daily_utc or [])
 
     # --------------------- helpers: spread, liquidity ---------------------
+
+    @staticmethod
+    def _detect_keep_zero_quantity_orders(sim_bridge: SimAdapter) -> bool:
+        """Detect whether zero-quantity orders should be preserved."""
+
+        def _type_name(obj: Any) -> str:
+            try:
+                return type(obj).__name__
+            except Exception:
+                return ""
+
+        def _module_name(obj: Any) -> str:
+            try:
+                module = type(obj).__module__
+            except Exception:
+                module = ""
+            return str(module or "")
+
+        explicit_flag = getattr(sim_bridge, "keep_zero_quantity_orders", None)
+        if explicit_flag is None:
+            explicit_flag = getattr(sim_bridge, "allow_zero_quantity_orders", None)
+        if explicit_flag is not None:
+            return bool(explicit_flag)
+
+        bridge_name = _type_name(sim_bridge).lower()
+        bridge_module = _module_name(sim_bridge).lower()
+        if bridge_name == "barbacktestsimbridge":
+            return True
+        if "barbacktest" in bridge_name or "bar_backtest" in bridge_module:
+            return True
+
+        executor = getattr(sim_bridge, "executor", None)
+        executor_name = _type_name(executor).lower()
+        executor_module = _module_name(executor).lower()
+        if executor_name == "barexecutor":
+            return True
+        if executor_name.endswith("barexecutor"):
+            return True
+        if "impl_bar_executor" in executor_module or "bar_executor" in executor_module:
+            return True
+
+        return False
+
 
     def _compute_vol_factor(self, row: pd.Series, *, ref: float, has_hl: bool) -> float:
         estimator = getattr(self.sim, "vol_estimator", None)
@@ -412,7 +456,7 @@ class BacktestAdapter:
                 logger.warning("Failed to normalise order quantity: %s", o, exc_info=True)
                 continue
 
-            if qty == 0:
+            if qty == 0 and not self._keep_zero_quantity_orders:
                 continue
 
             side_raw = getattr(o.side, "value", o.side)
