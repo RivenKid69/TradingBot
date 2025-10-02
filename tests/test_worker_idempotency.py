@@ -32,6 +32,9 @@ class DummyMetric:
     def observe(self, value: float) -> None:
         self.observations.append(float(value))
 
+    def set(self, value: float) -> None:
+        self.observations.append(float(value))
+
 
 class DummyLogger:
     def __init__(self) -> None:
@@ -742,3 +745,164 @@ def test_worker_propagates_adv_to_executor(monkeypatch) -> None:
     assert decision["impact_mode"] == "model"
     instructions = report.meta["instructions"]
     assert len(instructions) == 4
+
+
+def test_process_uses_true_bar_boundaries(monkeypatch) -> None:
+    timeframe_ms = 120_000
+    dedup_timeframe_ms = 90_000
+    (
+        worker,
+        _logger,
+        _publish_calls,
+        _executor_calls,
+        _metrics,
+        _dispatch_calls,
+    ) = _make_worker(
+        monkeypatch,
+        ws_dedup_timeframe_ms=dedup_timeframe_ms,
+        bar_timeframe_ms=timeframe_ms,
+    )
+
+    worker._ws_dedup_enabled = True
+    worker._pipeline_cfg = PipelineConfig()
+
+    monkeypatch.setattr(service_signal_runner.monitoring, "inc_stage", lambda *a, **k: None)
+    monkeypatch.setattr(service_signal_runner.monitoring, "inc_reason", lambda *a, **k: None)
+    monkeypatch.setattr(service_signal_runner.monitoring, "record_signals", lambda *a, **k: None)
+    monkeypatch.setattr(service_signal_runner.monitoring, "signal_error_rate", DummyMetric())
+    monkeypatch.setattr(service_signal_runner.monitoring, "ws_dup_skipped_count", DummyMetric())
+    monkeypatch.setattr(service_signal_runner.monitoring, "signal_boundary_count", DummyMetric())
+    monkeypatch.setattr(service_signal_runner.monitoring, "ttl_expired_boundary_count", DummyMetric())
+    monkeypatch.setattr(service_signal_runner, "pipeline_stage_drop_count", DummyMetric())
+    monkeypatch.setattr(service_signal_runner, "skipped_incomplete_bars", DummyMetric())
+
+    monkeypatch.setattr(service_signal_runner.signal_bus, "ENABLED", True, raising=False)
+
+    bar_ts = 1_700_000
+    bar = Bar(
+        ts=bar_ts,
+        symbol="BTCUSDT",
+        open=Decimal("100"),
+        high=Decimal("105"),
+        low=Decimal("95"),
+        close=Decimal("102"),
+    )
+
+    order = types.SimpleNamespace(meta={}, symbol=bar.symbol)
+
+    def _closed_guard(*args, **kwargs):
+        return service_signal_runner.PipelineResult(
+            action="pass", stage=service_signal_runner.Stage.CLOSED_BAR
+        )
+
+    def _policy_decide(*_args, **_kwargs):
+        return service_signal_runner.PipelineResult(
+            action="pass",
+            stage=service_signal_runner.Stage.POLICY,
+            decision=[order],
+        )
+
+    def _apply_risk(*_args, **_kwargs):
+        return service_signal_runner.PipelineResult(
+            action="pass",
+            stage=service_signal_runner.Stage.RISK,
+            decision=[order],
+        )
+
+    worker._apply_signal_quality_filter = types.MethodType(
+        lambda self, bar, *, skip_metrics=False: (True, {}),
+        worker,
+    )
+    worker._extract_features = types.MethodType(
+        lambda self, bar, *, skip_metrics=False: {},
+        worker,
+    )
+    worker._evaluate_no_trade_windows = types.MethodType(
+        lambda self, ts_ms, symbol, *, stage_cfg=None: (
+            service_signal_runner.PipelineResult(
+                action="pass", stage=service_signal_runner.Stage.WINDOWS
+            ),
+            None,
+        ),
+        worker,
+    )
+
+    monkeypatch.setattr(service_signal_runner, "closed_bar_guard", _closed_guard)
+    monkeypatch.setattr(service_signal_runner, "policy_decide", _policy_decide)
+    monkeypatch.setattr(service_signal_runner, "apply_risk", _apply_risk)
+
+    ttl_calls: list[dict[str, int]] = []
+
+    def _check_ttl(*, bar_close_ms: int, now_ms: int, timeframe_ms: int):
+        ttl_calls.append(
+            {
+                "bar_close_ms": bar_close_ms,
+                "now_ms": now_ms,
+                "timeframe_ms": timeframe_ms,
+            }
+        )
+        return True, bar_close_ms + timeframe_ms, None
+
+    monkeypatch.setattr(service_signal_runner, "check_ttl", _check_ttl)
+
+    skip_calls: list[tuple[str, int]] = []
+    update_calls: list[tuple[str, int]] = []
+
+    def _should_skip(symbol: str, bar_close_ms: int) -> bool:
+        skip_calls.append((symbol, bar_close_ms))
+        return False
+
+    def _update(symbol: str, bar_close_ms: int) -> None:
+        update_calls.append((symbol, bar_close_ms))
+
+    monkeypatch.setattr(service_signal_runner.signal_bus, "should_skip", _should_skip)
+    monkeypatch.setattr(service_signal_runner.signal_bus, "update", _update)
+
+    now_ms = bar_ts + 1_000
+    monkeypatch.setattr(clock, "now_ms", lambda: now_ms)
+
+    publish_calls: list[dict[str, int]] = []
+
+    def _publish_decision(
+        self: service_signal_runner._Worker,
+        o: Any,
+        symbol: str,
+        bar_open_ms: int,
+        *,
+        bar_close_ms: int,
+        stage_cfg: PipelineStageConfig | None = None,
+    ) -> service_signal_runner.PipelineResult:
+        publish_calls.append(
+            {
+                "symbol": symbol,
+                "bar_open_ms": bar_open_ms,
+                "bar_close_ms": bar_close_ms,
+            }
+        )
+        return service_signal_runner.PipelineResult(
+            action="pass", stage=service_signal_runner.Stage.PUBLISH, decision=o
+        )
+
+    worker.publish_decision = types.MethodType(_publish_decision, worker)
+
+    emitted = worker.process(bar)
+
+    assert emitted == [order]
+    expected_open_ms = bar_ts - timeframe_ms
+    assert publish_calls == [
+        {
+            "symbol": "BTCUSDT",
+            "bar_open_ms": expected_open_ms,
+            "bar_close_ms": bar_ts,
+        }
+    ]
+    assert ttl_calls == [
+        {
+            "bar_close_ms": bar_ts,
+            "now_ms": now_ms,
+            "timeframe_ms": dedup_timeframe_ms,
+        }
+    ]
+    assert skip_calls == [("BTCUSDT", bar_ts)]
+    assert update_calls == [("BTCUSDT", bar_ts)]
+
