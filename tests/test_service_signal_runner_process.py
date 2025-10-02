@@ -38,22 +38,34 @@ class _DummyMetric:
         return None
 
 
+def _make_monitoring_stub() -> SimpleNamespace:
+    stub = SimpleNamespace()
+    stub.inc_stage = lambda *args, **kwargs: None
+    stub.record_signals = lambda *args, **kwargs: None
+    stub.record_fill = lambda *args, **kwargs: None
+    stub.record_pnl = lambda *args, **kwargs: None
+    stub.inc_reason = lambda *args, **kwargs: None
+    stub.alert_zero_signals = lambda *args, **kwargs: None
+    stub.signal_error_rate = _DummyMetric()
+    stub.ws_dup_skipped_count = _DummyMetric()
+    stub.ttl_expired_boundary_count = _DummyMetric()
+    stub.signal_boundary_count = _DummyMetric()
+    stub.signal_published_count = _DummyMetric()
+    stub.age_at_publish_ms = _DummyMetric()
+    stub.signal_idempotency_skipped_count = _DummyMetric()
+    stub.signal_absolute_count = _DummyMetric()
+    stub.throttle_dropped_count = _DummyMetric()
+    stub.throttle_enqueued_count = _DummyMetric()
+    stub.throttle_queue_expired_count = _DummyMetric()
+    return stub
+
+
 def test_process_propagates_open_and_close(monkeypatch) -> None:
     timeframe_ms = 60_000
     bar_close_ms = 1_700_000_120_000
     expected_open_ms = bar_close_ms - timeframe_ms
 
-    monitoring_stub = SimpleNamespace()
-    monitoring_stub.inc_stage = lambda *args, **kwargs: None
-    monitoring_stub.record_signals = lambda *args, **kwargs: None
-    monitoring_stub.record_fill = lambda *args, **kwargs: None
-    monitoring_stub.record_pnl = lambda *args, **kwargs: None
-    monitoring_stub.inc_reason = lambda *args, **kwargs: None
-    monitoring_stub.alert_zero_signals = lambda *args, **kwargs: None
-    monitoring_stub.signal_error_rate = _DummyMetric()
-    monitoring_stub.ws_dup_skipped_count = _DummyMetric()
-    monitoring_stub.ttl_expired_boundary_count = _DummyMetric()
-    monitoring_stub.signal_boundary_count = _DummyMetric()
+    monitoring_stub = _make_monitoring_stub()
     monkeypatch.setattr(service_signal_runner, "monitoring", monitoring_stub)
     monkeypatch.setattr(
         service_signal_runner, "pipeline_stage_drop_count", _DummyMetric()
@@ -149,24 +161,7 @@ def test_process_spot_envelope_records_created_ts(monkeypatch) -> None:
     bar_close_ms = 1_700_000_000_000
     now_ms = bar_close_ms + 500
 
-    monitoring_stub = SimpleNamespace()
-    monitoring_stub.inc_stage = lambda *args, **kwargs: None
-    monitoring_stub.record_signals = lambda *args, **kwargs: None
-    monitoring_stub.record_fill = lambda *args, **kwargs: None
-    monitoring_stub.record_pnl = lambda *args, **kwargs: None
-    monitoring_stub.inc_reason = lambda *args, **kwargs: None
-    monitoring_stub.alert_zero_signals = lambda *args, **kwargs: None
-    monitoring_stub.signal_error_rate = _DummyMetric()
-    monitoring_stub.ws_dup_skipped_count = _DummyMetric()
-    monitoring_stub.ttl_expired_boundary_count = _DummyMetric()
-    monitoring_stub.signal_boundary_count = _DummyMetric()
-    monitoring_stub.signal_published_count = _DummyMetric()
-    monitoring_stub.age_at_publish_ms = _DummyMetric()
-    monitoring_stub.signal_idempotency_skipped_count = _DummyMetric()
-    monitoring_stub.signal_absolute_count = _DummyMetric()
-    monitoring_stub.throttle_dropped_count = _DummyMetric()
-    monitoring_stub.throttle_enqueued_count = _DummyMetric()
-    monitoring_stub.throttle_queue_expired_count = _DummyMetric()
+    monitoring_stub = _make_monitoring_stub()
     monkeypatch.setattr(service_signal_runner, "monitoring", monitoring_stub)
     monkeypatch.setattr(
         service_signal_runner, "pipeline_stage_drop_count", _DummyMetric()
@@ -346,3 +341,186 @@ def test_process_spot_envelope_records_created_ts(monkeypatch) -> None:
     expires_vals = {call["expires_at_ms"] for call in publish_calls}
     assert expires_vals == {bar_close_ms}
     assert any(call["now_ms"] == now_ms for call in ttl_calls)
+
+
+def test_emit_clamps_expires_at_to_bar_close(monkeypatch) -> None:
+    timeframe_ms = 60_000
+    bar_close_ms = 1_700_000_200_000
+    bar_open_ms = bar_close_ms - timeframe_ms
+    now_ms = bar_close_ms + 500
+
+    monitoring_stub = _make_monitoring_stub()
+    monkeypatch.setattr(service_signal_runner, "monitoring", monitoring_stub)
+    monkeypatch.setattr(
+        service_signal_runner, "pipeline_stage_drop_count", _DummyMetric()
+    )
+    monkeypatch.setattr(
+        service_signal_runner, "skipped_incomplete_bars", _DummyMetric()
+    )
+
+    monkeypatch.setattr(service_signal_runner.signal_bus, "ENABLED", True, raising=False)
+    monkeypatch.setattr(service_signal_runner.signal_bus, "OUT_WRITER", None, raising=False)
+
+    def _check_ttl(*, bar_close_ms: int, now_ms: int, timeframe_ms: int):
+        return True, bar_close_ms - 10_000, None
+
+    monkeypatch.setattr(service_signal_runner, "check_ttl", _check_ttl)
+    monkeypatch.setattr(clock, "now_ms", lambda: now_ms)
+
+    publish_calls: list[dict[str, Any]] = []
+
+    def _publish(
+        symbol: str,
+        close_ms: int,
+        payload: Any,
+        dispatcher: Any,
+        *,
+        expires_at_ms: int,
+        dedup_key: str | None = None,
+        valid_until_ms: int | None = None,
+    ) -> bool:
+        publish_calls.append(
+            {
+                "symbol": symbol,
+                "bar_close_ms": close_ms,
+                "expires_at_ms": expires_at_ms,
+                "valid_until_ms": valid_until_ms,
+                "payload": payload,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(service_signal_runner, "publish_signal_envelope", _publish)
+
+    class _StubFeaturePipe:
+        def __init__(self) -> None:
+            self.signal_quality: dict[str, object] = {}
+            self.timeframe_ms = timeframe_ms
+            self.spread_ttl_ms = 0
+
+        def update(
+            self, bar: Bar, *, skip_metrics: bool | None = None
+        ) -> dict[str, float]:
+            return {"close": float(bar.close)}
+
+    class _StubPolicy:
+        def __init__(self) -> None:
+            self.timeframe_ms = timeframe_ms
+
+        def decide(self, features, ctx):
+            return [SimpleNamespace(symbol=ctx.symbol, meta={}, side="buy")]
+
+        def consume_signal_transitions(self):
+            return []
+
+    executor = SimpleNamespace(submit=lambda order: None, execute=lambda order: None)
+
+    worker = service_signal_runner._Worker(
+        _StubFeaturePipe(),
+        _StubPolicy(),
+        logging.getLogger("emit-test"),
+        executor,
+        enforce_closed_bars=False,
+        ws_dedup_enabled=True,
+        ws_dedup_timeframe_ms=timeframe_ms,
+        bar_timeframe_ms=timeframe_ms,
+    )
+
+    order = SimpleNamespace(
+        meta={
+            "payload": {
+                "kind": "target_weight",
+                "target_weight": 0.5,
+                "valid_until_ms": bar_close_ms - 5_000,
+            },
+            "dedup_key": "test-key",
+        },
+        created_ts_ms=bar_close_ms - 15_000,
+        score=1.0,
+        side="buy",
+        features_hash="abc",
+        volume_frac=0.1,
+    )
+
+    result = worker._emit(order, "BTCUSDT", bar_close_ms, bar_open_ms=bar_open_ms)
+
+    assert result is True
+    assert len(publish_calls) == 1
+    call = publish_calls[0]
+    assert call["expires_at_ms"] == bar_close_ms
+    assert call["valid_until_ms"] == bar_close_ms - 5_000
+
+
+def test_build_drop_envelope_clamps_expires(monkeypatch) -> None:
+    timeframe_ms = 60_000
+    bar_close_ms = 1_700_000_300_000
+
+    monitoring_stub = _make_monitoring_stub()
+    monkeypatch.setattr(service_signal_runner, "monitoring", monitoring_stub)
+    monkeypatch.setattr(
+        service_signal_runner, "pipeline_stage_drop_count", _DummyMetric()
+    )
+    monkeypatch.setattr(
+        service_signal_runner, "skipped_incomplete_bars", _DummyMetric()
+    )
+
+    def _check_ttl(*, bar_close_ms: int, now_ms: int, timeframe_ms: int):
+        return True, bar_close_ms - 20_000, None
+
+    monkeypatch.setattr(service_signal_runner, "check_ttl", _check_ttl)
+    monkeypatch.setattr(clock, "now_ms", lambda: bar_close_ms + 1_000)
+
+    class _StubFeaturePipe:
+        def __init__(self) -> None:
+            self.signal_quality: dict[str, object] = {}
+            self.timeframe_ms = timeframe_ms
+            self.spread_ttl_ms = 0
+
+        def update(
+            self, bar: Bar, *, skip_metrics: bool | None = None
+        ) -> dict[str, float]:
+            return {"close": float(bar.close)}
+
+    class _StubPolicy:
+        def __init__(self) -> None:
+            self.timeframe_ms = timeframe_ms
+
+        def decide(self, features, ctx):
+            return [SimpleNamespace(symbol=ctx.symbol, meta={}, side="buy")]
+
+        def consume_signal_transitions(self):
+            return []
+
+    executor = SimpleNamespace(submit=lambda order: None, execute=lambda order: None)
+
+    worker = service_signal_runner._Worker(
+        _StubFeaturePipe(),
+        _StubPolicy(),
+        logging.getLogger("drop-test"),
+        executor,
+        enforce_closed_bars=False,
+        ws_dedup_enabled=True,
+        ws_dedup_timeframe_ms=timeframe_ms,
+        bar_timeframe_ms=timeframe_ms,
+    )
+
+    order = SimpleNamespace(
+        meta={
+            "payload": {
+                "kind": "target_weight",
+                "target_weight": 0.25,
+                "valid_until_ms": bar_close_ms - 30_000,
+            }
+        },
+        created_ts_ms=bar_close_ms - 40_000,
+        score=1.0,
+        side="buy",
+        features_hash="xyz",
+        volume_frac=0.1,
+    )
+
+    envelope = worker._build_drop_envelope(order, "BTCUSDT", bar_close_ms)
+
+    assert isinstance(envelope, SpotSignalEnvelope)
+    assert envelope.bar_close_ms == bar_close_ms
+    assert envelope.expires_at_ms == bar_close_ms
