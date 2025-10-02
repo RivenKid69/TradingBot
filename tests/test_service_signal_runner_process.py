@@ -6,6 +6,8 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 import clock
 import service_signal_runner
 from core_models import Bar
@@ -58,6 +60,18 @@ def _make_monitoring_stub() -> SimpleNamespace:
     stub.throttle_enqueued_count = _DummyMetric()
     stub.throttle_queue_expired_count = _DummyMetric()
     return stub
+
+
+def _make_simple_order(symbol: str, *, created_ts_ms: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        symbol=symbol,
+        side="buy",
+        score=0.0,
+        features_hash="",
+        volume_frac=0.1,
+        meta={"created_ts_ms": created_ts_ms, "payload": {}},
+        created_ts_ms=created_ts_ms,
+    )
 
 
 def test_process_propagates_open_and_close(monkeypatch) -> None:
@@ -154,6 +168,80 @@ def test_process_propagates_open_and_close(monkeypatch) -> None:
     assert ttl_calls == [(bar_close_ms, bar_close_ms + 1_000, timeframe_ms)]
     assert dedup_should_calls == [("BTCUSDT", bar_close_ms)]
     assert dedup_update_calls == [("BTCUSDT", bar_close_ms)]
+
+
+def test_publish_decision_respects_bar_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    timeframe_ms = 60_000
+    bar_close_ms = 1_700_000_000_000
+    bar_open_ms = bar_close_ms - timeframe_ms
+    symbol = "BTCUSDT"
+
+    monitoring_stub = _make_monitoring_stub()
+    monkeypatch.setattr(service_signal_runner, "monitoring", monitoring_stub)
+    monkeypatch.setattr(service_signal_runner, "pipeline_stage_drop_count", _DummyMetric())
+    monkeypatch.setattr(service_signal_runner, "skipped_incomplete_bars", _DummyMetric())
+    monkeypatch.setattr(service_signal_runner.signal_bus, "ENABLED", False, raising=False)
+
+    class _StubFeaturePipe:
+        spread_ttl_ms = 0
+
+        def __init__(self, timeframe_ms: int) -> None:
+            self.timeframe_ms = timeframe_ms
+
+    class _StubPolicy:
+        def __init__(self, timeframe_ms: int) -> None:
+            self.timeframe_ms = timeframe_ms
+
+        def consume_signal_transitions(self):
+            return []
+
+    executor = SimpleNamespace(execute=lambda order: None, submit=lambda order: None)
+
+    worker = service_signal_runner._Worker(
+        _StubFeaturePipe(timeframe_ms),
+        _StubPolicy(timeframe_ms),
+        logging.getLogger("test-worker"),
+        executor,
+        enforce_closed_bars=False,
+        ws_dedup_enabled=True,
+        ws_dedup_timeframe_ms=timeframe_ms,
+        bar_timeframe_ms=timeframe_ms,
+        execution_mode="bar",
+    )
+
+    monkeypatch.setattr(worker, "_build_envelope_payload", lambda order, sym: ({}, None, None))
+    monkeypatch.setattr(worker, "_should_skip_idempotent", lambda *args, **kwargs: False)
+    monkeypatch.setattr(worker, "_remember_idempotency_key", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "_commit_exposure", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "_rollback_exposure", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "_refund_tokens", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "_log_drop_envelope", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "_update_queue_metrics", lambda: None)
+    monkeypatch.setattr(worker, "_maybe_drop_due_to_cooldown", lambda *args, **kwargs: False)
+
+    within_order = _make_simple_order(symbol, created_ts_ms=bar_close_ms)
+    monkeypatch.setattr(clock, "now_ms", lambda: bar_close_ms + timeframe_ms - 1)
+
+    within_result = worker.publish_decision(
+        within_order,
+        symbol,
+        bar_open_ms,
+        bar_close_ms=bar_close_ms,
+    )
+
+    assert within_result.action == "pass"
+
+    expired_order = _make_simple_order(symbol, created_ts_ms=bar_close_ms)
+    monkeypatch.setattr(clock, "now_ms", lambda: bar_close_ms + timeframe_ms + 1)
+
+    expired_result = worker.publish_decision(
+        expired_order,
+        symbol,
+        bar_open_ms,
+        bar_close_ms=bar_close_ms,
+    )
+
+    assert expired_result.action == "drop"
 
 
 def test_process_spot_envelope_records_created_ts(monkeypatch) -> None:

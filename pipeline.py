@@ -10,7 +10,7 @@ from collections import deque
 
 from core_models import Bar
 from core_contracts import FeaturePipe, SignalPolicy, PolicyCtx
-from utils_time import next_bar_open_ms, is_bar_closed
+from utils_time import is_bar_closed
 from no_trade import (
     _parse_daily_windows_min,
     _in_daily_window,
@@ -490,9 +490,28 @@ def compute_expires_at(bar_close_ms: int, timeframe_ms: int) -> int:
     Returns
     -------
     int
-        The timestamp (ms since epoch) when the next bar opens.
+        The timestamp (ms since epoch) when the bar's TTL expires.
+
+    Notes
+    -----
+    This helper normalises both inputs to integers and guarantees that the TTL
+    spans exactly one full bar after ``bar_close_ms``.
     """
-    return next_bar_open_ms(bar_close_ms, timeframe_ms)
+
+    try:
+        close_ms = int(bar_close_ms)
+    except (TypeError, ValueError):  # pragma: no cover - defensive guard
+        raise ValueError("bar_close_ms must be an integer timestamp") from None
+
+    try:
+        tf_ms = int(timeframe_ms)
+    except (TypeError, ValueError):
+        raise ValueError("timeframe_ms must be an integer duration") from None
+
+    if tf_ms <= 0:
+        raise ValueError("timeframe_ms must be a positive duration")
+
+    return close_ms + tf_ms
 
 
 def check_ttl(
