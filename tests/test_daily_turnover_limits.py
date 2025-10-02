@@ -2,12 +2,18 @@ import logging
 import math
 from decimal import Decimal
 from types import MethodType, SimpleNamespace
+from typing import Any, Mapping
 
 import pytest
 
 from core_config import SpotTurnoverCaps, SpotTurnoverLimit
 from core_models import Order, OrderType, Side
 from service_signal_runner import _Worker
+from api.spot_signals import (
+    SpotSignalEnvelope,
+    SpotSignalTargetWeightPayload,
+    SpotSignalEconomics,
+)
 
 
 def _make_worker_with_daily_cap(limit_usd: float) -> _Worker:
@@ -123,6 +129,35 @@ def _make_turnover_rich_order(
     )
 
 
+def _make_enveloped_order(
+    symbol: str, target_weight: float, turnover_usd: float
+) -> Order:
+    envelope = SpotSignalEnvelope(
+        symbol=symbol,
+        bar_close_ms=0,
+        expires_at_ms=60_000,
+        payload=SpotSignalTargetWeightPayload(
+            target_weight=target_weight,
+            economics=SpotSignalEconomics(
+                edge_bps=0.0,
+                cost_bps=0.0,
+                net_bps=0.0,
+                turnover_usd=turnover_usd,
+                act_now=True,
+            ),
+        ),
+    )
+    return Order(
+        ts=0,
+        symbol=symbol,
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta=envelope,
+    )
+
+
 def test_daily_turnover_cap_clamps_and_defers() -> None:
     worker = _make_worker_with_daily_cap(500.0)
 
@@ -168,13 +203,14 @@ def test_daily_turnover_cap_uses_economics_payload() -> None:
     first = _make_economics_order("ETHUSDT", 0.5, 150.0)
     adjusted_first = worker._apply_daily_turnover_limits([first], "ETHUSDT", 1)
     assert len(adjusted_first) == 1
-    assert adjusted_first[0].meta.get("_daily_turnover_usd") == pytest.approx(150.0)
+    first_meta = worker._ensure_order_meta(adjusted_first[0])
+    assert first_meta.get("_daily_turnover_usd") == pytest.approx(150.0)
     payload_first = worker._extract_signal_payload(adjusted_first[0])
-    adjusted_first[0].meta["_bar_execution"] = {
+    first_meta["_bar_execution"] = {
         "filled": True,
         "target_weight": payload_first["target_weight"],
         "delta_weight": payload_first["target_weight"],
-        "turnover_usd": adjusted_first[0].meta.get("_daily_turnover_usd"),
+        "turnover_usd": first_meta.get("_daily_turnover_usd"),
     }
     worker._commit_exposure(adjusted_first[0])
     assert worker._daily_symbol_turnover["ETHUSDT"]["total"] == pytest.approx(150.0)
@@ -199,6 +235,54 @@ def test_daily_turnover_cap_uses_economics_payload() -> None:
     assert adjusted_third == []
     snapshot = worker._daily_turnover_snapshot()
     assert snapshot["portfolio"]["remaining_usd"] == pytest.approx(0.0)
+
+
+def test_daily_turnover_cap_handles_enveloped_meta() -> None:
+    worker = _make_worker_with_daily_cap(200.0)
+
+    def _target_from_payload(payload: Mapping[str, Any]) -> float:
+        if "target_weight" in payload:
+            return float(payload["target_weight"])
+        if "target" in payload:
+            return float(payload["target"])
+        raise AssertionError("target weight not present in payload")
+
+    first = _make_enveloped_order("SOLUSDT", 0.5, 150.0)
+    adjusted_first = worker._apply_daily_turnover_limits([first], "SOLUSDT", 1)
+    assert len(adjusted_first) == 1
+    payload_first = worker._extract_signal_payload(adjusted_first[0])
+    first_meta = worker._ensure_order_meta(adjusted_first[0])
+    object.__setattr__(adjusted_first[0], "meta", first_meta)
+    first_meta.setdefault("payload", payload_first)
+    assert first_meta.get("_daily_turnover_usd") == pytest.approx(150.0)
+    assert _target_from_payload(payload_first) == pytest.approx(0.5)
+    economics_first = payload_first.get("economics", {})
+    assert economics_first.get("turnover_usd") == pytest.approx(150.0)
+    first_meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": payload_first["target_weight"],
+        "delta_weight": payload_first["target_weight"],
+        "turnover_usd": first_meta.get("_daily_turnover_usd"),
+    }
+    worker._commit_exposure(adjusted_first[0])
+
+    second = _make_enveloped_order("SOLUSDT", 0.9, 100.0)
+    adjusted_second = worker._apply_daily_turnover_limits([second], "SOLUSDT", 1)
+    assert len(adjusted_second) == 1
+    payload_second = worker._extract_signal_payload(adjusted_second[0])
+    second_meta = worker._ensure_order_meta(adjusted_second[0])
+    object.__setattr__(adjusted_second[0], "meta", second_meta)
+    second_meta.setdefault("payload", payload_second)
+    assert second_meta.get("_daily_turnover_usd") == pytest.approx(50.0)
+    assert _target_from_payload(payload_second) == pytest.approx(0.7)
+    second_meta["_bar_execution"] = {
+        "filled": True,
+        "target_weight": _target_from_payload(payload_second),
+        "delta_weight": _target_from_payload(payload_second) - 0.5,
+        "turnover_usd": second_meta.get("_daily_turnover_usd"),
+    }
+    worker._commit_exposure(adjusted_second[0])
+    assert worker._daily_symbol_turnover["SOLUSDT"]["total"] == pytest.approx(200.0)
 
 
 def test_daily_turnover_limits_use_sequential_weights_for_orders() -> None:
