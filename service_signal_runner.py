@@ -92,6 +92,7 @@ from services.utils_config import (
     snapshot_config,
 )  # снапшот конфига (Фаза 3)  # noqa: F401
 from services.utils_app import atomic_write_with_retry
+from api.spot_signals import SpotSignalEnvelope
 from core_config import (
     CommonRunConfig,
     ClockSyncConfig,
@@ -1955,23 +1956,81 @@ class _Worker:
 
     def _extract_signal_payload(self, order: Any) -> Dict[str, Any]:
         meta = getattr(order, "meta", None)
-        candidate: Any = None
-        if isinstance(meta, MappingABC):
-            candidate = meta.get("payload")
-            if candidate is None:
-                candidate = meta.get("rebalance")
-            if candidate is None:
-                candidate = meta.get("signal_payload")
-        elif meta is not None:
+
+        def _materialize_candidate(candidate: Any) -> Dict[str, Any]:
+            if isinstance(candidate, SpotSignalEnvelope):
+                return self._materialize_mapping(candidate.payload)
+            payload_map = self._materialize_mapping(candidate)
+            if payload_map:
+                return payload_map
+            if isinstance(candidate, MappingABC):
+                return dict(candidate)
+            return {}
+
+        sidecar_meta = self._order_meta_sidecar_lookup(order)
+        if isinstance(sidecar_meta, MappingABC):
+            sidecar_map = dict(sidecar_meta)
+            payload_val = sidecar_map.get("payload")
+            if payload_val is not None:
+                resolved = _materialize_candidate(payload_val)
+                if resolved:
+                    return resolved
+            rebalance_val = sidecar_map.get("rebalance")
+            if rebalance_val is not None:
+                resolved = _materialize_candidate(rebalance_val)
+                if resolved:
+                    return resolved
+            signal_payload_val = sidecar_map.get("signal_payload")
+            if signal_payload_val is not None:
+                resolved = _materialize_candidate(signal_payload_val)
+                if resolved:
+                    return resolved
+
+        if isinstance(meta, SpotSignalEnvelope):
+            return _materialize_candidate(meta)
+
+        meta_map: Dict[str, Any] | None = None
+        if meta is not None:
+            meta_map = self._materialize_mapping(meta)
+            if not meta_map and isinstance(meta, MappingABC):
+                meta_map = dict(meta)
+        elif isinstance(meta, MappingABC):
+            meta_map = dict(meta)
+
+        if meta_map:
+            payload_val = meta_map.get("payload")
+            if payload_val is not None:
+                return _materialize_candidate(payload_val)
+            rebalance_val = meta_map.get("rebalance")
+            if rebalance_val is not None:
+                return _materialize_candidate(rebalance_val)
+            signal_payload_val = meta_map.get("signal_payload")
+            if signal_payload_val is not None:
+                return _materialize_candidate(signal_payload_val)
+
+        if meta is not None and not isinstance(meta, MappingABC):
             getter = getattr(meta, "get", None)
             if callable(getter):
-                candidate = getter("payload")
-                if candidate is None:
-                    candidate = getter("rebalance")
-        if candidate is None:
-            candidate = getattr(order, "payload", None)
-        payload = self._materialize_mapping(candidate)
-        return payload
+                payload_val = getter("payload")
+                if payload_val is not None:
+                    return _materialize_candidate(payload_val)
+                rebalance_val = getter("rebalance")
+                if rebalance_val is not None:
+                    return _materialize_candidate(rebalance_val)
+                signal_payload_val = getter("signal_payload")
+                if signal_payload_val is not None:
+                    return _materialize_candidate(signal_payload_val)
+
+        payload_attr = getattr(order, "payload", None)
+        if payload_attr is not None:
+            return _materialize_candidate(payload_attr)
+
+        if isinstance(meta, MappingABC):
+            rebalance_payload = meta.get("rebalance")
+            if isinstance(rebalance_payload, MappingABC):
+                return dict(rebalance_payload)
+
+        return {}
 
     @staticmethod
     def _coerce_mapping(value: Any) -> Dict[str, Any] | None:
