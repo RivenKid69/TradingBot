@@ -819,6 +819,13 @@ class BarExecutor(TradeExecutor):
 
         instructions: List[RebalanceInstruction] = []
         final_state = state
+        prev_quantity = state.quantity
+        if not isinstance(prev_quantity, Decimal):
+            try:
+                prev_quantity = Decimal(str(prev_quantity or "0"))
+            except Exception:
+                prev_quantity = Decimal("0")
+        signed_fill_quantity = Decimal("0")
 
         execute_branch = (
             bool(getattr(metrics, "act_now", False))
@@ -889,6 +896,7 @@ class BarExecutor(TradeExecutor):
                     metrics = metrics.copy(update={"turnover_usd": turnover_usd})
                 delta_weight = executed_target_weight - state.weight
                 target_weight = executed_target_weight
+                signed_fill_quantity = executed_quantity - prev_quantity
                 final_state = replace(
                     state,
                     weight=executed_target_weight,
@@ -941,6 +949,8 @@ class BarExecutor(TradeExecutor):
             delta_weight = 0.0
             turnover_usd = 0.0
 
+        abs_filled_quantity = signed_fill_quantity.copy_abs()
+
         storage_key = symbol_key or final_state.symbol
         self._states[storage_key] = final_state
 
@@ -962,6 +972,8 @@ class BarExecutor(TradeExecutor):
             "delta_weight": delta_weight,
             "instructions": [instr.to_dict() for instr in instructions],
         }
+        report_meta["signed_filled_quantity"] = float(signed_fill_quantity)
+        report_meta["filled_quantity"] = float(abs_filled_quantity)
         report_meta["requested_target_weight"] = requested_target_weight
         report_meta["requested_delta_weight"] = requested_delta_weight
         if skip_due_to_step:
@@ -1044,6 +1056,8 @@ class BarExecutor(TradeExecutor):
         report_meta["executed_turnover_usd"] = executed_turnover
         snapshot["filled"] = filled
         snapshot["executed_turnover_usd"] = executed_turnover
+        snapshot["signed_filled_quantity"] = float(signed_fill_quantity)
+        snapshot["filled_quantity"] = float(abs_filled_quantity)
         self._last_snapshot = snapshot
 
         execution_meta: Dict[str, Any] = {
@@ -1055,6 +1069,8 @@ class BarExecutor(TradeExecutor):
             "requested_target_weight": requested_target_weight,
             "requested_delta_weight": requested_delta_weight,
         }
+        execution_meta["signed_filled_quantity"] = float(signed_fill_quantity)
+        execution_meta["filled_quantity"] = float(abs_filled_quantity)
         if skip_reason is not None:
             execution_meta["reason"] = skip_reason
         if instructions:
@@ -1084,7 +1100,7 @@ class BarExecutor(TradeExecutor):
             side=_normalize_side(order.side),
             order_type=order.order_type if isinstance(order.order_type, OrderType) else OrderType.MARKET,
             price=exec_price,
-            quantity=Decimal("0"),
+            quantity=abs_filled_quantity,
             fee=Decimal("0"),
             fee_asset=None,
             exec_status=exec_status,
