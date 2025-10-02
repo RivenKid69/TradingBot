@@ -360,11 +360,18 @@ def test_bar_executor_clears_turnover_when_skipping_execution():
     decision = report.meta["decision"]
     assert decision["act_now"] is False
     assert decision["turnover_usd"] == pytest.approx(0.0)
+    execution_meta = report.meta["execution"]
+    assert execution_meta["turnover_usd"] == pytest.approx(0.0)
+    assert report.meta["executed_turnover_usd"] == pytest.approx(0.0)
     assert report.meta["instructions"] == []
 
     snapshot = executor.monitoring_snapshot()
     assert snapshot["act_now"] is False
     assert snapshot["turnover_usd"] == pytest.approx(0.0)
+    assert isinstance(order.meta, dict)
+    bar_execution = order.meta.get("_bar_execution")
+    assert bar_execution is not None
+    assert bar_execution["turnover_usd"] == pytest.approx(0.0)
 
 
 def test_bar_executor_turnover_cap_allows_quantized_trade():
