@@ -384,8 +384,10 @@ class BinanceWS:
                                 continue
                             if bool(k.get("x", False)):
                                 try:
+                                    bar_open_ms = int(k.get("t", 0))
+                                    bar_close_ms = int(k.get("T", 0))
                                     bar = Bar(
-                                        ts=int(k.get("t", 0)),
+                                        ts=bar_close_ms,
                                         symbol=str(k.get("s", "")).upper(),
                                         open=Decimal(k.get("o", 0.0)),
                                         high=Decimal(k.get("h", 0.0)),
@@ -418,8 +420,6 @@ class BinanceWS:
                                     if delay_ms > 0:
                                         self._dd_delay += 1
                                         await asyncio.sleep(delay_ms / 1000.0)
-                                bar_close_ms = int(k.get("T", 0))
-                                bar_open_ms = int(bar.ts)
                                 prev_open = self._last_open_ts.get(bar.symbol)
                                 gap_ms = None
                                 duplicate_ts = False
