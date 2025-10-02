@@ -913,6 +913,7 @@ class BarExecutor(TradeExecutor):
                 if remaining_candidates:
                     caps_eval["effective_cap"] = min(remaining_candidates)
         else:
+            turnover_usd = 0.0
             target_weight = final_state.weight
             delta_weight = 0.0
             dump_fn = getattr(metrics, "model_dump", None)
@@ -937,6 +938,7 @@ class BarExecutor(TradeExecutor):
         if not instructions:
             target_weight = final_state.weight
             delta_weight = 0.0
+            turnover_usd = 0.0
 
         storage_key = symbol_key or final_state.symbol
         self._states[storage_key] = final_state
