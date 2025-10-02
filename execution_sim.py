@@ -69,6 +69,7 @@ try:
         get_liquidity_multiplier,
         load_hourly_seasonality,
         watch_seasonality_file,
+        bar_close_ms,
         next_bar_open_ms,
     )
 except Exception:  # pragma: no cover - fallback when running as standalone file
@@ -83,6 +84,7 @@ except Exception:  # pragma: no cover - fallback when running as standalone file
         get_liquidity_multiplier,
         load_hourly_seasonality,
         watch_seasonality_file,
+        bar_close_ms,
         next_bar_open_ms,
     )
 
@@ -3234,7 +3236,8 @@ class ExecutionSimulator:
         expected_new: Optional[int] = None
         if timeframe_hint is not None and timeframe_hint > 0:
             try:
-                expected_new = next_bar_open_ms(int(ts_ms), int(timeframe_hint))
+                bar_close_hint = bar_close_ms(int(ts_ms), int(timeframe_hint))
+                expected_new = next_bar_open_ms(bar_close_hint, int(timeframe_hint))
             except Exception:
                 expected_new = None
         object.__setattr__(self, "_next_open_expected_ts", expected_new)

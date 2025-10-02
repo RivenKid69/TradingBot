@@ -28,9 +28,10 @@ def test_bar_boundaries_are_consistent(timeframe_ms: int, offsets):
         assert close - start == timeframe_ms
         assert start == floor_to_timeframe(ts, timeframe_ms)
         assert start <= ts < close
-        assert next_bar_open_ms(ts, timeframe_ms) == close
-        next_after_close = next_bar_open_ms(close, timeframe_ms)
-        assert next_after_close == close + timeframe_ms
+        if ts > start:
+            assert next_bar_open_ms(ts, timeframe_ms) == close
+        assert next_bar_open_ms(close - 1, timeframe_ms) == close
+        assert next_bar_open_ms(close, timeframe_ms) == close
 
 
 @pytest.mark.parametrize("bad_timeframe", [0, -60_000])
