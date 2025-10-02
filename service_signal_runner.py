@@ -5990,7 +5990,10 @@ class ServiceSignalRunner:
         mode = "order"
         if exec_cfg is not None:
             mode = str(getattr(exec_cfg, "mode", mode) or mode)
-        self._execution_mode = mode.lower()
+        mode = mode.strip().lower()
+        if mode not in {"bar", "order"}:
+            mode = "order"
+        self._execution_mode = mode
         self.alerts: AlertManager | None = None
         self.monitoring_agg: MonitoringAggregator | None = None
         self._clock_safe_mode = False
