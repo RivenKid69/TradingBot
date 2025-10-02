@@ -2486,6 +2486,7 @@ class _Worker:
                 payload_expires_ms = None
             if payload_expires_ms is not None:
                 expires_at_ms = min(expires_at_ms, payload_expires_ms)
+        expires_at_ms = max(expires_at_ms, base_bar_close_ms)
         try:
             return build_signal_envelope(
                 symbol=str(symbol),
@@ -5119,6 +5120,7 @@ class _Worker:
                 valid_until_ms_int = None
         if valid_until_ms_int is not None:
             expires_at_ms = min(expires_at_ms, valid_until_ms_int)
+        expires_at_ms = max(expires_at_ms, bar_close_ms)
         published = True
         stack_pushed = False
         if getattr(signal_bus, "ENABLED", False):
