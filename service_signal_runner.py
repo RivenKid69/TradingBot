@@ -5224,8 +5224,9 @@ class _Worker:
             )
 
         symbol = bar.symbol.upper()
-        ts_ms = int(bar.ts)
-        bar_open_ms = ts_ms
+        bar_close_ms = int(bar.ts)
+        ts_ms = bar_close_ms
+        bar_open_ms = bar_close_ms
         self._last_bar_snapshot[symbol] = bar
         close_val = self._coerce_price(getattr(bar, "close", None))
         if close_val is not None:
@@ -5413,32 +5414,30 @@ class _Worker:
         )
         ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
         ttl_timeframe_ms = self._resolve_ttl_timeframe_ms(log_if_invalid=ttl_enabled)
-        ttl_bar_close_ms = bar_open_ms
-        if ttl_timeframe_ms is not None:
-            ttl_bar_close_ms = bar_open_ms + ttl_timeframe_ms
 
-        publish_timeframe_ms = self._bar_timeframe_ms
-        if publish_timeframe_ms <= 0:
-            publish_timeframe_ms = self._ws_dedup_timeframe_ms
-        if publish_timeframe_ms <= 0 and ttl_timeframe_ms is not None:
-            publish_timeframe_ms = ttl_timeframe_ms
-        bar_close_for_publish = bar_open_ms
-        if publish_timeframe_ms > 0:
-            bar_close_for_publish = bar_open_ms + publish_timeframe_ms
+        open_timeframe_ms = self._bar_timeframe_ms
+        if open_timeframe_ms <= 0:
+            open_timeframe_ms = self._ws_dedup_timeframe_ms
+        if open_timeframe_ms <= 0 and ttl_timeframe_ms is not None:
+            open_timeframe_ms = ttl_timeframe_ms
+        if open_timeframe_ms > 0:
+            bar_open_ms = bar_close_ms - open_timeframe_ms
+        else:
+            bar_open_ms = bar_close_ms
 
-        close_ms: int | None = None
+        ttl_bar_close_ms = bar_close_ms
+
         dedup_stage_cfg = self._pipeline_cfg.get("dedup") if self._pipeline_cfg else None
         dedup_enabled = self._ws_dedup_enabled and (
             dedup_stage_cfg is None or dedup_stage_cfg.enabled
         )
         if self._ws_dedup_enabled:
-            close_ms = int(bar.ts) + self._ws_dedup_timeframe_ms
             if dedup_enabled:
                 try:
                     monitoring.inc_stage(Stage.DEDUP)
                 except Exception:
                     pass
-                if signal_bus.should_skip(bar.symbol, close_ms):
+                if signal_bus.should_skip(bar.symbol, bar_close_ms):
                     if self._ws_dedup_log_skips:
                         try:
                             self._logger.info("SKIP_DUPLICATE_BAR")
@@ -5829,7 +5828,7 @@ class _Worker:
                 o,
                 bar.symbol,
                 bar_open_ms,
-                bar_close_ms=bar_close_for_publish,
+                bar_close_ms=bar_close_ms,
                 stage_cfg=(
                     self._pipeline_cfg.get("publish") if self._pipeline_cfg else None
                 ),
@@ -5858,9 +5857,9 @@ class _Worker:
 
         self._update_queue_metrics()
 
-        if self._ws_dedup_enabled and close_ms is not None:
+        if self._ws_dedup_enabled:
             try:
-                signal_bus.update(bar.symbol, close_ms)
+                signal_bus.update(bar.symbol, bar_close_ms)
             except Exception:
                 pass
         return _finalize()
