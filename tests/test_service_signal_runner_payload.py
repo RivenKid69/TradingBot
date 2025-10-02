@@ -133,6 +133,16 @@ def test_build_envelope_payload_extracts_adv_quote() -> None:
     assert payload["economics"]["adv_quote"] == pytest.approx(adv_quote)
 
 
+def test_build_envelope_payload_does_not_fall_back_to_cap_usd() -> None:
+    worker = _make_worker()
+    order = SimpleNamespace(meta={"cap_usd": 1_000.0}, payload={"target_weight": 0.1})
+
+    payload, _, adv_quote = worker._build_envelope_payload(order, "BTCUSDT")
+
+    assert adv_quote is None
+    assert payload["economics"].get("adv_quote") is None
+
+
 def test_normalize_weight_targets_aggregates_symbol_totals() -> None:
     worker = _make_worker()
     worker._execution_mode = "bar"

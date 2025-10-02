@@ -1263,9 +1263,7 @@ class _Worker:
 
         if isinstance(meta, MappingABC):
             _collect(meta.get("adv_quote"))
-            nested_meta_adv = self._find_in_mapping(
-                meta, ("adv_quote", "cap_quote", "cap_usd", "daily_notional_cap")
-            )
+            nested_meta_adv = self._find_in_mapping(meta, ("adv_quote",))
             if nested_meta_adv is not None:
                 _collect(nested_meta_adv)
 
