@@ -95,6 +95,7 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
     assert row["bar_act_now"] == 1
     assert row["bar_turnover_usd"] == pytest.approx(800.0)
     assert row["bar_cap_usd"] == pytest.approx(12_000.0)
+    assert row["bar_adv_quote"] == pytest.approx(10_000.0)
     assert row["bar_act_now_rate"] == pytest.approx(0.5)
     assert row["bar_turnover_vs_cap"] == pytest.approx(800.0 / 12_000.0)
     assert "realized_slippage_bps" in row.index
@@ -110,6 +111,7 @@ def test_aggregate_accepts_bar_mode_logs(tmp_path: Path) -> None:
     assert day["bar_act_now"] == 1
     assert day["bar_turnover_usd"] == pytest.approx(800.0)
     assert day["bar_cap_usd"] == pytest.approx(12_000.0)
+    assert day["bar_adv_quote"] == pytest.approx(10_000.0)
     assert day["bar_turnover_vs_cap"] == pytest.approx(800.0 / 12_000.0)
     assert "cost_bias_bps" in day.index
 
@@ -139,12 +141,14 @@ def test_aggregate_skips_slippage_for_zero_notional(tmp_path: Path) -> None:
     row = bars.iloc[0]
     assert pd.isna(row["realized_slippage_bps"])
     assert pd.isna(row["cost_bias_bps"])
+    assert row["bar_adv_quote"] == pytest.approx(5_000.0)
 
     days = pd.read_csv(out_days)
     assert days.shape[0] == 1
     day = days.iloc[0]
     assert pd.isna(day["realized_slippage_bps"])
     assert pd.isna(day["cost_bias_bps"])
+    assert day["bar_adv_quote"] == pytest.approx(5_000.0)
 
 
 def test_aggregate_uses_single_cap_denominator(tmp_path: Path) -> None:
@@ -191,6 +195,7 @@ def test_aggregate_uses_single_cap_denominator(tmp_path: Path) -> None:
     assert row["bar_turnover_usd"] == pytest.approx(expected_turnover)
     assert row["bar_cap_usd"] == pytest.approx(shared_cap)
     assert row["bar_turnover_vs_cap"] == pytest.approx(expected_turnover / shared_cap)
+    assert pd.isna(row["bar_adv_quote"])
 
     days = pd.read_csv(out_days)
     assert days.shape[0] == 1
@@ -198,6 +203,39 @@ def test_aggregate_uses_single_cap_denominator(tmp_path: Path) -> None:
     assert day["bar_turnover_usd"] == pytest.approx(expected_turnover)
     assert day["bar_cap_usd"] == pytest.approx(shared_cap)
     assert day["bar_turnover_vs_cap"] == pytest.approx(expected_turnover / shared_cap)
+    assert pd.isna(day["bar_adv_quote"])
+
+
+def test_adv_does_not_fill_missing_cap(tmp_path: Path) -> None:
+    meta = {
+        "mode": "target",
+        "decision": {"turnover_usd": 1_000.0, "act_now": True},
+        "adv_quote": 50_000.0,
+        "bar_ts": 180_000,
+    }
+
+    trades_df = pd.DataFrame([_make_row(180_000, meta)])
+    trades_path = tmp_path / "log_trades.csv"
+    trades_df.to_csv(trades_path, index=False)
+
+    out_bars = tmp_path / "bars.csv"
+    out_days = tmp_path / "days.csv"
+
+    aggregate(str(trades_path), "", str(out_bars), str(out_days), bar_seconds=60)
+
+    bars = pd.read_csv(out_bars)
+    assert bars.shape[0] == 1
+    row = bars.iloc[0]
+    assert pd.isna(row["bar_cap_usd"])
+    assert pd.isna(row["bar_turnover_vs_cap"])
+    assert row["bar_adv_quote"] == pytest.approx(50_000.0)
+
+    days = pd.read_csv(out_days)
+    assert days.shape[0] == 1
+    day = days.iloc[0]
+    assert pd.isna(day["bar_cap_usd"])
+    assert pd.isna(day["bar_turnover_vs_cap"])
+    assert day["bar_adv_quote"] == pytest.approx(50_000.0)
 
 
 def test_aggregate_accepts_string_act_now_column(tmp_path: Path) -> None:
