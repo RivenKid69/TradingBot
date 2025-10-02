@@ -536,7 +536,10 @@ def aggregate(
         lambda m: _extract_meta_float(m, ("turnover_usd", "turnover", "notional_usd")) or 0.0
     )
     cap_from_meta = meta_series.apply(
-        lambda m: _extract_meta_float(m, ("cap_usd", "adv_quote", "cap_quote", "daily_notional_cap"))
+        lambda m: _extract_meta_float(m, ("cap_usd", "cap_quote", "daily_notional_cap"))
+    )
+    adv_from_meta = meta_series.apply(
+        lambda m: _extract_meta_float(m, ("adv_quote", "adv_usd"))
     )
     act_now_from_meta = meta_series.apply(
         lambda m: _extract_meta_bool(m, ("act_now", "execute_now"))
@@ -578,6 +581,11 @@ def aggregate(
     else:
         trades["cap_usd"] = cap_from_meta
 
+    if "adv_quote" in trades.columns:
+        trades["adv_quote"] = pd.to_numeric(trades["adv_quote"], errors="coerce")
+    else:
+        trades["adv_quote"] = pd.to_numeric(adv_from_meta, errors="coerce")
+
     if "act_now" in trades.columns:
         trades["act_now_flag"] = trades["act_now"].apply(_normalize_bool_like)
     else:
@@ -586,6 +594,7 @@ def aggregate(
     trades["act_now_flag"] = trades["act_now_flag"].astype(object)
     trades.loc[trades["execution_mode"] != "bar", "turnover_usd"] = 0.0
     trades.loc[trades["execution_mode"] != "bar", "cap_usd"] = float("nan")
+    trades.loc[trades["execution_mode"] != "bar", "adv_quote"] = float("nan")
     trades.loc[trades["execution_mode"] != "bar", "act_now_flag"] = None
 
     # Execution cost diagnostics
@@ -647,9 +656,18 @@ def aggregate(
         cap_series = pd.to_numeric(
             df.get("cap_usd", pd.Series(dtype=float)), errors="coerce"
         )
-        cap_values = cap_series.dropna()
+        cap_values = cap_series[cap_series > 0]
         cap_value = float(cap_values.iloc[0]) if not cap_values.empty else float("nan")
-        ratio = float(turnover_total / cap_value) if cap_value > 0 else float("nan")
+        ratio = (
+            float(turnover_total / cap_value)
+            if cap_value > 0 and math.isfinite(cap_value)
+            else float("nan")
+        )
+        adv_series = pd.to_numeric(
+            df.get("adv_quote", pd.Series(dtype=float)), errors="coerce"
+        )
+        adv_values = adv_series[adv_series > 0]
+        adv_value = float(adv_values.iloc[0]) if not adv_values.empty else float("nan")
         act_rate = float(bar_act_now / bar_decisions) if bar_decisions > 0 else float("nan")
         realized_series = pd.to_numeric(df.get("realized_slippage_bps"), errors="coerce")
         modeled_series = pd.to_numeric(df.get("modeled_cost_bps"), errors="coerce")
@@ -683,6 +701,7 @@ def aggregate(
             "bar_turnover_usd": turnover_total,
             "bar_cap_usd": float(cap_value) if cap_value > 0 else float("nan"),
             "bar_turnover_vs_cap": ratio,
+            "bar_adv_quote": float(adv_value) if adv_value > 0 else float("nan"),
             "realized_slippage_bps": float(realized_avg),
             "modeled_cost_bps": float(modeled_avg),
             "cost_bias_bps": float(bias_avg),
@@ -707,8 +726,13 @@ def aggregate(
         cap_series = pd.to_numeric(
             df.get("cap_usd", pd.Series(dtype=float)), errors="coerce"
         )
-        cap_values = cap_series.dropna()
+        cap_values = cap_series[cap_series > 0]
         cap_value = float(cap_values.iloc[0]) if not cap_values.empty else float("nan")
+        adv_series = pd.to_numeric(
+            df.get("adv_quote", pd.Series(dtype=float)), errors="coerce"
+        )
+        adv_values = adv_series[adv_series > 0]
+        adv_value = float(adv_values.iloc[0]) if not adv_values.empty else float("nan")
         bar_decisions = float(df.get("bar_decision_count", pd.Series(dtype=float)).sum())
         bar_act_now = float(df.get("bar_act_now_count", pd.Series(dtype=float)).sum())
         turnover_total = float(df.get("turnover_usd", pd.Series(dtype=float)).sum())
@@ -744,8 +768,9 @@ def aggregate(
             "bar_turnover_usd": turnover_total,
             "bar_cap_usd": float(cap_value) if cap_value > 0 else float("nan"),
             "bar_turnover_vs_cap": float(turnover_total / cap_value)
-            if cap_value > 0
+            if cap_value > 0 and math.isfinite(cap_value)
             else float("nan"),
+            "bar_adv_quote": float(adv_value) if adv_value > 0 else float("nan"),
             "realized_slippage_bps": float(realized_avg),
             "modeled_cost_bps": float(modeled_avg),
             "cost_bias_bps": float(bias_avg),
