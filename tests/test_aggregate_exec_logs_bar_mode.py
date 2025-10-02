@@ -198,3 +198,45 @@ def test_aggregate_uses_single_cap_denominator(tmp_path: Path) -> None:
     assert day["bar_turnover_usd"] == pytest.approx(expected_turnover)
     assert day["bar_cap_usd"] == pytest.approx(shared_cap)
     assert day["bar_turnover_vs_cap"] == pytest.approx(expected_turnover / shared_cap)
+
+
+def test_aggregate_accepts_string_act_now_column(tmp_path: Path) -> None:
+    base_meta = {
+        "mode": "target",
+        "decision": {"turnover_usd": 200.0, "act_now": False},
+        "cap_usd": 5_000.0,
+        "bar_ts": 180_000,
+    }
+
+    rows: list[dict[str, object]] = []
+    act_now_values = ["TRUE", "false", "1", "0"]
+    for idx, act_now in enumerate(act_now_values):
+        meta = dict(base_meta)
+        meta["decision"] = dict(base_meta["decision"])
+        meta["decision"]["turnover_usd"] = 200.0 + idx * 50.0
+        row = _make_row(180_000 + idx * 5, meta)
+        row["act_now"] = act_now
+        rows.append(row)
+
+    trades_df = pd.DataFrame(rows)
+    trades_path = tmp_path / "log_trades.csv"
+    trades_df.to_csv(trades_path, index=False)
+
+    out_bars = tmp_path / "bars.csv"
+    out_days = tmp_path / "days.csv"
+
+    aggregate(str(trades_path), "", str(out_bars), str(out_days), bar_seconds=60)
+
+    bars = pd.read_csv(out_bars)
+    assert bars.shape[0] == 1
+    row = bars.iloc[0]
+    assert row["bar_decisions"] == 4
+    assert row["bar_act_now"] == 2
+    assert row["bar_act_now_rate"] == pytest.approx(0.5)
+
+    days = pd.read_csv(out_days)
+    assert days.shape[0] == 1
+    day = days.iloc[0]
+    assert day["bar_decisions"] == 4
+    assert day["bar_act_now"] == 2
+    assert day["bar_act_now_rate"] == pytest.approx(0.5)
