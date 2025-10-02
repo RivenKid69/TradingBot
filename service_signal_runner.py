@@ -5413,9 +5413,18 @@ class _Worker:
         )
         ttl_enabled = ttl_stage_cfg is None or ttl_stage_cfg.enabled
         ttl_timeframe_ms = self._resolve_ttl_timeframe_ms(log_if_invalid=ttl_enabled)
-        bar_close_for_ttl = bar_open_ms
+        ttl_bar_close_ms = bar_open_ms
         if ttl_timeframe_ms is not None:
-            bar_close_for_ttl = bar_open_ms + ttl_timeframe_ms
+            ttl_bar_close_ms = bar_open_ms + ttl_timeframe_ms
+
+        publish_timeframe_ms = self._bar_timeframe_ms
+        if publish_timeframe_ms <= 0:
+            publish_timeframe_ms = self._ws_dedup_timeframe_ms
+        if publish_timeframe_ms <= 0 and ttl_timeframe_ms is not None:
+            publish_timeframe_ms = ttl_timeframe_ms
+        bar_close_for_publish = bar_open_ms
+        if publish_timeframe_ms > 0:
+            bar_close_for_publish = bar_open_ms + publish_timeframe_ms
 
         close_ms: int | None = None
         dedup_stage_cfg = self._pipeline_cfg.get("dedup") if self._pipeline_cfg else None
@@ -5778,7 +5787,7 @@ class _Worker:
                 except Exception:
                     pass
                 ok, expires_at_ms, _ = check_ttl(
-                    bar_close_ms=bar_close_for_ttl,
+                    bar_close_ms=ttl_bar_close_ms,
                     now_ms=created_ts_ms,
                     timeframe_ms=ttl_timeframe_ms,
                 )
@@ -5788,7 +5797,7 @@ class _Worker:
                             "TTL_EXPIRED_BOUNDARY %s",
                             {
                                 "symbol": bar.symbol,
-                                "bar_close_ms": bar_close_for_ttl,
+                                "bar_close_ms": ttl_bar_close_ms,
                                 "now_ms": created_ts_ms,
                                 "expires_at_ms": expires_at_ms,
                             },
@@ -5820,7 +5829,7 @@ class _Worker:
                 o,
                 bar.symbol,
                 bar_open_ms,
-                bar_close_ms=bar_close_for_ttl,
+                bar_close_ms=bar_close_for_publish,
                 stage_cfg=(
                     self._pipeline_cfg.get("publish") if self._pipeline_cfg else None
                 ),

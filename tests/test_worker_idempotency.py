@@ -8,6 +8,7 @@ import pytest
 
 from core_config import SpotCostConfig
 from core_models import Bar, Order, OrderType, Side
+from pipeline import PipelineConfig, PipelineStageConfig
 
 import clock
 import service_signal_runner
@@ -252,6 +253,66 @@ def test_emit_uses_fallback_timeframe_when_ws_timeframe_zero(monkeypatch) -> Non
     assert len(dispatch_calls) == 1
     assert not any("TTL_BYPASSED" in msg for msg, *_ in logger.messages)
     assert ttl_stage_calls
+
+
+def test_emit_publishes_with_ttl_disabled(monkeypatch) -> None:
+    actual_timeframe = 60_000
+    ttl_timeframe = 1_000
+    bar_open_ms = 1_000_000
+    now_state = {"ms": bar_open_ms + actual_timeframe - 1}
+
+    (
+        worker,
+        _logger,
+        _publish_calls,
+        _executor_calls,
+        _metrics,
+        dispatch_calls,
+    ) = _make_worker(
+        monkeypatch,
+        execution_mode="bar",
+        ws_dedup_timeframe_ms=ttl_timeframe,
+        bar_timeframe_ms=actual_timeframe,
+        now_ms=lambda: now_state["ms"],
+    )
+
+    worker._pipeline_cfg = PipelineConfig(
+        stages={"ttl": PipelineStageConfig(enabled=False)}
+    )
+
+    assert worker._resolve_ttl_timeframe_ms(log_if_invalid=False) == ttl_timeframe
+    assert worker._bar_timeframe_ms == actual_timeframe
+
+    publish_events: list[dict[str, int]] = []
+
+    def _publish(symbol, bar_close_ms, payload, callback, *, expires_at_ms, **kwargs):
+        current = clock.now_ms()
+        publish_events.append(
+            {
+                "symbol": symbol,
+                "bar_close_ms": bar_close_ms,
+                "expires_at_ms": expires_at_ms,
+                "now": current,
+            }
+        )
+        if current >= expires_at_ms:
+            return False
+        callback({"symbol": symbol, "payload": payload})
+        return True
+
+    monkeypatch.setattr(service_signal_runner, "publish_signal_envelope", _publish)
+    monkeypatch.setattr(service_signal_runner.signal_bus, "ENABLED", True, raising=False)
+
+    order = _make_order("sig-ttl-disabled", created_ts_ms=now_state["ms"])
+    bar_close_ms = bar_open_ms + actual_timeframe
+
+    assert worker._emit(order, "BTCUSDT", bar_close_ms, bar_open_ms=bar_open_ms) is True
+    assert publish_events
+    event = publish_events[0]
+    assert event["bar_close_ms"] == bar_close_ms
+    assert event["expires_at_ms"] >= bar_close_ms
+    assert event["now"] < event["expires_at_ms"]
+    assert dispatch_calls
 
 
 def test_publish_decision_uses_fallback_timeframe_for_close(monkeypatch) -> None:
