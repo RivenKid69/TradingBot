@@ -68,6 +68,7 @@ from pipeline import (
     PipelineStageConfig,
 )
 from services.signal_bus import (
+    build_envelope as build_signal_envelope,
     log_drop,
     publish_signal as publish_signal_envelope,
     signal_id as envelope_signal_id,
@@ -2282,6 +2283,77 @@ class _Worker:
         else:
             envelope_payload["delta_weight"] = resolved_delta
         return envelope_payload, valid_until_ms, adv_quote
+
+    def _build_drop_envelope(
+        self, order: Any, symbol: str, bar_close_ms: int
+    ) -> Any | None:
+        payload, payload_valid_until_ms, adv_quote = self._build_envelope_payload(
+            order, symbol
+        )
+        try:
+            meta_map = self._ensure_order_meta(order)
+        except Exception:
+            meta_map = None
+        if adv_quote is not None and isinstance(meta_map, MappingABC):
+            try:
+                meta_map["adv_quote"] = adv_quote
+            except Exception:
+                pass
+        try:
+            created_ts = int(getattr(order, "created_ts_ms", 0) or 0)
+        except (TypeError, ValueError):
+            created_ts = 0
+        try:
+            base_bar_close_ms = int(bar_close_ms)
+        except (TypeError, ValueError):
+            base_bar_close_ms = 0
+        expires_at_ms = max(created_ts, base_bar_close_ms)
+        if self._ws_dedup_timeframe_ms > 0 and created_ts > 0:
+            expires_at_ms = max(
+                expires_at_ms, created_ts + self._ws_dedup_timeframe_ms
+            )
+        ttl_timeframe_ms = self._resolve_ttl_timeframe_ms(log_if_invalid=False)
+        if ttl_timeframe_ms is not None and ttl_timeframe_ms > 0:
+            try:
+                _, ttl_expires_at_ms, _ = check_ttl(
+                    bar_close_ms=base_bar_close_ms,
+                    now_ms=clock.now_ms(),
+                    timeframe_ms=ttl_timeframe_ms,
+                )
+            except Exception:
+                ttl_expires_at_ms = None
+            if ttl_expires_at_ms is not None:
+                expires_at_ms = min(expires_at_ms, ttl_expires_at_ms)
+        if payload_valid_until_ms is not None:
+            try:
+                payload_expires_ms = int(payload_valid_until_ms)
+            except (TypeError, ValueError):
+                payload_expires_ms = None
+            if payload_expires_ms is not None:
+                expires_at_ms = min(expires_at_ms, payload_expires_ms)
+        try:
+            return build_signal_envelope(
+                symbol=str(symbol),
+                bar_close_ms=base_bar_close_ms,
+                expires_at_ms=int(expires_at_ms),
+                payload=payload,
+            )
+        except Exception:
+            return None
+
+    def _log_drop_envelope(
+        self, order: Any, symbol: str, bar_close_ms: int, reason: str
+    ) -> None:
+        try:
+            envelope = self._build_drop_envelope(order, symbol, bar_close_ms)
+        except Exception:
+            envelope = None
+        if envelope is None:
+            return
+        try:
+            log_drop(envelope, reason)
+        except Exception:
+            pass
 
     def _persist_exposure_state(self, ts_ms: int | None = None) -> None:
         timestamp = int(ts_ms if ts_ms is not None else clock.now_ms())
@@ -4814,10 +4886,7 @@ class _Worker:
                     ).inc()
                 except Exception:
                     pass
-                try:
-                    log_drop(symbol, bar_close_ms, o, reason or "RISK")
-                except Exception:
-                    pass
+                self._log_drop_envelope(o, symbol, bar_close_ms, reason or "RISK")
                 return False
             o = list(checked)[0]
 
@@ -5055,8 +5124,8 @@ class _Worker:
                         pass
                     return PipelineResult(action="queue", stage=Stage.PUBLISH)
                 self._rollback_exposure(o)
+                self._log_drop_envelope(o, symbol, bar_close_ms, reason or "")
                 try:
-                    log_drop(symbol, bar_close_ms, o, reason or "")
                     monitoring.throttle_dropped_count.labels(symbol, reason or "").inc()
                 except Exception:
                     pass
@@ -5100,9 +5169,12 @@ class _Worker:
                     self._rollback_exposure(order)
                 except Exception:
                     pass
+                self._log_drop_envelope(order, symbol, bar_close_ms, "QUEUE_EXPIRED")
                 try:
-                    log_drop(symbol, bar_close_ms, order, "QUEUE_EXPIRED")
                     monitoring.throttle_queue_expired_count.labels(symbol).inc()
+                except Exception:
+                    pass
+                try:
                     monitoring.throttle_dropped_count.labels(
                         symbol, "QUEUE_EXPIRED"
                     ).inc()
