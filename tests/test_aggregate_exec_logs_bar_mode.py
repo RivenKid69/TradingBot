@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -204,6 +206,72 @@ def test_aggregate_uses_single_cap_denominator(tmp_path: Path) -> None:
     assert day["bar_cap_usd"] == pytest.approx(shared_cap)
     assert day["bar_turnover_vs_cap"] == pytest.approx(expected_turnover / shared_cap)
     assert pd.isna(day["bar_adv_quote"])
+
+
+def test_aggregate_rejects_non_positive_bar_seconds(tmp_path: Path) -> None:
+    trades_df = pd.DataFrame(
+        [
+            _make_row(
+                60_000,
+                {
+                    "mode": "target",
+                    "decision": {"turnover_usd": 100.0, "act_now": True},
+                    "reference_price": 10_000.0,
+                },
+            )
+        ]
+    )
+    trades_path = tmp_path / "log_trades.csv"
+    trades_df.to_csv(trades_path, index=False)
+
+    out_bars = tmp_path / "bars.csv"
+    out_days = tmp_path / "days.csv"
+
+    with pytest.raises(ValueError) as excinfo:
+        aggregate(str(trades_path), "", str(out_bars), str(out_days), bar_seconds=0)
+
+    assert "bar_seconds must be a positive integer" in str(excinfo.value)
+
+
+def test_cli_rejects_non_positive_bar_seconds(tmp_path: Path) -> None:
+    trades_df = pd.DataFrame(
+        [
+            _make_row(
+                60_000,
+                {
+                    "mode": "target",
+                    "decision": {"turnover_usd": 100.0, "act_now": True},
+                    "reference_price": 10_000.0,
+                },
+            )
+        ]
+    )
+    trades_path = tmp_path / "log_trades.csv"
+    trades_df.to_csv(trades_path, index=False)
+
+    out_bars = tmp_path / "bars.csv"
+    out_days = tmp_path / "days.csv"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "aggregate_exec_logs",
+            "--trades",
+            str(trades_path),
+            "--out-bars",
+            str(out_bars),
+            "--out-days",
+            str(out_days),
+            "--bar-seconds",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "bar_seconds must be a positive integer" in result.stderr
 
 
 def test_adv_does_not_fill_missing_cap(tmp_path: Path) -> None:

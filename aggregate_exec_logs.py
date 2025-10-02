@@ -395,6 +395,11 @@ def _normalize_reports(df: pd.DataFrame) -> pd.DataFrame:
 
 def _bucket_ts_ms(ts_ms: pd.Series, *, bar_seconds: int) -> pd.Series:
     """Floors ms timestamp to bar_seconds buckets."""
+    if bar_seconds <= 0:
+        raise ValueError(
+            f"bar_seconds must be a positive integer (received {bar_seconds!r})"
+        )
+
     step = int(bar_seconds) * 1000
     return (pd.to_numeric(ts_ms, errors="coerce").astype("Int64") // step) * step
 
@@ -898,15 +903,18 @@ def main() -> None:
     p.add_argument("--metrics-md", default="", help="Optional path to save metrics summary in Markdown")
     args = p.parse_args()
 
-    aggregate(
-        args.trades,
-        args.reports,
-        args.out_bars,
-        args.out_days,
-        bar_seconds=int(args.bar_seconds),
-        equity_png=args.equity_png,
-        metrics_md=args.metrics_md,
-    )
+    try:
+        aggregate(
+            args.trades,
+            args.reports,
+            args.out_bars,
+            args.out_days,
+            bar_seconds=int(args.bar_seconds),
+            equity_png=args.equity_png,
+            metrics_md=args.metrics_md,
+        )
+    except ValueError as exc:
+        p.error(str(exc))
 
 
 if __name__ == "__main__":
