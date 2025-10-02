@@ -126,8 +126,11 @@ class BinancePublicBarSource(MarketDataSource):
                 except (ArithmeticError, ValueError, TypeError):
                     volume_quote = None
 
+            open_ts = int(k["t"])
+            close_ts = int(k.get("T", k["t"]))
+
             bar = Bar(
-                ts=int(k["t"]),
+                ts=close_ts,
                 symbol=str(k["s"]).upper(),
                 open=Decimal(k["o"]),
                 high=Decimal(k["h"]),
@@ -138,7 +141,7 @@ class BinancePublicBarSource(MarketDataSource):
                 trades=int(k.get("n", 0)),
                 is_final=bool(k.get("x", False)),
             )
-            bar_open_ms = int(bar.ts)
+            bar_open_ms = open_ts
             prev_open = self._last_open_ts.get(bar.symbol)
             gap_ms = None
             duplicate_ts = False
