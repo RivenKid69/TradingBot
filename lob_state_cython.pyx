@@ -1,7 +1,7 @@
 # cython: language_level=3, language=c++, c_string_type=str, c_string_encoding=utf-8, boundscheck=False, wraparound=False
 from libcpp.vector cimport vector
 from libcpp.utility cimport pair
-from libcpp.array cimport array as cpp_array
+from array_specializations cimport ArrayDouble4, ArrayDouble168
 
 from cython cimport Py_ssize_t
 from libc.stddef cimport size_t
@@ -88,9 +88,6 @@ N_FEATURES = _compute_n_features()
 # Используется для предварительного выделения памяти под NumPy массивы.
 DEF MAX_TRADES_PER_STEP = 10000
 DEF MAX_GENERATED_EVENTS_PER_TYPE = 5000
-
-ctypedef cpp_array[double, 4] ArrayDouble4
-ctypedef cpp_array[double, 168] ArrayDouble168
 
 cdef extern from "MarketSimulator.h":
 

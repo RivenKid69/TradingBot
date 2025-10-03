@@ -1,16 +1,16 @@
 # cython: language_level=3, language=c++
 from libcpp.vector cimport vector
 from libcpp.utility cimport pair
-from libcpp.array cimport array as cpp_array
+from array_specializations cimport ArrayDouble6, ArrayDouble6x6
 
 from fast_lob cimport OrderBook, CythonLOB
 from core_constants cimport MarketRegime
 
 cdef extern from "cpp_microstructure_generator.h":
-    cdef enum MicroEventType:
-        LIMIT
-        MARKET
-        CANCEL
+    cdef enum MicroEventType "MicroEventType":
+        LIMIT "MicroEventType::LIMIT"
+        MARKET "MicroEventType::MARKET"
+        CANCEL "MicroEventType::CANCEL"
 
     cdef int CH_LIM_BUY
     cdef int CH_LIM_SELL
@@ -28,10 +28,8 @@ cdef extern from "cpp_microstructure_generator.h":
         unsigned long long order_id
         int timestamp
 
-    ctypedef cpp_array[double, 6] ArrayDouble6
-    ctypedef cpp_array[ArrayDouble6, 6] ArrayDouble6x6
-
     cdef cppclass HawkesParams:
+        HawkesParams() except +
         ArrayDouble6 mu
         ArrayDouble6x6 alpha
         ArrayDouble6x6 beta
@@ -83,16 +81,16 @@ cdef extern from "cpp_microstructure_generator.h":
     cdef cppclass CppMicrostructureGenerator:
         CppMicrostructureGenerator() except +
         void set_seed(unsigned long long seed)
-        void set_hawkes_params(HawkesParams const& hp)
-        void set_size_models(SizeDist const& limit_sz, SizeDist const& market_sz)
-        void set_placement_profile(PlacementProfile const& pp)
+        void set_hawkes_params(const HawkesParams& hp)
+        void set_size_models(const SizeDist& limit_sz, const SizeDist& market_sz)
+        void set_placement_profile(const PlacementProfile& pp)
         void set_cancel_rate(double base_cancel_rate)
-        void set_flash_shocks(ShockParams const& sp)
-        void set_black_swan(BlackSwanParams const& bp)
+        void set_flash_shocks(const ShockParams& sp)
+        void set_black_swan(const BlackSwanParams& bp)
         void set_regime(MarketRegime regime)
-        void reset(long long mid0_ticks, long long best_bid_ticks=*, long long best_ask_ticks=*)
+        void reset(long long mid0_ticks, long long best_bid_ticks=0, long long best_ask_ticks=0)
         int step(OrderBook& lob, int timestamp, MicroEvent* out_events, int cap)
-        MicroFeatures current_features(OrderBook const& lob) const
+        MicroFeatures current_features(const OrderBook& lob) const
         unsigned long long last_order_id() const
         void copy_lambda_hat(double* out) const
 

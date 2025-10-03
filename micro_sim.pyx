@@ -17,7 +17,7 @@ cdef extern from "OrderBook.h":
         pass
 
 cdef extern from "cpp_microstructure_generator.h":
-    cdef enum MicroEventType:
+    cdef enum MicroEventType "MicroEventType":
         pass
 
     cdef struct MicroEvent:
