@@ -66,9 +66,14 @@ def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     float_cols = ["open","high","low","close","volume","quote_asset_volume",
                   "taker_buy_base_asset_volume","taker_buy_quote_asset_volume"]
-    int_cols = ["timestamp","number_of_trades"]
+    int_cols = ["number_of_trades"]
     for c in float_cols:
         df[c] = df[c].astype(float)
+    # Normalize timestamp column (detect milliseconds and convert to seconds)
+    ts = pd.to_numeric(df["timestamp"], errors="raise")
+    if ts.max() > 10_000_000_000:
+        ts = ts // 1000
+    df["timestamp"] = ts.astype("int64")
     for c in int_cols:
         df[c] = df[c].astype("int64")
     df["symbol"] = df["symbol"].astype(str)
