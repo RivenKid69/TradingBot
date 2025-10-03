@@ -121,6 +121,10 @@ def load_all_data(feather_paths: List[str], synthetic_fraction: float = 0.0, see
             df["close_orig"] = df["close"].astype(float)
             df["close"] = df["close"].shift(1)
         # Merge Fear & Greed on the same hour (left join to preserve OHLCV)
+        orig_fear_col = None
+        if "fear_greed_value" in df.columns:
+            orig_fear_col = "fear_greed_value_orig"
+            df = df.rename(columns={"fear_greed_value": orig_fear_col})
         if not fng.empty:
             fng_sorted = fng.sort_values("timestamp")[["timestamp","fear_greed_value"]].copy()
             df = pd.merge_asof(
@@ -129,7 +133,14 @@ def load_all_data(feather_paths: List[str], synthetic_fraction: float = 0.0, see
                 on="timestamp",
                 direction="backward"
             )
-            df["fear_greed_value"] = df["fear_greed_value"].ffill()
+            if "fear_greed_value" in df.columns:
+                df["fear_greed_value"] = df["fear_greed_value"].ffill()
+        if "fear_greed_value" not in df.columns and orig_fear_col:
+            df["fear_greed_value"] = df[orig_fear_col]
+        elif "fear_greed_value" in df.columns and orig_fear_col:
+            df["fear_greed_value"] = df["fear_greed_value"].fillna(df[orig_fear_col])
+        if orig_fear_col and orig_fear_col in df.columns:
+            df = df.drop(columns=[orig_fear_col])
         # Maintain stable column order
         base_cols = [
             "timestamp","symbol","open","high","low","close","volume","quote_asset_volume",
