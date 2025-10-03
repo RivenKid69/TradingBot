@@ -2,6 +2,9 @@
 """
 Полный цикл обновления данных и инференса сигналов.
 
+Функции ``run_single_cycle`` и ``run_continuous`` позволяют переиспользовать
+логику без настройки переменных окружения.
+
 Шаги (single pass):
   1) Догрузить последние закрытые свечи по каждому символу
      (Binance, 1h, limit=3 — берём предпоследнюю)
@@ -17,7 +20,7 @@
      [скрипт: infer_signals.py]
   6) Лог «✓ Cycle completed»
 
-ENV:
+ENV (для CLI по умолчанию):
   SYMS=BTCUSDT,ETHUSDT    — список символов для шага 1
   LOOP=0|1                — бесконечный цикл
   SLEEP_MIN=15            — пауза между проходами (мин)
@@ -34,8 +37,9 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import Iterable, List, Sequence
 
 
 def _log(msg: str) -> None:
@@ -68,10 +72,18 @@ def _exists_script(fname: str) -> bool:
     return os.path.exists(fname) and fname.endswith(".py")
 
 
-def _run(cmd: str, *, check: bool = True) -> int:
-    _log(f"$ {cmd}")
+def _format_cmd(cmd: Sequence[str]) -> str:
+    return " ".join(shlex.quote(c) for c in cmd)
+
+
+def _run(cmd: Iterable[str] | str, *, check: bool = True) -> int:
+    if isinstance(cmd, str):
+        args = shlex.split(cmd)
+    else:
+        args = list(cmd)
+    _log(f"$ {_format_cmd(args)}")
     try:
-        res = subprocess.run(shlex.split(cmd), check=check)
+        res = subprocess.run(args, check=check)
         return int(res.returncode or 0)
     except subprocess.CalledProcessError as e:
         _log(f"! command failed (code={e.returncode}): {cmd}")
@@ -89,16 +101,28 @@ def _date_str(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
 
-def _step1_incremental_klines(symbols: List[str]) -> None:
+def _normalize_symbols(symbols: Sequence[str]) -> List[str]:
+    return [s.strip().upper() for s in symbols if s and s.strip()]
+
+
+def _step1_incremental_klines(symbols: Sequence[str]) -> None:
     if not _exists_script("incremental_klines.py"):
         _log("! skip step1: incremental_klines.py not found")
         return
-    syms_arg = ",".join(symbols)
-    _run(f"{sys.executable} incremental_klines.py --symbols {syms_arg}", check=False)
+    syms_arg = ",".join(_normalize_symbols(symbols))
+    _run(
+        [
+            sys.executable,
+            "incremental_klines.py",
+            "--symbols",
+            syms_arg,
+        ],
+        check=False,
+    )
 
 
-def _step2_prepare_events(days: int) -> None:
-    if _env_bool("SKIP_EVENTS", False):
+def _step2_prepare_events(days: int, *, skip_events: bool) -> None:
+    if skip_events:
         _log("~ step2: SKIP_EVENTS=1 — пропускаем обновление экономкалендаря")
         return
     if not _exists_script("prepare_events.py"):
@@ -106,20 +130,26 @@ def _step2_prepare_events(days: int) -> None:
         return
     to = datetime.now(timezone.utc).date()
     frm = to - timedelta(days=max(1, days))
-    cmd = (
-        f"{sys.executable} prepare_events.py "
-        f"--from {_date_str(frm)} --to {_date_str(to)}"
+    _run(
+        [
+            sys.executable,
+            "prepare_events.py",
+            "--from",
+            _date_str(frm),
+            "--to",
+            _date_str(to),
+        ],
+        check=False,
     )
-    _run(cmd, check=False)
 
 
-def _step3_build_features() -> None:
-    extra = os.getenv("EXTRA_ARGS_PREPARE", "")
+def _step3_build_features(extra_args: Sequence[str]) -> None:
+    extra = list(extra_args)
     if _exists_script("prepare_advanced_data.py"):
-        _run(f"{sys.executable} prepare_advanced_data.py {extra}", check=True)
+        _run([sys.executable, "prepare_advanced_data.py", *extra], check=True)
         return
     if _exists_script("prepare_and_run.py"):
-        _run(f"{sys.executable} prepare_and_run.py {extra}", check=True)
+        _run([sys.executable, "prepare_and_run.py", *extra], check=True)
         return
     _log(
         "! step3 skipped: neither prepare_advanced_data.py nor prepare_and_run.py found"
@@ -130,34 +160,117 @@ def _step4_validate_processed() -> None:
     if not _exists_script("validate_processed.py"):
         _log("! step4 skipped: validate_processed.py not found")
         return
-    rc = _run(f"{sys.executable} validate_processed.py", check=False)
+    rc = _run([sys.executable, "validate_processed.py"], check=False)
     if rc != 0:
         raise RuntimeError("validate_processed.py reported failures")
 
 
-def _step5_infer_signals() -> None:
-    extra = os.getenv("EXTRA_ARGS_INFER", "")
+def _step5_infer_signals(extra_args: Sequence[str]) -> None:
+    extra = list(extra_args)
     if not _exists_script("infer_signals.py"):
         _log("! step5 skipped: infer_signals.py not found")
         return
-    _run(f"{sys.executable} infer_signals.py {extra}", check=True)
+    _run([sys.executable, "infer_signals.py", *extra], check=True)
 
 
-def once() -> None:
-    symbols = _env_list("SYMS", ["BTCUSDT", "ETHUSDT"])
-    events_days = _env_int("EVENTS_DAYS", 90)
-
+def run_single_cycle(
+    symbols: Sequence[str],
+    *,
+    events_days: int = 90,
+    skip_events: bool = False,
+    extra_prepare_args: Sequence[str] | None = None,
+    extra_infer_args: Sequence[str] | None = None,
+) -> None:
+    symbols_list = _normalize_symbols(symbols) or ["BTCUSDT", "ETHUSDT"]
+    prepare_args = list(extra_prepare_args or [])
+    infer_args = list(extra_infer_args or [])
     _log("=== CYCLE START ===")
-    _log(f"symbols={symbols}")
+    _log(f"symbols={symbols_list}")
     try:
-        _step1_incremental_klines(symbols)
-        _step2_prepare_events(events_days)
-        _step3_build_features()
+        _step1_incremental_klines(symbols_list)
+        _step2_prepare_events(events_days, skip_events=skip_events)
+        _step3_build_features(prepare_args)
         _step4_validate_processed()
-        _step5_infer_signals()
+        _step5_infer_signals(infer_args)
     except Exception as e:
         _log(f"! cycle failed: {e}")
         raise
     finally:
         _log("=== CYCLE END ===")
     _log("✓ Cycle completed")
+
+
+def run_continuous(
+    symbols: Sequence[str],
+    *,
+    events_days: int = 90,
+    sleep_minutes: float = 15.0,
+    skip_events: bool = False,
+    extra_prepare_args: Sequence[str] | None = None,
+    extra_infer_args: Sequence[str] | None = None,
+) -> None:
+    while True:
+        run_single_cycle(
+            symbols,
+            events_days=events_days,
+            skip_events=skip_events,
+            extra_prepare_args=extra_prepare_args,
+            extra_infer_args=extra_infer_args,
+        )
+        pause = max(0.0, float(sleep_minutes))
+        if pause <= 0:
+            continue
+        _log(f"sleeping for {pause:.2f} minutes ...")
+        time.sleep(pause * 60)
+
+
+def _extra_from_env(name: str) -> List[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return []
+    return shlex.split(raw)
+
+
+def once() -> None:
+    symbols = _env_list("SYMS", ["BTCUSDT", "ETHUSDT"])
+    events_days = _env_int("EVENTS_DAYS", 90)
+    skip_events = _env_bool("SKIP_EVENTS", False)
+    run_single_cycle(
+        symbols,
+        events_days=events_days,
+        skip_events=skip_events,
+        extra_prepare_args=_extra_from_env("EXTRA_ARGS_PREPARE"),
+        extra_infer_args=_extra_from_env("EXTRA_ARGS_INFER"),
+    )
+
+
+def main() -> None:
+    loop = _env_bool("LOOP", False)
+    symbols = _env_list("SYMS", ["BTCUSDT", "ETHUSDT"])
+    events_days = _env_int("EVENTS_DAYS", 90)
+    sleep_min = _env_int("SLEEP_MIN", 15)
+    skip_events = _env_bool("SKIP_EVENTS", False)
+    extra_prepare = _extra_from_env("EXTRA_ARGS_PREPARE")
+    extra_infer = _extra_from_env("EXTRA_ARGS_INFER")
+
+    if loop:
+        run_continuous(
+            symbols,
+            events_days=events_days,
+            sleep_minutes=sleep_min,
+            skip_events=skip_events,
+            extra_prepare_args=extra_prepare,
+            extra_infer_args=extra_infer,
+        )
+    else:
+        run_single_cycle(
+            symbols,
+            events_days=events_days,
+            skip_events=skip_events,
+            extra_prepare_args=extra_prepare,
+            extra_infer_args=extra_infer,
+        )
+
+
+if __name__ == "__main__":
+    main()

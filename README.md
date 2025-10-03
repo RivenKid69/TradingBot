@@ -46,6 +46,47 @@ python script_fetch_exchange_specs.py --market futures --symbols BTCUSDT,ETHUSDT
 python scripts/validate_seasonality.py --historical path/to/trades.csv --multipliers data/latency/liquidity_latency_seasonality.json
 ```
 
+### Полный цикл обновления и инференса
+
+Для запуска полного пайплайна без отдельного YAML используйте
+`scripts/run_full_cycle.py`. Скрипт сначала выгружает и агрегирует свечи через
+`ingest_orchestrator`, а затем запускает обновление данных и инференс сигналов из
+`update_and_infer.py`.
+
+Пример одноразового запуска с базовым интервалом `1m` и агрегацией в `5m` и
+`15m`:
+
+```bash
+python scripts/run_full_cycle.py \
+  --symbols BTCUSDT,ETHUSDT \
+  --interval 1m,5m,15m \
+  --start 2024-01-01 --end 2024-12-31 \
+  --prepare-args "--config configs/feature_prepare.yaml" \
+  --infer-args "--config configs/infer.yaml"
+```
+
+Основные аргументы CLI:
+
+- `--symbols` — список символов (через запятую или несколько флагов).
+- `--interval` — первый интервал выгружается напрямую, остальные агрегируются
+  из базового.
+- `--start` / `--end` — границы окна дат для скачивания свечей.
+- `--loop` и `--sleep-min` — включают бесконечный цикл с паузой между
+  итерациями.
+- `--prepare-args`, `--infer-args` — дополнительные параметры, передаваемые
+  соответственно в `prepare_advanced_data.py`/`prepare_and_run.py` и
+  `infer_signals.py`.
+- Дополнительные флаги (`--klines-dir`, `--futures-dir`, `--prices-out` и т.д.)
+  переопределяют пути и задержки, повторяя настройки `ingest_orchestrator`.
+
+`update_and_infer.py` по-прежнему читает переменные окружения (`SYMS`,
+`LOOP`, `SLEEP_MIN`, `EVENTS_DAYS`, `SKIP_EVENTS`, `EXTRA_ARGS_PREPARE`,
+`EXTRA_ARGS_INFER`) при прямом запуске:
+
+```bash
+SYMS=BTCUSDT,ETHUSDT LOOP=1 SLEEP_MIN=30 python update_and_infer.py
+```
+
 Runners load the symbol universe from ``data/universe/symbols.json`` by default.
 Override it with the ``--symbols`` CLI flag or an explicit ``data.symbols``
 entry in the YAML configuration.

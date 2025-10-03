@@ -59,13 +59,7 @@ def _run(cmd: List[str]) -> None:
         raise SystemExit(f"Команда завершилась с ошибкой: {' '.join(cmd)}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Orchestrate public Binance ingest (no keys).")
-    parser.add_argument("--config", default="configs/ingest.yaml", help="Путь к YAML конфигу")
-    args = parser.parse_args()
-
-    cfg: IngestConfig = load_config(args.config)
-
+def run_from_config(cfg: IngestConfig) -> None:
     symbols: List[str] = [s.upper() for s in cfg.symbols]
     if not symbols:
         raise SystemExit("В конфиге не указаны symbols")
@@ -183,6 +177,16 @@ def main():
             _run(cmd)
 
     print("Готово: ingest → aggregate → funding/mark (если фьючи) → prices завершены.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Orchestrate public Binance ingest (no keys).")
+    parser.add_argument("--config", default="configs/ingest.yaml", help="Путь к YAML конфигу")
+    args = parser.parse_args()
+
+    cfg: IngestConfig = load_config(args.config)
+
+    run_from_config(cfg)
 
 
 if __name__ == "__main__":
