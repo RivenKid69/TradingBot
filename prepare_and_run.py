@@ -9,11 +9,12 @@ Also enforces column schema and avoids renaming 'volume'.
 import os
 import glob
 import re
+import argparse
 
 import numpy as np
 import pandas as pd
 
-RAW_DIR = os.path.join("data","candles")
+RAW_DIR = os.path.join("data","candles")  # оставим как дефолт для обратной совместимости
 FNG = os.path.join("data","fear_greed.csv")
 EVENTS = os.path.join("data","economic_events.csv")
 EVENT_HORIZON_HOURS = 96
@@ -133,6 +134,34 @@ def _read_any_raw(path: str) -> pd.DataFrame:
     raise ValueError(f"Unsupported raw extension: {path}")
 
 
+def _discover_raw_paths(raw_dirs: list[str]) -> list[str]:
+    """Собираем все CSV/Parquet из указанных директорий."""
+    patterns = ("*.csv", "*_1h.parquet", "*.parquet")
+    paths = set()
+    for d in raw_dirs:
+        if not d:
+            continue
+        for pat in patterns:
+            paths.update(glob.glob(os.path.join(d, pat)))
+    return sorted(paths)
+
+
+def _parse_args():
+    ap = argparse.ArgumentParser(description="Prepare processed feathers from raw candles")
+    ap.add_argument(
+        "--raw-dir",
+        help="Comma-separated list of directories with raw candles (csv/parquet). "
+             "If omitted, uses ENV RAW_DIR or defaults to 'data/candles,data/klines'.",
+        default=os.environ.get("RAW_DIR", "")
+    )
+    ap.add_argument(
+        "--out-dir",
+        help="Output directory for processed feather files (default: data/processed or ENV OUT_DIR).",
+        default=os.environ.get("OUT_DIR", OUT_DIR),
+    )
+    return ap.parse_args()
+
+
 def _read_fng() -> pd.DataFrame:
     if not os.path.exists(FNG):
         return pd.DataFrame(columns=["timestamp","fear_greed_value","fear_greed_value_norm"])
@@ -168,11 +197,19 @@ def prepare() -> list[str]:
     events = _read_events()
     written: list[str] = []
 
-    raw_paths = sorted({
-        *glob.glob(os.path.join(RAW_DIR, "*.csv")),
-        *glob.glob(os.path.join(RAW_DIR, "*_1h.parquet")),
-        *glob.glob(os.path.join(RAW_DIR, "*.parquet")),
-    })
+    # 1) выбираем директории для поиска raw
+    raw_dirs_env = os.environ.get("RAW_DIR", "")
+    # резервные директории по умолчанию: и candles, и klines
+    default_dirs = [RAW_DIR, os.path.join("data","klines")]
+    raw_dirs = [p for p in raw_dirs_env.split(",") if p] or default_dirs
+
+    # 2) собираем пути raw
+    raw_paths = _discover_raw_paths(raw_dirs)
+    if not raw_paths:
+        raise FileNotFoundError(
+            f"No raw files found. Checked: {', '.join(raw_dirs)}. "
+            f"Provide --raw-dir or set RAW_DIR, or place files into one of defaults."
+        )
     for path in raw_paths:
         df_raw = _read_any_raw(path)
         df = _normalize_ohlcv(df_raw, path)
@@ -227,6 +264,15 @@ def prepare() -> list[str]:
 
 
 def main():
+    args = _parse_args()
+    # если пользователь указал иной out-dir — применим
+    global OUT_DIR
+    if args.out_dir and args.out_dir != OUT_DIR:
+        OUT_DIR = args.out_dir
+        os.makedirs(OUT_DIR, exist_ok=True)
+    # прокинем RAW_DIR через окружение для совместимости с prepare()
+    if args.raw_dir:
+        os.environ["RAW_DIR"] = args.raw_dir
     paths = prepare()
     print(f"Prepared {len(paths)} files in {OUT_DIR}")
 
