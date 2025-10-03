@@ -30,7 +30,7 @@ cdef extern from "MarketSimulator.h" nogil:
             double* low,
             double* volume_usd,
             size_t n_steps,
-            uint64_t seed
+            uint64_t seed = 0
         ) except +
         double step(size_t i, double black_swan_probability, bint is_training_mode)
         void set_seed(uint64_t seed)

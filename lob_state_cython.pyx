@@ -1,11 +1,13 @@
 # cython: language_level=3, language=c++, c_string_type=str, c_string_encoding=utf-8, boundscheck=False, wraparound=False
 from libcpp.vector cimport vector
 from libcpp.utility cimport pair
+from libcpp.array cimport array as cpp_array
 
 from cython cimport Py_ssize_t
 from libc.stddef cimport size_t
 from libc.stdlib cimport rand
 from libc.math cimport log, tanh, fmax, fmin, log1p, fabs, isnan
+from libc.stdint cimport uint64_t
 
 cimport cython
 cimport numpy as np
@@ -87,34 +89,39 @@ N_FEATURES = _compute_n_features()
 DEF MAX_TRADES_PER_STEP = 10000
 DEF MAX_GENERATED_EVENTS_PER_TYPE = 5000
 
-# --- ИСПРАВЛЕННЫЕ C++ ДЕКЛАРАЦИИ ---
-# Объявляем, что мы будем использовать C++ класс MarketSimulator с полным набором указателей
-# PATCH‑ID:P15_LOBSTATE_comment  (no code change – for traceability)
+ctypedef cpp_array[double, 4] ArrayDouble4
+ctypedef cpp_array[double, 168] ArrayDouble168
+
 cdef extern from "MarketSimulator.h":
-    
+
     cdef cppclass MarketSimulator:
         MarketSimulator(
-            float* price_arr, float* open_arr, float* high_arr, float* low_arr,
-            float* volume_usd_arr,
-            size_t n_steps, int window_size,
-            int ma5_window, int ma20_window, int atr_window, int rsi_window,
-            int macd_fast, int macd_slow, int macd_signal, int momentum_window,
-            int cci_window, int bb_window, double bb_std_dev, int obv_ma_window
+            double* price,
+            double* open,
+            double* high,
+            double* low,
+            double* volume_usd,
+            size_t n_steps,
+            uint64_t seed = 0
         ) except +
-        double step(size_t, double, bint)
-        double get_last_price() const
-        double get_ma5(size_t)
-        double get_ma20(size_t)
-        double get_atr(size_t)
-        double get_rsi(size_t)
-        double get_macd(size_t)
-        double get_macd_signal(size_t)
-        double get_momentum(size_t)
-        double get_cci(size_t)
-        double get_obv(size_t)
-        double get_bb_lower(size_t)
-        double get_bb_upper(size_t)
-        void force_market_regime(MarketRegime, size_t, size_t)
+        double step(size_t i, double black_swan_probability, bint is_training_mode)
+        void set_regime_distribution(const ArrayDouble4& probs)
+        void enable_random_shocks(bint enable, double probability_per_step)
+        void force_market_regime(MarketRegime regime, size_t start, size_t duration)
+        void set_liquidity_seasonality(const ArrayDouble168& multipliers)
+        int shock_triggered(size_t i) const
+        double get_ma5(size_t i) const
+        double get_ma20(size_t i) const
+        double get_atr(size_t i) const
+        double get_rsi(size_t i) const
+        double get_macd(size_t i) const
+        double get_macd_signal(size_t i) const
+        double get_momentum(size_t i) const
+        double get_cci(size_t i) const
+        double get_obv(size_t i) const
+        double get_bb_lower(size_t i) const
+        double get_bb_upper(size_t i) const
+        void set_seed(uint64_t seed)
 
 
 
@@ -125,46 +132,59 @@ cdef class MarketSimulatorWrapper:
     Управляет жизненным циклом C++ объекта и предоставляет Python-интерфейс.
     """
     cdef MarketSimulator* thisptr  # Указатель на C++ объект
-    # НОВОЕ: Добавляем члены класса для хранения ссылок на массивы
     cdef public object _price_arr_ref, _open_arr_ref, _high_arr_ref, _low_arr_ref, _volume_usd_arr_ref
+    cdef double* _price_ptr
+    cdef size_t _n_steps
+    cdef size_t _last_step_idx
+    cdef double _last_price
 
     def __cinit__(self,
-                  # Основные сырые данные
-                  np.ndarray[float, ndim=1, mode="c"] price_arr,
-                  np.ndarray[float, ndim=1, mode="c"] open_arr,
-                  np.ndarray[float, ndim=1, mode="c"] high_arr,
-                  np.ndarray[float, ndim=1, mode="c"] low_arr,
-                  np.ndarray[float, ndim=1, mode="c"] volume_usd_arr,
-                  # Параметры индикаторов и симуляции
-                  int rsi_window, int macd_fast, int macd_slow, int macd_signal,
-                  int momentum_window, int cci_window, int bb_window, double bb_std_dev,
-                  int ma5_window, int ma20_window, int atr_window, int window_size, int obv_ma_window):
-        
-        # НОВОЕ: Сохраняем ссылки. Это увеличивает счетчик ссылок,
-        # и GC не тронет массивы, пока жив этот объект.
-        self._price_arr_ref = price_arr
-        self._open_arr_ref = open_arr
-        self._high_arr_ref = high_arr
-        self._low_arr_ref = low_arr
-        self._volume_usd_arr_ref = volume_usd_arr
-        cdef size_t n_steps = price_arr.shape[0]
+                  object price_arr not None,
+                  object open_arr not None,
+                  object high_arr not None,
+                  object low_arr not None,
+                  object volume_usd_arr not None,
+                  unsigned long long seed=0):
+
+        self.thisptr = NULL
+        self._price_ptr = <double*>NULL
+        self._n_steps = <size_t>0
+        self._last_step_idx = <size_t>0
+        self._last_price = 0.0
+
+        cdef np.ndarray[np.float64_t, ndim=1] price = np.ascontiguousarray(price_arr, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1] open_ = np.ascontiguousarray(open_arr, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1] high = np.ascontiguousarray(high_arr, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1] low = np.ascontiguousarray(low_arr, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1] volume = np.ascontiguousarray(volume_usd_arr, dtype=np.float64)
+
+        if price.shape[0] != open_.shape[0] or price.shape[0] != high.shape[0] or \
+           price.shape[0] != low.shape[0] or price.shape[0] != volume.shape[0]:
+            raise ValueError("All OHLCV arrays must have the same length")
+        if price.shape[0] == 0:
+            raise ValueError("Market simulator requires at least one timestep")
+
+        self._price_arr_ref = price
+        self._open_arr_ref = open_
+        self._high_arr_ref = high
+        self._low_arr_ref = low
+        self._volume_usd_arr_ref = volume
+
+        self._n_steps = <size_t>price.shape[0]
+        self._last_step_idx = <size_t>0
+        self._price_ptr = &price[0]
+        self._last_price = price[0]
+
+        cdef uint64_t c_seed = <uint64_t>seed
+
         self.thisptr = new MarketSimulator(
-            &price_arr[0], &open_arr[0], &high_arr[0], &low_arr[0],
-            &volume_usd_arr[0],
-            n_steps, window_size,
-            # --- Аргументы должны идти в этом порядке ---
-            ma5_window, 
-            ma20_window, 
-            atr_window, 
-            rsi_window, 
-            macd_fast,
-            macd_slow, 
-            macd_signal, 
-            momentum_window, 
-            cci_window, 
-            bb_window, 
-            bb_std_dev,
-            obv_ma_window
+            &price[0],
+            &open_[0],
+            &high[0],
+            &low[0],
+            &volume[0],
+            self._n_steps,
+            c_seed
         )
         if not self.thisptr:
             raise MemoryError("Failed to allocate MarketSimulator")
@@ -173,14 +193,30 @@ cdef class MarketSimulatorWrapper:
         if self.thisptr is not NULL:
             del self.thisptr
             self.thisptr = NULL
+        self._price_ptr = <double*>NULL
+        self._n_steps = <size_t>0
+        self._last_step_idx = <size_t>0
+        self._last_price = 0.0
 
     cpdef double step(self, int current_step_idx, double black_swan_probability, bint is_training_mode):
         """
         Вызывает C++ метод step для выполнения одного шага симуляции.
         """
-        return self.thisptr.step(current_step_idx, black_swan_probability, is_training_mode)
+        if self.thisptr is NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
+        if current_step_idx < 0:
+            raise ValueError("current_step_idx must be non-negative")
+
+        self._last_step_idx = <size_t>current_step_idx
+        self._last_price = self.thisptr.step(self._last_step_idx, black_swan_probability, is_training_mode)
+        return self._last_price
     cpdef double get_last_price(self):
-        return self.thisptr.get_last_price()
+        if self._price_ptr != <double*>NULL and self._n_steps > 0:
+            if self._last_step_idx < self._n_steps:
+                return self._price_ptr[self._last_step_idx]
+            return self._price_ptr[self._n_steps - 1]
+        return self._last_price
     cpdef double get_ma5(self, size_t idx):
         return self.thisptr.get_ma5(idx)
     cpdef double get_ma20(self, size_t idx):
@@ -212,7 +248,10 @@ cdef class MarketSimulatorWrapper:
             regime = STRONG_TREND
         else:
             regime = NORMAL
-        
+
+        if self.thisptr is NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
         self.thisptr.force_market_regime(regime, start_idx, duration)
 
 
