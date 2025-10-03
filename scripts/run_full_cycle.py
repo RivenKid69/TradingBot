@@ -149,6 +149,20 @@ def main() -> None:
         default="",
         help="Дополнительные аргументы для infer_signals.py (одной строкой)",
     )
+    parser.add_argument(
+        "--validate-max-age-sec",
+        type=int,
+        default=3600,
+        help=(
+            "Максимальный возраст последнего бара для validate_processed (сек). "
+            "Значение <=0 отключает проверку."
+        ),
+    )
+    parser.add_argument(
+        "--skip-validate-freshness",
+        action="store_true",
+        help="Полностью пропустить проверку свежести в validate_processed",
+    )
     parser.add_argument("--klines-dir", help="Путь для сохранения свечей")
     parser.add_argument("--futures-dir", help="Путь для данных funding/mark")
     parser.add_argument("--prices-out", help="Путь для итогового prices.parquet")
@@ -183,6 +197,10 @@ def main() -> None:
             skip_events=args.skip_events,
             extra_prepare_args=prepare_args,
             extra_infer_args=infer_args,
+            validate_max_age_sec=args.validate_max_age_sec,
+            skip_validate_freshness=(
+                args.skip_validate_freshness or args.validate_max_age_sec <= 0
+            ),
         )
     else:
         run_single_cycle(
@@ -191,6 +209,10 @@ def main() -> None:
             skip_events=args.skip_events,
             extra_prepare_args=prepare_args,
             extra_infer_args=infer_args,
+            validate_max_age_sec=args.validate_max_age_sec,
+            skip_validate_freshness=(
+                args.skip_validate_freshness or args.validate_max_age_sec <= 0
+            ),
         )
 
 
