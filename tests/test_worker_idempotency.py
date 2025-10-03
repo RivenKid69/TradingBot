@@ -70,6 +70,7 @@ def _make_worker(
     throttle_cfg: types.SimpleNamespace | None = None,
     ws_dedup_timeframe_ms: int = 60_000,
     bar_timeframe_ms: int | None = None,
+    executor: Any | None = None,
 ):
     fp = types.SimpleNamespace(spread_ttl_ms=0)
     policy = types.SimpleNamespace()
@@ -79,7 +80,8 @@ def _make_worker(
     def _submit(order):
         executor_calls.append(order)
 
-    executor = types.SimpleNamespace(submit=_submit)
+    if executor is None:
+        executor = types.SimpleNamespace(submit=_submit)
 
     published_metric = DummyMetric()
     age_metric = DummyMetric()
@@ -97,6 +99,22 @@ def _make_worker(
         service_signal_runner.monitoring,
         "signal_idempotency_skipped_count",
         skipped_metric,
+    )
+    monkeypatch.setattr(
+        service_signal_runner.monitoring,
+        "record_signals",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        service_signal_runner.monitoring,
+        "alert_zero_signals",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        service_signal_runner.monitoring,
+        "signal_error_rate",
+        DummyMetric(),
+        raising=False,
     )
 
     publish_calls: list[tuple] = []
@@ -131,6 +149,17 @@ def _make_worker(
         "age": age_metric,
         "skipped": skipped_metric,
     }, dispatch_calls
+
+
+def _make_bar_executor_policy_worker(monkeypatch, executor: BarExecutor) -> _Worker:
+    worker, _logger, _publish_calls, _executor_calls, _metrics, _dispatch_calls = _make_worker(
+        monkeypatch,
+        execution_mode="bar",
+        ws_dedup_timeframe_ms=0,
+        bar_timeframe_ms=0,
+        executor=executor,
+    )
+    return worker
 
 
 def test_emit_skips_duplicate_idempotency(monkeypatch) -> None:
@@ -316,6 +345,29 @@ def test_emit_publishes_with_ttl_disabled(monkeypatch) -> None:
     assert event["expires_at_ms"] >= bar_close_ms
     assert event["now"] < event["expires_at_ms"]
     assert dispatch_calls
+
+
+def test_process_uses_executor_bar_price(monkeypatch) -> None:
+    executor = BarExecutor(bar_price="open")
+    worker = _make_bar_executor_policy_worker(monkeypatch, executor)
+    worker._portfolio_equity = 100.0
+    worker._weights["BTCUSDT"] = 0.5
+    worker._pipeline_cfg = PipelineConfig(enabled=False)
+
+    bar = Bar(
+        ts=1_000,
+        symbol="BTCUSDT",
+        open=Decimal("10"),
+        high=Decimal("11"),
+        low=Decimal("9"),
+        close=Decimal("12"),
+    )
+
+    worker.process(bar)
+
+    assert worker._bar_price_field == "open"
+    assert worker._last_prices["BTCUSDT"] == pytest.approx(10.0)
+    assert worker._positions["BTCUSDT"] == pytest.approx(5.0)
 
 
 def test_publish_decision_uses_fallback_timeframe_for_close(monkeypatch) -> None:
