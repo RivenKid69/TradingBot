@@ -31,68 +31,68 @@ rest_budget:
 
 datasets:
   train:
-    version: "v2023.12-train"
-    start: "2022-01-01T00:00:00Z"
-    end: "2023-06-30T23:59:59Z"
+    version: "v2025.10-train"
+    start: "2017-07-14T00:00:00Z"
+    end: "2025-03-31T23:59:59Z"
     seasonality:
       input:
-        start: "2021-12-01T00:00:00Z"
-        end: "2023-06-30T23:59:59Z"
+        start: "2017-06-01T00:00:00Z"
+        end: "2025-03-31T23:59:59Z"
       output_path: "data/latency/liquidity_latency_seasonality_train.json"
-      verification_hash: "sha256:c65e110a637b969320af9c8fb56e635bb0241654ab71aac4f5ee9fbf99dd19d8"
+      verification_hash: null
     adv:
       input:
-        start: "2022-01-01T00:00:00Z"
-        end: "2023-06-30T23:59:59Z"
+        start: "2017-07-14T00:00:00Z"
+        end: "2025-03-31T23:59:59Z"
       output_path: "data/adv/train.parquet"
-      verification_hash: "sha256:0d31b96da5012582e4dee88ab1308a531225bf929b70c5edc1dd05b9be6c8b40"
+      verification_hash: null
     fees:
       input:
-        start: "2022-01-01T00:00:00Z"
-        end: "2023-06-30T23:59:59Z"
+        start: "2017-07-14T00:00:00Z"
+        end: "2025-03-31T23:59:59Z"
       output_path: "data/fees/train_fees.json"
-      verification_hash: "sha256:180676bb19383095d3ec84389c4ed8c7508be4b1a6b7179dd89b9590d5a32df0"
+      verification_hash: null
   val:
-    version: "v2023.12-val"
-    start: "2023-07-01T00:00:00Z"
-    end: "2023-09-30T23:59:59Z"
+    version: "v2025.10-val"
+    start: "2025-04-01T00:00:00Z"
+    end: "2025-06-30T23:59:59Z"
     seasonality:
       input:
-        start: "2023-03-01T00:00:00Z"
-        end: "2023-09-30T23:59:59Z"
+        start: "2024-10-01T00:00:00Z"
+        end: "2025-06-30T23:59:59Z"
       output_path: "data/latency/liquidity_latency_seasonality_val.json"
-      verification_hash: "sha256:05c2712cf030b664f90ad23d98a505d8a41942045f6141442d4c0c2c006a3c0c"
+      verification_hash: null
     adv:
       input:
-        start: "2023-07-01T00:00:00Z"
-        end: "2023-09-30T23:59:59Z"
+        start: "2025-04-01T00:00:00Z"
+        end: "2025-06-30T23:59:59Z"
       output_path: "data/adv/val.parquet"
-      verification_hash: "sha256:30e7f92ae9c95ed975ec575dd17edeb11d51e8d0c0bdae6e22a453fe67ceadb3"
+      verification_hash: null
     fees:
       input:
-        start: "2023-07-01T00:00:00Z"
-        end: "2023-09-30T23:59:59Z"
+        start: "2025-04-01T00:00:00Z"
+        end: "2025-06-30T23:59:59Z"
       output_path: "data/fees/val_fees.json"
-      verification_hash: "sha256:66a85a10d108cac103f843762366fe7544a85b2d5d8ad9de4b9e9c6a6d1b555c"
+      verification_hash: null
   test:
-    version: "v2023.12-test"
-    start: "2023-10-01T00:00:00Z"
-    end: "2023-12-31T23:59:59Z"
+    version: "v2025.10-test"
+    start: "2025-07-01T00:00:00Z"
+    end: "2025-09-30T23:59:59Z"
     seasonality:
       input:
-        start: "2023-06-01T00:00:00Z"
-        end: "2023-12-31T23:59:59Z"
+        start: "2025-01-01T00:00:00Z"
+        end: "2025-09-30T23:59:59Z"
       output_path: "data/latency/liquidity_latency_seasonality_test.json"
-      verification_hash: "sha256:bc7aafe50ca5dc104c1bccee22d73b318b6536c565c7dc0db146ba620d0f5f7a"
+      verification_hash: null
     adv:
       input:
-        start: "2023-10-01T00:00:00Z"
-        end: "2023-12-31T23:59:59Z"
+        start: "2025-07-01T00:00:00Z"
+        end: "2025-09-30T23:59:59Z"
       output_path: "data/adv/test.parquet"
-      verification_hash: "sha256:42ef42f8d5817f8ee8113cf6e11e4f8e60d13e37f6b45e64b796e884621df9d5"
+      verification_hash: null
     fees:
       input:
-        start: "2023-10-01T00:00:00Z"
-        end: "2023-12-31T23:59:59Z"
+        start: "2025-07-01T00:00:00Z"
+        end: "2025-09-30T23:59:59Z"
       output_path: "data/fees/test_fees.json"
-      verification_hash: "sha256:a928048704211e015c7d86cf3ddf0be900ef8a1d275096f86b4caa667f8bc65b"
+      verification_hash: null

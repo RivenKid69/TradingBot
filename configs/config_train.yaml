@@ -41,14 +41,14 @@ market: spot
 data:
   timeframe: "1m"  # symbols are loaded from data/universe/symbols.json
   # Training window (train_start_ts/train_end_ts); legacy aliases start_ts/end_ts remain supported.
-  train_start_ts: 1640995200     # 2022-01-01T00:00:00Z (aka start_ts)
-  train_end_ts: 1688169599       # 2023-06-30T23:59:59Z (aka end_ts)
-  # start_ts: 1640995200         # Uncomment for legacy-style configs (kept for compatibility)
-  # end_ts: 1688169599           # Uncomment for legacy-style configs (kept for compatibility)
-  val_start_ts: 1688169600       # 2023-07-01T00:00:00Z
-  val_end_ts: 1696118399         # 2023-09-30T23:59:59Z
-  test_start_ts: 1696118400      # 2023-10-01T00:00:00Z
-  test_end_ts: 1704067199        # 2023-12-31T23:59:59Z
+  train_start_ts: 1499990400     # 2017-07-14T00:00:00Z (aka start_ts)
+  train_end_ts: 1743465599       # 2025-03-31T23:59:59Z (aka end_ts)
+  # start_ts: 1499990400         # Uncomment for legacy-style configs (kept for compatibility)
+  # end_ts: 1743465599           # Uncomment for legacy-style configs (kept for compatibility)
+  val_start_ts: 1743465600       # 2025-04-01T00:00:00Z
+  val_end_ts: 1751327999         # 2025-06-30T23:59:59Z
+  test_start_ts: 1751328000      # 2025-07-01T00:00:00Z
+  test_end_ts: 1759276799        # 2025-09-30T23:59:59Z
 
 model:
   algo: "ppo"
