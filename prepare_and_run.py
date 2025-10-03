@@ -14,7 +14,7 @@ import argparse
 import numpy as np
 import pandas as pd
 
-RAW_DIR = os.path.join("data","candles")  # оставим как дефолт для обратной совместимости
+RAW_DIR = os.path.join("data","candles")  # дефолт; ниже добавим data/klines в список по умолчанию
 FNG = os.path.join("data","fear_greed.csv")
 EVENTS = os.path.join("data","economic_events.csv")
 EVENT_HORIZON_HOURS = 96
@@ -49,13 +49,27 @@ def _read_raw(path: str) -> pd.DataFrame:
     return df
 
 
-def _to_seconds(ts: pd.Series) -> pd.Series:
-    ts = pd.to_numeric(ts, errors="coerce")
-    ts_max = ts.max(skipna=True)
-    # поддержка ms → сек
-    if pd.notna(ts_max) and ts_max > 10_000_000_000:
-        ts = ts // 1000
-    return ts
+def _canon(name: str) -> str:
+    # нормализуем имя: нижний регистр + только буквы/цифры
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _to_seconds_any(x: pd.Series) -> pd.Series:
+    """Пытаемся привести любую временную колонку к секундам epoch."""
+
+    s = pd.to_numeric(x, errors="ignore")
+    if hasattr(s, "dtype") and s.dtype.kind in "biufc":  # числовое
+        s = pd.to_numeric(s, errors="coerce")
+        s = s.astype("Int64")
+        s_max = s.max(skipna=True)
+        if pd.notna(s_max) and s_max > 10_000_000_000:  # миллисекунды
+            s = s // 1000
+        return s
+
+    dt = pd.to_datetime(x, errors="coerce", utc=True, infer_datetime_format=True)
+    dt_int = pd.Series(dt.view("int64"), index=x.index, dtype="Int64")
+    dt_int[dt.isna()] = pd.NA
+    return dt_int.floordiv(1_000_000_000)
 
 
 def _infer_symbol(path: str, df: pd.DataFrame) -> str:
@@ -71,37 +85,73 @@ def _infer_symbol(path: str, df: pd.DataFrame) -> str:
 
 
 def _normalize_ohlcv(df: pd.DataFrame, path: str) -> pd.DataFrame:
-    # timestamp
-    if "timestamp" in df.columns:
-        ts = _to_seconds(df["timestamp"])
-    elif "close_time" in df.columns:
-        ts = _to_seconds(df["close_time"])
-    elif "open_time" in df.columns:
-        ts = _to_seconds(df["open_time"]) + 3600  # сместим к закрытию часа
-    else:
-        raise ValueError(f"{path}: no 'timestamp'/'close_time'/'open_time'")
+    cols = {_canon(c): c for c in df.columns}
 
-    ts = ((ts // 3600) * 3600).astype("Int64")
+    close_time_cands = [
+        "timestamp", "closetime", "klineclosetime", "endtime", "barend", "time", "t"
+    ]
+    open_time_cands = [
+        "opentime", "open_time", "klineopentime", "starttime", "barstart"
+    ]
 
-    # базовые поля
-    def num(col, fallback=None, dtype=float):
-        if col in df.columns:
-            return pd.to_numeric(df[col], errors="coerce")
-        if fallback is not None:
-            return pd.Series(fallback, index=df.index, dtype=dtype)
-        return pd.Series(np.nan, index=df.index, dtype="float64")
+    ts = None
+    for key in close_time_cands:
+        if key in cols:
+            ts = _to_seconds_any(df[cols[key]])
+            break
+    if ts is None:
+        for key in open_time_cands:
+            if key in cols:
+                ts = _to_seconds_any(df[cols[key]]) + 3600  # 1h бар → сместим к закрытию
+                break
+    if ts is None:
+        for c in df.columns:
+            cn = _canon(c)
+            if "time" in cn or "date" in cn or cn in {"datetime"}:
+                cand = _to_seconds_any(df[c])
+                if cand.notna().any():
+                    ts = cand
+                    break
+    if ts is None:
+        raise ValueError(f"{path}: no usable time column; have: {list(df.columns)}")
 
-    open_ = num("open")
-    high_ = num("high")
-    low_ = num("low")
-    close_ = num("close")
-    vol = num("volume")
-    qvol = num("quote_asset_volume")
+    def pick(names, default=np.nan, as_int=False):
+        for n in names:
+            cn = _canon(n)
+            if cn in cols:
+                ser = pd.to_numeric(df[cols[cn]], errors="coerce")
+                if as_int:
+                    return ser.fillna(0).astype("Int64").astype(int)
+                return ser
+        if as_int:
+            return pd.Series(0, index=df.index, dtype="Int64").astype(int)
+        return pd.Series(default, index=df.index, dtype="float64")
+
+    open_ = pick(["open", "o"])
+    high_ = pick(["high", "h"])
+    low_ = pick(["low", "l"])
+    close_ = pick(["close", "c"])
+    vol = pick(["volume", "v", "baseassetvolume", "base_volume"])
+    qvol = pick(["quoteassetvolume", "quote_volume", "q"])
     if qvol.isna().all():
         qvol = close_.astype(float) * vol.astype(float)
-    ntr = num("number_of_trades", 0, dtype=int).fillna(0).astype(int)
-    tb_base = num("taker_buy_base_asset_volume", 0.0).fillna(0.0)
-    tb_quote = num("taker_buy_quote_asset_volume")
+    ntr = pick(["numberoftrades", "num_trades", "n", "trades"], as_int=True)
+    tb_base = pick([
+        "taker_buy_base_asset_volume",
+        "takerbuybaseassetvolume",
+        "takerbuybase",
+        "v_buy",
+        "vbuy",
+        "tb_base",
+    ])
+    tb_quote = pick([
+        "taker_buy_quote_asset_volume",
+        "takerbuyquoteassetvolume",
+        "takerbuyquote",
+        "q_buy",
+        "qbuy",
+        "tb_quote",
+    ])
     if tb_quote.isna().all():
         tb_quote = (tb_base.astype(float) * close_.astype(float)).fillna(0.0)
 
