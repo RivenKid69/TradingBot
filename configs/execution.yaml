@@ -1,5 +1,6 @@
 # Standalone execution configuration overrides
 execution:
+  mode: bar
   intrabar_price_model: null
   timeframe_ms: null
   use_latency_from: null

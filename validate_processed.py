@@ -1,9 +1,10 @@
 # validate_processed.py
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -193,7 +194,11 @@ def _check_same_columns(cols: Sequence[str], ref_cols: Sequence[str]) -> None:
 
 
 def _validate_file(
-    path: Path, ref_cols: List[str] | None
+    path: Path,
+    ref_cols: List[str] | None,
+    *,
+    max_age_sec: Optional[int],
+    skip_freshness: bool,
 ) -> Tuple[bool, List[str], List[str]]:
     """Возвращает (ok, cols, errors)."""
     errs: List[str] = []
@@ -209,7 +214,13 @@ def _validate_file(
         _check_utc_alignment(df)
         _check_symbol_consistency(df, path)
         _check_no_duplicates(df)
-        _check_freshness(df, max_age_sec=3600)
+        if not skip_freshness:
+            if max_age_sec is None:
+                eff_age = 3600
+            else:
+                eff_age = max_age_sec
+            if eff_age > 0:
+                _check_freshness(df, max_age_sec=eff_age)
         cols = list(df.columns)
         # Единообразие схемы (если есть ref)
         if ref_cols is not None:
@@ -224,8 +235,35 @@ def _validate_file(
         return False, cols, errs
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate processed feature tables produced by prepare_and_run.py",
+    )
+    parser.add_argument(
+        "--base-dir",
+        default="data/processed",
+        help="Каталог с .feather файлами (по умолчанию data/processed)",
+    )
+    parser.add_argument(
+        "--max-age-sec",
+        type=int,
+        default=3600,
+        help=(
+            "Максимальный допустимый возраст последнего бара в секундах. "
+            "Значение <=0 отключает проверку."
+        ),
+    )
+    parser.add_argument(
+        "--skip-freshness",
+        action="store_true",
+        help="Полностью пропустить проверку свежести данных",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    base = Path("data/processed")
+    args = _parse_args()
+    base = Path(args.base_dir)
     if not base.exists():
         print(f"[FAIL] {base} does not exist", file=sys.stderr)
         sys.exit(1)
@@ -240,7 +278,12 @@ def main() -> None:
     fail_total = 0
 
     for i, path in enumerate(files, 1):
-        ok, cols, errs = _validate_file(path, ref_cols)
+        ok, cols, errs = _validate_file(
+            path,
+            ref_cols,
+            max_age_sec=args.max_age_sec,
+            skip_freshness=args.skip_freshness or (args.max_age_sec <= 0),
+        )
         if ok:
             print(f"[OK]   {path.name}")
             ok_total += 1

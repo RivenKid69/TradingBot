@@ -6,11 +6,18 @@ Merge raw 1h candles from data/candles/ with Fear & Greed (data/fear_greed.csv)
 and write per-symbol Feather files to data/processed/ expected by training.
 Also enforces column schema and avoids renaming 'volume'.
 """
-import os
 import glob
+import os
+from pathlib import Path
+from typing import Dict, Tuple
+
+import numpy as np
 import pandas as pd
 
+from impl_offline_data import timeframe_to_ms
+
 RAW_DIR = os.path.join("data","candles")
+KLINES_DIR = os.path.join("data", "klines")
 FNG = os.path.join("data","fear_greed.csv")
 EVENTS = os.path.join("data","economic_events.csv")
 EVENT_HORIZON_HOURS = 96
@@ -18,31 +25,185 @@ OUT_DIR = os.path.join("data","processed")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
-def _read_raw(path: str) -> pd.DataFrame:
+RAW_COLUMNS = [
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_time",
+    "quote_asset_volume",
+    "number_of_trades",
+    "taker_buy_base_asset_volume",
+    "taker_buy_quote_asset_volume",
+    "symbol",
+]
+
+
+def _normalize_raw_df(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    df = df.copy()
+    df["symbol"] = df.get("symbol", symbol).fillna(symbol).astype(str)
+    for col in ("open_time", "close_time"):
+        if col not in df.columns:
+            raise ValueError(f"Missing column '{col}' in raw candles for {symbol}")
+        series = pd.to_numeric(df[col], errors="coerce")
+        if series.max() > 10_000_000_000:
+            series = (series // 1000).astype("int64")
+        else:
+            series = series.astype("int64")
+        df[col] = series
+    float_cols = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_asset_volume",
+        "taker_buy_base_asset_volume",
+        "taker_buy_quote_asset_volume",
+    ]
+    for col in float_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["quote_asset_volume"] = df["quote_asset_volume"].fillna(
+        df["close"].astype(float) * df["volume"].astype(float)
+    )
+    df["number_of_trades"] = pd.to_numeric(
+        df.get("number_of_trades", 0), errors="coerce"
+    ).fillna(0).astype("int64")
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"]).copy()
+    df["taker_buy_base_asset_volume"] = df["taker_buy_base_asset_volume"].fillna(0.0)
+    df["taker_buy_quote_asset_volume"] = df["taker_buy_quote_asset_volume"].fillna(0.0)
+    df["timestamp"] = (df["close_time"] // 3600) * 3600
+    df = df[
+        [
+            "timestamp",
+            "symbol",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_asset_volume",
+            "number_of_trades",
+            "taker_buy_base_asset_volume",
+            "taker_buy_quote_asset_volume",
+        ]
+    ].drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+    return df
+
+
+def _read_raw(path: str) -> Tuple[str, pd.DataFrame]:
     df = pd.read_csv(path)
     # Convert open/close time to seconds
-    for c in ["open_time","close_time"]:
-        if df[c].max() > 10_000_000_000:
-            df[c] = (df[c] // 1000).astype("int64")
-        else:
-            df[c] = df[c].astype("int64")
-    # Canonical timestamp = close_time floored to hour
-    df["timestamp"] = (df["close_time"] // 3600) * 3600
-    # Ensure symbol
-    if "symbol" not in df.columns:
-        sym = os.path.splitext(os.path.basename(path))[0]
-        df["symbol"] = sym
-    # Ensure quote_asset_volume
-    if "quote_asset_volume" not in df.columns:
-        df["quote_asset_volume"] = df["close"].astype(float) * df["volume"].astype(float)
-    # Minimal schema
-    keep = ["timestamp","symbol","open","high","low","close","volume","quote_asset_volume",
-            "number_of_trades","taker_buy_base_asset_volume","taker_buy_quote_asset_volume"]
-    for c in keep:
-        if c not in df.columns:
-            df[c] = 0 if c in ["number_of_trades"] else 0.0
-    df = df[keep].drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
-    return df
+    sym = os.path.splitext(os.path.basename(path))[0]
+    return sym, _normalize_raw_df(df, sym)
+
+
+def _parse_interval_ms(stem: str) -> Tuple[str, int]:
+    if "_" in stem:
+        sym, interval = stem.split("_", 1)
+    else:
+        sym, interval = stem, "1h"
+    try:
+        interval_ms = timeframe_to_ms(interval)
+    except Exception:
+        interval_ms = 3_600_000
+    return sym.upper(), int(interval_ms)
+
+
+def _infer_interval_ms(open_time_ms: pd.Series, fallback: int) -> int:
+    values = np.sort(open_time_ms.dropna().unique())
+    if len(values) <= 1:
+        return fallback
+    diffs = np.diff(values)
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        return fallback
+    return int(diffs.min())
+
+
+def _read_klines_parquet(path: str, *, write_csv: bool = True) -> Tuple[str, pd.DataFrame]:
+    df = pd.read_parquet(path)
+    stem = Path(path).stem
+    symbol, interval_hint_ms = _parse_interval_ms(stem)
+    if df.empty:
+        return symbol, df
+    df = df.copy()
+    if "ts_ms" not in df.columns:
+        raise ValueError(f"Missing ts_ms column in {path}")
+    df["ts_ms"] = pd.to_numeric(df["ts_ms"], errors="coerce")
+    df = df.dropna(subset=["ts_ms"])
+    df["ts_ms"] = df["ts_ms"].astype("int64")
+    interval_ms = _infer_interval_ms(df["ts_ms"], interval_hint_ms)
+    raw = pd.DataFrame()
+    raw["open_time"] = df["ts_ms"]
+    raw["close_time"] = raw["open_time"] + int(interval_ms)
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in df.columns:
+            raise ValueError(f"Missing column '{col}' in {path}")
+        raw[col] = pd.to_numeric(df[col], errors="coerce")
+    if "quote_asset_volume" in df.columns:
+        raw["quote_asset_volume"] = pd.to_numeric(df["quote_asset_volume"], errors="coerce")
+    else:
+        raw["quote_asset_volume"] = np.nan
+    raw["number_of_trades"] = pd.to_numeric(
+        df.get("number_of_trades", 0), errors="coerce"
+    )
+    raw["taker_buy_base_asset_volume"] = pd.to_numeric(
+        df.get("taker_buy_base_asset_volume", df.get("taker_buy_base", 0)),
+        errors="coerce",
+    )
+    raw["taker_buy_quote_asset_volume"] = pd.to_numeric(
+        df.get("taker_buy_quote_asset_volume", df.get("taker_buy_quote", 0)),
+        errors="coerce",
+    )
+    if "symbol" in df.columns:
+        raw["symbol"] = df["symbol"].astype(str).fillna(symbol)
+    else:
+        raw["symbol"] = symbol
+    raw = raw[RAW_COLUMNS]
+    if raw["quote_asset_volume"].isna().all():
+        raw["quote_asset_volume"] = raw["close"].astype(float) * raw["volume"].astype(float)
+    raw["number_of_trades"] = raw["number_of_trades"].fillna(0)
+    raw["taker_buy_base_asset_volume"] = raw["taker_buy_base_asset_volume"].fillna(0.0)
+    raw["taker_buy_quote_asset_volume"] = raw["taker_buy_quote_asset_volume"].fillna(0.0)
+    if write_csv:
+        os.makedirs(RAW_DIR, exist_ok=True)
+        csv_path = os.path.join(RAW_DIR, f"{symbol}.csv")
+        raw.to_csv(csv_path, index=False)
+    return symbol, _normalize_raw_df(raw, symbol)
+
+
+def _gather_raw_frames() -> Dict[str, pd.DataFrame]:
+    frames: Dict[str, pd.DataFrame] = {}
+
+    def _register(symbol: str, frame: pd.DataFrame) -> None:
+        if frame is None or frame.empty:
+            return
+        prev = frames.get(symbol)
+        if prev is None or len(frame) > len(prev):
+            frames[symbol] = frame
+
+    for path in sorted(glob.glob(os.path.join(KLINES_DIR, "*.parquet"))):
+        try:
+            symbol, frame = _read_klines_parquet(path)
+        except Exception as exc:
+            print(f"! Failed to convert {path}: {exc}")
+            continue
+        _register(symbol, frame)
+
+    for path in sorted(glob.glob(os.path.join(RAW_DIR, "*.csv"))):
+        try:
+            symbol, frame = _read_raw(path)
+        except Exception as exc:
+            print(f"! Failed to read {path}: {exc}")
+            continue
+        _register(symbol, frame)
+
+    return frames
 
 
 def _read_fng() -> pd.DataFrame:
@@ -80,8 +241,9 @@ def prepare() -> list[str]:
     events = _read_events()
     written: list[str] = []
 
-    for path in glob.glob(os.path.join(RAW_DIR, "*.csv")):
-        df = _read_raw(path)
+    frames = _gather_raw_frames()
+    for sym in sorted(frames.keys()):
+        df = frames[sym].copy()
         if not fng.empty:
             fng_sorted = fng.sort_values("timestamp")[["timestamp","fear_greed_value"]].copy()
             df = pd.merge_asof(
@@ -115,7 +277,6 @@ def prepare() -> list[str]:
             df["is_high_importance"] = ((df["importance_level"] == 2) & df["event_ts"].notna()).astype(int)
             df = df.drop(columns=["timestamp_dt", "event_ts_dt", "event_ts", "importance_level"])
 
-        sym = os.path.splitext(os.path.basename(path))[0]
         out = os.path.join(OUT_DIR, f"{sym}.feather")
         prefix = ["timestamp","symbol","open","high","low","close","volume","quote_asset_volume",
                   "number_of_trades","taker_buy_base_asset_volume","taker_buy_quote_asset_volume"]

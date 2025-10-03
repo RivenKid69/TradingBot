@@ -593,7 +593,7 @@ class MonitoringAggregator:
         self.daily_pnl: Optional[float] = None
 
         self._bar_interval_ms: Dict[str, int] = {}
-        self._execution_mode: str = "order"
+        self._execution_mode: str = "bar"
         self._bar_events: Dict[str, deque[Dict[str, Any]]] = {
             key: deque() for key in self._window_ms
         }
@@ -923,9 +923,9 @@ class MonitoringAggregator:
             self.daily_turnover = cleaned if cleaned is not None else {}
 
     def set_execution_mode(self, mode: str) -> None:
-        normalized = str(mode or "order").lower()
+        normalized = str(mode or "bar").lower()
         if normalized not in {"order", "bar"}:
-            normalized = "order"
+            normalized = "bar"
         if normalized == self._execution_mode:
             return
         self._execution_mode = normalized

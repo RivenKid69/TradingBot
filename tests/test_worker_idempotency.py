@@ -65,7 +65,7 @@ def _make_order(signal_id: str, created_ts_ms: int) -> types.SimpleNamespace:
 def _make_worker(
     monkeypatch,
     *,
-    execution_mode: str = "order",
+    execution_mode: str = "bar",
     now_ms: int | Callable[[], int] = 5000,
     throttle_cfg: types.SimpleNamespace | None = None,
     ws_dedup_timeframe_ms: int = 60_000,
