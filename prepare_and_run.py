@@ -55,21 +55,21 @@ def _canon(name: str) -> str:
 
 
 def _to_seconds_any(x: pd.Series) -> pd.Series:
-    """Пытаемся привести любую временную колонку к секундам epoch."""
+    """Любую временную колонку в секунды epoch; поддерживаем ms и строки."""
 
-    s = pd.to_numeric(x, errors="ignore")
-    if hasattr(s, "dtype") and s.dtype.kind in "biufc":  # числовое
+    try:
+        s = pd.to_numeric(x, errors="raise")
         s = pd.to_numeric(s, errors="coerce")
-        s = s.astype("Int64")
-        s_max = s.max(skipna=True)
-        if pd.notna(s_max) and s_max > 10_000_000_000:  # миллисекунды
-            s = s // 1000
-        return s
-
-    dt = pd.to_datetime(x, errors="coerce", utc=True, infer_datetime_format=True)
-    dt_int = pd.Series(dt.view("int64"), index=x.index, dtype="Int64")
-    dt_int[dt.isna()] = pd.NA
-    return dt_int.floordiv(1_000_000_000)
+        s_series = pd.Series(s, index=x.index, dtype="float64")
+        s_max = s_series.max(skipna=True)
+        if pd.notna(s_max) and s_max > 10_000_000_000:  # похоже на миллисекунды
+            s_series = s_series // 1000
+        if s_series.isna().any():
+            raise ValueError("NaNs after numeric conversion")
+        return s_series.astype("int64")
+    except Exception:
+        dt = pd.to_datetime(x, errors="coerce", utc=True, infer_datetime_format=True)
+        return (dt.view("int64") // 1_000_000_000).astype("int64")
 
 
 def _infer_symbol(path: str, df: pd.DataFrame) -> str:
@@ -88,7 +88,8 @@ def _normalize_ohlcv(df: pd.DataFrame, path: str) -> pd.DataFrame:
     cols = {_canon(c): c for c in df.columns}
 
     close_time_cands = [
-        "timestamp", "closetime", "klineclosetime", "endtime", "barend", "time", "t"
+        "timestamp", "closetime", "klineclosetime", "endtime", "barend",
+        "time", "t", "ts", "tsms", "ts_ms"
     ]
     open_time_cands = [
         "opentime", "open_time", "klineopentime", "starttime", "barstart"
@@ -140,6 +141,8 @@ def _normalize_ohlcv(df: pd.DataFrame, path: str) -> pd.DataFrame:
         "taker_buy_base_asset_volume",
         "takerbuybaseassetvolume",
         "takerbuybase",
+        "taker_buy_base",
+        "takerbuybase",
         "v_buy",
         "vbuy",
         "tb_base",
@@ -147,6 +150,8 @@ def _normalize_ohlcv(df: pd.DataFrame, path: str) -> pd.DataFrame:
     tb_quote = pick([
         "taker_buy_quote_asset_volume",
         "takerbuyquoteassetvolume",
+        "takerbuyquote",
+        "taker_buy_quote",
         "takerbuyquote",
         "q_buy",
         "qbuy",
@@ -260,53 +265,69 @@ def prepare() -> list[str]:
             f"No raw files found. Checked: {', '.join(raw_dirs)}. "
             f"Provide --raw-dir or set RAW_DIR, or place files into one of defaults."
         )
+    by_sym: dict[str, list[pd.DataFrame]] = {}
     for path in raw_paths:
         df_raw = _read_any_raw(path)
-        df = _normalize_ohlcv(df_raw, path)
+        df_norm = _normalize_ohlcv(df_raw, path)
+        sym = _infer_symbol(path, df_norm)
+        df_norm["symbol"] = sym
+        by_sym.setdefault(sym, []).append(df_norm)
+
+    for sym, parts in by_sym.items():
+        df = pd.concat(parts, ignore_index=True).sort_values("timestamp")
+        df = df.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+
         if not fng.empty:
-            fng_sorted = fng.sort_values("timestamp")[["timestamp","fear_greed_value"]].copy()
-            df = pd.merge_asof(
-                df.sort_values("timestamp"),
-                fng_sorted,
-                on="timestamp",
-                direction="backward"
-            )
+            fng_sorted = fng.sort_values("timestamp")[["timestamp", "fear_greed_value"]].copy()
+            df = pd.merge_asof(df, fng_sorted, on="timestamp", direction="backward")
             df["fear_greed_value"] = df["fear_greed_value"].ffill()
 
         if not events.empty:
-            df_sorted = df.sort_values("timestamp").copy()
-            df_sorted["timestamp_dt"] = pd.to_datetime(df_sorted["timestamp"], unit="s").astype("datetime64[ns]")
-            df_sorted = df_sorted.sort_values("timestamp_dt")
-
-            ev = events.rename(columns={"timestamp": "event_ts"}).sort_values("event_ts").copy()
+            dfs = df.copy()
+            dfs["timestamp_dt"] = pd.to_datetime(dfs["timestamp"], unit="s").astype("datetime64[ns]")
+            ev = events.rename(columns={"timestamp": "event_ts"}).copy()
             ev["event_ts_dt"] = pd.to_datetime(ev["event_ts"], unit="s").astype("datetime64[ns]")
             ev = ev.sort_values("event_ts_dt")
-
-            df = pd.merge_asof(
-                df_sorted,
+            dfs = dfs.sort_values("timestamp_dt")
+            dfs = pd.merge_asof(
+                dfs,
                 ev,
                 left_on="timestamp_dt",
                 right_on="event_ts_dt",
                 direction="backward",
                 tolerance=pd.Timedelta(hours=EVENT_HORIZON_HOURS),
             )
-            df["time_since_last_event_hours"] = (
-                (df["timestamp_dt"] - df["event_ts_dt"]).dt.total_seconds() / 3600.0
+            dfs["time_since_last_event_hours"] = (
+                (dfs["timestamp_dt"] - dfs["event_ts_dt"]).dt.total_seconds() / 3600.0
             )
-            df["is_high_importance"] = ((df["importance_level"] == 2) & df["event_ts"].notna()).astype(int)
-            df = df.drop(columns=["timestamp_dt", "event_ts_dt", "event_ts", "importance_level"])
+            dfs["is_high_importance"] = (
+                (dfs.get("importance_level", 0) == 2) & dfs["event_ts_dt"].notna()
+            ).astype(int)
+            drop_cols = [c for c in ["timestamp_dt", "event_ts_dt", "event_ts", "importance_level"] if c in dfs.columns]
+            dfs = dfs.drop(columns=drop_cols)
+            df = dfs
 
-        sym = _infer_symbol(path, df)
         out = os.path.join(OUT_DIR, f"{sym}.feather")
-        prefix = ["timestamp","symbol","open","high","low","close","volume","quote_asset_volume",
-                  "number_of_trades","taker_buy_base_asset_volume","taker_buy_quote_asset_volume"]
+        prefix = [
+            "timestamp",
+            "symbol",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "quote_asset_volume",
+            "number_of_trades",
+            "taker_buy_base_asset_volume",
+            "taker_buy_quote_asset_volume",
+        ]
         other = [c for c in df.columns if c not in prefix]
-        df = df[prefix + other]
+        df_out = df[prefix + other]
         tmp = out + ".tmp"
-        df.reset_index(drop=True).to_feather(tmp)
+        df_out.reset_index(drop=True).to_feather(tmp)
         os.replace(tmp, out)
         written.append(out)
-        print(f"✓ Wrote {out} ({len(df)} rows)")
+        print(f"✓ Wrote {out} ({len(df_out)} rows)")
 
     if len(written) != len(set(written)):
         raise ValueError("Duplicate output paths detected")
