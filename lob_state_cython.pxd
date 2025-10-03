@@ -1,12 +1,24 @@
 # cython: language_level=3, language=c++
 from libcpp.vector cimport vector
 from libcpp.utility cimport pair
+from libcpp.array cimport array as cpp_array
+
+from fast_lob cimport OrderBook, CythonLOB
+from core_constants cimport MarketRegime
 
 cdef extern from "cpp_microstructure_generator.h":
     cdef enum MicroEventType:
         LIMIT
         MARKET
         CANCEL
+
+    cdef int CH_LIM_BUY
+    cdef int CH_LIM_SELL
+    cdef int CH_MKT_BUY
+    cdef int CH_MKT_SELL
+    cdef int CH_CAN_BUY
+    cdef int CH_CAN_SELL
+    cdef int CH_K
 
     cdef struct MicroEvent:
         MicroEventType type
@@ -16,23 +28,73 @@ cdef extern from "cpp_microstructure_generator.h":
         unsigned long long order_id
         int timestamp
 
+    ctypedef cpp_array[double, 6] ArrayDouble6
+    ctypedef cpp_array[ArrayDouble6, 6] ArrayDouble6x6
+
+    cdef cppclass HawkesParams:
+        ArrayDouble6 mu
+        ArrayDouble6x6 alpha
+        ArrayDouble6x6 beta
+
+    cdef cppclass SizeDist:
+        double lognorm_m
+        double lognorm_s
+        double min_size
+        double max_size
+
+    cdef cppclass PlacementProfile:
+        double at_best_prob
+        double geometric_p
+        int max_levels
+
+    cdef cppclass ShockParams:
+        bint enabled
+        double prob_per_step
+        double intensity_scale
+        double price_bps_mu
+        double price_bps_std
+
+    cdef cppclass BlackSwanParams:
+        bint enabled
+        double prob_per_step
+        double crash_min
+        double crash_max
+        double mania_min
+        double mania_max
+        int cooldown_steps
+        double intensity_scale
+        int duration_steps
+
+    cdef struct MicroFeatures:
+        long long best_bid
+        long long best_ask
+        double mid
+        double spread_ticks
+        double depth_bid_top1
+        double depth_ask_top1
+        double depth_bid_top5
+        double depth_ask_top5
+        double imbalance_top1
+        double imbalance_top5
+        ArrayDouble6 lambda_hat
+        int last_trade_sign
+        double last_trade_size
+
     cdef cppclass CppMicrostructureGenerator:
-        CppMicrostructureGenerator(double momentum_factor, double mean_reversion_factor, double adversarial_factor) except +
-        void generate_public_events(
-            double bar_price,
-            double bar_open,
-            double bar_volume_usd,
-            int bar_trade_count,
-            double bar_taker_buy_volume,
-            double agent_net_taker_flow,
-            double agent_limit_buy_vol,
-            double agent_limit_sell_vol,
-            double base_order_imbalance_ratio,
-            double base_cancel_ratio,
-            int timestamp,
-            vector[MicroEvent]& out_events,
-            long long& next_public_order_id
-        )
+        CppMicrostructureGenerator() except +
+        void set_seed(unsigned long long seed)
+        void set_hawkes_params(HawkesParams const& hp)
+        void set_size_models(SizeDist const& limit_sz, SizeDist const& market_sz)
+        void set_placement_profile(PlacementProfile const& pp)
+        void set_cancel_rate(double base_cancel_rate)
+        void set_flash_shocks(ShockParams const& sp)
+        void set_black_swan(BlackSwanParams const& bp)
+        void set_regime(MarketRegime regime)
+        void reset(long long mid0_ticks, long long best_bid_ticks=*, long long best_ask_ticks=*)
+        int step(OrderBook& lob, int timestamp, MicroEvent* out_events, int cap)
+        MicroFeatures current_features(OrderBook const& lob) const
+        unsigned long long last_order_id() const
+        void copy_lambda_hat(double* out) const
 
 cdef extern from "AgentOrderTracker.h":
     cdef struct AgentOrderInfo:
@@ -55,19 +117,12 @@ cdef class CyMicrostructureGenerator:
     cdef CppMicrostructureGenerator* thisptr
     cdef public double base_order_imbalance_ratio
     cdef public double base_cancel_ratio
-    cpdef long long generate_public_events_cy(
+    cpdef unsigned long long generate_public_events_cy(
         self,
         vector[MicroEvent]& out_events,
-        unsigned long long next_public_order_id,
-        double bar_price,
-        double bar_open,
-        double bar_volume_usd,
-        int bar_trade_count,
-        double bar_taker_buy_volume,
-        double agent_net_taker_flow,
-        double agent_limit_buy_vol,
-        double agent_limit_sell_vol,
-        int timestamp
+        CythonLOB lob,
+        int timestamp,
+        int max_events=*
     )
 
 cdef class EnvState:
