@@ -266,7 +266,13 @@ def _load_time_splits(data_cfg) -> tuple[str | None, dict[str, list[tuple[int | 
             splits[phase].append(_normalize_interval({"start_ts": start_attr, "end_ts": end_attr}))
 
     if not splits["train"]:
-        fallback = _normalize_interval({"start_ts": getattr(data_cfg, "start_ts", None), "end_ts": getattr(data_cfg, "end_ts", None)})
+        primary_start = getattr(data_cfg, "train_start_ts", None)
+        primary_end = getattr(data_cfg, "train_end_ts", None)
+        legacy_start = getattr(data_cfg, "start_ts", None)
+        legacy_end = getattr(data_cfg, "end_ts", None)
+        start_ts = primary_start if primary_start is not None else legacy_start
+        end_ts = primary_end if primary_end is not None else legacy_end
+        fallback = _normalize_interval({"start_ts": start_ts, "end_ts": end_ts})
         if fallback != (None, None):
             splits["train"].append(fallback)
 

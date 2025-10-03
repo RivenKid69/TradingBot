@@ -1050,6 +1050,8 @@ class TrainDataConfig(BaseModel):
     timeframe: str
     start_ts: Optional[int] = None
     end_ts: Optional[int] = None
+    train_start_ts: Optional[int] = None
+    train_end_ts: Optional[int] = None
     val_start_ts: Optional[int] = None
     val_end_ts: Optional[int] = None
     test_start_ts: Optional[int] = None
@@ -1061,6 +1063,50 @@ class TrainDataConfig(BaseModel):
     role_column: str = Field(default="wf_role")
     features_params: Dict[str, Any] = Field(default_factory=dict)
     target_params: Dict[str, Any] = Field(default_factory=dict)
+
+    @root_validator(pre=True)
+    def _sync_train_window_aliases(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        start = values.get("start_ts")
+        train_start = values.get("train_start_ts")
+        if start is not None and train_start is not None and start != train_start:
+            raise ValueError("start_ts and train_start_ts must match when both are provided")
+        if start is None and train_start is not None:
+            values["start_ts"] = train_start
+        elif train_start is None and start is not None:
+            values["train_start_ts"] = start
+
+        end = values.get("end_ts")
+        train_end = values.get("train_end_ts")
+        if end is not None and train_end is not None and end != train_end:
+            raise ValueError("end_ts and train_end_ts must match when both are provided")
+        if end is None and train_end is not None:
+            values["end_ts"] = train_end
+        elif train_end is None and end is not None:
+            values["train_end_ts"] = end
+
+        return values
+
+    @model_validator(mode="after")
+    def _ensure_train_window_aliases(cls, values: "TrainDataConfig") -> "TrainDataConfig":
+        start = getattr(values, "start_ts", None)
+        train_start = getattr(values, "train_start_ts", None)
+        if train_start is None:
+            object.__setattr__(values, "train_start_ts", start)
+        elif start is None:
+            object.__setattr__(values, "start_ts", train_start)
+        elif start != train_start:
+            raise ValueError("start_ts and train_start_ts diverged during validation")
+
+        end = getattr(values, "end_ts", None)
+        train_end = getattr(values, "train_end_ts", None)
+        if train_end is None:
+            object.__setattr__(values, "train_end_ts", end)
+        elif end is None:
+            object.__setattr__(values, "end_ts", train_end)
+        elif end != train_end:
+            raise ValueError("end_ts and train_end_ts diverged during validation")
+
+        return values
 
 
 class ModelConfig(BaseModel):
