@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,11 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
+
+if __package__ in {None, ""}:
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 
 from utils.time import hour_of_week
 from scripts.offline_utils import (
