@@ -1956,11 +1956,11 @@ def from_config(
     price_col = params.get("price_col", "ref_price")
 
     exec_cfg_block = getattr(cfg, "execution", None)
-    exec_mode_value = getattr(exec_cfg_block, "mode", "order") if exec_cfg_block is not None else "order"
+    exec_mode_value = getattr(exec_cfg_block, "mode", "bar") if exec_cfg_block is not None else "bar"
     try:
-        exec_mode = str(exec_mode_value or "order").lower()
+        exec_mode = str(exec_mode_value or "bar").lower()
     except Exception:
-        exec_mode = "order"
+        exec_mode = "bar"
 
     exec_spec = cfg.components.executor
     if exec_mode != "bar" and exec_spec and isinstance(exec_spec.params, dict):

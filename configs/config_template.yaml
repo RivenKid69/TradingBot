@@ -16,6 +16,7 @@ execution_params:
   ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
   tif: GTC               # e.g. IOC or FOK
 execution:
+  mode: bar
   intrabar_price_model: "bridge"  # Intrabar price sampling model (e.g. linear, bridge, reference).
   timeframe_ms: 3600000           # Base bar length in milliseconds (H1 = 60 minutes = 3_600_000 ms).
   reference_prices_path: null     # Optional path to an M1 reference dataset used by the "reference" intrabar mode.

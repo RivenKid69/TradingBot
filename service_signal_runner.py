@@ -593,7 +593,7 @@ class _Worker:
         monitoring_agg: MonitoringAggregator | None = None,
         worker_id: str | None = None,
         status_callback: Callable[[str, Dict[str, Any]], None] | None = None,
-        execution_mode: str = "order",
+        execution_mode: str = "bar",
         portfolio_equity: float | None = None,
         max_total_weight: float | None = None,
         idempotency_cache_size: int = 1024,
@@ -666,9 +666,9 @@ class _Worker:
         self._monitoring: MonitoringAggregator | None = (
             monitoring if monitoring is not None else monitoring_agg
         )
-        execution_mode_normalized = str(execution_mode or "order").lower()
+        execution_mode_normalized = str(execution_mode or "bar").lower()
         if execution_mode_normalized not in {"order", "bar"}:
-            execution_mode_normalized = "order"
+            execution_mode_normalized = "bar"
         self._execution_mode = execution_mode_normalized
         try:
             cache_size = int(idempotency_cache_size)
@@ -6214,12 +6214,12 @@ class ServiceSignalRunner:
         self.monitoring_cfg = monitoring_cfg or MonitoringConfig()
         self._run_config = run_config
         exec_cfg = getattr(run_config, "execution", None) if run_config is not None else None
-        mode = "order"
+        mode = "bar"
         if exec_cfg is not None:
             mode = str(getattr(exec_cfg, "mode", mode) or mode)
         mode = mode.strip().lower()
         if mode not in {"bar", "order"}:
-            mode = "order"
+            mode = "bar"
         self._execution_mode = mode
         self.alerts: AlertManager | None = None
         self.monitoring_agg: MonitoringAggregator | None = None
