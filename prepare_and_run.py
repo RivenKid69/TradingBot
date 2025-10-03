@@ -93,18 +93,23 @@ def prepare() -> list[str]:
             df["fear_greed_value"] = df["fear_greed_value"].ffill()
 
         if not events.empty:
-            ev = events.rename(columns={"timestamp": "event_ts"})
+            df_sorted = df.sort_values("timestamp").copy()
+            df_sorted["timestamp_dt"] = pd.to_datetime(df_sorted["timestamp"], unit="s")
+
+            ev = events.rename(columns={"timestamp": "event_ts"}).sort_values("event_ts").copy()
+            ev["event_ts_dt"] = pd.to_datetime(ev["event_ts"], unit="s")
+
             df = pd.merge_asof(
-                df.sort_values("timestamp"),
-                ev.sort_values("event_ts"),
-                left_on="timestamp",
-                right_on="event_ts",
+                df_sorted,
+                ev,
+                left_on="timestamp_dt",
+                right_on="event_ts_dt",
                 direction="backward",
                 tolerance=pd.Timedelta(hours=EVENT_HORIZON_HOURS),
             )
             df["time_since_last_event_hours"] = (df["timestamp"] - df["event_ts"]) / 3600.0
             df["is_high_importance"] = ((df["importance_level"] == 2) & df["event_ts"].notna()).astype(int)
-            df = df.drop(columns=["event_ts", "importance_level"])
+            df = df.drop(columns=["timestamp_dt", "event_ts_dt", "event_ts", "importance_level"])
 
         sym = os.path.splitext(os.path.basename(path))[0]
         out = os.path.join(OUT_DIR, f"{sym}.feather")
