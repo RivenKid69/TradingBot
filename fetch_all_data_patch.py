@@ -121,10 +121,10 @@ def load_all_data(feather_paths: List[str], synthetic_fraction: float = 0.0, see
         if "taker_buy_quote_asset_volume" not in df.columns:
             df["taker_buy_quote_asset_volume"] = 0.0
         df = _ensure_required_columns(df)
-        # Preserve original close and shift to avoid lookahead in features
+        # Не ломаем OHLC: оставляем close как есть, а «прошлый close» кладём отдельно
         if "close" in df.columns:
             df["close_orig"] = df["close"].astype(float)
-            df["close"] = df["close"].shift(1)
+            df["close_prev"] = df["close_orig"].shift(1)  # используйте это в фичах вместо сдвига самого close
         # Merge Fear & Greed on the same hour (left join to preserve OHLCV)
         orig_fear_col = None
         if "fear_greed_value" in df.columns:
