@@ -604,6 +604,13 @@ class _Worker:
         self._policy = policy
         self._logger = logger
         self._executor = executor
+        bar_price_field = getattr(self._executor, "bar_price_field", "close")
+        try:
+            bar_price_field_str = str(bar_price_field)
+        except Exception:
+            bar_price_field_str = "close"
+        bar_price_field_str = bar_price_field_str.strip() or "close"
+        self._bar_price_field = bar_price_field_str
         self._guards = guards
         self._safe_mode_fn = safe_mode_fn or (lambda: False)
         self._enforce_closed_bars = enforce_closed_bars
@@ -5354,9 +5361,12 @@ class _Worker:
         ts_ms = bar_close_ms
         bar_open_ms = bar_close_ms
         self._last_bar_snapshot[symbol] = bar
-        close_val = self._coerce_price(getattr(bar, "close", None))
-        if close_val is not None:
-            self._set_last_price(symbol, close_val)
+        price_attr = getattr(self, "_bar_price_field", "close") or "close"
+        price_val = self._coerce_price(getattr(bar, price_attr, None))
+        if price_val is None and price_attr != "close":
+            price_val = self._coerce_price(getattr(bar, "close", None))
+        if price_val is not None:
+            self._set_last_price(symbol, price_val)
         else:
             self._maybe_fetch_rest_price(symbol)
         if self._execution_mode == "bar":
