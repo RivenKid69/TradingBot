@@ -16,7 +16,7 @@ import numpy as np
 import core_constants as consts
 from core_constants cimport MarketRegime, NORMAL, CHOPPY_FLAT, STRONG_TREND
 from coreworkspace cimport SimulationWorkspace
-from fast_lob cimport CythonLOB
+from fast_lob cimport CythonLOB, OrderBook
 from obs_builder cimport build_observation_vector_c
 
 # Инициализируем NumPy C-API
@@ -318,33 +318,75 @@ cdef class CyMicrostructureGenerator:
 
         self.base_order_imbalance_ratio = base_order_imbalance_ratio
         self.base_cancel_ratio = base_cancel_ratio
-        self.thisptr = new CppMicrostructureGenerator(
-            momentum_factor, mean_reversion_factor, adversarial_factor)
+        self.thisptr = new CppMicrostructureGenerator()
+        if self.thisptr is NULL:
+            raise MemoryError("Failed to allocate CppMicrostructureGenerator")
+
+        cdef HawkesParams hp = HawkesParams()
+        cdef int i, j
+        cdef double base_limit_mu = 0.2
+        cdef double buy_multiplier = base_order_imbalance_ratio if base_order_imbalance_ratio > 0 else 1.0
+
+        for i in range(CH_K):
+            hp.mu[i] = base_limit_mu
+
+        hp.mu[CH_LIM_BUY] = base_limit_mu * buy_multiplier
+        hp.mu[CH_LIM_SELL] = base_limit_mu
+        hp.mu[CH_MKT_BUY] = 0.12
+        hp.mu[CH_MKT_SELL] = 0.12
+        hp.mu[CH_CAN_BUY] = 0.10
+        hp.mu[CH_CAN_SELL] = 0.10
+
+        for i in range(CH_K):
+            for j in range(CH_K):
+                hp.alpha[i][j] = 0.15 if i == j else 0.03
+                hp.beta[i][j] = 1.20
+
+        self.thisptr.set_hawkes_params(hp)
+        if base_cancel_ratio < 0.0:
+            base_cancel_ratio = 0.0
+        self.thisptr.set_cancel_rate(base_cancel_ratio)
 
     def __dealloc__(self):
         if self.thisptr is not NULL:
             del self.thisptr
             self.thisptr = NULL
 
-    cpdef long long generate_public_events_cy(self,
+    cpdef unsigned long long generate_public_events_cy(self,
             vector[MicroEvent]& out_events,
-            unsigned long long next_public_order_id,
-            double bar_price, double bar_open, double bar_volume_usd,
-            int bar_trade_count, double bar_taker_buy_volume,
-            double agent_net_taker_flow, double agent_limit_buy_vol,
-            double agent_limit_sell_vol, int timestamp):
+            CythonLOB lob,
+            int timestamp,
+            int max_events=MAX_GENERATED_EVENTS_PER_TYPE):
 
-        cdef long long next_id_ref = next_public_order_id
-        self.thisptr.generate_public_events(
-            bar_price, bar_open, bar_volume_usd, bar_trade_count, bar_taker_buy_volume,
-            agent_net_taker_flow, agent_limit_buy_vol, agent_limit_sell_vol,
-            self.base_order_imbalance_ratio,
-            self.base_cancel_ratio,
-            timestamp,
-            out_events,
-            next_id_ref
-        )
-        return next_id_ref
+        if self.thisptr is NULL:
+            raise ValueError("Generator is not initialized")
+        if max_events <= 0:
+            return self.thisptr.last_order_id() + 1
+
+        cdef vector[MicroEvent] buffer = vector[MicroEvent]()
+        buffer.resize(max_events)
+
+        cdef Py_ssize_t idx
+        for idx in range(max_events):
+            buffer[idx].timestamp = -1
+            buffer[idx].type = MicroEventType.CANCEL
+            buffer[idx].is_buy = False
+            buffer[idx].price_ticks = 0
+            buffer[idx].size = 0.0
+            buffer[idx].order_id = 0
+
+        cdef OrderBook* lob_ptr = <OrderBook*>lob.raw_ptr()
+        if lob_ptr == NULL:
+            raise ValueError("CythonLOB is not initialized")
+
+        self.thisptr.step(lob_ptr[0], timestamp, &buffer[0], max_events)
+
+        for idx in range(max_events):
+            if buffer[idx].timestamp == -1:
+                break
+            out_events.push_back(buffer[idx])
+
+        return self.thisptr.last_order_id() + 1
 
 # ==============================================================================
 # ====== НАЧАЛО РЕФАКТОРИНГА: НОВАЯ СТРУКТУРА ДЛЯ АТОМАРНЫХ ИЗМЕНЕНИЙ ======
@@ -443,7 +485,7 @@ cpdef tuple run_full_step_logic_cython(
     cdef vector[long long] ids_to_cancel
     cdef pair[long long, long long] closest_order
     cdef MicroEvent agent_event, cancel_ev, current_event
-    cdef CythonLOB lob_clone
+    cdef CythonLOB lob_clone, public_lob
     cdef long long closest_order_price
     cdef unsigned long long agent_order_id
     cdef const AgentOrderInfo* info_ptr
@@ -604,13 +646,12 @@ cpdef tuple run_full_step_logic_cython(
         # --- 1.2. Генерация публичных событий ---
         agent_net_taker_flow = agent_taker_buy_vol_this_step - agent_taker_sell_vol_this_step
         size_before = all_events.size()
+        public_lob = lob_clone.clone()
         state.next_order_id = generator.generate_public_events_cy(
-            all_events, # Передаем вектор для добавления публичных событий
-            state.next_order_id,
-            bar_price, bar_open, bar_volume_usd, bar_trade_count,
-            bar_taker_buy_volume, agent_net_taker_flow,
-            agent_limit_buy_vol_this_step, agent_limit_sell_vol_this_step,
-            state.step_idx
+            all_events,
+            public_lob,
+            state.step_idx,
+            MAX_GENERATED_EVENTS_PER_TYPE
         )
         size_after = all_events.size()
         for i in range(size_before, size_after):
