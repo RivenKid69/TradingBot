@@ -266,13 +266,7 @@ def _load_time_splits(data_cfg) -> tuple[str | None, dict[str, list[tuple[int | 
             splits[phase].append(_normalize_interval({"start_ts": start_attr, "end_ts": end_attr}))
 
     if not splits["train"]:
-        primary_start = getattr(data_cfg, "train_start_ts", None)
-        primary_end = getattr(data_cfg, "train_end_ts", None)
-        legacy_start = getattr(data_cfg, "start_ts", None)
-        legacy_end = getattr(data_cfg, "end_ts", None)
-        start_ts = primary_start if primary_start is not None else legacy_start
-        end_ts = primary_end if primary_end is not None else legacy_end
-        fallback = _normalize_interval({"start_ts": start_ts, "end_ts": end_ts})
+        fallback = _normalize_interval({"start_ts": getattr(data_cfg, "start_ts", None), "end_ts": getattr(data_cfg, "end_ts", None)})
         if fallback != (None, None):
             splits["train"].append(fallback)
 
@@ -544,6 +538,8 @@ def objective(trial: optuna.Trial,
               test_obs_by_token: dict,
               norm_stats: dict,
               sim_config: dict,
+              timing_env_kwargs: dict,
+              leak_guard_kwargs: dict,
               trials_dir: Path):
 
     print(f">>> Trial {trial.number+1} with budget={total_timesteps}")
@@ -1216,6 +1212,8 @@ def main():
             test_obs_by_token,
             norm_stats,
             sim_config,
+            timing_env_kwargs,
+            leak_guard_kwargs,
             trials_dir,
         ),
         n_trials=HPO_TRIALS,
