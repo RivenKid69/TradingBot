@@ -610,7 +610,14 @@ def objective(trial: optuna.Trial,
     leak_guard_train = LeakGuard(LeakConfig(**leak_guard_kwargs))
     leak_guard_val = LeakGuard(LeakConfig(**leak_guard_kwargs))
 
+    train_symbol_items = sorted(train_data_by_token.items())
+    if not train_symbol_items:
+        raise ValueError("Нет тренировочных символов для создания сред.")
+
     def make_env_train(rank: int):
+        symbol_idx = rank % len(train_symbol_items)
+        symbol, df = train_symbol_items[symbol_idx]
+
         def _init():
             # Создаем уникальный seed для каждого trial-а и каждого воркера
             # Это гарантирует воспроизводимость и декорреляцию
@@ -631,8 +638,6 @@ def objective(trial: optuna.Trial,
                 "adversarial_factor": params["adversarial_factor"],
 
                 # 2. Данные, которые передаются в функцию objective
-                "df_dict": train_data_by_token,
-                "obs_dict": train_obs_by_token,
                 "norm_stats": norm_stats,
 
                 # 3. Статические параметры и параметры индикаторов
@@ -656,7 +661,14 @@ def objective(trial: optuna.Trial,
             env_params.update(timing_env_kwargs)
 
             # Создаем и возвращаем экземпляр среды
-            return TradingEnv(**env_params, leak_guard=leak_guard_train)
+            env = TradingEnv(
+                df,
+                **env_params,
+                leak_guard=leak_guard_train,
+                seed=unique_seed,
+            )
+            setattr(env, "selected_symbol", symbol)
+            return env
         return _init
 
     env_constructors = [make_env_train(rank=i) for i in range(n_envs)]
@@ -676,10 +688,12 @@ def objective(trial: optuna.Trial,
     env_tr.save(str(train_stats_path))
     save_sidecar_metadata(str(train_stats_path), extra={"kind": "vecnorm_stats", "phase": "train"})
 
-    def make_env_val():
+    val_symbol_items = sorted(val_data_by_token.items())
+    if not val_symbol_items:
+        raise ValueError("Нет валидационных символов для создания сред.")
+
+    def _make_val_env_factory(symbol: str, df: pd.DataFrame):
         env_val_params = {
-            "df_dict": val_data_by_token,
-            "obs_dict": val_obs_by_token,
             "norm_stats": norm_stats,
             "window_size": params["window_size"],
             "gamma": params["gamma"],
@@ -705,9 +719,19 @@ def objective(trial: optuna.Trial,
         }
         env_val_params.update(sim_config)
         env_val_params.update(timing_env_kwargs)
-        return TradingEnv(**env_val_params, leak_guard=leak_guard_val)
+        env = TradingEnv(
+            df,
+            **env_val_params,
+            leak_guard=leak_guard_val,
+        )
+        setattr(env, "selected_symbol", symbol)
+        return env
 
-    monitored_env_va = VecMonitor(DummyVecEnv([make_env_val]))
+    val_env_fns = [
+        lambda symbol=symbol, df=df: _make_val_env_factory(symbol, df)
+        for symbol, df in val_symbol_items
+    ]
+    monitored_env_va = VecMonitor(DummyVecEnv(val_env_fns))
     check_model_compat(str(train_stats_path))
     env_va = VecNormalize.load(str(train_stats_path), monitored_env_va)
     env_va.training = False
@@ -810,60 +834,67 @@ def objective(trial: optuna.Trial,
 
     # 2. Последовательно оцениваем модель в каждом режиме
     for regime in regimes_to_evaluate:
-        def make_final_eval_env():
-            final_env_params = {
-                "df_dict": eval_phase_data, "obs_dict": eval_phase_obs,
-                "norm_stats": norm_stats, "window_size": params["window_size"],
-                "gamma": params["gamma"], "atr_multiplier": params["atr_multiplier"],
-                "trailing_atr_mult": params["trailing_atr_mult"], "tp_atr_mult": params["tp_atr_mult"],
-                "trade_frequency_penalty": params["trade_frequency_penalty"],
-                "turnover_penalty_coef": params["turnover_penalty_coef"], "mode": eval_phase_name,
-                "reward_shaping": False, "warmup_period": warmup_period,
-                "ma5_window": MA5_WINDOW, "ma20_window": MA20_WINDOW, "atr_window": ATR_WINDOW,
-                "rsi_window": RSI_WINDOW, "macd_fast": MACD_FAST, "macd_slow": MACD_SLOW,
-                "macd_signal": MACD_SIGNAL, "momentum_window": MOMENTUM_WINDOW,
-                "cci_window": CCI_WINDOW, "bb_window": BB_WINDOW, "obv_ma_window": OBV_MA_WINDOW,
-            }
-            final_env_params.update(sim_config)
-            final_env_params.update(timing_env_kwargs)
-            return TradingEnv(
-                **final_env_params,
-                leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs))
-            )
-
-        check_model_compat(str(train_stats_path))
-        final_eval_norm = VecNormalize.load(
-            str(train_stats_path),
-            DummyVecEnv([make_final_eval_env]),
-        )
-        final_eval_norm.training = False
-        final_eval_norm.norm_reward = False
-        final_eval_norm.clip_reward = None
-        final_eval_env = VecMonitor(final_eval_norm)
+        symbol_equity_curves: list[list[float]] = []
         test_stats_path = trials_dir / f"vec_normalize_test_{trial.number}.pkl"
+
+        for symbol, df in sorted(eval_phase_data.items()):
+            def make_final_eval_env(symbol: str = symbol, df: pd.DataFrame = df):
+                final_env_params = {
+                    "norm_stats": norm_stats, "window_size": params["window_size"],
+                    "gamma": params["gamma"], "atr_multiplier": params["atr_multiplier"],
+                    "trailing_atr_mult": params["trailing_atr_mult"], "tp_atr_mult": params["tp_atr_mult"],
+                    "trade_frequency_penalty": params["trade_frequency_penalty"],
+                    "turnover_penalty_coef": params["turnover_penalty_coef"], "mode": eval_phase_name,
+                    "reward_shaping": False, "warmup_period": warmup_period,
+                    "ma5_window": MA5_WINDOW, "ma20_window": MA20_WINDOW, "atr_window": ATR_WINDOW,
+                    "rsi_window": RSI_WINDOW, "macd_fast": MACD_FAST, "macd_slow": MACD_SLOW,
+                    "macd_signal": MACD_SIGNAL, "momentum_window": MOMENTUM_WINDOW,
+                    "cci_window": CCI_WINDOW, "bb_window": BB_WINDOW, "obv_ma_window": OBV_MA_WINDOW,
+                }
+                final_env_params.update(sim_config)
+                final_env_params.update(timing_env_kwargs)
+                env = TradingEnv(
+                    df,
+                    **final_env_params,
+                    leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs)),
+                )
+                setattr(env, "selected_symbol", symbol)
+                return env
+
+            check_model_compat(str(train_stats_path))
+            final_eval_norm = VecNormalize.load(
+                str(train_stats_path),
+                DummyVecEnv([make_final_eval_env]),
+            )
+            final_eval_norm.training = False
+            final_eval_norm.norm_reward = False
+            final_eval_norm.clip_reward = None
+            final_eval_env = VecMonitor(final_eval_norm)
+
+            if regime != 'normal':
+                final_eval_env.env_method("set_market_regime", regime=regime, duration=regime_duration)
+
+            _rewards, equity_curves = evaluate_policy_custom_cython(model, final_eval_env, num_episodes=1)
+            symbol_equity_curves.extend(equity_curves)
+
+            nt_stats = final_eval_env.env_method("get_no_trade_stats")
+            if nt_stats:
+                total_steps = sum(s["total_steps"] for s in nt_stats if s)
+                blocked_steps = sum(s["blocked_steps"] for s in nt_stats if s)
+                ratio = blocked_steps / total_steps if total_steps else 0.0
+                print(
+                    f"[{symbol}] No-trade blocks: {blocked_steps}/{total_steps} steps ({ratio:.2%})"
+                )
+
+            final_eval_env.close()
+
         if not test_stats_path.exists():
             final_eval_norm.save(str(test_stats_path))
             save_sidecar_metadata(str(test_stats_path), extra={"kind": "vecnorm_stats", "phase": eval_phase_name})
 
-        if regime != 'normal':
-            final_eval_env.env_method("set_market_regime", regime=regime, duration=regime_duration)
-
-        num_episodes = len(eval_phase_data.keys())
-        _rewards, equity_curves = evaluate_policy_custom_cython(model, final_eval_env, num_episodes=num_episodes)
-
-        all_returns = [pd.Series(c).pct_change().dropna().to_numpy() for c in equity_curves if len(c) > 1]
+        all_returns = [pd.Series(c).pct_change().dropna().to_numpy() for c in symbol_equity_curves if len(c) > 1]
         flat_returns = np.concatenate(all_returns) if all_returns else np.array([0.0])
         final_metrics[regime] = sortino_ratio(flat_returns)
-
-        nt_stats = final_eval_env.env_method("get_no_trade_stats")
-        total_steps = sum(s["total_steps"] for s in nt_stats if s)
-        blocked_steps = sum(s["blocked_steps"] for s in nt_stats if s)
-        ratio = blocked_steps / total_steps if total_steps else 0.0
-        print(
-            f"No-trade blocks: {blocked_steps}/{total_steps} steps ({ratio:.2%})"
-        )
-
-        final_eval_env.close()
 
     # --- РАСЧЕТ ИТОГОВОЙ ВЗВЕШЕННОЙ МЕТРИКИ ---
     main_sortino = final_metrics.get('normal', -1.0)
@@ -1271,11 +1302,9 @@ def main():
         if not final_eval_data:
             print("⚠️ Skipping final validation: evaluation split is empty.")
         else:
-            def _make_env_val():
+            def _make_env_val(symbol: str, df: pd.DataFrame):
                 params = best_trial.params
                 env_val_params = {
-                    "df_dict": final_eval_data,
-                    "obs_dict": final_eval_obs,
                     "norm_stats": norm_stats,
                     "window_size": params["window_size"],
                     "gamma": params["gamma"],
@@ -1301,12 +1330,20 @@ def main():
                 }
                 env_val_params.update(sim_config)
                 env_val_params.update(timing_env_kwargs)
-                return TradingEnv(
+                env = TradingEnv(
+                    df,
                     **env_val_params,
                     leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs))
                 )
+                setattr(env, "selected_symbol", symbol)
+                return env
 
-            monitored_eval_env = VecMonitor(DummyVecEnv([_make_env_val]))
+            eval_env_fns = [
+                (lambda symbol=symbol, df=df: _make_env_val(symbol, df))
+                for symbol, df in sorted(final_eval_data.items())
+            ]
+
+            monitored_eval_env = VecMonitor(DummyVecEnv(eval_env_fns))
             check_model_compat(str(best_stats_path))
             eval_env = VecNormalize.load(str(best_stats_path), monitored_eval_env)
             eval_env.training = False
