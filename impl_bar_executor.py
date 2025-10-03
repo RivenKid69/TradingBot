@@ -1168,6 +1168,13 @@ class BarExecutor(TradeExecutor):
         if price <= Decimal("0"):
             return state
 
+        try:
+            equity_dec = _as_decimal(state.equity_usd)
+        except Exception:
+            return state
+        if equity_dec <= Decimal("0"):
+            return state
+
         quantity_value = state.quantity
         if not isinstance(quantity_value, Decimal):
             try:
@@ -1176,16 +1183,17 @@ class BarExecutor(TradeExecutor):
                 return state
 
         if quantity_value == Decimal("0"):
-            if state.weight == 0.0:
+            try:
+                weight_dec = _as_decimal(state.weight)
+            except Exception:
                 return state
-            return replace(state, weight=0.0)
-
-        try:
-            equity_dec = _as_decimal(state.equity_usd)
-        except Exception:
-            return state
-        if equity_dec <= Decimal("0"):
-            return state
+            if weight_dec <= Decimal("0"):
+                return state
+            implied_quantity = (weight_dec * equity_dec) / price
+            if implied_quantity <= Decimal("0"):
+                return state
+            quantity_value = implied_quantity
+            state = replace(state, quantity=quantity_value)
 
         notional = quantity_value * price
         if notional <= Decimal("0"):

@@ -131,6 +131,40 @@ def test_bar_executor_target_weight_single_instruction():
     assert pos.qty == Decimal("0.05")
 
 
+def test_bar_executor_initial_weights_respected_on_first_execute():
+    executor = BarExecutor(
+        run_id="test",
+        bar_price="close",
+        min_rebalance_step=0.0,
+        cost_config=SpotCostConfig(),
+        default_equity_usd=1000.0,
+        initial_weights={"BTCUSDT": 0.25},
+    )
+
+    order = Order(
+        ts=1,
+        symbol="BTCUSDT",
+        side=Side.BUY,
+        order_type=OrderType.MARKET,
+        quantity=Decimal("0"),
+        price=None,
+        meta={
+            "bar": make_bar(1, 10000.0),
+            "payload": {"target_weight": 0.5, "edge_bps": 20.0},
+        },
+    )
+
+    report = executor.execute(order)
+    instructions = report.meta["instructions"]
+
+    assert instructions, "expected rebalance instructions on first execute"
+    instr = instructions[0]
+    assert instr["target_weight"] == pytest.approx(0.5)
+    assert instr["delta_weight"] == pytest.approx(0.25)
+    decision = report.meta["decision"]
+    assert decision["delta_weight"] == pytest.approx(0.25)
+
+
 def test_bar_executor_reduces_weight_after_price_increase():
     executor = BarExecutor(
         run_id="test",
@@ -267,7 +301,11 @@ def test_bar_executor_handles_symbol_case_variants():
 
     second_report = executor.execute(decrease_order)
     assert second_report.meta["decision"]["target_weight"] == pytest.approx(0.1)
-    assert second_report.meta["decision"]["delta_weight"] == pytest.approx(-0.3)
+    price_ratio = float(second_bar.close) / float(first_bar.close)
+    expected_delta = 0.1 - (0.4 * price_ratio)
+    assert second_report.meta["decision"]["delta_weight"] == pytest.approx(
+        expected_delta
+    )
 
     positions_upper = executor.get_open_positions(symbols=["ETHUSDT"])
     assert "ETHUSDT" in positions_upper
@@ -621,8 +659,10 @@ def test_bar_executor_falls_back_to_nested_economics() -> None:
         economics.edge_bps - economics.cost_bps
     )
     assert decision["act_now"] is True
-    expected_turnover = payload.target_weight * executor.default_equity_usd
-    assert decision["turnover_usd"] == pytest.approx(expected_turnover)
+    assert decision["turnover_usd"] == pytest.approx(economics.turnover_usd)
+    expected_target = economics.turnover_usd / executor.default_equity_usd
+    assert decision["target_weight"] == pytest.approx(expected_target)
+    assert decision["delta_weight"] == pytest.approx(expected_target)
 
 
 def test_bar_executor_delta_weight_twap_and_participation():
@@ -658,7 +698,7 @@ def test_bar_executor_delta_weight_twap_and_participation():
     assert len(instructions) == 8
     assert instructions[0]["slice_index"] == 0
     assert instructions[-1]["slice_index"] == 7
-    assert instructions[-1]["target_weight"] == 0.4
+    assert instructions[-1]["target_weight"] == pytest.approx(0.4)
 
 
 def test_bar_executor_uses_default_max_participation():
@@ -1220,7 +1260,7 @@ def test_worker_normalizes_weights_accumulates_same_symbol_orders():
         price=None,
         meta={
             "payload": {
-                "target_weight": 0.3,
+                "target_weight": 0.6,
                 "edge_bps": 10.0,
                 "economics": {"turnover_usd": order1_turnover},
             },
@@ -1241,7 +1281,7 @@ def test_worker_normalizes_weights_accumulates_same_symbol_orders():
         price=None,
         meta={
             "payload": {
-                "target_weight": 0.4,
+                "target_weight": 0.8,
                 "edge_bps": 12.0,
                 "economics": {"turnover_usd": order2_turnover},
             },
@@ -1258,16 +1298,18 @@ def test_worker_normalizes_weights_accumulates_same_symbol_orders():
     assert applied is True
     payloads = [order.meta["payload"] for order in normalized_orders]
     factor = payloads[0]["normalization"]["factor"]
-    assert factor == pytest.approx(0.6)
+    expected_factor = pytest.approx(0.3 / 0.7)
+    assert factor == expected_factor
     assert payloads[1]["normalization"]["factor"] == pytest.approx(factor)
-    assert payloads[0]["normalization"]["delta_positive_total"] == pytest.approx(0.5)
+    assert payloads[0]["normalization"]["delta_positive_total"] == pytest.approx(0.7)
     assert payloads[0]["normalization"]["delta_negative_total"] == pytest.approx(0.0)
-    assert payloads[0]["normalization"]["requested_total"] == pytest.approx(0.7)
-    assert payloads[0]["normalization"]["delta_total"] == pytest.approx(0.5)
+    assert payloads[0]["normalization"]["requested_total"] == pytest.approx(0.8)
+    assert payloads[0]["normalization"]["delta_total"] == pytest.approx(0.7)
     assert payloads[0]["normalization"]["available_delta"] == pytest.approx(0.3)
 
-    expected_target1 = 0.1 + (0.3 - 0.1) * factor
-    expected_target2 = expected_target1 + (0.4 - expected_target1) * factor
+    expected_target1 = 0.1 + (0.6 - 0.1) * factor
+    available_total = payloads[0]["normalization"]["available_total"]
+    expected_target2 = min(available_total, 0.8)
     assert payloads[0]["target_weight"] == pytest.approx(expected_target1)
     assert payloads[1]["target_weight"] == pytest.approx(expected_target2)
     assert payloads[0]["delta_weight"] == pytest.approx(expected_target1 - 0.1)
@@ -1305,7 +1347,7 @@ def test_worker_normalizes_weights_stacks_symbol_orders_to_cap():
         quantity=Decimal("0"),
         price=None,
         meta={
-            "payload": {"target_weight": 0.2, "edge_bps": 15.0},
+            "payload": {"target_weight": 0.4, "edge_bps": 15.0},
         },
     )
     order2 = Order(
@@ -1316,7 +1358,7 @@ def test_worker_normalizes_weights_stacks_symbol_orders_to_cap():
         quantity=Decimal("0"),
         price=None,
         meta={
-            "payload": {"target_weight": 0.25, "edge_bps": 20.0},
+            "payload": {"target_weight": 0.5, "edge_bps": 20.0},
         },
     )
 
@@ -1328,9 +1370,11 @@ def test_worker_normalizes_weights_stacks_symbol_orders_to_cap():
     assert applied is True
     payloads = [order.meta["payload"] for order in normalized_orders]
     factor = payloads[0]["normalization"]["factor"]
+    assert factor == pytest.approx(0.6)
 
     expected_first = requested1 * factor
-    expected_second = expected_first + (requested2 - expected_first) * factor
+    available_total = payloads[0]["normalization"]["available_total"]
+    expected_second = min(available_total, requested2)
 
     assert payloads[0]["target_weight"] == pytest.approx(expected_first)
     assert payloads[1]["target_weight"] == pytest.approx(expected_second)
@@ -1708,10 +1752,16 @@ def test_bar_executor_aborts_when_weight_would_exceed_one():
 
     report = executor.execute(order)
 
-    assert report.meta["instructions"] == []
-    assert report.meta.get("reason") == "rounded_weight_above_one"
-    assert report.meta["target_weight"] == pytest.approx(0.8)
-    assert report.meta["decision"]["act_now"] is False
+    instructions = report.meta["instructions"]
+    assert instructions, "expected rebalance instructions when clamping above 100%"
+    instr = instructions[0]
+    assert instr["target_weight"] == pytest.approx(1.0)
+    assert instr["delta_weight"] == pytest.approx(0.2)
+    assert report.meta.get("reason") is None
+    assert report.meta["target_weight"] == pytest.approx(1.0)
+    decision = report.meta["decision"]
+    assert decision["act_now"] is True
+    assert decision["delta_weight"] == pytest.approx(0.2)
 
 
 def test_bar_executor_aborts_when_weight_would_drop_below_zero():
@@ -1739,8 +1789,14 @@ def test_bar_executor_aborts_when_weight_would_drop_below_zero():
 
     report = executor.execute(order)
 
-    assert report.meta["instructions"] == []
-    assert report.meta.get("reason") == "rounded_weight_below_zero"
-    assert report.meta["target_weight"] == pytest.approx(0.2)
-    assert report.meta["decision"]["act_now"] is False
+    instructions = report.meta["instructions"]
+    assert instructions, "expected rebalance instructions when clamping below 0%"
+    instr = instructions[0]
+    assert instr["target_weight"] == pytest.approx(0.0)
+    assert instr["delta_weight"] == pytest.approx(-0.2)
+    assert report.meta.get("reason") is None
+    assert report.meta["target_weight"] == pytest.approx(0.0)
+    decision = report.meta["decision"]
+    assert decision["act_now"] is True
+    assert decision["delta_weight"] == pytest.approx(-0.2)
 
