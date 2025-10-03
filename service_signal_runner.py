@@ -5084,9 +5084,31 @@ class _Worker:
         except Exception:
             pass
         meta_map = self._ensure_order_meta(o)
-        payload, payload_valid_until_ms, adv_quote = self._build_envelope_payload(o, symbol)
+        payload, payload_valid_until_ms, adv_quote = self._build_envelope_payload(
+            o, symbol
+        )
         if adv_quote is not None:
             meta_map["adv_quote"] = adv_quote
+        equity_override = self._resolve_order_equity(o, payload, symbol)
+        if equity_override is None:
+            fallback_equity = self._portfolio_equity
+            if fallback_equity is not None:
+                try:
+                    fallback_val = float(fallback_equity)
+                except (TypeError, ValueError):
+                    fallback_val = None
+                else:
+                    if math.isfinite(fallback_val) and fallback_val > 0.0:
+                        equity_override = fallback_val
+        if (
+            equity_override is not None
+            and math.isfinite(equity_override)
+            and equity_override > 0.0
+        ):
+            try:
+                meta_map["equity_usd"] = float(equity_override)
+            except Exception:
+                pass
         dedup_key: str | None = None
         if isinstance(meta_map, MappingABC):
             raw_key = meta_map.get("dedup_key")

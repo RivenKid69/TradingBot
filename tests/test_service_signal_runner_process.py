@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import types
+from collections.abc import Mapping as MappingABC
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -450,6 +451,136 @@ def test_emit_clamps_expires_at_to_bar_close(monkeypatch) -> None:
     assert call["expires_at_ms"] == bar_close_ms
     assert call["valid_until_ms"] == bar_close_ms - 5_000
 
+
+def test_emit_populates_equity_before_bar_execute(monkeypatch) -> None:
+    timeframe_ms = 60_000
+    bar_close_ms = 1_700_000_250_000
+
+    monitoring_stub = _make_monitoring_stub()
+    monkeypatch.setattr(service_signal_runner, "monitoring", monitoring_stub)
+    monkeypatch.setattr(
+        service_signal_runner, "pipeline_stage_drop_count", _DummyMetric()
+    )
+    monkeypatch.setattr(
+        service_signal_runner, "skipped_incomplete_bars", _DummyMetric()
+    )
+
+    monkeypatch.setattr(service_signal_runner.signal_bus, "ENABLED", True, raising=False)
+    monkeypatch.setattr(service_signal_runner.signal_bus, "OUT_WRITER", None, raising=False)
+
+    def _should_skip(_symbol: str, _close_ms: int) -> bool:
+        return False
+
+    def _update(_symbol: str, _close_ms: int) -> None:
+        return None
+
+    monkeypatch.setattr(service_signal_runner.signal_bus, "should_skip", _should_skip)
+    monkeypatch.setattr(service_signal_runner.signal_bus, "update", _update)
+
+    monkeypatch.setattr(clock, "now_ms", lambda: bar_close_ms + 1_000)
+
+    publish_calls: list[dict[str, Any]] = []
+
+    def _publish_signal(
+        symbol: str,
+        close_ms: int,
+        payload: Any,
+        dispatcher: Any,
+        *,
+        expires_at_ms: int,
+        **kwargs: Any,
+    ) -> bool:
+        publish_calls.append(
+            {
+                "symbol": symbol,
+                "bar_close_ms": close_ms,
+                "payload": payload,
+                "expires_at_ms": expires_at_ms,
+            }
+        )
+        dispatcher({"symbol": symbol, "payload": payload})
+        return True
+
+    monkeypatch.setattr(
+        service_signal_runner, "publish_signal_envelope", _publish_signal
+    )
+
+    class _StubFeaturePipe:
+        def __init__(self) -> None:
+            self.signal_quality: dict[str, object] = {}
+            self.timeframe_ms = timeframe_ms
+            self.spread_ttl_ms = 0
+
+        def update(
+            self, bar: Bar, *, skip_metrics: bool | None = None
+        ) -> dict[str, float]:
+            return {"close": float(bar.close)}
+
+    class _StubPolicy:
+        def __init__(self) -> None:
+            self.timeframe_ms = timeframe_ms
+
+        def decide(self, features, ctx):
+            return [SimpleNamespace(symbol=ctx.symbol, meta={}, side="buy")]
+
+        def consume_signal_transitions(self):
+            return []
+
+    class _RecordingExecutor:
+        def __init__(self) -> None:
+            self.executed_orders: list[Any] = []
+            self.equity_values: list[Any] = []
+
+        def submit(self, order: Any) -> None:  # pragma: no cover - interface stub
+            return None
+
+        def execute(self, order: Any) -> None:
+            self.executed_orders.append(order)
+            meta = getattr(order, "meta", {})
+            if isinstance(meta, MappingABC):
+                equity_val = meta.get("equity_usd")
+            else:
+                equity_val = getattr(meta, "get", lambda *_: None)("equity_usd")
+            self.equity_values.append(equity_val)
+
+    executor = _RecordingExecutor()
+
+    worker = service_signal_runner._Worker(
+        _StubFeaturePipe(),
+        _StubPolicy(),
+        logging.getLogger("equity-test"),
+        executor,
+        enforce_closed_bars=False,
+        ws_dedup_enabled=True,
+        ws_dedup_timeframe_ms=timeframe_ms,
+        bar_timeframe_ms=timeframe_ms,
+        execution_mode="bar",
+    )
+
+    worker._symbol_equity["BTCUSDT"] = 10_000.0
+
+    order = SimpleNamespace(
+        meta={
+            "payload": {
+                "kind": "target_weight",
+                "target_weight": 0.25,
+            }
+        },
+        created_ts_ms=bar_close_ms - 5_000,
+        score=0.0,
+        side="buy",
+        features_hash="hash",
+    )
+
+    result = worker._emit(order, "BTCUSDT", bar_close_ms, bar_open_ms=bar_close_ms - timeframe_ms)
+
+    assert result is True
+    assert publish_calls, "expected the signal to be published"
+    assert executor.executed_orders, "expected the executor to be invoked"
+    equity_vals = executor.equity_values
+    assert len(equity_vals) == 1
+    assert equity_vals[0] is not None and float(equity_vals[0]) > 0.0
+    assert order.meta.get("equity_usd") == equity_vals[0]
 
 def test_build_drop_envelope_clamps_expires(monkeypatch) -> None:
     timeframe_ms = 60_000
