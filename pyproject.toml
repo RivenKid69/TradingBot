@@ -5,6 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tradingbot"
 version = "0.1.0"
+description = "Cython/C++ extensions: LOB and microstructure generator"
 dependencies = ["pandas>=2.0.0", "numpy>=1.24.0", "pydantic", "pyyaml"]
 
 [project.scripts]
