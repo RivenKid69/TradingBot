@@ -129,6 +129,20 @@ ext_modules = [
         extra_compile_args=cxx_args,
         extra_link_args=link_args,
     ),
+    Extension(
+        name="lob_state_cython",
+        sources=[
+            "lob_state_cython.pyx",
+            "MarketSimulator.cpp",
+            "cpp_microstructure_generator.cpp",
+        ],
+        include_dirs=include_dirs,
+        libraries=libraries,
+        library_dirs=library_dirs,
+        language="c++",
+        extra_compile_args=cxx_args,
+        extra_link_args=link_args,
+    ),
 ]
 
 setup(
