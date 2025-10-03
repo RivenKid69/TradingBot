@@ -1402,9 +1402,9 @@ with tabs[6]:
     runtime_impact_cfg = copy.deepcopy(runtime_costs_effective.get("impact") or {})
 
     mode_options = ["order", "bar"]
-    current_mode = str(runtime_exec_effective.get("mode", "order") or "order").lower()
+    current_mode = str(runtime_exec_effective.get("mode", "bar") or "bar").lower()
     if current_mode not in mode_options:
-        current_mode = "order"
+        current_mode = "bar"
     bar_price_default = str(runtime_exec_effective.get("bar_price") or "")
 
     def _format_optional_number(value: Any) -> str:

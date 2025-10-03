@@ -10,6 +10,7 @@ execution_params:
   ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
   tif: GTC               # e.g. IOC or FOK
 execution:
+  mode: bar
   entry_mode: default         # Entry mode for fills; ``default`` mirrors the legacy simulator behaviour.
   clip_to_bar:                # Controls clipping of simulated prices to the observed bar range.
     enabled: true             # Keep prices within [low, high] of the current bar (legacy behaviour).

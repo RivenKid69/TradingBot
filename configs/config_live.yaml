@@ -21,6 +21,8 @@ execution_params:
   limit_offset_bps: 0.0  # e.g. 25 for 0.25% offset when using LIMIT_MID_BPS
   ttl_steps: 0           # e.g. 5 to cancel after 5 simulation steps
   tif: GTC               # e.g. IOC or FOK
+execution:
+  mode: bar
 timing:
   enforce_closed_bars: true
   timeframe_ms: 60000
