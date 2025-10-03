@@ -14,6 +14,27 @@ from dataclasses import asdict, is_dataclass
 from multiprocessing import Lock
 from utils.prometheus import Counter
 
+
+class Topics:
+    """Common event topics used across trading components."""
+
+    RISK = "risk"
+
+
+__all__ = [
+    "Topics",
+    "configure",
+    "set_defaults",
+    "run_dir",
+    "log_signal_metric",
+    "log_trade",
+    "log_trade_row",
+    "log_trade_exec",
+    "log_risk",
+    "flush",
+    "close",
+]
+
 # Уровень событий: NONE=0, SUMMARY=1, FULL=2
 class EventLevel(int):
     NONE = 0
