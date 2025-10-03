@@ -40,6 +40,12 @@ market: spot
 
 data:
   timeframe: "1m"  # symbols are loaded from data/universe/symbols.json
+  train_start_ts: 1640995200     # 2022-01-01T00:00:00Z
+  train_end_ts: 1688169599       # 2023-06-30T23:59:59Z
+  val_start_ts: 1688169600       # 2023-07-01T00:00:00Z
+  val_end_ts: 1696118399         # 2023-09-30T23:59:59Z
+  test_start_ts: 1696118400      # 2023-10-01T00:00:00Z
+  test_end_ts: 1704067199        # 2023-12-31T23:59:59Z
 
 model:
   algo: "ppo"
