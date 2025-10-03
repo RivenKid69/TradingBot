@@ -8,6 +8,9 @@ Also enforces column schema and avoids renaming 'volume'.
 """
 import os
 import glob
+import re
+
+import numpy as np
 import pandas as pd
 
 RAW_DIR = os.path.join("data","candles")
@@ -45,6 +48,91 @@ def _read_raw(path: str) -> pd.DataFrame:
     return df
 
 
+def _to_seconds(ts: pd.Series) -> pd.Series:
+    ts = pd.to_numeric(ts, errors="coerce")
+    ts_max = ts.max(skipna=True)
+    # поддержка ms → сек
+    if pd.notna(ts_max) and ts_max > 10_000_000_000:
+        ts = ts // 1000
+    return ts
+
+
+def _infer_symbol(path: str, df: pd.DataFrame) -> str:
+    if "symbol" in df.columns and df["symbol"].notna().any():
+        try:
+            v = str(df["symbol"].dropna().iloc[0])
+            if v:
+                return v
+        except Exception:
+            pass
+    base = os.path.basename(path)
+    return re.split(r"[_.]", base)[0]  # BTCUSDT_1h.parquet → BTCUSDT
+
+
+def _normalize_ohlcv(df: pd.DataFrame, path: str) -> pd.DataFrame:
+    # timestamp
+    if "timestamp" in df.columns:
+        ts = _to_seconds(df["timestamp"])
+    elif "close_time" in df.columns:
+        ts = _to_seconds(df["close_time"])
+    elif "open_time" in df.columns:
+        ts = _to_seconds(df["open_time"]) + 3600  # сместим к закрытию часа
+    else:
+        raise ValueError(f"{path}: no 'timestamp'/'close_time'/'open_time'")
+
+    ts = ((ts // 3600) * 3600).astype("Int64")
+
+    # базовые поля
+    def num(col, fallback=None, dtype=float):
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce")
+        if fallback is not None:
+            return pd.Series(fallback, index=df.index, dtype=dtype)
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+
+    open_ = num("open")
+    high_ = num("high")
+    low_ = num("low")
+    close_ = num("close")
+    vol = num("volume")
+    qvol = num("quote_asset_volume")
+    if qvol.isna().all():
+        qvol = close_.astype(float) * vol.astype(float)
+    ntr = num("number_of_trades", 0, dtype=int).fillna(0).astype(int)
+    tb_base = num("taker_buy_base_asset_volume", 0.0).fillna(0.0)
+    tb_quote = num("taker_buy_quote_asset_volume")
+    if tb_quote.isna().all():
+        tb_quote = (tb_base.astype(float) * close_.astype(float)).fillna(0.0)
+
+    sym = _infer_symbol(path, df)
+    out = pd.DataFrame({
+        "timestamp": ts,
+        "symbol": sym,
+        "open": open_.astype(float),
+        "high": high_.astype(float),
+        "low": low_.astype(float),
+        "close": close_.astype(float),
+        "volume": vol.astype(float),
+        "quote_asset_volume": qvol.astype(float),
+        "number_of_trades": ntr.astype(int),
+        "taker_buy_base_asset_volume": tb_base.astype(float),
+        "taker_buy_quote_asset_volume": tb_quote.astype(float),
+    })
+    out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
+    out = out.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+    out["timestamp"] = out["timestamp"].astype("int64")
+    return out
+
+
+def _read_any_raw(path: str) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        return _read_raw(path)  # существующая функция
+    if ext == ".parquet":
+        return pd.read_parquet(path)
+    raise ValueError(f"Unsupported raw extension: {path}")
+
+
 def _read_fng() -> pd.DataFrame:
     if not os.path.exists(FNG):
         return pd.DataFrame(columns=["timestamp","fear_greed_value","fear_greed_value_norm"])
@@ -80,8 +168,14 @@ def prepare() -> list[str]:
     events = _read_events()
     written: list[str] = []
 
-    for path in glob.glob(os.path.join(RAW_DIR, "*.csv")):
-        df = _read_raw(path)
+    raw_paths = sorted({
+        *glob.glob(os.path.join(RAW_DIR, "*.csv")),
+        *glob.glob(os.path.join(RAW_DIR, "*_1h.parquet")),
+        *glob.glob(os.path.join(RAW_DIR, "*.parquet")),
+    })
+    for path in raw_paths:
+        df_raw = _read_any_raw(path)
+        df = _normalize_ohlcv(df_raw, path)
         if not fng.empty:
             fng_sorted = fng.sort_values("timestamp")[["timestamp","fear_greed_value"]].copy()
             df = pd.merge_asof(
@@ -115,7 +209,7 @@ def prepare() -> list[str]:
             df["is_high_importance"] = ((df["importance_level"] == 2) & df["event_ts"].notna()).astype(int)
             df = df.drop(columns=["timestamp_dt", "event_ts_dt", "event_ts", "importance_level"])
 
-        sym = os.path.splitext(os.path.basename(path))[0]
+        sym = _infer_symbol(path, df)
         out = os.path.join(OUT_DIR, f"{sym}.feather")
         prefix = ["timestamp","symbol","open","high","low","close","volume","quote_asset_volume",
                   "number_of_trades","taker_buy_base_asset_volume","taker_buy_quote_asset_volume"]
