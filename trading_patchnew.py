@@ -471,23 +471,31 @@ class TradingEnv(gym.Env):
             high_arr    = self.df["high" ].to_numpy(dtype="float32", copy=True)
             low_arr     = self.df["low"  ].to_numpy(dtype="float32", copy=True)
             vol_usd_arr = self.df["quote_asset_volume"].to_numpy(dtype="float32", copy=True)
-            # создаём MarketSimulatorWrapper; параметры RSI_WINDOW и др. должны быть определены в вашей конфигурации
+
+            pid = 0
+            try:
+                pid = int(os.getpid())
+            except Exception:
+                pid = 0
+            base_seed = int(self.seed_value or 0)
+            sim_seed = base_seed ^ pid if pid else base_seed
+
             self.market_sim = MarketSimulatorWrapper(
-                price_arr, open_arr, high_arr, low_arr, vol_usd_arr,
-                RSI_WINDOW, MACD_FAST, MACD_SLOW, MACD_SIGNAL,
-                MOMENTUM_WINDOW, CCI_WINDOW, BB_WINDOW, 2.0,
-                MA5_WINDOW, MA20_WINDOW, ATR_WINDOW,
-                window_size=1, obv_ma_window=OBV_MA_WINDOW
+                price_arr,
+                open_arr,
+                high_arr,
+                low_arr,
+                vol_usd_arr,
+                seed=int(sim_seed & 0xFFFFFFFFFFFFFFFF),
             )
             # создаём генератор микроструктурных событий
             self.flow_gen = CyMicrostructureGenerator(
                 momentum_factor=0.3, mean_reversion_factor=0.5,
                 adversarial_factor=0.6
             )
-            import os as _os2
             try:
                 # уникальный seed: исходный seed XOR PID
-                self.flow_gen.set_seed(int(self.seed_value or 0) ^ _os2.getpid())
+                self.flow_gen.set_seed(int(sim_seed))
             except Exception:
                 pass  # fallback, если метода нет
         else:
