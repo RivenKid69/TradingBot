@@ -115,6 +115,7 @@ cdef class CyMicrostructureGenerator:
     cdef CppMicrostructureGenerator* thisptr
     cdef public double base_order_imbalance_ratio
     cdef public double base_cancel_ratio
+    cpdef void set_seed(self, unsigned long long seed)
     cpdef unsigned long long generate_public_events_cy(
         self,
         vector[MicroEvent]& out_events,
