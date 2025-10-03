@@ -174,11 +174,18 @@ def _step3_build_features(extra_args: Sequence[str]) -> None:
         )
 
 
-def _step4_validate_processed() -> None:
+def _step4_validate_processed(
+    *, max_age_sec: int | None = 3600, skip_freshness: bool = False
+) -> None:
     if not _exists_script("validate_processed.py"):
         _log("! step4 skipped: validate_processed.py not found")
         return
-    rc = _run([sys.executable, "validate_processed.py"], check=False)
+    cmd = [sys.executable, "validate_processed.py"]
+    if skip_freshness or (max_age_sec is not None and max_age_sec <= 0):
+        cmd.append("--skip-freshness")
+    elif max_age_sec is not None:
+        cmd.extend(["--max-age-sec", str(max_age_sec)])
+    rc = _run(cmd, check=False)
     if rc != 0:
         raise RuntimeError("validate_processed.py reported failures")
 
@@ -198,6 +205,8 @@ def run_single_cycle(
     skip_events: bool = False,
     extra_prepare_args: Sequence[str] | None = None,
     extra_infer_args: Sequence[str] | None = None,
+    validate_max_age_sec: int | None = 3600,
+    skip_validate_freshness: bool = False,
 ) -> None:
     symbols_list = _normalize_symbols(symbols) or ["BTCUSDT", "ETHUSDT"]
     prepare_args = list(extra_prepare_args or [])
@@ -208,7 +217,10 @@ def run_single_cycle(
         _step1_incremental_klines(symbols_list)
         _step2_prepare_events(events_days, skip_events=skip_events)
         _step3_build_features(prepare_args)
-        _step4_validate_processed()
+        _step4_validate_processed(
+            max_age_sec=validate_max_age_sec,
+            skip_freshness=skip_validate_freshness,
+        )
         _step5_infer_signals(infer_args)
     except Exception as e:
         _log(f"! cycle failed: {e}")
@@ -226,6 +238,8 @@ def run_continuous(
     skip_events: bool = False,
     extra_prepare_args: Sequence[str] | None = None,
     extra_infer_args: Sequence[str] | None = None,
+    validate_max_age_sec: int | None = 3600,
+    skip_validate_freshness: bool = False,
 ) -> None:
     while True:
         run_single_cycle(
@@ -234,6 +248,8 @@ def run_continuous(
             skip_events=skip_events,
             extra_prepare_args=extra_prepare_args,
             extra_infer_args=extra_infer_args,
+            validate_max_age_sec=validate_max_age_sec,
+            skip_validate_freshness=skip_validate_freshness,
         )
         pause = max(0.0, float(sleep_minutes))
         if pause <= 0:
@@ -253,12 +269,16 @@ def once() -> None:
     symbols = _env_list("SYMS", ["BTCUSDT", "ETHUSDT"])
     events_days = _env_int("EVENTS_DAYS", 90)
     skip_events = _env_bool("SKIP_EVENTS", False)
+    validate_max_age_sec = _env_int("VALIDATE_MAX_AGE_SEC", 3600)
+    skip_validate_freshness = _env_bool("SKIP_VALIDATE_FRESHNESS", False)
     run_single_cycle(
         symbols,
         events_days=events_days,
         skip_events=skip_events,
         extra_prepare_args=_extra_from_env("EXTRA_ARGS_PREPARE"),
         extra_infer_args=_extra_from_env("EXTRA_ARGS_INFER"),
+        validate_max_age_sec=validate_max_age_sec,
+        skip_validate_freshness=skip_validate_freshness,
     )
 
 
@@ -270,6 +290,8 @@ def main() -> None:
     skip_events = _env_bool("SKIP_EVENTS", False)
     extra_prepare = _extra_from_env("EXTRA_ARGS_PREPARE")
     extra_infer = _extra_from_env("EXTRA_ARGS_INFER")
+    validate_max_age_sec = _env_int("VALIDATE_MAX_AGE_SEC", 3600)
+    skip_validate_freshness = _env_bool("SKIP_VALIDATE_FRESHNESS", False)
 
     if loop:
         run_continuous(
@@ -279,6 +301,8 @@ def main() -> None:
             skip_events=skip_events,
             extra_prepare_args=extra_prepare,
             extra_infer_args=extra_infer,
+            validate_max_age_sec=validate_max_age_sec,
+            skip_validate_freshness=skip_validate_freshness,
         )
     else:
         run_single_cycle(
@@ -287,6 +311,8 @@ def main() -> None:
             skip_events=skip_events,
             extra_prepare_args=extra_prepare,
             extra_infer_args=extra_infer,
+            validate_max_age_sec=validate_max_age_sec,
+            skip_validate_freshness=skip_validate_freshness,
         )
 
 
