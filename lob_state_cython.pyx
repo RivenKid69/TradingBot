@@ -134,6 +134,9 @@ cdef class MarketSimulatorWrapper:
     cdef size_t _n_steps
     cdef size_t _last_step_idx
     cdef double _last_price
+    cdef object _regime_distribution_cache
+    cdef bint _random_shocks_enabled
+    cdef double _random_shock_probability
 
     def __cinit__(self,
                   object price_arr not None,
@@ -171,6 +174,9 @@ cdef class MarketSimulatorWrapper:
         self._last_step_idx = <size_t>0
         self._price_ptr = &price[0]
         self._last_price = price[0]
+        self._regime_distribution_cache = None
+        self._random_shocks_enabled = False
+        self._random_shock_probability = 0.0
 
         cdef uint64_t c_seed = <uint64_t>seed
 
@@ -208,6 +214,73 @@ cdef class MarketSimulatorWrapper:
         self._last_step_idx = <size_t>current_step_idx
         self._last_price = self.thisptr.step(self._last_step_idx, black_swan_probability, is_training_mode)
         return self._last_price
+
+    cpdef set_regime_distribution(self, object probabilities):
+        """Validate, normalise and forward regime probabilities to the simulator."""
+        cdef np.ndarray[np.float64_t, ndim=1] prob_array
+        cdef ArrayDouble4 c_probs
+        cdef double total
+        cdef Py_ssize_t i
+
+        if self.thisptr is NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+        if probabilities is None:
+            raise ValueError("probabilities must not be None")
+
+        prob_array = np.ascontiguousarray(probabilities, dtype=np.float64)
+        if prob_array.ndim != 1 or prob_array.shape[0] != 4:
+            raise ValueError("probabilities must be a 1D array of length 4")
+
+        total = 0.0
+        for i in range(4):
+            if prob_array[i] < 0.0:
+                raise ValueError("probabilities must be non-negative")
+            total += prob_array[i]
+
+        if total <= 0.0:
+            raise ValueError("probabilities must sum to a positive value")
+
+        prob_array = np.ascontiguousarray(prob_array / total, dtype=np.float64)
+        for i in range(4):
+            c_probs[i] = prob_array[i]
+
+        self.thisptr.set_regime_distribution(c_probs)
+        self._regime_distribution_cache = np.array(prob_array, dtype=np.float64, copy=True)
+
+    cpdef enable_random_shocks(self, bint enable, object probability_per_step=None):
+        """Enable or disable random shocks after validating the provided probability."""
+        cdef double probability
+        cdef np.ndarray[np.float64_t, ndim=1] prob_array
+
+        if self.thisptr is NULL:
+            raise RuntimeError("MarketSimulator instance not initialised")
+
+        if probability_per_step is None:
+            probability = 0.0
+        elif np.isscalar(probability_per_step):
+            probability = float(probability_per_step)
+        else:
+            prob_array = np.asarray(probability_per_step, dtype=np.float64)
+            if prob_array.ndim > 1 or prob_array.size != 1:
+                raise ValueError("probability_per_step must be a scalar value")
+            probability = float(prob_array.ravel()[0])
+
+        if probability < 0.0:
+            raise ValueError("probability_per_step must be non-negative")
+
+        self.thisptr.enable_random_shocks(enable, probability)
+        self._random_shocks_enabled = enable
+        self._random_shock_probability = probability
+
+    property regime_distribution:
+        def __get__(self):
+            return self.get_regime_distribution()
+
+    cpdef np.ndarray[np.float64_t, ndim=1] get_regime_distribution(self):
+        """Return a copy of the cached regime probabilities."""
+        if self._regime_distribution_cache is None:
+            raise AttributeError("Regime distribution has not been set")
+        return np.array(self._regime_distribution_cache, dtype=np.float64, copy=True)
     cpdef double get_last_price(self):
         if self._price_ptr != <double*>NULL and self._n_steps > 0:
             if self._last_step_idx < self._n_steps:
