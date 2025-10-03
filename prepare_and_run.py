@@ -94,10 +94,12 @@ def prepare() -> list[str]:
 
         if not events.empty:
             df_sorted = df.sort_values("timestamp").copy()
-            df_sorted["timestamp_dt"] = pd.to_datetime(df_sorted["timestamp"], unit="s")
+            df_sorted["timestamp_dt"] = pd.to_datetime(df_sorted["timestamp"], unit="s").astype("datetime64[ns]")
+            df_sorted = df_sorted.sort_values("timestamp_dt")
 
             ev = events.rename(columns={"timestamp": "event_ts"}).sort_values("event_ts").copy()
-            ev["event_ts_dt"] = pd.to_datetime(ev["event_ts"], unit="s")
+            ev["event_ts_dt"] = pd.to_datetime(ev["event_ts"], unit="s").astype("datetime64[ns]")
+            ev = ev.sort_values("event_ts_dt")
 
             df = pd.merge_asof(
                 df_sorted,
@@ -107,7 +109,9 @@ def prepare() -> list[str]:
                 direction="backward",
                 tolerance=pd.Timedelta(hours=EVENT_HORIZON_HOURS),
             )
-            df["time_since_last_event_hours"] = (df["timestamp"] - df["event_ts"]) / 3600.0
+            df["time_since_last_event_hours"] = (
+                (df["timestamp_dt"] - df["event_ts_dt"]).dt.total_seconds() / 3600.0
+            )
             df["is_high_importance"] = ((df["importance_level"] == 2) & df["event_ts"].notna()).astype(int)
             df = df.drop(columns=["timestamp_dt", "event_ts_dt", "event_ts", "importance_level"])
 
