@@ -106,6 +106,10 @@ cdef double compute_reward_view(
 ) noexcept nogil:
     cdef double reward = net_worth - prev_net_worth
     cdef double phi_t = 0.0
+    cdef double base_cost_bps = 0.0
+    cdef double total_cost_bps = 0.0
+    cdef double participation = 0.0
+    cdef double impact_exp = 0.0
 
     if use_legacy_log_reward:
         reward += log_return(net_worth, prev_net_worth)
@@ -135,12 +139,12 @@ cdef double compute_reward_view(
 
     cdef double trade_notional = fabs(last_executed_notional)
     if trade_notional > 0.0:
-        cdef double base_cost_bps = spot_cost_taker_fee_bps + spot_cost_half_spread_bps
-        cdef double total_cost_bps = base_cost_bps if base_cost_bps > 0.0 else 0.0
+        base_cost_bps = spot_cost_taker_fee_bps + spot_cost_half_spread_bps
+        total_cost_bps = base_cost_bps if base_cost_bps > 0.0 else 0.0
         if spot_cost_impact_coeff > 0.0 and spot_cost_adv_quote > 0.0:
-            cdef double participation = trade_notional / spot_cost_adv_quote
+            participation = trade_notional / spot_cost_adv_quote
             if participation > 0.0:
-                cdef double impact_exp = spot_cost_impact_exponent if spot_cost_impact_exponent > 0.0 else 1.0
+                impact_exp = spot_cost_impact_exponent if spot_cost_impact_exponent > 0.0 else 1.0
                 total_cost_bps += spot_cost_impact_coeff * participation ** impact_exp
         if total_cost_bps > 0.0:
             reward -= trade_notional * total_cost_bps * 1e-4
