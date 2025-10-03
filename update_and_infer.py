@@ -145,15 +145,33 @@ def _step2_prepare_events(days: int, *, skip_events: bool) -> None:
 
 def _step3_build_features(extra_args: Sequence[str]) -> None:
     extra = list(extra_args)
+    ran_any = False
     if _exists_script("prepare_advanced_data.py"):
-        _run([sys.executable, "prepare_advanced_data.py", *extra], check=True)
-        return
+        ran_any = True
+        try:
+            _run([sys.executable, "prepare_advanced_data.py", *extra], check=True)
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - defensive
+            msg = (
+                "prepare_advanced_data.py failed during step3 "
+                f"(exit code {exc.returncode})"
+            )
+            _log(f"! {msg}")
+            raise RuntimeError(msg) from exc
     if _exists_script("prepare_and_run.py"):
-        _run([sys.executable, "prepare_and_run.py", *extra], check=True)
-        return
-    _log(
-        "! step3 skipped: neither prepare_advanced_data.py nor prepare_and_run.py found"
-    )
+        ran_any = True
+        try:
+            _run([sys.executable, "prepare_and_run.py", *extra], check=True)
+        except subprocess.CalledProcessError as exc:  # pragma: no cover - defensive
+            msg = (
+                "prepare_and_run.py failed during step3 "
+                f"(exit code {exc.returncode})"
+            )
+            _log(f"! {msg}")
+            raise RuntimeError(msg) from exc
+    if not ran_any:
+        _log(
+            "! step3 skipped: neither prepare_advanced_data.py nor prepare_and_run.py found"
+        )
 
 
 def _step4_validate_processed() -> None:
