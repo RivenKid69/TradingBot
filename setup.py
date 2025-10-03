@@ -139,7 +139,6 @@ setup(
     entry_points={
         "console_scripts": ["no-trade-mask=apply_no_trade_mask:main"],
     },
-    install_requires=["pandas", "pydantic", "pyyaml"],
     ext_modules=cythonize(
         ext_modules,
         compiler_directives={
