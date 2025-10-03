@@ -49,6 +49,26 @@ class OrderBook;
 
 enum class MicroEventType : int { LIMIT = 0, MARKET = 1, CANCEL = 2 };
 
+constexpr MicroEventType operator|(MicroEventType lhs, MicroEventType rhs) {
+    return static_cast<MicroEventType>(static_cast<int>(lhs) | static_cast<int>(rhs));
+}
+
+constexpr MicroEventType operator<<(MicroEventType lhs, int rhs) {
+    return static_cast<MicroEventType>(static_cast<int>(lhs) << rhs);
+}
+
+constexpr MicroEventType operator*(MicroEventType lhs, MicroEventType rhs) {
+    return static_cast<MicroEventType>(static_cast<int>(lhs) * static_cast<int>(rhs));
+}
+
+constexpr MicroEventType operator*(MicroEventType lhs, int rhs) {
+    return static_cast<MicroEventType>(static_cast<int>(lhs) * rhs);
+}
+
+constexpr MicroEventType operator*(int lhs, MicroEventType rhs) {
+    return static_cast<MicroEventType>(lhs * static_cast<int>(rhs));
+}
+
 static constexpr int CH_LIM_BUY  = 0;
 static constexpr int CH_LIM_SELL = 1;
 static constexpr int CH_MKT_BUY  = 2;

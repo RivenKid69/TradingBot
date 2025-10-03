@@ -99,7 +99,7 @@ cdef extern from "MarketSimulator.h":
             double* low,
             double* volume_usd,
             size_t n_steps,
-            uint64_t seed = 0
+            uint64_t seed
         ) except +
         double step(size_t i, double black_swan_probability, bint is_training_mode)
         void set_regime_distribution(const ArrayDouble4& probs)
@@ -441,7 +441,7 @@ cdef class CyMicrostructureGenerator:
             del self.thisptr
             self.thisptr = NULL
 
-    cpdef set_seed(self, unsigned long long seed):
+    cpdef void set_seed(self, unsigned long long seed):
         """Set the random seed for the underlying generator."""
         if self.thisptr is NULL:
             raise ValueError("Generator is not initialized")
