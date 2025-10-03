@@ -5,7 +5,14 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import sys
+from pathlib import Path
 from typing import List, Sequence
+
+# Ensure repository root is on sys.path when executed as a script
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from ingest_config import (
     FuturesConfig,
