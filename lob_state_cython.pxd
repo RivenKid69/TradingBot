@@ -3,23 +3,18 @@ from libcpp.vector cimport vector
 from libcpp.utility cimport pair
 
 cdef extern from "cpp_microstructure_generator.h":
-    cdef enum MarketEventType:
-        NO_EVENT
-        PUBLIC_LIMIT_ADD
-        PUBLIC_MARKET_MATCH
-        PUBLIC_CANCEL_RANDOM
-        AGENT_LIMIT_ADD
-        AGENT_MARKET_MATCH
-        AGENT_CANCEL_SPECIFIC
+    cdef enum MicroEventType:
+        LIMIT
+        MARKET
+        CANCEL
 
-    cdef struct MarketEvent:
-        MarketEventType type
+    cdef struct MicroEvent:
+        MicroEventType type
         bint is_buy
-        long long price
+        long long price_ticks
         double size
         unsigned long long order_id
-        int buy_cancel_count
-        int sell_cancel_count
+        int timestamp
 
     cdef cppclass CppMicrostructureGenerator:
         CppMicrostructureGenerator(double momentum_factor, double mean_reversion_factor, double adversarial_factor) except +
@@ -35,7 +30,7 @@ cdef extern from "cpp_microstructure_generator.h":
             double base_order_imbalance_ratio,
             double base_cancel_ratio,
             int timestamp,
-            vector[MarketEvent]& out_events,
+            vector[MicroEvent]& out_events,
             long long& next_public_order_id
         )
 
@@ -62,7 +57,7 @@ cdef class CyMicrostructureGenerator:
     cdef public double base_cancel_ratio
     cpdef long long generate_public_events_cy(
         self,
-        vector[MarketEvent]& out_events,
+        vector[MicroEvent]& out_events,
         unsigned long long next_public_order_id,
         double bar_price,
         double bar_open,

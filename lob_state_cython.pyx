@@ -24,13 +24,17 @@ np.import_array()
 # создаём временный буфер достаточной длины
 cdef public int N_FEATURES
 @cython.cfunc
-cdef void _shuffle_events(vector[MarketEvent]& events):
+cdef void _shuffle_events(vector[MicroEvent]& events, vector[unsigned char]& sources):
     cdef size_t n = events.size()
     cdef size_t i
     cdef size_t j
-    cdef MarketEvent tmp
+    cdef MicroEvent tmp
+    cdef unsigned char tmp_source
 
     if n <= 1:
+        return
+
+    if sources.size() != n:
         return
 
     i = n
@@ -40,6 +44,9 @@ cdef void _shuffle_events(vector[MarketEvent]& events):
         tmp = events[i]
         events[i] = events[j]
         events[j] = tmp
+        tmp_source = sources[i]
+        sources[i] = sources[j]
+        sources[j] = tmp_source
 
 def _compute_n_features() -> int:
     """Вспомогательная функция для подсчёта длины вектора признаков."""
@@ -281,7 +288,7 @@ cdef class CyMicrostructureGenerator:
             self.thisptr = NULL
 
     cpdef long long generate_public_events_cy(self,
-            vector[MarketEvent]& out_events,
+            vector[MicroEvent]& out_events,
             unsigned long long next_public_order_id,
             double bar_price, double bar_open, double bar_volume_usd,
             int bar_trade_count, double bar_taker_buy_volume,
@@ -386,15 +393,17 @@ cpdef tuple run_full_step_logic_cython(
     cdef object order_id_to_remove, order_info_dict, reason_obj
     cdef tuple generated_events
     cdef np.ndarray limit_sides_bool, limit_prices, limit_sizes, cancel_sides, public_market_sides_bool, public_market_sizes
-    cdef bint is_buy, should_replace_order, is_buy_for_ideal_price, is_agent_taker
+    cdef bint is_buy, should_replace_order, is_buy_for_ideal_price, is_agent_taker, is_agent_event
     cdef bint is_taker, is_maker
     cdef int cancelled_order_count = 0
     cdef int trades_start_idx, j, agent_trades_count, dynamic_sl_offset_range, random_ticks_offset, sl_range, trades_this_step
+    cdef size_t size_before, size_after
     # Новые переменные для событийной модели
-    cdef vector[MarketEvent] all_events
+    cdef vector[MicroEvent] all_events
+    cdef vector[unsigned char] event_sources
     cdef vector[long long] ids_to_cancel
     cdef pair[long long, long long] closest_order
-    cdef MarketEvent agent_event, cancel_ev, current_event
+    cdef MicroEvent agent_event, cancel_ev, current_event
     cdef CythonLOB lob_clone
     cdef long long closest_order_price
     cdef unsigned long long agent_order_id
@@ -490,9 +499,19 @@ cpdef tuple run_full_step_logic_cython(
                 ids_to_cancel = state.agent_orders_ptr.get_all_ids()
                 cancelled_order_count = ids_to_cancel.size()
                 for i in range(cancelled_order_count):
-                    cancel_ev.type = AGENT_CANCEL_SPECIFIC
+                    cancel_ev.type = MicroEventType.CANCEL
                     cancel_ev.order_id = ids_to_cancel[i]
+                    cancel_ev.timestamp = state.step_idx
+                    info_ptr = state.agent_orders_ptr.get_info(ids_to_cancel[i])
+                    if info_ptr is not NULL:
+                        cancel_ev.is_buy = info_ptr.is_buy_side
+                        cancel_ev.price_ticks = info_ptr.price
+                    else:
+                        cancel_ev.is_buy = True
+                        cancel_ev.price_ticks = 0
+                    cancel_ev.size = 0.0
                     all_events.push_back(cancel_ev)
+                    event_sources.push_back(1)
 
                 is_buy = (delta_ratio > 0)
                 volume_to_trade = abs(delta_ratio) * state.prev_net_worth / current_price
@@ -517,28 +536,35 @@ cpdef tuple run_full_step_logic_cython(
                         price += offset_in_ticks * tick_size_rand
 
                         # СОЗДАЕМ СОБЫТИЕ ЛИМИТНОГО ОРДЕРА АГЕНТА
-                        agent_event.type = AGENT_LIMIT_ADD
+                        agent_event.type = MicroEventType.LIMIT
                         agent_event.is_buy = is_buy
-                        agent_event.price = <long long>(price * state.price_scale)
+                        agent_event.price_ticks = <long long>(price * state.price_scale)
                         agent_event.size = volume_to_trade
                         agent_event.order_id = agent_order_id
+                        agent_event.timestamp = state.step_idx
                         all_events.push_back(agent_event)
+                        event_sources.push_back(1)
                         # Запоминаем намерение для расчета потока
                         if is_buy: agent_limit_buy_vol_this_step += volume_to_trade
                         else: agent_limit_sell_vol_this_step += volume_to_trade
 
                     else: # Market order
                         # СОЗДАЕМ СОБЫТИЕ РЫНОЧНОГО ОРДЕРА АГЕНТА
-                        agent_event.type = AGENT_MARKET_MATCH
+                        agent_event.type = MicroEventType.MARKET
                         agent_event.is_buy = is_buy
                         agent_event.size = volume_to_trade
+                        agent_event.price_ticks = 0
+                        agent_event.order_id = 0
+                        agent_event.timestamp = state.step_idx
                         all_events.push_back(agent_event)
+                        event_sources.push_back(1)
                         # Запоминаем намерение для расчета потока
                         if is_buy: agent_taker_buy_vol_this_step += volume_to_trade
                         else: agent_taker_sell_vol_this_step += volume_to_trade
 
         # --- 1.2. Генерация публичных событий ---
         agent_net_taker_flow = agent_taker_buy_vol_this_step - agent_taker_sell_vol_this_step
+        size_before = all_events.size()
         state.next_order_id = generator.generate_public_events_cy(
             all_events, # Передаем вектор для добавления публичных событий
             state.next_order_id,
@@ -547,30 +573,34 @@ cpdef tuple run_full_step_logic_cython(
             agent_limit_buy_vol_this_step, agent_limit_sell_vol_this_step,
             state.step_idx
         )
+        size_after = all_events.size()
+        for i in range(size_before, size_after):
+            event_sources.push_back(0)
 
         # --- 1.3. Перемешивание всех событий ---
         if all_events.size() > 1:
-            _shuffle_events(all_events)
+            _shuffle_events(all_events, event_sources)
 
         # --- 1.4. НОВЫЙ ЦИКЛ: Исполнение перемешанных событий ---
         for i in range(all_events.size()):
             current_event = all_events[i]
             trades_made_this_event = 0
             executed_count_this_event = 0
+            is_agent_event = (event_sources[i] != 0)
 
             # Используем клон LOB для всех операций в цикле
-            if current_event.type == AGENT_LIMIT_ADD or current_event.type == PUBLIC_LIMIT_ADD:
+            if current_event.type == MicroEventType.LIMIT:
                 lob_clone.add_limit_order_with_id(
                     current_event.is_buy,
-                    current_event.price,
+                    current_event.price_ticks,
                     current_event.size,
                     current_event.order_id,
                     state.step_idx,
-                    current_event.type == AGENT_LIMIT_ADD,
+                    is_agent_event,
                 )
 
-            elif current_event.type == AGENT_MARKET_MATCH or current_event.type == PUBLIC_MARKET_MATCH:
-                is_agent_taker = (current_event.type == AGENT_MARKET_MATCH)
+            elif current_event.type == MicroEventType.MARKET:
+                is_agent_taker = is_agent_event
                 trades_made_this_event, fee_total_event = lob_clone.match_market_order_cy(
                     current_event.is_buy, current_event.size, state.step_idx, is_agent_taker,
                     prices_all_arr, volumes_all_arr, maker_ids_all_arr,
@@ -582,16 +612,13 @@ cpdef tuple run_full_step_logic_cython(
                     is_buy_side_all_arr[total_trades_count : total_trades_count + trades_made_this_event] = current_event.is_buy
                     taker_is_agent_all_arr[total_trades_count : total_trades_count + trades_made_this_event] = is_agent_taker
 
-            elif current_event.type == AGENT_CANCEL_SPECIFIC:
-                info_ptr = state.agent_orders_ptr.get_info(current_event.order_id)
-                if info_ptr is not NULL:
-                    lob_clone.remove_order(info_ptr.is_buy_side, info_ptr.price, current_event.order_id)
-
-            elif current_event.type == PUBLIC_CANCEL_RANDOM:
-                if current_event.buy_cancel_count > 0:
-                    lob_clone.cancel_random_public_orders(True, current_event.buy_cancel_count)
-                if current_event.sell_cancel_count > 0:
-                    lob_clone.cancel_random_public_orders(False, current_event.sell_cancel_count)
+            elif current_event.type == MicroEventType.CANCEL:
+                if is_agent_event:
+                    info_ptr = state.agent_orders_ptr.get_info(current_event.order_id)
+                    if info_ptr is not NULL:
+                        lob_clone.remove_order(info_ptr.is_buy_side, info_ptr.price, current_event.order_id)
+                else:
+                    lob_clone.remove_order(current_event.is_buy, current_event.price_ticks, current_event.order_id)
 
             # --- КРИТИЧЕСКИ ВАЖНО: ОБРАБОТКА PNL ВНУТРИ ЦИКЛА ---
             if trades_made_this_event > 0:
