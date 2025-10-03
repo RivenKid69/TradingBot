@@ -14,7 +14,7 @@ cimport numpy as np
 import numpy as np
 
 import core_constants as consts
-from core_constants cimport MarketRegime, NORMAL, CHOPPY_FLAT, STRONG_TREND
+from core_constants cimport MarketRegime, NORMAL, CHOPPY_FLAT, STRONG_TREND, ILLIQUID
 from coreworkspace cimport SimulationWorkspace
 from fast_lob cimport CythonLOB, OrderBook
 from obs_builder cimport build_observation_vector_c
@@ -310,14 +310,33 @@ cdef class MarketSimulatorWrapper:
     cpdef double get_bb_upper(self, size_t idx):
         return self.thisptr.get_bb_upper(idx)
 
-    cpdef force_market_regime(self, str regime_name, size_t start_idx, size_t duration):
+    cpdef force_market_regime(self, object regime_name, size_t start_idx, size_t duration):
+        """Force a regime via MarketRegime, an integer code, or a string alias."""
         cdef MarketRegime regime
-        if regime_name == "choppy_flat" or regime_name == "flat":
-            regime = CHOPPY_FLAT
-        elif regime_name in ("strong_trend", "liquidity_shock", "trend"):
-            regime = STRONG_TREND
+
+        if isinstance(regime_name, consts.MarketRegime):
+            regime = <MarketRegime><int>regime_name
+        elif isinstance(regime_name, int):
+            if regime_name == consts.MarketRegime.NORMAL:
+                regime = NORMAL
+            elif regime_name == consts.MarketRegime.CHOPPY_FLAT:
+                regime = CHOPPY_FLAT
+            elif regime_name == consts.MarketRegime.STRONG_TREND:
+                regime = STRONG_TREND
+            elif regime_name == consts.MarketRegime.ILLIQUID:
+                regime = ILLIQUID
+            else:
+                raise ValueError("Unknown market regime code: %s" % (regime_name,))
         else:
-            regime = NORMAL
+            regime_str = str(regime_name).strip().lower()
+            if regime_str in ("choppy_flat", "flat"):
+                regime = CHOPPY_FLAT
+            elif regime_str in ("strong_trend", "liquidity_shock", "trend"):
+                regime = STRONG_TREND
+            elif regime_str in ("illiquid", "illiquidity"):
+                regime = ILLIQUID
+            else:
+                regime = NORMAL
 
         if self.thisptr is NULL:
             raise RuntimeError("MarketSimulator instance not initialised")
