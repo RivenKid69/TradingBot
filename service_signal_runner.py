@@ -1380,10 +1380,37 @@ class _Worker:
         return requested, filled
 
     def _extract_bar_execution_metrics(
-        self, snapshot: Mapping[str, Any] | None
+        self,
+        snapshot: Mapping[str, Any] | None,
+        *,
+        expected_bar_ts: int | None = None,
+        total_signals: int | None = None,
     ) -> Dict[str, Any] | None:
         if not snapshot or self._execution_mode != "bar":
             return None
+        expected_count: int | None = None
+        if total_signals is not None:
+            try:
+                expected_count = int(total_signals)
+            except (TypeError, ValueError):
+                expected_count = None
+            else:
+                if expected_count <= 0:
+                    return None
+
+        def _coerce_int(value: Any) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return 1 if value else 0
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                try:
+                    return int(float(value))
+                except (TypeError, ValueError):
+                    return None
+
         decision_raw = snapshot.get("decision")
         decision = self._materialize_mapping(decision_raw)
         has_decision_data = False
@@ -1404,6 +1431,11 @@ class _Worker:
                     has_decision_data = bool(nested_decision)
                 except Exception:
                     has_decision_data = True
+        if not has_decision_data and snapshot is not None:
+            alt_decision = snapshot.get("bar_execution")
+            if isinstance(alt_decision, MappingABC):
+                decision = self._materialize_mapping(alt_decision)
+                has_decision_data = bool(decision)
         turnover = self._coerce_float(
             self._find_in_mapping(decision, ("turnover_usd", "turnover", "notional_usd"))
         )
@@ -1485,6 +1517,34 @@ class _Worker:
                 reason_label = str(reason_val)
             except Exception:
                 reason_label = None
+        decisions_raw = None
+        if decision is not None:
+            decisions_raw = self._find_in_mapping(
+                decision,
+                (
+                    "decisions",
+                    "decision_count",
+                    "count",
+                    "emissions",
+                    "emitted",
+                    "signals",
+                    "orders",
+                ),
+            )
+        if decisions_raw is None:
+            decisions_raw = self._find_in_mapping(
+                snapshot,
+                (
+                    "decisions",
+                    "decision_count",
+                    "count",
+                    "emissions",
+                    "emitted",
+                    "signals",
+                    "orders",
+                ),
+            )
+        decisions_count = _coerce_int(decisions_raw)
         bar_ts: int | None = None
         if snapshot is not None:
             ts_value = snapshot.get("bar_ts")
@@ -1501,6 +1561,15 @@ class _Worker:
                     except Exception:
                         bar_ts = None
 
+        if expected_bar_ts is not None:
+            try:
+                expected_ts = int(expected_bar_ts)
+            except (TypeError, ValueError):
+                expected_ts = None
+            else:
+                if bar_ts is None or bar_ts != expected_ts:
+                    return None
+
         metrics: Dict[str, Any] = {
             "decisions": 1,
             "act_now": 1 if act_now_flag else 0,
@@ -1508,6 +1577,12 @@ class _Worker:
             "cap_usd": cap_value,
             "normalized": bool(normalized_flag),
         }
+        if decisions_count is not None:
+            if expected_count is not None and decisions_count <= 0:
+                return None
+            metrics["decisions"] = max(decisions_count, 0)
+        elif expected_count is not None:
+            metrics["decisions"] = max(expected_count, 0)
         if adv_value is not None:
             metrics["adv_quote"] = adv_value
         if bar_ts is not None:
@@ -5430,6 +5505,7 @@ class _Worker:
             emitted_count = len(emitted)
             runtime_monitoring = self._monitoring
             duplicates_count = duplicates
+            total_events = emitted_count + duplicates_count
             if runtime_monitoring is not None:
                 try:
                     runtime_monitoring.record_signals(
@@ -5457,46 +5533,64 @@ class _Worker:
                         except Exception:
                             pass
                 else:
-                    bar_metrics = self._extract_bar_execution_metrics(snapshot)
+                    bar_metrics = self._extract_bar_execution_metrics(
+                        snapshot,
+                        expected_bar_ts=ts_ms,
+                        total_signals=total_events,
+                    )
                     if bar_metrics:
+                        metrics_bar_ts = bar_metrics.get("bar_ts")
                         try:
-                            runtime_monitoring.record_bar_execution(
-                                bar.symbol,
-                                decisions=int(bar_metrics.get("decisions", 0)),
-                                act_now=int(bar_metrics.get("act_now", 0)),
-                                turnover_usd=float(bar_metrics.get("turnover_usd", 0.0)),
-                                cap_usd=bar_metrics.get("cap_usd"),
-                                impact_mode=bar_metrics.get("impact_mode"),
-                                modeled_cost_bps=bar_metrics.get("modeled_cost_bps"),
-                                realized_slippage_bps=bar_metrics.get(
-                                    "realized_slippage_bps"
-                                ),
-                                cost_bias_bps=bar_metrics.get("cost_bias_bps"),
-                                bar_ts=bar_metrics.get("bar_ts"),
+                            metrics_bar_ts_int = (
+                                int(metrics_bar_ts)
+                                if metrics_bar_ts is not None
+                                else None
                             )
-                        except Exception:
-                            pass
-                        reason = str(bar_metrics.get("reason") or "").strip()
-                        if reason:
+                        except (TypeError, ValueError):
+                            metrics_bar_ts_int = None
+                        if metrics_bar_ts_int == ts_ms and total_events > 0:
                             try:
-                                self._logger.info(
-                                    "BAR_EXECUTOR_SKIP %s",
-                                    {"symbol": bar.symbol, "reason": reason},
+                                runtime_monitoring.record_bar_execution(
+                                    bar.symbol,
+                                    decisions=int(bar_metrics.get("decisions", 0)),
+                                    act_now=int(bar_metrics.get("act_now", 0)),
+                                    turnover_usd=float(
+                                        bar_metrics.get("turnover_usd", 0.0)
+                                    ),
+                                    cap_usd=bar_metrics.get("cap_usd"),
+                                    impact_mode=bar_metrics.get("impact_mode"),
+                                    modeled_cost_bps=bar_metrics.get(
+                                        "modeled_cost_bps"
+                                    ),
+                                    realized_slippage_bps=bar_metrics.get(
+                                        "realized_slippage_bps"
+                                    ),
+                                    cost_bias_bps=bar_metrics.get("cost_bias_bps"),
+                                    bar_ts=bar_metrics.get("bar_ts"),
                                 )
                             except Exception:
                                 pass
-                            try:
-                                monitoring.inc_reason(reason)
-                            except Exception:
-                                pass
-                            try:
-                                pipeline_stage_drop_count.labels(
-                                    bar.symbol,
-                                    Stage.PUBLISH.name,
-                                    reason,
-                                ).inc()
-                            except Exception:
-                                pass
+                            reason = str(bar_metrics.get("reason") or "").strip()
+                            if reason:
+                                try:
+                                    self._logger.info(
+                                        "BAR_EXECUTOR_SKIP %s",
+                                        {"symbol": bar.symbol, "reason": reason},
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    monitoring.inc_reason(reason)
+                                except Exception:
+                                    pass
+                                try:
+                                    pipeline_stage_drop_count.labels(
+                                        bar.symbol,
+                                        Stage.PUBLISH.name,
+                                        reason,
+                                    ).inc()
+                                except Exception:
+                                    pass
                 pnl_value = self._extract_daily_pnl(snapshot)
                 if pnl_value is not None:
                     try:
@@ -5521,7 +5615,7 @@ class _Worker:
                             pass
                 else:
                     self._zero_signal_streak = 0
-            total = emitted_count + duplicates_count
+            total = total_events
             if total > 0:
                 try:
                     monitoring.signal_error_rate.labels(bar.symbol).set(
