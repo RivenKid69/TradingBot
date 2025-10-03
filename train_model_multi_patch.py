@@ -903,7 +903,7 @@ def main():
     )
     parser.add_argument(
         "--dataset-split",
-        default="train",
+        default="val",
         help="Dataset split identifier declared in the offline config",
     )
     parser.add_argument(
