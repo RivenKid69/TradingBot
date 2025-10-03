@@ -12,16 +12,11 @@ import pandas as pd
 import pytest
 
 
-_infra_module = types.ModuleType("infra")
-sys.modules.setdefault("infra", _infra_module)
+lob_state_module = types.ModuleType("lob_state_cython")
+lob_state_module.N_FEATURES = 8
+sys.modules.setdefault("lob_state_cython", lob_state_module)
 
-event_bus_module = types.ModuleType("infra.event_bus")
-event_bus_module.Topics = types.SimpleNamespace(RISK="risk")
-event_bus_module.event_bus = types.SimpleNamespace(configure=lambda level: None)
-sys.modules.setdefault("infra.event_bus", event_bus_module)
-setattr(_infra_module, "event_bus", event_bus_module)
-
-time_provider_module = types.ModuleType("infra.time_provider")
+import trading_patchnew
 
 
 class _StubTimeProvider:
@@ -29,16 +24,7 @@ class _StubTimeProvider:
         return 0
 
 
-time_provider_module.TimeProvider = _StubTimeProvider
-time_provider_module.RealTimeProvider = _StubTimeProvider
-sys.modules.setdefault("infra.time_provider", time_provider_module)
-setattr(_infra_module, "time_provider", time_provider_module)
-
-lob_state_module = types.ModuleType("lob_state_cython")
-lob_state_module.N_FEATURES = 8
-sys.modules.setdefault("lob_state_cython", lob_state_module)
-
-import trading_patchnew
+_TOPICS_STUB = types.SimpleNamespace(RISK="risk")
 
 
 def _make_base_dataframe() -> pd.DataFrame:
@@ -74,6 +60,9 @@ def _stub_external_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         return np.ones(trading_patchnew.HOURS_IN_WEEK, dtype=float)
 
     monkeypatch.setattr(trading_patchnew, "load_hourly_seasonality", _fake_seasonality)
+    monkeypatch.setattr(trading_patchnew, "Topics", _TOPICS_STUB, raising=False)
+    monkeypatch.setattr(trading_patchnew, "TimeProvider", _StubTimeProvider, raising=False)
+    monkeypatch.setattr(trading_patchnew, "RealTimeProvider", _StubTimeProvider, raising=False)
     monkeypatch.setattr(
         trading_patchnew,
         "get_no_trade_config",

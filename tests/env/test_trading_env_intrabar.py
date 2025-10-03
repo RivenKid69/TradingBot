@@ -12,19 +12,11 @@ import pandas as pd
 import pytest
 
 
-# ---------------------------------------------------------------------------
-# Minimal stubs so ``trading_patchnew`` can be imported without optional deps.
-# ---------------------------------------------------------------------------
-_infra_module = types.ModuleType("infra")
-sys.modules.setdefault("infra", _infra_module)
+_lob_state_module = types.ModuleType("lob_state_cython")
+_lob_state_module.N_FEATURES = 8
+sys.modules.setdefault("lob_state_cython", _lob_state_module)
 
-_event_bus_module = types.ModuleType("infra.event_bus")
-_event_bus_module.Topics = types.SimpleNamespace(RISK="risk")
-_event_bus_module.event_bus = types.SimpleNamespace(configure=lambda level: None)
-sys.modules.setdefault("infra.event_bus", _event_bus_module)
-setattr(_infra_module, "event_bus", _event_bus_module)
-
-_time_provider_module = types.ModuleType("infra.time_provider")
+import trading_patchnew
 
 
 class _StubTimeProvider:
@@ -32,16 +24,7 @@ class _StubTimeProvider:
         return 0
 
 
-_time_provider_module.TimeProvider = _StubTimeProvider
-_time_provider_module.RealTimeProvider = _StubTimeProvider
-sys.modules.setdefault("infra.time_provider", _time_provider_module)
-setattr(_infra_module, "time_provider", _time_provider_module)
-
-_lob_state_module = types.ModuleType("lob_state_cython")
-_lob_state_module.N_FEATURES = 8
-sys.modules.setdefault("lob_state_cython", _lob_state_module)
-
-import trading_patchnew
+_TOPICS_STUB = types.SimpleNamespace(RISK="risk")
 
 
 def _make_intrabar_dataframe() -> pd.DataFrame:
@@ -79,6 +62,9 @@ def _stub_external_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep ``TradingEnv`` deterministic and lightweight for unit tests."""
 
     monkeypatch.setattr(trading_patchnew, "_HAVE_FAST_MARKET", False, raising=False)
+    monkeypatch.setattr(trading_patchnew, "Topics", _TOPICS_STUB, raising=False)
+    monkeypatch.setattr(trading_patchnew, "TimeProvider", _StubTimeProvider, raising=False)
+    monkeypatch.setattr(trading_patchnew, "RealTimeProvider", _StubTimeProvider, raising=False)
     monkeypatch.setattr(
         trading_patchnew,
         "load_hourly_seasonality",

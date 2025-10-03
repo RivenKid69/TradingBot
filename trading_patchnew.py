@@ -63,8 +63,8 @@ except ModuleNotFoundError:  # pragma: no cover - depends on optional dependency
 
 import numpy as np
 import pandas as pd
-from infra.event_bus import Topics
-from infra.time_provider import TimeProvider, RealTimeProvider
+from event_bus import Topics
+from utils.time_provider import TimeProvider, RealTimeProvider
 from leakguard import LeakGuard, LeakConfig
 from no_trade import (
     NoTradeConfig,

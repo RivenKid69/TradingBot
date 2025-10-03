@@ -5,17 +5,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.append(os.getcwd())
-# stub minimal infra modules required for import
-infra_pkg = types.ModuleType("infra")
-event_bus_stub = types.ModuleType("event_bus")
-event_bus_stub.publish = lambda *a, **k: None
-event_bus_stub.Topics = object
-time_provider_stub = types.ModuleType("time_provider")
-time_provider_stub.TimeProvider = object
-time_provider_stub.RealTimeProvider = object
-sys.modules["infra"] = infra_pkg
-sys.modules["infra.event_bus"] = event_bus_stub
-sys.modules["infra.time_provider"] = time_provider_stub
+# stub minimal optional modules required for import
 lob_state_stub = types.ModuleType("lob_state_cython")
 lob_state_stub.N_FEATURES = 1
 sys.modules["lob_state_cython"] = lob_state_stub
