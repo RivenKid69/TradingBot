@@ -349,6 +349,12 @@ cdef class CyMicrostructureGenerator:
             del self.thisptr
             self.thisptr = NULL
 
+    cpdef set_seed(self, unsigned long long seed):
+        """Set the random seed for the underlying generator."""
+        if self.thisptr is NULL:
+            raise ValueError("Generator is not initialized")
+        self.thisptr.set_seed(seed)
+
     cpdef unsigned long long generate_public_events_cy(self,
             vector[MicroEvent]& out_events,
             CythonLOB lob,
