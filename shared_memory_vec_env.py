@@ -26,7 +26,7 @@ DTYPE_TO_CSTYLE = {
     'int16': 'h',
 }
 
-def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, dones_shm, info_queue, barrier, reset_signal, close_signal, obs_dtype, action_dtype, action_shape, base_seed: int = 0):
+def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, dones_shm, info_queue, barrier, reset_signal, close_signal, obs_dtype, action_dtype, action_shape, obs_shape, base_seed: int = 0):
     try:
         # 1. Создаем среду и получаем numpy-представления
         env = env_fn_wrapper.var()
@@ -39,9 +39,9 @@ def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, do
         np.random.seed(seed)
         # собственный генератор среды (если используется)
         env._rng = np.random.default_rng(seed)
-        obs_space_shape = env.observation_space.shape
+        # НЕ трогаем env.observation_space до reset(); используем форму, переданную из родителя
         actions_np = np.frombuffer(actions_shm.get_obj(), dtype=action_dtype).reshape((num_envs,) + action_shape)
-        obs_np = np.frombuffer(obs_shm.get_obj(), dtype=obs_dtype).reshape((num_envs,) + obs_space_shape)
+        obs_np = np.frombuffer(obs_shm.get_obj(), dtype=obs_dtype).reshape((num_envs,) + obs_shape)
         rewards_np = np.frombuffer(rewards_shm.get_obj(), dtype=np.float32)
         dones_np = np.frombuffer(dones_shm.get_obj(), dtype=np.bool_)
 
@@ -196,7 +196,24 @@ class SharedMemoryVecEnv(VecEnv):
         for i, env_fn in enumerate(env_fns):
             process = mp.Process(
                 target=worker,
-                args=(i, self.num_envs, CloudpickleWrapper(env_fn), self.actions_shm, self.obs_shm, self.rewards_shm, self.dones_shm, self.info_queue, self.barrier, self.reset_signal, self.close_signal, obs_dtype, self.action_space.dtype, self.action_space.shape, self._base_seed)
+                args=(
+                    i,
+                    self.num_envs,
+                    CloudpickleWrapper(env_fn),
+                    self.actions_shm,
+                    self.obs_shm,
+                    self.rewards_shm,
+                    self.dones_shm,
+                    self.info_queue,
+                    self.barrier,
+                    self.reset_signal,
+                    self.close_signal,
+                    obs_dtype,
+                    self.action_space.dtype,
+                    self.action_space.shape,
+                    obs_shape,
+                    self._base_seed,
+                )
             )
             process.daemon = True
             process.start()
