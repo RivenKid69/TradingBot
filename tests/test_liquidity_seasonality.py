@@ -155,7 +155,7 @@ def test_seasonality_file_missing(tmp_path):
     assert sim._last_spread_bps == 1.0
 
 
-def test_ts_ms_none_skips_multipliers_and_logs_warning(caplog):
+def test_ts_ms_none_skips_multipliers_without_logging(caplog):
     liq_mult = [2.0] * 168
     spr_mult = [3.0] * 168
     sim = ExecutionSimulator(
@@ -168,7 +168,7 @@ def test_ts_ms_none_skips_multipliers_and_logs_warning(caplog):
         )
     assert sim._last_liquidity == 5.0
     assert sim._last_spread_bps == 1.0
-    assert "ts_ms is None" in caplog.text
+    assert not caplog.records
 
 
 def test_seasonality_linear_interpolation():

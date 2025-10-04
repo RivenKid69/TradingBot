@@ -6745,10 +6745,7 @@ class ExecutionSimulator:
         liq_mult = 1.0
         spread_mult = 1.0
         how: Optional[int] = None
-        if ts_ms is None:
-            if self.use_seasonality:
-                logger.warning("ts_ms is None; seasonality multipliers not applied")
-        else:
+        if ts_ms is not None:
             # Convert UTC milliseconds to hour-of-week (0=Mon 00:00 UTC) via the
             # shared helper: (ts_ms // HOUR_MS + 72) % 168.  This keeps hour
             # indexing consistent across modules.
