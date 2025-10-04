@@ -41,6 +41,7 @@ from core_config import (
     ExecutionProfile,
     load_timing_profiles,
     resolve_execution_timing,
+    TrainConfig,
 )
 
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, DummyVecEnv, VecEnv
@@ -686,6 +687,7 @@ def sortino_ratio(returns: np.ndarray, risk_free_rate: float = 0.0) -> float:
 # --- ИЗМЕНЕНИЕ: Старая Python-функция удалена, так как заменена на Cython-версию ---
 
 def objective(trial: optuna.Trial,
+              cfg: TrainConfig,
               total_timesteps: int,
               train_data_by_token: dict,
               train_obs_by_token: dict,
@@ -700,7 +702,19 @@ def objective(trial: optuna.Trial,
               trials_dir: Path):
 
     print(f">>> Trial {trial.number+1} with budget={total_timesteps}")
-    
+
+    def _extract_bins_vol_from_cfg(cfg, default=101):
+        try:
+            aw = getattr(getattr(cfg, "algo", None), "action_wrapper", None)
+            val = getattr(aw, "bins_vol", None) if aw is not None else None
+            if val is None and hasattr(aw, "__dict__"):
+                val = aw.__dict__.get("bins_vol")
+            return max(2, int(val)) if val is not None else int(default)
+        except Exception:
+            return int(default)
+
+    bins_vol = _extract_bins_vol_from_cfg(cfg, default=101)
+
 
     # ИСПРАВЛЕНО: window_size возвращен в пространство поиска HPO
     params = {
@@ -771,7 +785,7 @@ def objective(trial: optuna.Trial,
     if not train_symbol_items:
         raise ValueError("Нет тренировочных символов для создания сред.")
 
-    def make_env_train(rank: int, _bins_vol=bins_vol):
+    def make_env_train(rank: int):
         symbol_idx = rank % len(train_symbol_items)
         symbol, df = train_symbol_items[symbol_idx]
 
@@ -825,7 +839,7 @@ def objective(trial: optuna.Trial,
                 seed=unique_seed,
             )
             setattr(env, "selected_symbol", symbol)
-            env = _wrap_action_space_if_needed(env, bins_vol=_bins_vol)
+            env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
             return env
         return _init
 
@@ -850,7 +864,7 @@ def objective(trial: optuna.Trial,
     if not val_symbol_items:
         raise ValueError("Нет валидационных символов для создания сред.")
 
-    def _make_val_env_factory(symbol: str, df: pd.DataFrame, _bins_vol=bins_vol):
+    def _make_val_env_factory(symbol: str, df: pd.DataFrame):
         env_val_params = {
             "norm_stats": norm_stats,
             "window_size": params["window_size"],
@@ -883,7 +897,7 @@ def objective(trial: optuna.Trial,
             leak_guard=leak_guard_val,
         )
         setattr(env, "selected_symbol", symbol)
-        env = _wrap_action_space_if_needed(env, bins_vol=_bins_vol)
+        env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
         return env
 
     val_env_fns = [
@@ -997,7 +1011,7 @@ def objective(trial: optuna.Trial,
         test_stats_path = trials_dir / f"vec_normalize_test_{trial.number}.pkl"
 
         for symbol, df in sorted(eval_phase_data.items()):
-            def make_final_eval_env(symbol: str = symbol, df: pd.DataFrame = df, _bins_vol=bins_vol):
+            def make_final_eval_env(symbol: str = symbol, df: pd.DataFrame = df):
                 final_env_params = {
                     "norm_stats": norm_stats, "window_size": params["window_size"],
                     "gamma": params["gamma"], "atr_multiplier": params["atr_multiplier"],
@@ -1018,7 +1032,7 @@ def objective(trial: optuna.Trial,
                     leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs)),
                 )
                 setattr(env, "selected_symbol", symbol)
-                env = _wrap_action_space_if_needed(env, bins_vol=_bins_vol)
+                env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
                 return env
 
             check_model_compat(str(train_stats_path))
@@ -1424,6 +1438,7 @@ def main():
     study.optimize(
         lambda t: objective(
             t,
+            cfg,
             HPO_BUDGET_PER_TRIAL,
             train_data_by_token,
             train_obs_by_token,
@@ -1492,7 +1507,7 @@ def main():
         if not final_eval_data:
             print("⚠️ Skipping final validation: evaluation split is empty.")
         else:
-            def _make_env_val(symbol: str, df: pd.DataFrame, _bins_vol=bins_vol):
+            def _make_env_val(symbol: str, df: pd.DataFrame):
                 params = best_trial.params
                 env_val_params = {
                     "norm_stats": norm_stats,
@@ -1526,7 +1541,7 @@ def main():
                     leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs))
                 )
                 setattr(env, "selected_symbol", symbol)
-                env = _wrap_action_space_if_needed(env, bins_vol=_bins_vol)
+                env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
                 return env
 
             eval_env_fns = [
