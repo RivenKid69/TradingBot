@@ -1059,6 +1059,7 @@ class TrainDataConfig(BaseModel):
     processed_dir: str = Field(default="data/processed")
     split_path: Optional[str] = None
     split_version: Optional[str] = None
+    split_overrides: Optional[Dict[str, Any]] = None
     timestamp_column: str = Field(default="timestamp")
     role_column: str = Field(default="wf_role")
     features_params: Dict[str, Any] = Field(default_factory=dict)
