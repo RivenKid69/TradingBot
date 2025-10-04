@@ -6,6 +6,8 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from wrappers.action_space import _wrap_action_space_if_needed
+
 
 class _DummyEnv:
     """Simple environment used when real TradingEnv is unavailable."""
@@ -103,7 +105,7 @@ def make_env(use_dummy: bool):
     if not use_dummy:
         try:
             from trading_patchnew import TradingEnv  # type: ignore
-            return TradingEnv()
+            return _wrap_action_space_if_needed(TradingEnv())
         except Exception:
             print("⚠️  Falling back to dummy environment")
     return _DummyEnv()

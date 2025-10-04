@@ -147,6 +147,7 @@ torch.backends.cudnn.benchmark = True
 
 
 from trading_patchnew import TradingEnv, DecisionTiming
+from wrappers.action_space import _wrap_action_space_if_needed
 from custom_policy_patch1 import CustomActorCriticPolicy
 from fetch_all_data_patch import load_all_data
 # --- ИЗМЕНЕНИЕ: Импортируем быструю Cython-функцию оценки ---
@@ -805,6 +806,7 @@ def objective(trial: optuna.Trial,
                 seed=unique_seed,
             )
             setattr(env, "selected_symbol", symbol)
+            env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
             return env
         return _init
 
@@ -862,6 +864,7 @@ def objective(trial: optuna.Trial,
             leak_guard=leak_guard_val,
         )
         setattr(env, "selected_symbol", symbol)
+        env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
         return env
 
     val_env_fns = [
@@ -996,6 +999,7 @@ def objective(trial: optuna.Trial,
                     leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs)),
                 )
                 setattr(env, "selected_symbol", symbol)
+                env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
                 return env
 
             check_model_compat(str(train_stats_path))
@@ -1180,6 +1184,17 @@ def main():
     if seasonality_hash:
         cfg_dict["liquidity_seasonality_hash"] = seasonality_hash
     cfg = cfg.__class__.parse_obj(cfg_dict)
+
+    action_wrapper_cfg = getattr(getattr(cfg, "algo", None), "action_wrapper", None)
+    candidate_bins_vol = None
+    if isinstance(action_wrapper_cfg, dict):
+        candidate_bins_vol = action_wrapper_cfg.get("bins_vol")
+    elif action_wrapper_cfg is not None:
+        candidate_bins_vol = getattr(action_wrapper_cfg, "bins_vol", None)
+    try:
+        bins_vol = max(2, int(candidate_bins_vol)) if candidate_bins_vol is not None else 101
+    except (TypeError, ValueError):
+        bins_vol = 101
 
     timing_defaults, timing_profiles = load_timing_profiles()
     exec_profile = getattr(cfg, "execution_profile", ExecutionProfile.MKT_OPEN_NEXT_H1)
@@ -1483,6 +1498,7 @@ def main():
                     leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs))
                 )
                 setattr(env, "selected_symbol", symbol)
+                env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
                 return env
 
             eval_env_fns = [
