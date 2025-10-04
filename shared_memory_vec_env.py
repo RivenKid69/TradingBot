@@ -8,6 +8,7 @@ import weakref
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv, CloudpickleWrapper
 from collections import OrderedDict
 from gymnasium import spaces
+from gymnasium.spaces.utils import flatten, flatten_space, unflatten
 import atexit, signal
 try:
     from multiprocessing.context import BrokenBarrierError
@@ -27,7 +28,7 @@ DTYPE_TO_CSTYLE = {
     'int16': 'h',
 }
 
-def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, dones_shm, info_queue, barrier, reset_signal, close_signal, obs_dtype, action_dtype, action_shape, obs_shape, base_seed: int = 0):
+def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, dones_shm, info_queue, barrier, reset_signal, close_signal, obs_dtype, action_dtype, action_shape, obs_shape, action_is_structured, base_seed: int = 0):
     try:
         # 1. Создаем среду и получаем numpy-представления
         env = env_fn_wrapper.var()
@@ -67,7 +68,7 @@ def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, do
                 break    # graceful‑shutdown (PATCH‑ID:P12_P7_closecheck)
             barrier.wait()
 
-            if close_signal.value: 
+            if close_signal.value:
                 break # graceful-shutdown
             if reset_signal.value:
                 # === ЛОГИКА СБРОСА ===
@@ -77,7 +78,11 @@ def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, do
                 info_queue.put((rank, info))
             else:
                 # === ЛОГИКА ШАГА (осталась прежней) ===
-                action = actions_np[rank]
+                if action_is_structured:
+                    flat_action = np.array(actions_np[rank], copy=True)
+                    action = unflatten(env.action_space, flat_action)
+                else:
+                    action = actions_np[rank]
                 obs, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
 
@@ -148,6 +153,12 @@ class SharedMemoryVecEnv(VecEnv):
                 "Set spaces in __init__ or ensure reset() defines them."
             )
 
+        self._action_is_structured = isinstance(self.action_space, (spaces.Dict, spaces.Tuple))
+        if self._action_is_structured:
+            self._flat_action_space = flatten_space(self.action_space)
+        else:
+            self._flat_action_space = self.action_space
+
         # --- Robust dtype/shape discovery for action space -----------------
         # Некоторые среды (особенно с дискретными действиями) могут не
         # выставлять shape/dtype до первого reset() или вовсе держать их в
@@ -155,8 +166,8 @@ class SharedMemoryVecEnv(VecEnv):
         # буфера действий, иначе расчёт размера общей памяти упадёт.
 
         # 1) Попробуем взять dtype/shape напрямую
-        action_dtype_raw = getattr(self.action_space, "dtype", None)
-        action_shape = getattr(self.action_space, "shape", None)
+        action_dtype_raw = getattr(self._flat_action_space, "dtype", None)
+        action_shape = getattr(self._flat_action_space, "shape", None)
 
         # 2) Если что-то не определено, используем sample() пространства
         action_sample_np = None
@@ -165,7 +176,7 @@ class SharedMemoryVecEnv(VecEnv):
             and any(dim is None for dim in action_shape)
         ):
             # sample() может вернуть python-скаляры – приводим к numpy-массиву
-            action_sample = self.action_space.sample()
+            action_sample = self._flat_action_space.sample()
             action_sample_np = np.asarray(
                 action_sample,
                 dtype=action_dtype_raw if action_dtype_raw is not None else None,
@@ -179,6 +190,8 @@ class SharedMemoryVecEnv(VecEnv):
                 action_shape = action_sample_np.shape
 
         # 3) Нормализуем dtype к numpy-классу (np.float32, np.int64, ...)
+        if self._action_is_structured and action_dtype_raw is not None and _np.dtype(action_dtype_raw).type is np.float64:
+            action_dtype_raw = np.float32
         act_type = _np.dtype(action_dtype_raw).type
         if act_type not in DTYPE_TO_CSTYLE:
             raise TypeError(
@@ -186,6 +199,8 @@ class SharedMemoryVecEnv(VecEnv):
                 f"(normalized: {act_type}). Known: {list(DTYPE_TO_CSTYLE.keys())}"
             )
         action_type_code = DTYPE_TO_CSTYLE[act_type]
+
+        self._flat_action_dtype = act_type
 
         if hasattr(temp_env, "close"):
             temp_env.close()
@@ -204,6 +219,7 @@ class SharedMemoryVecEnv(VecEnv):
             # а sample_np.shape -> () тоже; условие просто не сработает).
             action_shape = action_sample_np.shape
         action_shape = tuple(action_shape)  # гарантируем кортеж
+        self._flat_action_shape = action_shape
 
         # 1. Создаем массивы в общей памяти с помощью multiprocessing.Array
         # 'f' - float, 'd' - double, 'b' - boolean
@@ -216,13 +232,13 @@ class SharedMemoryVecEnv(VecEnv):
             )
 
         self.obs_shm = mp.Array(obs_type_code, self.num_envs * int(np.prod(obs_shape)))
-        self.actions_shm = mp.Array(action_type_code, self.num_envs * int(np.prod(action_shape)))
+        self.actions_shm = mp.Array(action_type_code, self.num_envs * int(np.prod(self._flat_action_shape)))
         self.rewards_shm = mp.Array('f', self.num_envs) # Награды почти всегда float32
         self.dones_shm = mp.Array('B', self.num_envs) # 'B' = unsigned char, более безопасный тип для bool
 
         # 2. Создаем numpy-представления для удобной работы в главном процессе
         self.obs_np = np.frombuffer(self.obs_shm.get_obj(), dtype=obs_dtype).reshape((self.num_envs,) + obs_shape)
-        self.actions_np = np.frombuffer(self.actions_shm.get_obj(), dtype=self.action_space.dtype).reshape((self.num_envs,) + action_shape)
+        self.actions_np = np.frombuffer(self.actions_shm.get_obj(), dtype=self._flat_action_dtype).reshape((self.num_envs,) + self._flat_action_shape)
         self.rewards_np = np.frombuffer(self.rewards_shm.get_obj(), dtype=np.float32)
         self.dones_np = np.frombuffer(self.dones_shm.get_obj(), dtype=np.bool_)
         
@@ -251,9 +267,10 @@ class SharedMemoryVecEnv(VecEnv):
                     self.reset_signal,
                     self.close_signal,
                     obs_dtype,
-                    self.action_space.dtype,
-                    self.action_space.shape,
+                    self._flat_action_dtype,
+                    self._flat_action_shape,
                     obs_shape,
+                    self._action_is_structured,
                     self._base_seed,
                 )
             )
@@ -300,9 +317,54 @@ class SharedMemoryVecEnv(VecEnv):
 
         super().__init__(self.num_envs, self.observation_space, self.action_space)
 
+    def _flatten_single_action(self, action):
+        if self._action_is_structured:
+            flat = flatten(self.action_space, action)
+            flat = np.asarray(flat, dtype=self._flat_action_dtype)
+            return flat.reshape(self._flat_action_shape)
+        arr = np.asarray(action, dtype=self._flat_action_dtype)
+        return arr.reshape(self._flat_action_shape)
+
+    def _flatten_action_batch(self, actions):
+        if self._action_is_structured:
+            if isinstance(actions, np.ndarray):
+                if actions.shape == (self.num_envs,) + self._flat_action_shape:
+                    if actions.dtype != self._flat_action_dtype:
+                        actions = actions.astype(self._flat_action_dtype, copy=False)
+                    return np.ascontiguousarray(actions)
+                if self.num_envs == 1 and actions.shape == self._flat_action_shape:
+                    reshaped = actions.reshape((self.num_envs,) + self._flat_action_shape)
+                    if reshaped.dtype != self._flat_action_dtype:
+                        reshaped = reshaped.astype(self._flat_action_dtype, copy=False)
+                    return np.ascontiguousarray(reshaped)
+            if isinstance(actions, dict):
+                actions_iter = [actions]
+            else:
+                actions_iter = list(actions)
+            if len(actions_iter) != self.num_envs:
+                raise ValueError(
+                    f"Expected {self.num_envs} structured actions, got {len(actions_iter)}"
+                )
+            flat_actions = [self._flatten_single_action(act) for act in actions_iter]
+            stacked = np.stack(flat_actions, axis=0)
+            if stacked.dtype != self._flat_action_dtype:
+                stacked = stacked.astype(self._flat_action_dtype, copy=False)
+            return np.ascontiguousarray(stacked)
+
+        arr = np.asarray(actions, dtype=self._flat_action_dtype)
+        expected_shape = (self.num_envs,) + self._flat_action_shape
+        if arr.shape != expected_shape:
+            if arr.size != int(np.prod(expected_shape)):
+                raise ValueError(
+                    f"Cannot reshape actions of shape {arr.shape} into {expected_shape}"
+                )
+            arr = arr.reshape(expected_shape)
+        return np.ascontiguousarray(arr)
+
     def step_async(self, actions):
         # Копируем действия в общую память
-        np.copyto(self.actions_np, actions)
+        flattened_actions = self._flatten_action_batch(actions)
+        self.actions_np[...] = flattened_actions
         self.waiting = True
         self._last_step_t0 = time.perf_counter()     # ← отметка старта шага
         # Сигнализируем работникам, что можно начинать шаг (снимаем барьер)
@@ -380,10 +442,6 @@ class SharedMemoryVecEnv(VecEnv):
             # 2. Отпускаем воркеров, чтобы они НАЧАЛИ сброс
             self.barrier.wait(timeout=self.worker_timeout)
 
-            # 3. Отключаем сигнал немедленно, пока воркеры заняты.
-            # Это гарантирует, что они не увидят его снова в следующем цикле.
-            self.reset_signal.value = False
-
             # 4. Ждем, пока воркеры ЗАВЕРШАТ сброс
             self.barrier.wait(timeout=self.worker_timeout)
 
@@ -391,6 +449,8 @@ class SharedMemoryVecEnv(VecEnv):
             self._force_kill()
             self.close()
             raise RuntimeError("A worker process timed out or crashed during reset.")
+        finally:
+            self.reset_signal.value = False
 
         # 5. Собираем инфо-сообщения от воркеров
         infos = [{} for _ in range(self.num_envs)]
