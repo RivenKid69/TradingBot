@@ -15,9 +15,10 @@ import torch
 import torch.nn as nn
 import numpy as np
 from gymnasium import spaces
-from typing import Tuple, Type
+from typing import Tuple, Type, Optional, Dict, Any
 
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
+from stable_baselines3.common.type_aliases import Schedule  # тип коллбэка lr_schedule
 
 
 
@@ -56,11 +57,20 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         self,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        lr_schedule,
+        # правильное имя в SB3:
+        lr_schedule: Optional[Schedule] = None,
         *args,
+        # бэк-компат: если кто-то ещё передаёт старое имя:
+        lr_scheduler: Optional[Schedule] = None,
+        optimizer_class=None,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
         arch_params=None,
         **kwargs,
     ):
+        # если нам пришло lr_scheduler (старое имя) — мапим на lr_schedule
+        if lr_schedule is None and lr_scheduler is not None:
+            lr_schedule = lr_scheduler
+
         arch_params = arch_params or {}
         hidden_dim = arch_params.get('hidden_dim', 64)
         self.hidden_dim = hidden_dim
@@ -84,6 +94,8 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
             action_space,
             lr_schedule,
             *args,
+            optimizer_class=optimizer_class,
+            optimizer_kwargs=optimizer_kwargs,
             **kwargs,
         )
         

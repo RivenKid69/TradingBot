@@ -935,7 +935,7 @@ def objective(trial: optuna.Trial,
         return OneCycleLR(optimizer=optimizer, max_lr=params["learning_rate"] * 3, total_steps=total_optimizer_steps)
     
     # Оборачиваем ее в словарь для передачи в policy_kwargs
-    policy_kwargs["lr_scheduler"] = scheduler_fn
+    policy_kwargs["lr_schedule"] = scheduler_fn
     DistributionalPPO = _get_distributional_ppo()
     model = DistributionalPPO(
         use_torch_compile=True,
