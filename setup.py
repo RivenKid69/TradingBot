@@ -133,6 +133,7 @@ ext_modules = [
         name="lob_state_cython",
         sources=[
             "lob_state_cython.pyx",
+            "OrderBook.cpp",
             "MarketSimulator.cpp",
             "cpp_microstructure_generator.cpp",
         ],
