@@ -19,6 +19,8 @@ from gymnasium import spaces
 from typing import Tuple, Type, Optional, Dict, Any, Callable
 
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
+from sb3_contrib.common.recurrent.type_aliases import RNNStates
+from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import Schedule  # тип коллбэка lr_schedule
 
 
@@ -81,7 +83,13 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         # построенные на «hidden_dim», начнут конфликтовать по размерностям.
         kwargs = dict(kwargs)
         kwargs.setdefault("lstm_hidden_size", hidden_dim)
+        enable_critic_lstm = arch_params.get("enable_critic_lstm")
+        if enable_critic_lstm is not None:
+            kwargs.setdefault("enable_critic_lstm", enable_critic_lstm)
         self.hidden_dim = hidden_dim
+
+        if optimizer_class is None:
+            optimizer_class = torch.optim.Adam
 
         # super().__init__ вызывает _build, поэтому заранее сохраняем размерность действия
         if isinstance(action_space, spaces.Box):
@@ -156,15 +164,19 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         if isinstance(self.action_space, spaces.Box):
             self.unconstrained_log_std = nn.Parameter(torch.zeros(self.action_dim))
 
-        state_shape = (self.lstm_hidden_state_shape[0], 1, self.lstm_output_dim)
-        self.recurrent_initial_state = (
-            torch.zeros(state_shape, device=self.device),
-            torch.zeros(state_shape, device=self.device),
-        )
+        def _zeros_for(module: Optional[nn.Module]) -> Tuple[torch.Tensor, ...]:
+            zeros = torch.zeros(self.lstm_hidden_state_shape, device=self.device)
+            if isinstance(module, nn.GRU):
+                return (zeros.clone(),)
+            return (zeros.clone(), torch.zeros_like(zeros))
 
-        # Сохраняем ссылки на рекуррентные слои, созданные базовым классом.
-        self.pi_lstm = self.lstm_actor
-        self.vf_lstm = self.lstm_critic if self.lstm_critic is not None else self.lstm_actor
+        pi_initial = _zeros_for(self.lstm_actor)
+        if self.lstm_critic is not None:
+            vf_initial = _zeros_for(self.lstm_critic)
+        else:
+            vf_initial = tuple(t.clone() for t in pi_initial)
+
+        self.recurrent_initial_state = RNNStates(pi=pi_initial, vf=vf_initial)
 
         # После того как LSTM-слои фактически созданы, переинициализируем оптимизатор
         # с нужным набором параметров и (опционально) кастомным планировщиком.
@@ -254,33 +266,37 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
     # --- ИСПРАВЛЕНИЕ: Метод переименован с forward_rnn на _forward_recurrent ---
     def _forward_recurrent(
         self,
-        features: torch.Tensor,
-        lstm_states: Tuple[torch.Tensor, ...],
-        episode_starts: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, ...]]:
+        features: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
+        lstm_states: RNNStates,
+        episode_starts: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, RNNStates]:
         """
-        Обрабатывает последовательность признаков, используя раздельные рекуррентные
-        блоки для актёра и критика.
-        Возвращает скрытые состояния, которые будут использованы как latent_pi и latent_vf.
+        Обрабатывает последовательность признаков, используя рекуррентные блоки
+        актёра и критика из базовой политики.
+        Возвращает скрытые состояния и обновлённые RNNStates.
         """
-        pi_hidden_state, vf_hidden_state = lstm_states
+        if self.share_features_extractor:
+            pi_features = vf_features = features  # type: ignore[assignment]
+        else:
+            assert isinstance(features, tuple) and len(features) == 2
+            pi_features, vf_features = features
 
-        mask = (1.0 - episode_starts).reshape(1, -1, 1)
-        pi_hidden_state = pi_hidden_state * mask
-        vf_hidden_state = vf_hidden_state * mask
+        latent_pi, new_pi_states = self._process_sequence(
+            pi_features, lstm_states.pi, episode_starts, self.lstm_actor
+        )
 
-        features_rnn = features.unsqueeze(0)
+        if self.lstm_critic is not None:
+            latent_vf, new_vf_states = self._process_sequence(
+                vf_features, lstm_states.vf, episode_starts, self.lstm_critic
+            )
+        elif self.shared_lstm:
+            latent_vf = latent_pi.detach()
+            new_vf_states = tuple(state.detach() for state in new_pi_states)
+        else:
+            latent_vf = self.critic(vf_features)
+            new_vf_states = lstm_states.vf
 
-        # ИЗМЕНЕНО: latent_pi и latent_vf теперь являются прямыми выходами рекуррентного блока
-        latent_pi, new_pi_hidden_state = self.pi_lstm(features_rnn, pi_hidden_state)
-        latent_vf, new_vf_hidden_state = self.vf_lstm(features_rnn, vf_hidden_state)
-
-        latent_pi = latent_pi.squeeze(0)
-        latent_vf = latent_vf.squeeze(0)
-
-        new_lstm_states = (new_pi_hidden_state, new_vf_hidden_state)
-
-        return latent_pi, latent_vf, new_lstm_states
+        return latent_pi, latent_vf, RNNStates(new_pi_states, new_vf_states)
 
     def _get_action_dist_from_latent(self, latent_pi: torch.Tensor):
         if isinstance(self.action_space, spaces.Box):
@@ -310,3 +326,68 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         probs = torch.softmax(dist_logits, dim=-1)     # [B, n_atoms]
         value = (probs * self.atoms).sum(dim=-1, keepdim=True)  # [B, 1]
         return value
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        lstm_states: Optional[RNNStates],
+        episode_starts: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, RNNStates]:
+        if lstm_states is None:
+            lstm_states = self.recurrent_initial_state
+
+        features = self.extract_features(obs)
+        latent_pi, latent_vf, new_states = self._forward_recurrent(features, lstm_states, episode_starts)
+
+        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_vf = self.mlp_extractor.forward_critic(latent_vf)
+
+        values = self._get_value_from_latent(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+
+        return actions, values, log_prob, new_states
+
+    def evaluate_actions(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        lstm_states: Optional[RNNStates],
+        episode_starts: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if lstm_states is None:
+            lstm_states = self.recurrent_initial_state
+
+        features = self.extract_features(obs)
+        latent_pi, latent_vf, _ = self._forward_recurrent(features, lstm_states, episode_starts)
+
+        latent_pi = self.mlp_extractor.forward_actor(latent_pi)
+        latent_vf = self.mlp_extractor.forward_critic(latent_vf)
+
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.log_prob(actions)
+        values = self._get_value_from_latent(latent_vf)
+        entropy = distribution.entropy()
+
+        return values, log_prob, entropy
+
+    def predict_values(
+        self,
+        obs: torch.Tensor,
+        lstm_states: Tuple[torch.Tensor, ...],
+        episode_starts: torch.Tensor,
+    ) -> torch.Tensor:
+        features = super(ActorCriticPolicy, self).extract_features(obs, self.vf_features_extractor)
+
+        if self.lstm_critic is not None:
+            latent_vf, _ = self._process_sequence(features, lstm_states, episode_starts, self.lstm_critic)
+        elif self.shared_lstm:
+            latent_pi, _ = self._process_sequence(features, lstm_states, episode_starts, self.lstm_actor)
+            latent_vf = latent_pi.detach()
+        else:
+            latent_vf = self.critic(features)
+
+        latent_vf = self.mlp_extractor.forward_critic(latent_vf)
+        return self._get_value_from_latent(latent_vf)
