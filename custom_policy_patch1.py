@@ -75,6 +75,12 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
 
         arch_params = arch_params or {}
         hidden_dim = arch_params.get('hidden_dim', 64)
+        # SB3 ожидает, что lstm_hidden_size задаёт фактическую размерность скрытого
+        # состояния. Если мы не пробросим это значение, политика внутри базового
+        # класса создаст LSTM размером по умолчанию (256), а дальнейшие головы,
+        # построенные на «hidden_dim», начнут конфликтовать по размерностям.
+        kwargs = dict(kwargs)
+        kwargs.setdefault("lstm_hidden_size", hidden_dim)
         self.hidden_dim = hidden_dim
 
         # super().__init__ вызывает _build, поэтому заранее сохраняем размерность действия
@@ -106,7 +112,7 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
 
         # Параметры n_res_blocks, n_attn_blocks, attn_heads больше не нужны
         
-        self.use_memory = True # Теперь память обеспечивается только GRU
+        self.use_memory = True  # Память обеспечивается рекуррентными слоями SB3
 
         self.num_atoms = arch_params.get("num_atoms", 51)
         self.v_min = -1.0  # Начальное значение-заглушка
@@ -128,6 +134,11 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
             **kwargs,
         )
 
+        # После инициализации базовый класс знает фактическую размерность скрытого
+        # состояния (self.lstm_output_dim). Синхронизируем её с кастомным полем,
+        # чтобы избежать расхождений при создании голов актёра и критика.
+        self.hidden_dim = self.lstm_output_dim
+
         # буфер с опорой атомов остаётся
         atoms = torch.linspace(self.v_min, self.v_max, self.num_atoms)
         self.register_buffer("atoms", atoms)
@@ -140,10 +151,15 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         if isinstance(self.action_space, spaces.Box):
             self.unconstrained_log_std = nn.Parameter(torch.zeros(self.action_dim))
 
+        state_shape = (self.lstm_hidden_state_shape[0], 1, self.lstm_output_dim)
         self.recurrent_initial_state = (
-            torch.zeros(1, 1, self.hidden_dim, device=self.device),
-            torch.zeros(1, 1, self.hidden_dim, device=self.device),
+            torch.zeros(state_shape, device=self.device),
+            torch.zeros(state_shape, device=self.device),
         )
+
+        # Сохраняем ссылки на рекуррентные слои, созданные базовым классом.
+        self.pi_lstm = self.lstm_actor
+        self.vf_lstm = self.lstm_critic if self.lstm_critic is not None else self.lstm_actor
 
     @torch.no_grad()
     def update_atoms(self, v_min: float, v_max: float) -> None:
@@ -173,42 +189,30 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         )
     def _build(self, lr_schedule) -> None:
         """
-        Создает архитектуру сети, включая кастомные раздельные GRU
-        для actor и critic.
+        Создаёт архитектуру сети, используя базовую реализацию SB3, а затем
+        заменяет value-голову на дистрибутивную.
         """
-        # 1. Сначала вызываем _build_mlp_extractor, который создаст self.mlp_extractor
-        self._build_mlp_extractor()
+        super()._build(lr_schedule)
 
-        # 2. Определяем размерности для GRU
-        # Входная размерность для GRU - это выходная размерность MLP-экстрактора
-        gru_input_dim = self.mlp_extractor.latent_dim_pi
-
-        # 3. Создаем наши кастомные рекуррентные слои
-        self.pi_lstm = nn.GRU(gru_input_dim, self.hidden_dim, num_layers=1)
-        self.vf_lstm = nn.GRU(gru_input_dim, self.hidden_dim, num_layers=1)
-
-        # 4. Создаем головы для actor и critic
-        self.action_net = nn.Linear(self.hidden_dim, self.action_dim)
-
-        # Голова для value-распределения теперь создаётся здесь, когда уже
-        # известны размеры скрытых состояний. Это гарантирует, что атрибут
-        # существует до обращения к нему и устраняет падение при оптимизации.
-        self.dist_head = nn.Linear(self.hidden_dim, self.num_atoms)
+        # Перестраиваем value-голову на распределение атомов.
+        self.dist_head = nn.Linear(self.lstm_output_dim, self.num_atoms)
         self.value_net = self.dist_head
 
-        # 5. Создаем оптимизатор
-        # Собираем все параметры модели для оптимизатора
-        all_params = list(self.mlp_extractor.parameters()) + \
-                     list(self.pi_lstm.parameters()) + \
-                     list(self.vf_lstm.parameters()) + \
-                     list(self.action_net.parameters()) + \
-                     list(self.dist_head.parameters())
-        
-        # Если для action_space типа Box есть unconstrained_log_std, добавляем его
-        if hasattr(self, 'unconstrained_log_std'):
-            all_params.append(self.unconstrained_log_std)
+        modules: list[nn.Module] = [self.mlp_extractor, self.lstm_actor]
+        if self.lstm_critic is not None and self.lstm_critic is not self.lstm_actor:
+            modules.append(self.lstm_critic)
+        modules.extend([self.action_net, self.dist_head])
 
-        self.optimizer = self.optimizer_class(all_params, lr=lr_schedule(1), **self.optimizer_kwargs)
+        params: list[nn.Parameter] = []
+        for module in modules:
+            params.extend(module.parameters())
+
+        if hasattr(self, 'log_std') and self.log_std is not None:
+            params.append(self.log_std)
+        if hasattr(self, 'unconstrained_log_std'):
+            params.append(self.unconstrained_log_std)
+
+        self.optimizer = self.optimizer_class(params, lr=lr_schedule(1), **self.optimizer_kwargs)
         if self.optimizer_scheduler_fn is not None:
             self.optimizer_scheduler = self.optimizer_scheduler_fn(self.optimizer)
         else:
@@ -221,7 +225,8 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         episode_starts: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
-        Обрабатывает последовательность признаков, используя раздельные GRU для актера и критика.
+        Обрабатывает последовательность признаков, используя раздельные рекуррентные
+        блоки для актёра и критика.
         Возвращает скрытые состояния, которые будут использованы как latent_pi и latent_vf.
         """
         pi_hidden_state, vf_hidden_state = lstm_states
@@ -232,7 +237,7 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
 
         features_rnn = features.unsqueeze(0)
 
-        # ИЗМЕНЕНО: latent_pi и latent_vf теперь являются прямыми выходами из GRU
+        # ИЗМЕНЕНО: latent_pi и latent_vf теперь являются прямыми выходами рекуррентного блока
         latent_pi, new_pi_hidden_state = self.pi_lstm(features_rnn, pi_hidden_state)
         latent_vf, new_vf_hidden_state = self.vf_lstm(features_rnn, vf_hidden_state)
 
