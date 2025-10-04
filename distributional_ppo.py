@@ -6,9 +6,6 @@
 #    ускоряет вычисления и снижает нагрузку на CPU.
 # 3. Логика вычислений и результат функции остались прежними, изменился
 #    только способ их получения (без циклов).
-# ОПТИМИЗАЦИЯ (Смешанная точность):
-# 1. Добавлена поддержка Automatic Mixed Precision (AMP) с помощью
-#    torch.cuda.amp.GradScaler и autocast для ускорения обучения на GPU.
 
 import torch
 import numpy as np
@@ -41,9 +38,6 @@ def unwrap_vec_normalize(env):
 
 import torch.nn.functional as F
 from typing import Any, Dict, Optional, Type, Union
-
-# --- ИЗМЕНЕНИЕ: Импортируем инструменты для смешанной точности ---
-from torch.cuda.amp import autocast, GradScaler
 
 torch.set_float32_matmul_precision("high")
 
@@ -97,7 +91,7 @@ def calculate_cvar(probs: torch.Tensor, atoms: torch.Tensor, alpha: float) -> to
 
 class DistributionalPPO(RecurrentPPO):
     """
-    Дистрибутивный вариант RecurrentPPO с поддержкой смешанной точности.
+    Дистрибутивный вариант RecurrentPPO без использования смешанной точности.
     """
     def __init__(
         self,
@@ -123,15 +117,7 @@ class DistributionalPPO(RecurrentPPO):
         self.running_v_max = 0.0
         self.v_range_initialized = False
 
-        # --- ИЗМЕНЕНИЕ: Инициализация GradScaler для смешанной точности ---
         self.lr_scheduler = None
-        self.scaler = None
-        # Создаем скейлер, только если используется GPU
-        if self.device.type == "cuda":
-            self.scaler = GradScaler()
-            print("--> DistributionalPPO initialized with Mixed Precision Training (AMP) enabled.")
-        else:
-            print("--> DistributionalPPO initialized on CPU. Mixed Precision Training is disabled.")
         
         if use_torch_compile and self.device.type == "cuda":
             print("--> Compiling the policy with torch.compile...")
@@ -191,8 +177,7 @@ class DistributionalPPO(RecurrentPPO):
         callback.on_rollout_start()
 
         while n_steps < n_rollout_steps:
-            # Включаем autocast для инференса, если используется AMP
-            with torch.no_grad(), autocast(enabled=self.scaler is not None):
+            with torch.no_grad():
                 obs_tensor = self.policy.obs_to_tensor(self._last_obs)[0]
                 episode_starts = torch.as_tensor(self._last_episode_starts, dtype=torch.float32).to(self.device)
 
@@ -250,7 +235,7 @@ class DistributionalPPO(RecurrentPPO):
             self._last_obs = new_obs
             self._last_episode_starts = dones
 
-        with torch.no_grad(), autocast(enabled=self.scaler is not None):
+        with torch.no_grad():
             obs_tensor = self.policy.obs_to_tensor(new_obs)[0]
             episode_starts = torch.as_tensor(dones, dtype=torch.float32).to(self.device)
             _, _, _, _ = self.policy.forward(obs_tensor, self._last_lstm_states, episode_starts)
@@ -269,7 +254,7 @@ class DistributionalPPO(RecurrentPPO):
 
     def train(self) -> None:
         """
-        Обновляет политику с использованием смешанной точности (AMP).
+        Обновляет параметры политики стандартными градиентными шагами.
         """
         self.policy.set_training_mode(True)
         self._update_learning_rate(self.policy.optimizer)
@@ -293,37 +278,35 @@ class DistributionalPPO(RecurrentPPO):
                 
 
                 
-                # --- ИЗМЕНЕНИЕ: Включаем autocast для forward pass и loss ---
-                with autocast(enabled=self.scaler is not None):
-                    values, log_prob, entropy = self.policy.evaluate_actions(
-                        rollout_data.observations,
-                        rollout_data.actions,
-                        rollout_data.lstm_states,
-                        rollout_data.episode_starts,
-                    )
+                values, log_prob, entropy = self.policy.evaluate_actions(
+                    rollout_data.observations,
+                    rollout_data.actions,
+                    rollout_data.lstm_states,
+                    rollout_data.episode_starts,
+                )
 
-                    # --- РАСЧЕТ ПОЛИТИЧЕСКОЙ ПОТЕРИ (POLICY LOSS) ---
-                    advantages = rollout_data.advantages
-                    if self.normalize_advantage:
-                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                # --- РАСЧЕТ ПОЛИТИЧЕСКОЙ ПОТЕРИ (POLICY LOSS) ---
+                advantages = rollout_data.advantages
+                if self.normalize_advantage:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                    ratio = torch.exp(log_prob - rollout_data.old_log_prob)
-                    policy_loss_1 = advantages * ratio
-                    policy_loss_2 = advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                    policy_loss_ppo = -torch.min(policy_loss_1, policy_loss_2).mean()
+                ratio = torch.exp(log_prob - rollout_data.old_log_prob)
+                policy_loss_1 = advantages * ratio
+                policy_loss_2 = advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                policy_loss_ppo = -torch.min(policy_loss_1, policy_loss_2).mean()
 
-                    with torch.no_grad():
-                        weights = torch.exp(advantages / self.cql_beta)
-                        weights = torch.clamp(weights, max=100.0).detach()
-                    policy_loss_bc = (-log_prob * weights).mean()
+                with torch.no_grad():
+                    weights = torch.exp(advantages / self.cql_beta)
+                    weights = torch.clamp(weights, max=100.0).detach()
+                policy_loss_bc = (-log_prob * weights).mean()
 
-                    policy_loss = policy_loss_ppo + self.cql_alpha * policy_loss_bc
+                policy_loss = policy_loss_ppo + self.cql_alpha * policy_loss_bc
 
-                    # --- РАСЧЕТ ПОТЕРИ ЭНТРОПИИ ---
-                    if entropy is None:
-                        entropy_loss = -torch.mean(-log_prob)
-                    else:
-                        entropy_loss = -torch.mean(entropy)
+                # --- РАСЧЕТ ПОТЕРИ ЭНТРОПИИ ---
+                if entropy is None:
+                    entropy_loss = -torch.mean(-log_prob)
+                else:
+                    entropy_loss = -torch.mean(entropy)
 
                 # --- РАСЧЕТ КРИТИЧЕСКОЙ ПОТЕРИ (CRITIC LOSS) В ПОЛНОЙ ТОЧНОСТИ ---
                 value_logits = self.policy.last_value_logits
@@ -364,28 +347,13 @@ class DistributionalPPO(RecurrentPPO):
                     + self.cvar_weight * cvar_loss
                 )
 
-                # --- ИЗМЕНЕНИЕ: Рабочий процесс обратного прохода с GradScaler ---
                 self.policy.optimizer.zero_grad(set_to_none=True)
 
-                if self.scaler is not None:
-                    # Масштабируем loss и делаем backward pass
-                    self.scaler.scale(loss).backward()
-                    # Делаем unscale градиентов перед клиппингом
-                    self.scaler.unscale_(self.policy.optimizer)
-                    # Клиппинг градиентов
-                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                    # Делаем шаг оптимизатора через scaler
-                    self.scaler.step(self.policy.optimizer)
-                    # Обновляем масштаб для следующей итерации
-                    self.scaler.update()
-                    if self.lr_scheduler is not None:
-                        self.lr_scheduler.step()
-                else: # Стандартный путь для CPU
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                    self.policy.optimizer.step()
-                    if self.lr_scheduler is not None:
-                        self.lr_scheduler.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.policy.optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
 
 
                 with torch.no_grad():
@@ -413,5 +381,3 @@ class DistributionalPPO(RecurrentPPO):
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
         self.logger.record("train/clip_range", clip_range)
-        if self.scaler is not None:
-            self.logger.record("train/grad_scaler_scale", self.scaler.get_scale())
