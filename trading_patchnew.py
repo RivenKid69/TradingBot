@@ -453,7 +453,27 @@ class TradingEnv(gym.Env):
                 "ttl_steps": spaces.Discrete(33),
             }
         )
-        from lob_state_cython import N_FEATURES  # импорт числа признаков
+        # --- patched: dynamic N_FEATURES shim ---
+        try:
+            from lob_state_cython import _compute_n_features as _lob_nf
+        except Exception:
+            _lob_nf = None
+
+        if _lob_nf is not None:
+            N_FEATURES = int(_lob_nf())
+        else:
+            # Фолбэк: посчитать через obs_builder при наличии layout
+            try:
+                import obs_builder as _ob
+                from feature_config import FEATURES_LAYOUT as _OBS_LAYOUT  # если в проекте иначе — подставь актуальное имя
+                N_FEATURES = int(_ob.compute_n_features(_OBS_LAYOUT))
+            except Exception as _e:
+                raise ImportError(
+                    "Cannot determine N_FEATURES: build Cython (lob_state_cython) "
+                    "or expose OBS_LAYOUT for obs_builder.compute_n_features(layout)."
+                ) from _e
+        # --- end patch ---
+
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(N_FEATURES+2,), dtype=np.float32
         )
