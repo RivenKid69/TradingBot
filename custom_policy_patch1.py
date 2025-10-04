@@ -131,6 +131,7 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         # dist_head создаётся позже в _build, но атрибут инициализируем заранее,
         # чтобы на него можно было безопасно ссылаться до сборки модели.
         self.dist_head: Optional[nn.Linear] = None
+        self._last_value_logits: Optional[torch.Tensor] = None
 
         # lr_schedule уже используется базовым классом во время вызова super().__init__.
         # Сохраняем ссылку заранее, чтобы можно было переинициализировать оптимизатор
@@ -317,15 +318,28 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         else:
             raise NotImplementedError(f"Action space {type(self.action_space)} not supported")
 
+    def _get_value_logits(self, latent_vf: torch.Tensor) -> torch.Tensor:
+        """Возвращает логиты распределения ценностей без их агрегации."""
+
+        value_logits = self.dist_head(latent_vf)  # [B, n_atoms]
+        self._last_value_logits = value_logits
+        return value_logits
+
+    def _value_from_logits(self, value_logits: torch.Tensor) -> torch.Tensor:
+        probs = torch.softmax(value_logits, dim=-1)
+        return (probs * self.atoms).sum(dim=-1, keepdim=True)
+
     def _get_value_from_latent(self, latent_vf: torch.Tensor) -> torch.Tensor:
         """
         Переопределяем базовый метод SB3.
         Вместо отдельной линейной головы берём logits → probs → ожидание.
         """
-        dist_logits = self.dist_head(latent_vf)        # [B, n_atoms]
-        probs = torch.softmax(dist_logits, dim=-1)     # [B, n_atoms]
-        value = (probs * self.atoms).sum(dim=-1, keepdim=True)  # [B, 1]
-        return value
+        value_logits = self._get_value_logits(latent_vf)
+        return self._value_from_logits(value_logits)
+
+    @property
+    def last_value_logits(self) -> Optional[torch.Tensor]:
+        return self._last_value_logits
 
     def forward(
         self,
