@@ -131,6 +131,10 @@ class Mediator:
         latency_cfg — параметры модели латентности для ExecutionSimulator
         """
         self.env = env_ref
+        try:
+            self.event_level = int(event_level)
+        except Exception:
+            self.event_level = 0
         rc = getattr(env_ref, "run_config", None)
 
         if rate_limit is None and rc is not None:
@@ -304,6 +308,9 @@ class Mediator:
         # Внутренние «ожидаемые» объёмы по последним операциям (для согласования с отчётом)
         self._pending_buy_volume: float = 0.0
         self._pending_sell_volume: float = 0.0
+        self._context_row: Any | None = None
+        self._context_row_idx: int | None = None
+        self._context_timestamp: int | None = None
 
     def _check_rate_limit(self) -> bool:
         """Apply rate limiter using wall-clock milliseconds."""
@@ -339,6 +346,15 @@ class Mediator:
         self.total_signals = 0
         self.delayed_signals = 0
         self.rejected_signals = 0
+        self._context_row = None
+        self._context_row_idx = None
+        self._context_timestamp = None
+
+    def set_market_context(self, *, row: Any | None = None, row_idx: int | None = None, timestamp: int | None = None) -> None:
+        """Store per-step market context passed from the environment."""
+        self._context_row = row
+        self._context_row_idx = int(row_idx) if row_idx is not None else None
+        self._context_timestamp = int(timestamp) if timestamp is not None else None
 
     def on_episode_end(self) -> None:
         """Запросить и вывести статистику латентности и ограничителя сигналов."""
@@ -831,3 +847,200 @@ class Mediator:
             "info": info,
             "events": events,
         }
+
+    def _build_observation(self, *, row: Any | None, state: Any, mark_price: float) -> np.ndarray:
+        obs_shape = getattr(getattr(self.env, "observation_space", None), "shape", None)
+        if not obs_shape:
+            return np.zeros(0, dtype=np.float32)
+        obs = np.zeros(obs_shape, dtype=np.float32)
+        # Try to populate front slots with common market columns when available
+        if row is not None:
+            try:
+                columns = getattr(row, "index", [])
+            except Exception:
+                columns = []
+            col_order = [
+                "open",
+                "high",
+                "low",
+                "close",
+                "price",
+                "bid",
+                "ask",
+                "quote_asset_volume",
+            ]
+            pos = 0
+            for name in col_order:
+                if pos >= max(0, obs.shape[0] - 2):
+                    break
+                try:
+                    if columns is not None and name not in columns:
+                        continue
+                except Exception:
+                    # fallback to getattr
+                    pass
+                try:
+                    val = row.get(name) if hasattr(row, "get") else getattr(row, name, None)
+                except Exception:
+                    val = None
+                if val is None:
+                    continue
+                try:
+                    obs[pos] = float(val)
+                    pos += 1
+                except Exception:
+                    continue
+        # Always include mark price, units and cash in the tail slots if possible
+        if obs.size:
+            obs[0] = float(mark_price)
+        units = float(getattr(state, "units", 0.0) or 0.0)
+        cash = float(getattr(state, "cash", 0.0) or 0.0)
+        if obs.size >= 2:
+            obs[-2] = units
+            obs[-1] = cash
+        return obs
+
+    def step(self, proto: ActionProto):
+        env = self.env
+        state = getattr(env, "state", None)
+        if state is None:
+            raise RuntimeError("Mediator requires environment state")
+
+        current_idx = int(getattr(state, "step_idx", 0) or 0)
+        df = getattr(env, "df", None)
+        row_idx = self._context_row_idx if self._context_row_idx is not None else current_idx
+        row = self._context_row
+        if row is None and df is not None:
+            try:
+                if 0 <= row_idx < len(df):
+                    row = df.iloc[row_idx]
+            except Exception:
+                row = None
+
+        timestamp = self._context_timestamp
+        if timestamp is None:
+            if row is not None and hasattr(env, "_resolve_snapshot_timestamp"):
+                try:
+                    timestamp = int(env._resolve_snapshot_timestamp(row))
+                except Exception:
+                    timestamp = None
+        if timestamp is None:
+            timestamp = int(now_ms())
+
+        report = self.step_action(proto, timestamp=timestamp)
+
+        trades = list(report.get("trades", []))
+        cancelled_ids = [int(x) for x in report.get("cancelled_ids", [])]
+        new_order_ids = [int(x) for x in report.get("new_order_ids", [])]
+        fee_total = float(report.get("fee_total", 0.0) or 0.0)
+        events = list(report.get("events", []))
+
+        executed_notional = 0.0
+        for price, volume, _is_buy, _maker_is_agent in trades:
+            try:
+                executed_notional += abs(float(price) * float(volume))
+            except Exception:
+                continue
+
+        # Update agent order tracker if env.state holds it
+        agent_orders = getattr(state, "agent_orders", None)
+        if agent_orders is not None:
+            try:
+                for cid in cancelled_ids:
+                    agent_orders.discard(int(cid))
+                for oid in new_order_ids:
+                    agent_orders.add(int(oid))
+            except Exception:
+                pass
+
+        # Reduce pending expected volume counters
+        for _price, vol, is_buy, _maker_is_agent in trades:
+            try:
+                vol_f = float(vol)
+            except Exception:
+                continue
+            if is_buy:
+                self._pending_buy_volume = max(0.0, float(self._pending_buy_volume) - vol_f)
+            else:
+                self._pending_sell_volume = max(0.0, float(self._pending_sell_volume) - vol_f)
+
+        mark_price = getattr(env, "last_mtm_price", None)
+        if mark_price is None:
+            mark_price = getattr(env, "last_mid", None)
+        if mark_price is None and row is not None:
+            for key in ("close", "price", "open"):
+                if hasattr(row, "get"):
+                    candidate = row.get(key)
+                else:
+                    candidate = getattr(row, key, None)
+                if candidate is not None:
+                    try:
+                        mark_price = float(candidate)
+                        break
+                    except Exception:
+                        continue
+        if mark_price is None:
+            mark_price = 0.0
+        else:
+            mark_price = float(mark_price)
+
+        cash = float(getattr(state, "cash", 0.0) or 0.0)
+        units = float(getattr(state, "units", 0.0) or 0.0)
+        net_worth = cash + units * mark_price
+        try:
+            state.net_worth = float(net_worth)
+        except Exception:
+            pass
+        peak_value = float(getattr(state, "peak_value", net_worth) or net_worth)
+        if net_worth > peak_value:
+            try:
+                state.peak_value = float(net_worth)
+            except Exception:
+                pass
+
+        max_steps = int(getattr(env, "_max_steps", 0) or 0)
+        next_idx = current_idx + 1
+        truncated = False
+        if max_steps > 0 and next_idx >= max_steps:
+            truncated = True
+            next_idx = max_steps
+        try:
+            state.step_idx = int(next_idx)
+        except Exception:
+            pass
+
+        bankruptcy_th = float(getattr(env, "bankruptcy_cash_th", -1e12) or -1e12)
+        is_bankrupt = bool(getattr(state, "is_bankrupt", False))
+        if not is_bankrupt and cash <= bankruptcy_th:
+            is_bankrupt = True
+            try:
+                state.is_bankrupt = True
+            except Exception:
+                pass
+
+        info = dict(report.get("info", {}))
+        info.setdefault("executed_notional", executed_notional)
+        info.setdefault("turnover", executed_notional)
+        info.setdefault("fee_total", fee_total)
+        info.setdefault("mark_price", mark_price)
+        info.setdefault("cash", cash)
+        info.setdefault("units", units)
+        info.setdefault("net_worth", net_worth)
+        info.setdefault("step_idx", current_idx)
+        info["trades"] = trades
+        info["cancelled_ids"] = cancelled_ids
+        info["new_order_ids"] = new_order_ids
+        info["events"] = events
+
+        obs = self._build_observation(row=row, state=state, mark_price=mark_price)
+
+        terminated = is_bankrupt
+        if info.get("risk_event") in {"BANKRUPT", "STOP_TRADE"}:
+            terminated = True
+
+        self._context_row = None
+        self._context_row_idx = None
+        self._context_timestamp = None
+
+        reward = 0.0
+        return obs, float(reward), bool(terminated), bool(truncated), info

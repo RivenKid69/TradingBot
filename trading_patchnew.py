@@ -455,12 +455,23 @@ class TradingEnv(gym.Env):
         )
         # --- patched: dynamic N_FEATURES shim ---
         try:
-            from lob_state_cython import _compute_n_features as _lob_nf
+            import lob_state_cython as _lob_module  # type: ignore[import-not-found]
         except Exception:
-            _lob_nf = None
+            _lob_module = None  # type: ignore[assignment]
 
-        if _lob_nf is not None:
+        _lob_nf = None
+        if _lob_module is not None:
+            _lob_nf = getattr(_lob_module, "_compute_n_features", None)
+
+        if callable(_lob_nf):
             N_FEATURES = int(_lob_nf())
+        elif _lob_module is not None and hasattr(_lob_module, "N_FEATURES"):
+            try:
+                N_FEATURES = int(getattr(_lob_module, "N_FEATURES"))
+            except Exception as exc:
+                raise ImportError(
+                    "Cannot determine N_FEATURES from lob_state_cython.N_FEATURES"
+                ) from exc
         else:
             # Фолбэк: посчитать через obs_builder при наличии layout
             try:
@@ -1023,6 +1034,22 @@ class TradingEnv(gym.Env):
         prev_net_worth = float(getattr(self.state, "net_worth", 0.0) or 0.0)
         prev_turnover_total = float(getattr(self, "_turnover_total", 0.0) or 0.0)
         pre_len = len(getattr(self._mediator, "calls", []))
+
+        context_ts = self._resolve_snapshot_timestamp(row)
+        context_setter = getattr(self._mediator, "set_market_context", None)
+        if callable(context_setter):
+            try:
+                context_setter(row=row, row_idx=row_idx, timestamp=context_ts)
+            except Exception:
+                pass
+        else:
+            try:
+                setattr(self._mediator, "_context_row", row)
+                setattr(self._mediator, "_context_row_idx", int(row_idx))
+                setattr(self._mediator, "_context_timestamp", int(context_ts))
+            except Exception:
+                pass
+
         result = self._mediator.step(proto)
         if hasattr(self._mediator, "calls") and len(self._mediator.calls) == pre_len:
             self._mediator.calls.append(proto)
