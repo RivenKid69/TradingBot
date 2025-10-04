@@ -16,7 +16,25 @@ from sb3_contrib import RecurrentPPO
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from stable_baselines3.common.utils import explained_variance
 from stable_baselines3.common.vec_env import VecEnv
-from stable_baselines3.common.vec_env.vec_normalize import VecNormalize, unwrap_vec_normalize
+from stable_baselines3.common.vec_env.vec_normalize import VecNormalize
+try:
+    # SB3<=1.x: функция есть
+    from stable_baselines3.common.vec_env.vec_normalize import unwrap_vec_normalize as _sb3_unwrap
+except Exception:
+    _sb3_unwrap = None
+
+def unwrap_vec_normalize(env):
+    """Backcompat для SB3>=2.x: пройти обёртки и найти VecNormalize."""
+    if _sb3_unwrap is not None:
+        return _sb3_unwrap(env)
+    from stable_baselines3.common.vec_env.base_vec_env import VecEnvWrapper
+    e = env
+    while isinstance(e, VecEnvWrapper):
+        if isinstance(e, VecNormalize):
+            return e
+        e = getattr(e, "venv", None)
+    return None
+
 import torch.nn.functional as F
 from typing import Any, Dict, Optional, Type, Union
 
