@@ -1,6 +1,7 @@
 # Имя файла: shared_memory_vec_env.py
 import multiprocessing as mp
 import numpy as np
+import numpy as _np  # добавим alias на всякий случай
 import time
 import threading
 import weakref
@@ -124,19 +125,48 @@ class SharedMemoryVecEnv(VecEnv):
         
         # Создаем временную среду, чтобы получить размерности пространств
         temp_env = env_fns[0]()
-        self.action_space = temp_env.action_space
-        self.observation_space = temp_env.observation_space
-        temp_env.close()
+
+        # ЛЕНИВЫЙ ИНИТ: если спейсы ещё не выставлены в __init__, дергаем reset()
+        needs_reset = (
+            getattr(temp_env, "action_space", None) is None or
+            getattr(temp_env, "observation_space", None) is None or
+            getattr(getattr(temp_env, "action_space", None), "dtype", None) is None
+        )
+        if needs_reset:
+            try:
+                temp_env.reset()
+            except TypeError:
+                # на случай сигнатуры reset(seed=None, options=None)
+                temp_env.reset(seed=None)
+
+        self.action_space = getattr(temp_env, "action_space", None)
+        self.observation_space = getattr(temp_env, "observation_space", None)
+        if self.action_space is None or self.observation_space is None:
+            raise RuntimeError(
+                "Env didn't expose action/observation spaces even after reset(). "
+                "Set spaces in __init__ or ensure reset() defines them."
+            )
+
+        # Нормализуем dtype к классу (np.float32, np.int64, ...)
+        act_type = _np.dtype(self.action_space.dtype).type
+        if act_type not in DTYPE_TO_CSTYLE:
+            raise TypeError(
+                f"Unsupported action dtype {self.action_space.dtype} "
+                f"(normalized: {act_type}). Known: {list(DTYPE_TO_CSTYLE.keys())}"
+            )
+        action_type_code = DTYPE_TO_CSTYLE[act_type]
+
+        if hasattr(temp_env, "close"):
+            temp_env.close()
 
         obs_shape = self.observation_space.shape
         obs_dtype = self.observation_space.dtype
         action_shape = self.action_space.shape
-        
+
         # 1. Создаем массивы в общей памяти с помощью multiprocessing.Array
         # 'f' - float, 'd' - double, 'b' - boolean
         try:
             obs_type_code = DTYPE_TO_CSTYLE[obs_dtype.type]
-            action_type_code = DTYPE_TO_CSTYLE[self.action_space.dtype.type]
         except KeyError as e:
             raise KeyError(
                 f"Unsupported dtype {e} found in observation or action space. "
