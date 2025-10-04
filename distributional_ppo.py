@@ -287,27 +287,6 @@ class DistributionalPPO(RecurrentPPO):
                         rollout_data.episode_starts,
                     )
 
-                    # --- РАСЧЕТ КРИТИЧЕСКОЙ ПОТЕРИ (CRITIC LOSS) ---
-                    with torch.no_grad():
-                        target_returns = rollout_data.returns
-                        delta_z = (self.policy.v_max - self.policy.v_min) / (self.policy.num_atoms - 1)
-                        clamped_targets = target_returns.clamp(self.policy.v_min, self.policy.v_max)
-                        b = (clamped_targets - self.policy.v_min) / (delta_z + 1e-8)
-                        lower_bound = b.floor().long()
-                        upper_bound = b.ceil().long()
-                        lower_bound[(upper_bound > 0) & (lower_bound == upper_bound)] -= 1
-                        upper_bound[(lower_bound < (self.policy.num_atoms - 1)) & (lower_bound == upper_bound)] += 1
-                        target_distribution = torch.zeros_like(value_logits)
-                        upper_prob = (b - lower_bound.float())
-                        lower_prob = (upper_bound.float() - b)
-                        upper_prob = upper_prob.to(target_distribution.dtype)
-                        lower_prob = lower_prob.to(target_distribution.dtype)
-                        target_distribution.scatter_add_(1, lower_bound.unsqueeze(1), lower_prob.unsqueeze(1))
-                        target_distribution.scatter_add_(1, upper_bound.unsqueeze(1), upper_prob.unsqueeze(1))
-
-                    log_predictions = F.log_softmax(value_logits, dim=1)
-                    critic_loss = -(target_distribution * log_predictions).sum(dim=1).mean()
-
                     # --- РАСЧЕТ ПОЛИТИЧЕСКОЙ ПОТЕРИ (POLICY LOSS) ---
                     advantages = rollout_data.advantages
                     if self.normalize_advantage:
@@ -326,16 +305,45 @@ class DistributionalPPO(RecurrentPPO):
                     policy_loss = policy_loss_ppo + self.cql_alpha * policy_loss_bc
 
                     # --- РАСЧЕТ ПОТЕРИ ЭНТРОПИИ ---
-                    if entropy is None: entropy_loss = -torch.mean(-log_prob)
-                    else: entropy_loss = -torch.mean(entropy)
+                    if entropy is None:
+                        entropy_loss = -torch.mean(-log_prob)
+                    else:
+                        entropy_loss = -torch.mean(entropy)
 
-                    # --- РАСЧЕТ ПОТЕРИ CVaR ---
-                    pred_probs_for_cvar = F.softmax(value_logits, dim=1)
-                    predicted_cvar = calculate_cvar(pred_probs_for_cvar, self.policy.atoms, self.cvar_alpha)
-                    cvar_loss = -predicted_cvar.mean()
+                # --- РАСЧЕТ КРИТИЧЕСКОЙ ПОТЕРИ (CRITIC LOSS) В ПОЛНОЙ ТОЧНОСТИ ---
+                value_logits_fp32 = value_logits.float()
+                with torch.no_grad():
+                    target_returns = rollout_data.returns
+                    delta_z = (self.policy.v_max - self.policy.v_min) / (self.policy.num_atoms - 1)
+                    clamped_targets = target_returns.clamp(self.policy.v_min, self.policy.v_max)
+                    b = (clamped_targets - self.policy.v_min) / (delta_z + 1e-8)
+                    lower_bound = b.floor().long()
+                    upper_bound = b.ceil().long()
+                    lower_bound[(upper_bound > 0) & (lower_bound == upper_bound)] -= 1
+                    upper_bound[(lower_bound < (self.policy.num_atoms - 1)) & (lower_bound == upper_bound)] += 1
+                    target_distribution = torch.zeros_like(value_logits_fp32)
+                    upper_prob = (b - lower_bound.float())
+                    lower_prob = (upper_bound.float() - b)
+                    upper_prob = upper_prob.to(target_distribution.dtype)
+                    lower_prob = lower_prob.to(target_distribution.dtype)
+                    target_distribution.scatter_add_(1, lower_bound.unsqueeze(1), lower_prob.unsqueeze(1))
+                    target_distribution.scatter_add_(1, upper_bound.unsqueeze(1), upper_prob.unsqueeze(1))
 
-                    # --- ИТОГОВАЯ ФУНКЦИЯ ПОТЕРЬ ---
-                    loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * critic_loss + self.cvar_weight * cvar_loss
+                pred_probs_fp32 = torch.clamp(F.softmax(value_logits_fp32, dim=1), min=1e-8, max=1.0)
+                log_predictions = torch.log(pred_probs_fp32)
+                critic_loss = -(target_distribution * log_predictions).sum(dim=1).mean()
+
+                # --- РАСЧЕТ ПОТЕРИ CVaR (ПОЛНАЯ ТОЧНОСТЬ ДЛЯ РАСПРЕДЕЛЕНИЙ) ---
+                predicted_cvar = calculate_cvar(pred_probs_fp32, self.policy.atoms, self.cvar_alpha)
+                cvar_loss = -predicted_cvar.mean()
+
+                # --- ИТОГОВАЯ ФУНКЦИЯ ПОТЕРЬ ---
+                loss = (
+                    policy_loss.float()
+                    + self.ent_coef * entropy_loss.float()
+                    + self.vf_coef * critic_loss
+                    + self.cvar_weight * cvar_loss
+                )
 
                 # --- ИЗМЕНЕНИЕ: Рабочий процесс обратного прохода с GradScaler ---
                 self.policy.optimizer.zero_grad(set_to_none=True)
