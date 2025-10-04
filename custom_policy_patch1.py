@@ -114,6 +114,10 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
 
         self.optimizer_scheduler_fn = optimizer_scheduler_fn
 
+        # dist_head создаётся позже в _build, но атрибут инициализируем заранее,
+        # чтобы на него можно было безопасно ссылаться до сборки модели.
+        self.dist_head: Optional[nn.Linear] = None
+
         super().__init__(
             observation_space,
             action_space,
@@ -123,8 +127,6 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
             optimizer_kwargs=optimizer_kwargs,
             **kwargs,
         )
-        
-        self.dist_head = nn.Linear(self.mlp_extractor.latent_dim_vf, self.num_atoms)
 
         # буфер с опорой атомов остаётся
         atoms = torch.linspace(self.v_min, self.v_max, self.num_atoms)
@@ -187,7 +189,12 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
 
         # 4. Создаем головы для actor и critic
         self.action_net = nn.Linear(self.hidden_dim, self.action_dim)
-        # Голова для value-распределения уже создается в __init__ (self.dist_head)
+
+        # Голова для value-распределения теперь создаётся здесь, когда уже
+        # известны размеры скрытых состояний. Это гарантирует, что атрибут
+        # существует до обращения к нему и устраняет падение при оптимизации.
+        self.dist_head = nn.Linear(self.hidden_dim, self.num_atoms)
+        self.value_net = self.dist_head
 
         # 5. Создаем оптимизатор
         # Собираем все параметры модели для оптимизатора
