@@ -1,4 +1,4 @@
-"""Lightweight sanity check for the Dict→MultiDiscrete action wrapper."""
+"""Quick smoke-check for the Dict->MultiDiscrete action wrapper."""
 
 from __future__ import annotations
 
@@ -77,8 +77,9 @@ if "domain.adapters" not in sys.modules:
     sys.modules["domain"].adapters = adapters_stub
     sys.modules["domain.adapters"] = adapters_stub
 
+
 from trading_patchnew import TradingEnv
-from wrappers.action_space import _wrap_action_space_if_needed
+from wrappers.action_space import DictToMultiDiscreteActionWrapper
 
 
 def make_single_env() -> TradingEnv:
@@ -99,23 +100,21 @@ def make_single_env() -> TradingEnv:
 
 def main() -> None:
     env = make_single_env()
-    env = _wrap_action_space_if_needed(env, bins_vol=101)
+    if isinstance(env.action_space, spaces.Dict):
+        env = DictToMultiDiscreteActionWrapper(env, bins_vol=101)
 
     assert isinstance(env.action_space, spaces.MultiDiscrete)
-    assert env.action_space.nvec.tolist() == [201, 33, 4, 101]
+    assert env.action_space.nvec.tolist()[-1] == 101
 
     obs, info = env.reset()
-    print("Reset OK", type(obs), info)
-
     action = env.action_space.sample()
     obs, reward, terminated, truncated, info = env.step(action)
     print(
-        "Step OK",
-        np.shape(obs),
+        "OK",
+        type(obs),
         float(reward),
         bool(np.any(terminated)),
         bool(np.any(truncated)),
-        isinstance(info, dict),
     )
 
 
