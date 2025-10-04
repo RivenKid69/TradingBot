@@ -94,7 +94,10 @@ class WatchdogVecEnv(VecEnv):
     # ------------- прокси-API VecEnv -------------
 
     def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
+        obs = self.env.reset(**kwargs)
+        # Синхронизируем reset_infos с базовой средой (SharedMemoryVecEnv)
+        self.reset_infos = getattr(self.env, "reset_infos", [{} for _ in range(self.num_envs)])
+        return obs
 
     def step_async(self, actions):
         return self.env.step_async(actions)
@@ -106,6 +109,7 @@ class WatchdogVecEnv(VecEnv):
             self._log(f"Error in step_wait: {e!r}")
             self._reinit()
             obs = self.env.reset()
+            self.reset_infos = getattr(self.env, "reset_infos", [{} for _ in range(self.num_envs)])
             n = self.num_envs
             rewards = np.zeros((n,), dtype=np.float32)
             dones = np.ones((n,), dtype=bool)
