@@ -5,8 +5,9 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
+from gymnasium import spaces
 
-from wrappers.action_space import _wrap_action_space_if_needed
+from wrappers.action_space import DictToMultiDiscreteActionWrapper
 
 
 class _DummyEnv:
@@ -36,6 +37,18 @@ class _DummyEnv:
         spread = self._rng.normal(p["spread"], 0.1 * p["spread"])
         info = {"volatility": float(vol), "volume": float(volume), "spread": float(spread)}
         return 0, 0.0, False, info
+
+
+def _wrap_action_space_if_needed(env, bins_vol: int = 101):
+    try:
+        if isinstance(env.action_space, spaces.Dict):
+            keys = set(getattr(env.action_space, "spaces", {}).keys())
+            expected = {"price_offset_ticks", "ttl_steps", "type", "volume_frac"}
+            if expected.issubset(keys):
+                return DictToMultiDiscreteActionWrapper(env, bins_vol=bins_vol)
+    except Exception:
+        return env
+    return env
 
 
 def _set_regime(env, regime: str, duration: int):

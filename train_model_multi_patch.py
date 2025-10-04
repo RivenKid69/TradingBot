@@ -147,7 +147,8 @@ torch.backends.cudnn.benchmark = True
 
 
 from trading_patchnew import TradingEnv, DecisionTiming
-from wrappers.action_space import _wrap_action_space_if_needed
+from gymnasium import spaces
+from wrappers.action_space import DictToMultiDiscreteActionWrapper
 from custom_policy_patch1 import CustomActorCriticPolicy
 from fetch_all_data_patch import load_all_data
 # --- ИЗМЕНЕНИЕ: Импортируем быструю Cython-функцию оценки ---
@@ -167,6 +168,24 @@ def _file_sha256(path: str | None) -> str | None:
             return hashlib.sha256(f.read()).hexdigest()
     except FileNotFoundError:
         return None
+
+
+def _wrap_action_space_if_needed(env, bins_vol: int = 101):
+    """
+    If env.action_space is Dict with expected keys, wrap it into MultiDiscrete.
+    Otherwise return as is.
+    """
+
+    try:
+        if isinstance(env.action_space, spaces.Dict):
+            keys = set(getattr(env.action_space, "spaces", {}).keys())
+            expected = {"price_offset_ticks", "ttl_steps", "type", "volume_frac"}
+            if expected.issubset(keys):
+                return DictToMultiDiscreteActionWrapper(env, bins_vol=bins_vol)
+    except Exception:
+        # If anything goes wrong, fail open (no wrapping)
+        return env
+    return env
 
 
 def _coerce_timestamp(value) -> int | None:
@@ -752,7 +771,7 @@ def objective(trial: optuna.Trial,
     if not train_symbol_items:
         raise ValueError("Нет тренировочных символов для создания сред.")
 
-    def make_env_train(rank: int):
+    def make_env_train(rank: int, _bins_vol=bins_vol):
         symbol_idx = rank % len(train_symbol_items)
         symbol, df = train_symbol_items[symbol_idx]
 
@@ -806,7 +825,7 @@ def objective(trial: optuna.Trial,
                 seed=unique_seed,
             )
             setattr(env, "selected_symbol", symbol)
-            env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
+            env = _wrap_action_space_if_needed(env, bins_vol=_bins_vol)
             return env
         return _init
 
@@ -831,7 +850,7 @@ def objective(trial: optuna.Trial,
     if not val_symbol_items:
         raise ValueError("Нет валидационных символов для создания сред.")
 
-    def _make_val_env_factory(symbol: str, df: pd.DataFrame):
+    def _make_val_env_factory(symbol: str, df: pd.DataFrame, _bins_vol=bins_vol):
         env_val_params = {
             "norm_stats": norm_stats,
             "window_size": params["window_size"],
@@ -864,7 +883,7 @@ def objective(trial: optuna.Trial,
             leak_guard=leak_guard_val,
         )
         setattr(env, "selected_symbol", symbol)
-        env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
+        env = _wrap_action_space_if_needed(env, bins_vol=_bins_vol)
         return env
 
     val_env_fns = [
@@ -978,7 +997,7 @@ def objective(trial: optuna.Trial,
         test_stats_path = trials_dir / f"vec_normalize_test_{trial.number}.pkl"
 
         for symbol, df in sorted(eval_phase_data.items()):
-            def make_final_eval_env(symbol: str = symbol, df: pd.DataFrame = df):
+            def make_final_eval_env(symbol: str = symbol, df: pd.DataFrame = df, _bins_vol=bins_vol):
                 final_env_params = {
                     "norm_stats": norm_stats, "window_size": params["window_size"],
                     "gamma": params["gamma"], "atr_multiplier": params["atr_multiplier"],
@@ -999,7 +1018,7 @@ def objective(trial: optuna.Trial,
                     leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs)),
                 )
                 setattr(env, "selected_symbol", symbol)
-                env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
+                env = _wrap_action_space_if_needed(env, bins_vol=_bins_vol)
                 return env
 
             check_model_compat(str(train_stats_path))
@@ -1185,15 +1204,24 @@ def main():
         cfg_dict["liquidity_seasonality_hash"] = seasonality_hash
     cfg = cfg.__class__.parse_obj(cfg_dict)
 
-    action_wrapper_cfg = getattr(getattr(cfg, "algo", None), "action_wrapper", None)
-    candidate_bins_vol = None
-    if isinstance(action_wrapper_cfg, dict):
-        candidate_bins_vol = action_wrapper_cfg.get("bins_vol")
-    elif action_wrapper_cfg is not None:
-        candidate_bins_vol = getattr(action_wrapper_cfg, "bins_vol", None)
+    bins_vol = 101
     try:
-        bins_vol = max(2, int(candidate_bins_vol)) if candidate_bins_vol is not None else 101
-    except (TypeError, ValueError):
+        maybe = None
+        algo_cfg = getattr(cfg, "algo", None)
+        if algo_cfg is not None and hasattr(algo_cfg, "action_wrapper"):
+            aw = algo_cfg.action_wrapper
+            maybe = getattr(aw, "bins_vol", None)
+            if maybe is None and hasattr(aw, "__dict__"):
+                maybe = aw.__dict__.get("bins_vol")
+        if maybe is None and hasattr(cfg, "__dict__"):
+            maybe = (cfg.__dict__.get("algo", {}) or {}).get("action_wrapper", {}).get("bins_vol")
+        if maybe is not None:
+            bins_vol = int(maybe)
+    except Exception:
+        bins_vol = 101
+    try:
+        bins_vol = max(2, int(bins_vol))
+    except Exception:
         bins_vol = 101
 
     timing_defaults, timing_profiles = load_timing_profiles()
@@ -1464,7 +1492,7 @@ def main():
         if not final_eval_data:
             print("⚠️ Skipping final validation: evaluation split is empty.")
         else:
-            def _make_env_val(symbol: str, df: pd.DataFrame):
+            def _make_env_val(symbol: str, df: pd.DataFrame, _bins_vol=bins_vol):
                 params = best_trial.params
                 env_val_params = {
                     "norm_stats": norm_stats,
@@ -1498,7 +1526,7 @@ def main():
                     leak_guard=LeakGuard(LeakConfig(**leak_guard_kwargs))
                 )
                 setattr(env, "selected_symbol", symbol)
-                env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
+                env = _wrap_action_space_if_needed(env, bins_vol=_bins_vol)
                 return env
 
             eval_env_fns = [
