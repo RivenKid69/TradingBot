@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from core_models import Order, ExecReport, Position, TradeLogRow
     from core_contracts import TradeExecutor, RiskGuards
 
+import math
 import numpy as np
 
 from core_models import ExecReport, TradeLogRow, Side, OrderType, Liquidity, ExecStatus
@@ -848,6 +849,20 @@ class Mediator:
             "events": events,
         }
 
+    @staticmethod
+    def _coerce_finite(value: Any, default: float = 0.0) -> float:
+        """Cast ``value`` to ``float`` returning ``default`` when non‑finite."""
+
+        if value is None:
+            return float(default)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(numeric):
+            return float(default)
+        return numeric
+
     def _build_observation(self, *, row: Any | None, state: Any, mark_price: float) -> np.ndarray:
         obs_shape = getattr(getattr(self.env, "observation_space", None), "shape", None)
         if not obs_shape:
@@ -885,16 +900,14 @@ class Mediator:
                     val = None
                 if val is None:
                     continue
-                try:
-                    obs[pos] = float(val)
-                    pos += 1
-                except Exception:
-                    continue
+                coerced = self._coerce_finite(val, default=0.0)
+                obs[pos] = coerced
+                pos += 1
         # Always include mark price, units and cash in the tail slots if possible
         if obs.size:
-            obs[0] = float(mark_price)
-        units = float(getattr(state, "units", 0.0) or 0.0)
-        cash = float(getattr(state, "cash", 0.0) or 0.0)
+            obs[0] = self._coerce_finite(mark_price, default=0.0)
+        units = self._coerce_finite(getattr(state, "units", 0.0), default=0.0)
+        cash = self._coerce_finite(getattr(state, "cash", 0.0), default=0.0)
         if obs.size >= 2:
             obs[-2] = units
             obs[-1] = cash
@@ -979,13 +992,10 @@ class Mediator:
                         break
                     except Exception:
                         continue
-        if mark_price is None:
-            mark_price = 0.0
-        else:
-            mark_price = float(mark_price)
+        mark_price = self._coerce_finite(mark_price, default=0.0)
 
-        cash = float(getattr(state, "cash", 0.0) or 0.0)
-        units = float(getattr(state, "units", 0.0) or 0.0)
+        cash = self._coerce_finite(getattr(state, "cash", 0.0), default=0.0)
+        units = self._coerce_finite(getattr(state, "units", 0.0), default=0.0)
         net_worth = cash + units * mark_price
         try:
             state.net_worth = float(net_worth)
