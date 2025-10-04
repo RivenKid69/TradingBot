@@ -32,7 +32,7 @@ import sys
 import hashlib
 from functools import lru_cache
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Callable
 from features_pipeline import FeaturePipeline
 from pathlib import Path
 
@@ -1458,7 +1458,9 @@ def main():
 
     # Сохраняем итоговое исследование
     final_study = study
-    if not final_study: print("No final study completed. Exiting."); return
+    if not final_study:
+        print("No final study completed. Exiting.")
+        return
     # <-- КОНЕЦ БЛОКА ДЛЯ ЗАМЕНЫ -->
 
     print(f"\nSaving best {N_ENSEMBLE} models from the final stage...")
@@ -1544,10 +1546,12 @@ def main():
                 env = _wrap_action_space_if_needed(env, bins_vol=bins_vol)
                 return env
 
-            eval_env_fns = [
-                (lambda symbol=symbol, df=df: _make_env_val(symbol, df))
-                for symbol, df in sorted(final_eval_data.items())
-            ]
+            eval_env_fns: list[Callable[[], TradingEnv]] = []
+            for symbol, df in sorted(final_eval_data.items()):
+                def _factory(symbol=symbol, df=df):
+                    return _make_env_val(symbol, df)
+
+                eval_env_fns.append(_factory)
 
             monitored_eval_env = VecMonitor(DummyVecEnv(eval_env_fns))
             check_model_compat(str(best_stats_path))
