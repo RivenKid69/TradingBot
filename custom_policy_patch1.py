@@ -80,8 +80,15 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         # super().__init__ вызывает _build, поэтому заранее сохраняем размерность действия
         if isinstance(action_space, spaces.Box):
             self.action_dim = int(np.prod(action_space.shape))
+            self._multi_discrete_nvec: Optional[np.ndarray] = None
         elif isinstance(action_space, spaces.Discrete):
             self.action_dim = action_space.n
+            self._multi_discrete_nvec = None
+        elif isinstance(action_space, spaces.MultiDiscrete):
+            # MultiDiscrete actions are modeled via a MultiCategorical distribution
+            # whose logits are concatenated for every sub-action.
+            self._multi_discrete_nvec = action_space.nvec.astype(np.int64)
+            self.action_dim = int(self._multi_discrete_nvec.sum())
         else:
             raise NotImplementedError(
                 f"Action space {type(action_space)} is not supported by CustomActorCriticPolicy"
@@ -238,6 +245,12 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
             return self.action_dist.proba_distribution(mean_actions, log_std)
         elif isinstance(self.action_space, spaces.Discrete):
             action_logits = self.action_net(latent_pi)
+            return self.action_dist.proba_distribution(action_logits)
+        elif isinstance(self.action_space, spaces.MultiDiscrete):
+            action_logits = self.action_net(latent_pi)
+            # The underlying MultiCategorical distribution expects a concatenated
+            # logits tensor of shape [batch_size, sum(nvec)]. The policy head
+            # already produces the required dimensionality.
             return self.action_dist.proba_distribution(action_logits)
         else:
             raise NotImplementedError(f"Action space {type(self.action_space)} not supported")
