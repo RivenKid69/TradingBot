@@ -26,7 +26,10 @@ try:
 except Exception:
 
     class VecEnv:  # минимальный интерфейс для типовой совместимости
-        pass
+        def __init__(self, num_envs, observation_space, action_space):
+            self.num_envs = num_envs
+            self.observation_space = observation_space
+            self.action_space = action_space
 
 
 from shared_memory_vec_env import SharedMemoryVecEnv
@@ -53,12 +56,25 @@ class WatchdogVecEnv(VecEnv):
         self._restarts = 0
 
         self.env: SharedMemoryVecEnv = SharedMemoryVecEnv(self._env_fns)
+        self._sync_spaces()
+
+        try:
+            super().__init__(self.num_envs, self.observation_space, self.action_space)
+        except TypeError:
+            # если базовый VecEnv не требует инициализации (фолбэк выше)
+            pass
 
     # ------------- внутреннее -------------
 
     def _log(self, msg: str) -> None:
         if self._verbose:
             print(f"[WatchdogVecEnv] {msg}")
+
+    def _sync_spaces(self) -> None:
+        """Скопировать пространства из обёрнутой среды."""
+        self.num_envs = getattr(self.env, "num_envs", len(self._env_fns))
+        self.observation_space = getattr(self.env, "observation_space", None)
+        self.action_space = getattr(self.env, "action_space", None)
 
     def _reinit(self) -> None:
         """Закрыть текущую и создать новую базовую среду."""
@@ -73,12 +89,9 @@ class WatchdogVecEnv(VecEnv):
             pass
         self._log(f"Restarting underlying env (restart #{self._restarts})")
         self.env = SharedMemoryVecEnv(self._env_fns)
+        self._sync_spaces()
 
     # ------------- прокси-API VecEnv -------------
-
-    @property
-    def num_envs(self) -> int:
-        return getattr(self.env, "num_envs", len(self._env_fns))
 
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
