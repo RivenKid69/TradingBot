@@ -140,6 +140,9 @@ class DistributionalPPO(RecurrentPPO):
             self.policy = torch.compile(self.policy, mode="reduce-overhead")
             print("--> Policy compilation complete.")
         print(f"--> CVaR-in-loss settings: (alpha={self.cvar_alpha:.2f}, weight={self.cvar_weight:.2f}).")
+
+        if hasattr(self.policy, "optimizer_scheduler") and self.policy.optimizer_scheduler is not None:
+            self.lr_scheduler = self.policy.optimizer_scheduler
     
     def parameters(self, recurse: bool = True):
         """Позволяет обращаться к параметрам агента как к nn.Module."""

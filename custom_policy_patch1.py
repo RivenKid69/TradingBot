@@ -13,9 +13,10 @@
 
 import torch
 import torch.nn as nn
+from torch.optim import Optimizer
 import numpy as np
 from gymnasium import spaces
-from typing import Tuple, Type, Optional, Dict, Any
+from typing import Tuple, Type, Optional, Dict, Any, Callable
 
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
 from stable_baselines3.common.type_aliases import Schedule  # тип коллбэка lr_schedule
@@ -65,6 +66,7 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         optimizer_class=None,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         arch_params=None,
+        optimizer_scheduler_fn: Optional[Callable[[Optimizer], Any]] = None,
         **kwargs,
     ):
         # если нам пришло lr_scheduler (старое имя) — мапим на lr_schedule
@@ -84,10 +86,12 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         # Параметры n_res_blocks, n_attn_blocks, attn_heads больше не нужны
         
         self.use_memory = True # Теперь память обеспечивается только GRU
-                
+
         self.num_atoms = arch_params.get("num_atoms", 51)
         self.v_min = -1.0  # Начальное значение-заглушка
         self.v_max = 1.0
+
+        self.optimizer_scheduler_fn = optimizer_scheduler_fn
 
         super().__init__(
             observation_space,
@@ -178,6 +182,10 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
             all_params.append(self.unconstrained_log_std)
 
         self.optimizer = self.optimizer_class(all_params, lr=lr_schedule(1), **self.optimizer_kwargs)
+        if self.optimizer_scheduler_fn is not None:
+            self.optimizer_scheduler = self.optimizer_scheduler_fn(self.optimizer)
+        else:
+            self.optimizer_scheduler = None
     # --- ИСПРАВЛЕНИЕ: Метод переименован с forward_rnn на _forward_recurrent ---
     def _forward_recurrent(
         self,
