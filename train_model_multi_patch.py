@@ -584,6 +584,9 @@ class SortinoPruningCallback(BaseCallback):
             if self.verbose > 0:
                 print(f"Step {self.n_calls}: Pruning check with Sortino Ratio = {current_sortino:.4f}")
 
+            if self.logger is not None:
+                self.logger.record("pruning/sortino_ratio", current_sortino)
+
             # 1. Сообщаем Optuna о промежуточном результате (теперь это Sortino)
             self.trial.report(current_sortino, self.n_calls)
 
@@ -657,6 +660,12 @@ class ObjectiveScorePruningCallback(BaseCallback):
                 print(f"Comprehensive pruning check complete. Objective Score: {objective_score:.4f}")
                 print(f"Components -> Main: {main_sortino:.4f}, Choppy: {choppy_score:.4f}, Trend: {trend_score:.4f}\n")
 
+            if self.logger is not None:
+                self.logger.record("pruning/objective_score", objective_score)
+                self.logger.record("pruning/objective_main", main_sortino)
+                self.logger.record("pruning/objective_choppy", choppy_score)
+                self.logger.record("pruning/objective_trend", trend_score)
+
             # Сообщаем Optuna о результате и проверяем необходимость прунинга
             self.trial.report(objective_score, self.n_calls)
             if self.trial.should_prune():
@@ -699,7 +708,8 @@ def objective(trial: optuna.Trial,
               sim_config: dict,
               timing_env_kwargs: dict,
               leak_guard_kwargs: dict,
-              trials_dir: Path):
+              trials_dir: Path,
+              tensorboard_log_dir: Path | None):
 
     print(f">>> Trial {trial.number+1} with budget={total_timesteps}")
 
@@ -937,6 +947,12 @@ def objective(trial: optuna.Trial,
     # Оборачиваем ее в словарь для передачи в policy_kwargs
     policy_kwargs["optimizer_scheduler_fn"] = scheduler_fn
     DistributionalPPO = _get_distributional_ppo()
+
+    tb_log_path: Path | None = None
+    if tensorboard_log_dir is not None:
+        tb_log_path = tensorboard_log_dir / f"trial_{trial.number:03d}"
+        tb_log_path.mkdir(parents=True, exist_ok=True)
+
     model = DistributionalPPO(
         use_torch_compile=True,
         v_range_ema_alpha=params["v_range_ema_alpha"],
@@ -958,7 +974,7 @@ def objective(trial: optuna.Trial,
         clip_range=params["clip_range"],
         max_grad_norm=params["max_grad_norm"],
         policy_kwargs=policy_kwargs,
-        tensorboard_log="tensorboard_logs",
+        tensorboard_log=str(tb_log_path) if tb_log_path is not None else None,
         verbose=1
     )
 
@@ -980,7 +996,8 @@ def objective(trial: optuna.Trial,
         model.learn(
             total_timesteps=total_timesteps,
             callback=all_callbacks,
-            progress_bar=True
+            progress_bar=True,
+            tb_log_name=f"trial_{trial.number:03d}" if tb_log_path is not None else "run"
         )
     finally:
         env_tr.close()
@@ -1081,6 +1098,12 @@ def objective(trial: optuna.Trial,
  
     objective_score = (main_weight * main_sortino + choppy_weight * choppy_score + trend_weight * trend_score)
 
+    if model.logger is not None:
+        for regime_name, score in final_metrics.items():
+            model.logger.record(f"evaluation/{regime_name}_sortino", score)
+        model.logger.record("evaluation/final_objective_score", objective_score)
+        model.logger.dump(step=model.num_timesteps)
+
     # Сохраняем все компоненты для анализа
     trial.set_user_attr("main_sortino", main_sortino)
     trial.set_user_attr("choppy_sortino", choppy_score)
@@ -1118,7 +1141,18 @@ def main():
         default=None,
         help="Override path to liquidity seasonality coefficients (defaults to offline bundle)",
     )
+    parser.add_argument(
+        "--tensorboard-log-dir",
+        default="tensorboard_logs",
+        help="Directory where TensorBoard events will be written (use 'none' to disable)",
+    )
     args, unknown = parser.parse_known_args()
+
+    raw_tensorboard_dir = (args.tensorboard_log_dir or "").strip()
+    if raw_tensorboard_dir.lower() in {"", "none", "null"}:
+        tensorboard_log_dir = None
+    else:
+        tensorboard_log_dir = Path(raw_tensorboard_dir).expanduser()
 
     os.environ["MARKET_REGIMES_JSON"] = args.regime_config
 
@@ -1451,6 +1485,7 @@ def main():
             timing_env_kwargs,
             leak_guard_kwargs,
             trials_dir,
+            tensorboard_log_dir,
         ),
         n_trials=HPO_TRIALS,
         n_jobs=1,
