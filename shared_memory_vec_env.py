@@ -10,6 +10,7 @@ from collections import OrderedDict
 from gymnasium import spaces
 from gymnasium.spaces.utils import flatten, flatten_space, unflatten
 import atexit, signal
+from typing import Any
 try:
     from multiprocessing.context import BrokenBarrierError
 except Exception:  # Python 3.12: no BrokenBarrierError in multiprocessing
@@ -27,6 +28,32 @@ DTYPE_TO_CSTYLE = {
     'uint8': 'B',
     'int16': 'h',
 }
+
+def _safe_close_unlink(handle: Any) -> None:
+    """Attempt to close/unlink shared memory handles without crashing."""
+
+    if handle is None:
+        return
+
+    # Некоторые прокси объекты (например, ShareableList) держат ссылку на
+    # реальный SharedMemory в атрибуте ``shm``.  Освободим и его тоже.
+    inner = getattr(handle, "shm", None)
+    if inner is not None and inner is not handle:
+        _safe_close_unlink(inner)
+
+    for attr in ("close", "unlink"):
+        method = getattr(handle, attr, None)
+        if method is None:
+            continue
+        try:
+            method()
+        except AttributeError:
+            # multiprocessing.Array на некоторых платформах выбрасывает
+            # AttributeError при закрытии — игнорируем.
+            pass
+        except FileNotFoundError:
+            # unlink() мог быть вызван ранее — это нормально.
+            pass
 
 def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, dones_shm, info_queue, barrier, reset_signal, close_signal, obs_dtype, action_dtype, action_shape, obs_shape, action_is_structured, base_seed: int = 0):
     try:
@@ -97,10 +124,8 @@ def worker(rank, num_envs, env_fn_wrapper, actions_shm, obs_shm, rewards_shm, do
             barrier.wait()
         env.close()
         # --- cleanup shared-memory (PATCH-ID:P12_P7_shmcleanup) ---
-        obs_shm.close();      obs_shm.unlink()
-        actions_shm.close();  actions_shm.unlink()
-        rewards_shm.close();  rewards_shm.unlink()
-        dones_shm.close();    dones_shm.unlink()
+        for _shm in (obs_shm, actions_shm, rewards_shm, dones_shm):
+            _safe_close_unlink(_shm)
         return
 
     except BrokenBarrierError:
@@ -496,15 +521,7 @@ class SharedMemoryVecEnv(VecEnv):
 
         # 6) освобождаем и безопасно unlink-уем все shm-сегменты
         for _arr in (getattr(self, "_shm_arrays", []) or []):
-            try:
-                _arr.close()
-            except Exception:
-                pass
-            try:
-                _arr.unlink()
-            except Exception:
-                # сегмент уже мог быть удалён воркером — это нормально
-                pass
+            _safe_close_unlink(_arr)
 
         # останавливаем watchdog
         try:
