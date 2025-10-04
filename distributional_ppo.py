@@ -196,12 +196,17 @@ class DistributionalPPO(RecurrentPPO):
                 obs_tensor = self.policy.obs_to_tensor(self._last_obs)[0]
                 episode_starts = torch.as_tensor(self._last_episode_starts, dtype=torch.float32).to(self.device)
 
-                actions, values, log_probs, self._last_lstm_states = self.policy.forward(
+                actions, _, log_probs, self._last_lstm_states = self.policy.forward(
                     obs_tensor, self._last_lstm_states, episode_starts
                 )
-            
-            probs = F.softmax(values, dim=1)
-            scalar_values = (probs * self.policy.atoms).sum(dim=1)
+
+                value_logits = self.policy.last_value_logits
+
+            if value_logits is None:
+                raise RuntimeError("Policy did not cache value logits during forward pass")
+
+            probs = torch.softmax(value_logits, dim=1)
+            scalar_values = (probs * self.policy.atoms).sum(dim=1, keepdim=True).detach()
             actions = actions.cpu().numpy()
 
             clipped_actions = actions
@@ -233,7 +238,13 @@ class DistributionalPPO(RecurrentPPO):
             
 
             rollout_buffer.add(
-                self._last_obs, actions, rewards, self._last_episode_starts, scalar_values, log_probs, lstm_states=self._last_lstm_states
+                self._last_obs,
+                actions,
+                rewards,
+                self._last_episode_starts,
+                scalar_values.squeeze(-1),
+                log_probs,
+                lstm_states=self._last_lstm_states,
             )
 
             self._last_obs = new_obs
@@ -242,9 +253,13 @@ class DistributionalPPO(RecurrentPPO):
         with torch.no_grad(), autocast(enabled=self.scaler is not None):
             obs_tensor = self.policy.obs_to_tensor(new_obs)[0]
             episode_starts = torch.as_tensor(dones, dtype=torch.float32).to(self.device)
-            _, last_values_dist, _, _ = self.policy.forward(obs_tensor, self._last_lstm_states, episode_starts)
+            _, _, _, _ = self.policy.forward(obs_tensor, self._last_lstm_states, episode_starts)
 
-            last_probs = F.softmax(last_values_dist, dim=1)
+            last_value_logits = self.policy.last_value_logits
+            if last_value_logits is None:
+                raise RuntimeError("Policy did not cache value logits during terminal forward pass")
+
+            last_probs = torch.softmax(last_value_logits, dim=1)
             last_scalar_values = (last_probs * self.policy.atoms).sum(dim=1)
 
         rollout_buffer.compute_returns_and_advantage(last_values=last_scalar_values, dones=dones)
@@ -280,7 +295,7 @@ class DistributionalPPO(RecurrentPPO):
                 
                 # --- ИЗМЕНЕНИЕ: Включаем autocast для forward pass и loss ---
                 with autocast(enabled=self.scaler is not None):
-                    value_logits, log_prob, entropy = self.policy.evaluate_actions(
+                    values, log_prob, entropy = self.policy.evaluate_actions(
                         rollout_data.observations,
                         rollout_data.actions,
                         rollout_data.lstm_states,
@@ -311,6 +326,10 @@ class DistributionalPPO(RecurrentPPO):
                         entropy_loss = -torch.mean(entropy)
 
                 # --- РАСЧЕТ КРИТИЧЕСКОЙ ПОТЕРИ (CRITIC LOSS) В ПОЛНОЙ ТОЧНОСТИ ---
+                value_logits = self.policy.last_value_logits
+                if value_logits is None:
+                    raise RuntimeError("Policy did not cache value logits during training forward pass")
+
                 value_logits_fp32 = value_logits.float()
                 with torch.no_grad():
                     target_returns = rollout_data.returns
