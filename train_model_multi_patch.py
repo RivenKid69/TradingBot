@@ -31,6 +31,8 @@ import yaml
 import sys
 import hashlib
 from functools import lru_cache
+from collections.abc import Mapping, Sequence
+from typing import Any
 from features_pipeline import FeaturePipeline
 from pathlib import Path
 
@@ -153,7 +155,7 @@ from scripts.validate_regime_distributions import compare_regime_distributions
 from data_validation import DataValidator
 from utils.model_io import save_sidecar_metadata, check_model_compat
 from watchdog_vec_env import WatchdogVecEnv
-from scripts.offline_utils import resolve_split_bundle
+from scripts.offline_utils import load_offline_payload, resolve_split_bundle
 
 # --- helper to compute SHA256 of liquidity seasonality file ---
 def _file_sha256(path: str | None) -> str | None:
@@ -227,11 +229,89 @@ def _normalize_interval(item) -> tuple[int | None, int | None]:
     return (start_ts, end_ts)
 
 
+def _extract_offline_split_overrides(
+    payload: Mapping[str, Any] | None,
+    dataset_key: str,
+    *,
+    fallback_split: str = "time",
+) -> dict[str, list[dict[str, int | None]]]:
+    """Extract inline time split overrides from an offline payload."""
+
+    if payload is None:
+        return {}
+
+    datasets = payload.get("datasets") if isinstance(payload, Mapping) else None
+    dataset_entry = datasets.get(dataset_key) if isinstance(datasets, Mapping) else None
+
+    def _select_split_block(entry: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+        if not isinstance(entry, Mapping):
+            return None
+        splits_block = entry.get("splits")
+        if isinstance(splits_block, Mapping):
+            return splits_block
+        # Some payloads embed train/val/test directly at the dataset level.
+        direct = {k: entry.get(k) for k in ("train", "val", "test") if entry.get(k) is not None}
+        return direct or None
+
+    def _pick_split_entry(block: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+        if not isinstance(block, Mapping) or not block:
+            return None
+        if dataset_key in block and isinstance(block[dataset_key], Mapping):
+            return block[dataset_key]
+        if fallback_split in block and isinstance(block[fallback_split], Mapping):
+            return block[fallback_split]
+        # As a last resort take the first mapping value.
+        for value in block.values():
+            if isinstance(value, Mapping):
+                return value
+        return None
+
+    split_entry = _pick_split_entry(_select_split_block(dataset_entry))
+    if split_entry is None:
+        # fall back to top-level split registry if provided
+        split_entry = _pick_split_entry(
+            payload.get("splits") if isinstance(payload, Mapping) else None
+        )
+
+    if not isinstance(split_entry, Mapping):
+        return {}
+
+    overrides: dict[str, list[dict[str, int | None]]] = {}
+    for phase, entries in split_entry.items():
+        if phase not in {"train", "val", "test"}:
+            continue
+        if isinstance(entries, (list, tuple)):
+            iterable: Sequence[Any] = entries
+        else:
+            iterable = (entries,)
+        normalized_items: list[dict[str, int | None]] = []
+        for item in iterable:
+            try:
+                start_ts, end_ts = _normalize_interval(item)
+            except Exception:
+                continue
+            normalized_items.append({"start_ts": start_ts, "end_ts": end_ts})
+        if normalized_items:
+            overrides[phase] = normalized_items
+    return overrides
+
+
 def _load_time_splits(data_cfg) -> tuple[str | None, dict[str, list[tuple[int | None, int | None]]]]:
     """Derive train/val/test time windows from config or an external manifest."""
 
     splits: dict[str, list[tuple[int | None, int | None]]] = {"train": [], "val": [], "test": []}
     version: str | None = getattr(data_cfg, "split_version", None)
+
+    overrides = getattr(data_cfg, "split_overrides", None)
+    if isinstance(overrides, Mapping):
+        for phase, entries in overrides.items():
+            if phase not in splits:
+                splits[phase] = []
+            if isinstance(entries, (list, tuple)):
+                iterable = entries
+            else:
+                iterable = [entries]
+            splits[phase].extend(_normalize_interval(item) for item in iterable)
 
     split_path = getattr(data_cfg, "split_path", None)
     if split_path:
@@ -279,6 +359,63 @@ def _load_time_splits(data_cfg) -> tuple[str | None, dict[str, list[tuple[int | 
         raise ValueError("Training split is empty: provide train_start/train_end or a manifest")
 
     return version, splits
+
+
+def _ensure_validation_split_present(
+    dfs_with_roles: dict[str, pd.DataFrame],
+    intervals: dict[str, list[tuple[int | None, int | None]]],
+    timestamp_column: str,
+    role_column: str,
+) -> None:
+    """Abort execution when the validation split yields zero rows."""
+
+    val_rows = 0
+    for df in dfs_with_roles.values():
+        val_rows += int((df[role_column].astype(str) == "val").sum())
+    if val_rows > 0:
+        return
+
+    configured = intervals.get("val", [])
+    configured_desc = (
+        ", ".join(_format_interval(it) for it in configured)
+        if configured
+        else "(not configured)"
+    )
+    observed_start, observed_end = _phase_bounds(dfs_with_roles, timestamp_column)
+    coverage_desc = f"[{_fmt_ts(observed_start)} .. {_fmt_ts(observed_end)}]"
+
+    msg_lines = [
+        "Validation split is empty after applying configured intervals.",
+        f"Configured validation intervals: {configured_desc}",
+        f"Observed data coverage: {coverage_desc}",
+    ]
+
+    if configured:
+        overlap_detected = None
+        if observed_start is not None and observed_end is not None:
+            overlap_detected = False
+            for start, end in configured:
+                start_cmp = observed_start if start is None else start
+                end_cmp = observed_end if end is None else end
+                if start_cmp <= observed_end and end_cmp >= observed_start:
+                    overlap_detected = True
+                    break
+        if overlap_detected is False:
+            msg_lines.append(
+                "Configured validation window does not overlap with available data; "
+                "regenerate or refresh the offline dataset."
+            )
+        else:
+            msg_lines.append(
+                "Adjust the validation split configuration or refresh the offline dataset "
+                "to include the desired range."
+            )
+    else:
+        msg_lines.append(
+            "Provide validation split overrides or refresh the offline dataset to include validation data."
+        )
+
+    raise SystemExit("\n".join(msg_lines))
 
 
 def _apply_role_column(
@@ -950,6 +1087,8 @@ def main():
 
     split_key = (args.dataset_split or "").strip()
     offline_bundle = None
+    offline_payload: Mapping[str, Any] | None = None
+    offline_split_overrides: dict[str, list[dict[str, int | None]]] = {}
     if split_key and split_key.lower() not in {"none", "null"}:
         try:
             offline_bundle = resolve_split_bundle(args.offline_config, split_key)
@@ -961,6 +1100,10 @@ def main():
             ) from exc
         except ValueError as exc:
             raise SystemExit(f"Failed to resolve offline split '{split_key}': {exc}") from exc
+        offline_payload = load_offline_payload(args.offline_config)
+        offline_split_overrides = _extract_offline_split_overrides(
+            offline_payload, split_key, fallback_split="time"
+        )
 
     seasonality_path = args.liquidity_seasonality
     fees_path: str | None = None
@@ -1017,6 +1160,8 @@ def main():
         data_block = cfg_dict.setdefault("data", {})
         if offline_bundle.version:
             data_block["split_version"] = offline_bundle.version
+        if offline_split_overrides and not data_block.get("split_overrides"):
+            data_block["split_overrides"] = offline_split_overrides
         if adv_path:
             adv_block = cfg_dict.setdefault("adv", {})
             if not adv_block.get("path"):
@@ -1091,6 +1236,8 @@ def main():
         annotated, inferred_flag = _apply_role_column(df, time_splits, timestamp_column, role_column)
         dfs_with_roles[symbol] = annotated
         inferred_test_any = inferred_test_any or inferred_flag
+
+    _ensure_validation_split_present(dfs_with_roles, time_splits, timestamp_column, role_column)
 
     train_intervals = time_splits.get("train", [])
     train_start_candidates = [start for start, _ in train_intervals if start is not None]
