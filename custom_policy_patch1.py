@@ -124,6 +124,11 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         # чтобы на него можно было безопасно ссылаться до сборки модели.
         self.dist_head: Optional[nn.Linear] = None
 
+        # lr_schedule уже используется базовым классом во время вызова super().__init__.
+        # Сохраняем ссылку заранее, чтобы можно было переинициализировать оптимизатор
+        # после того, как базовый класс создаст рекуррентные слои (LSTM).
+        self._pending_lr_schedule = lr_schedule
+
         super().__init__(
             observation_space,
             action_space,
@@ -160,6 +165,10 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         # Сохраняем ссылки на рекуррентные слои, созданные базовым классом.
         self.pi_lstm = self.lstm_actor
         self.vf_lstm = self.lstm_critic if self.lstm_critic is not None else self.lstm_actor
+
+        # После того как LSTM-слои фактически созданы, переинициализируем оптимизатор
+        # с нужным набором параметров и (опционально) кастомным планировщиком.
+        self._setup_custom_optimizer()
 
     @torch.no_grad()
     def update_atoms(self, v_min: float, v_max: float) -> None:
@@ -198,25 +207,50 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         self.dist_head = nn.Linear(self.lstm_output_dim, self.num_atoms)
         self.value_net = self.dist_head
 
-        modules: list[nn.Module] = [self.mlp_extractor, self.lstm_actor]
-        if self.lstm_critic is not None and self.lstm_critic is not self.lstm_actor:
-            modules.append(self.lstm_critic)
+        # Во время вызова _build из базового класса рекуррентные слои ещё не созданы,
+        # поэтому откладываем настройку оптимизатора до завершения __init__.
+        self._pending_lr_schedule = lr_schedule
+
+    def _setup_custom_optimizer(self) -> None:
+        """
+        Настраивает оптимизатор и (опционально) планировщик, используя только те
+        параметры, которые должны участвовать в обучении кастомной политики.
+        """
+
+        lr_schedule = getattr(self, "_pending_lr_schedule", None)
+        if lr_schedule is None:
+            return
+
+        modules: list[nn.Module] = [self.mlp_extractor]
+
+        lstm_actor = getattr(self, "lstm_actor", None)
+        if lstm_actor is not None:
+            modules.append(lstm_actor)
+
+        lstm_critic = getattr(self, "lstm_critic", None)
+        if lstm_critic is not None and lstm_critic is not lstm_actor:
+            modules.append(lstm_critic)
+
         modules.extend([self.action_net, self.dist_head])
 
         params: list[nn.Parameter] = []
         for module in modules:
             params.extend(module.parameters())
 
-        if hasattr(self, 'log_std') and self.log_std is not None:
+        if getattr(self, "log_std", None) is not None:
             params.append(self.log_std)
-        if hasattr(self, 'unconstrained_log_std'):
+        if hasattr(self, "unconstrained_log_std"):
             params.append(self.unconstrained_log_std)
 
         self.optimizer = self.optimizer_class(params, lr=lr_schedule(1), **self.optimizer_kwargs)
+
         if self.optimizer_scheduler_fn is not None:
             self.optimizer_scheduler = self.optimizer_scheduler_fn(self.optimizer)
         else:
             self.optimizer_scheduler = None
+
+        # После настройки оптимизатора ссылка на lr_schedule больше не нужна.
+        self._pending_lr_schedule = None
     # --- ИСПРАВЛЕНИЕ: Метод переименован с forward_rnn на _forward_recurrent ---
     def _forward_recurrent(
         self,
