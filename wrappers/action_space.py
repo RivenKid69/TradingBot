@@ -1,12 +1,12 @@
 from __future__ import annotations
-
-from typing import Any, Tuple
+from typing import Any
 
 import numpy as np
 from gymnasium import spaces
+from gymnasium import ActionWrapper  # <-- ключевое: наследуемся от ActionWrapper
 
 
-class DictToMultiDiscreteActionWrapper:
+class DictToMultiDiscreteActionWrapper(ActionWrapper):
     """
     Convert Dict action space:
       { price_offset_ticks: Discrete(201),
@@ -15,44 +15,40 @@ class DictToMultiDiscreteActionWrapper:
         volume_frac:        Box(-1,1,(1,),float32) }
     -> MultiDiscrete([201, 33, 4, bins_vol])
 
-    Agent outputs [i_price, i_ttl, i_type, i_vol]; wrapper decodes to Dict.
-    Observation space is proxied unchanged.
+    Agent outputs [i_price, i_ttl, i_type, i_vol]; wrapper maps to Dict and
+    delegates to underlying env.step(...). Observation space is proxied unchanged.
     """
 
     def __init__(self, env: Any, bins_vol: int = 101):
+        # делаем класс полноценным Gymnasium-энвом
+        super().__init__(env)
         assert int(bins_vol) >= 2, "bins_vol must be >= 2"
-        self.env = env
         self.bins_vol = int(bins_vol)
+
+        # обновляем action_space на MultiDiscrete; observation_space оставляем как у базовой среды
         self.action_space = spaces.MultiDiscrete([201, 33, 4, self.bins_vol])
         self.observation_space = env.observation_space
-
-    def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
 
     def _vol_center(self, idx: int) -> float:
         idx = int(np.clip(idx, 0, self.bins_vol - 1))
         step = 2.0 / (self.bins_vol - 1)
         return float(-1.0 + step * idx)
 
-    def step(self, action) -> Tuple[Any, float, bool, bool, dict]:
+    # Метод ActionWrapper.action(a) преобразует действие ПЕРЕД вызовом env.step(...)
+    def action(self, action):
         a = np.asarray(action, dtype=np.int64).reshape(-1)
-        assert a.size == 4, f"Expected 4-dim MultiDiscrete, got shape {a.shape}"
+        if a.size != 4:
+            raise ValueError(f"Expected 4-dim MultiDiscrete action, got shape {a.shape}")
         price_i, ttl_i, type_i, vol_i = a.tolist()
 
+        # Собираем dict-действие для исходной среды
         dict_action = {
             "price_offset_ticks": int(np.clip(price_i, 0, 200)),
             "ttl_steps":          int(np.clip(ttl_i,   0, 32)),
             "type":               int(np.clip(type_i,  0, 3)),
             "volume_frac":        np.array([self._vol_center(vol_i)], dtype=np.float32),
         }
-        obs, rew, terminated, truncated, info = self.env.step(dict_action)
-        return obs, rew, terminated, truncated, info
-
-    def render(self):
-        return self.env.render()
-
-    def close(self):
-        return self.env.close()
+        return dict_action
 
 
 __all__ = ["DictToMultiDiscreteActionWrapper"]
