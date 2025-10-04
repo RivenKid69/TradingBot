@@ -1608,7 +1608,7 @@ if __name__ == "__main__":
     if flag_value is not None:
         os.environ["GRAD_SANITY"] = flag_value
 
-    # --- gradient sanity check (включается флагом окружения) ---что
+    # --- gradient sanity check (включается флагом окружения) ---
     from runtime_flags import get_bool
     if get_bool("GRAD_SANITY", False):
         from tools.grad_sanity import run_check
