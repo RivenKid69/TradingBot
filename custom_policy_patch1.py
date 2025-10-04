@@ -77,11 +77,25 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         hidden_dim = arch_params.get('hidden_dim', 64)
         self.hidden_dim = hidden_dim
 
+        # super().__init__ вызывает _build, поэтому заранее сохраняем размерность действия
+        if isinstance(action_space, spaces.Box):
+            self.action_dim = int(np.prod(action_space.shape))
+        elif isinstance(action_space, spaces.Discrete):
+            self.action_dim = action_space.n
+        else:
+            raise NotImplementedError(
+                f"Action space {type(action_space)} is not supported by CustomActorCriticPolicy"
+            )
+
         act_str = arch_params.get('activation', 'relu').lower()
-        if act_str == 'relu': self.activation = nn.ReLU
-        elif act_str == 'tanh': self.activation = nn.Tanh
-        elif act_str == 'leakyrelu': self.activation = nn.LeakyReLU
-        else: self.activation = nn.ReLU
+        if act_str == 'relu':
+            self.activation = nn.ReLU
+        elif act_str == 'tanh':
+            self.activation = nn.Tanh
+        elif act_str == 'leakyrelu':
+            self.activation = nn.LeakyReLU
+        else:
+            self.activation = nn.ReLU
 
         # Параметры n_res_blocks, n_attn_blocks, attn_heads больше не нужны
         
@@ -115,8 +129,7 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         
 
         if isinstance(self.action_space, spaces.Box):
-            action_dim = self.action_space.shape[0]
-            self.unconstrained_log_std = nn.Parameter(torch.zeros(action_dim))
+            self.unconstrained_log_std = nn.Parameter(torch.zeros(self.action_dim))
 
         self.recurrent_initial_state = (
             torch.zeros(1, 1, self.hidden_dim, device=self.device),
