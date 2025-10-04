@@ -18,6 +18,7 @@ DTYPE_TO_CSTYLE = {
     np.float32: 'f',
     np.float64: 'd',
     np.bool_: 'b',
+    np.int8: 'b',
     np.int32: 'i',
     np.int64: 'l',
     np.uint8: 'B',
@@ -147,11 +148,41 @@ class SharedMemoryVecEnv(VecEnv):
                 "Set spaces in __init__ or ensure reset() defines them."
             )
 
-        # Нормализуем dtype к классу (np.float32, np.int64, ...)
-        act_type = _np.dtype(self.action_space.dtype).type
+        # --- Robust dtype/shape discovery for action space -----------------
+        # Некоторые среды (особенно с дискретными действиями) могут не
+        # выставлять shape/dtype до первого reset() или вовсе держать их в
+        # виде None.  Нам нужно гарантированно определить и dtype, и форму
+        # буфера действий, иначе расчёт размера общей памяти упадёт.
+
+        # 1) Попробуем взять dtype/shape напрямую
+        action_dtype_raw = getattr(self.action_space, "dtype", None)
+        action_shape = getattr(self.action_space, "shape", None)
+
+        # 2) Если что-то не определено, используем sample() пространства
+        action_sample_np = None
+        if action_dtype_raw is None or action_shape is None or (
+            isinstance(action_shape, tuple)
+            and any(dim is None for dim in action_shape)
+        ):
+            # sample() может вернуть python-скаляры – приводим к numpy-массиву
+            action_sample = self.action_space.sample()
+            action_sample_np = np.asarray(
+                action_sample,
+                dtype=action_dtype_raw if action_dtype_raw is not None else None,
+            )
+            if action_dtype_raw is None:
+                action_dtype_raw = action_sample_np.dtype
+            if action_shape is None or (
+                isinstance(action_shape, tuple)
+                and any(dim is None for dim in action_shape)
+            ):
+                action_shape = action_sample_np.shape
+
+        # 3) Нормализуем dtype к numpy-классу (np.float32, np.int64, ...)
+        act_type = _np.dtype(action_dtype_raw).type
         if act_type not in DTYPE_TO_CSTYLE:
             raise TypeError(
-                f"Unsupported action dtype {self.action_space.dtype} "
+                f"Unsupported action dtype {action_dtype_raw} "
                 f"(normalized: {act_type}). Known: {list(DTYPE_TO_CSTYLE.keys())}"
             )
         action_type_code = DTYPE_TO_CSTYLE[act_type]
@@ -161,7 +192,18 @@ class SharedMemoryVecEnv(VecEnv):
 
         obs_shape = self.observation_space.shape
         obs_dtype = self.observation_space.dtype
-        action_shape = self.action_space.shape
+
+        # 4) Для скаляров (shape == ()) np.prod даст 1 и reshape корректно
+        if action_shape is None:
+            # fallback: если пространство экзотическое и даже sample() не дал
+            # shape, трактуем действие как скаляр.
+            action_shape = ()
+        elif action_sample_np is not None and action_sample_np.shape != action_shape:
+            # Подстрахуемся: приведём форму к кортежу из sample(), если она
+            # отличается (бывает с python-скалярами, где space.shape -> (),
+            # а sample_np.shape -> () тоже; условие просто не сработает).
+            action_shape = action_sample_np.shape
+        action_shape = tuple(action_shape)  # гарантируем кортеж
 
         # 1. Создаем массивы в общей памяти с помощью multiprocessing.Array
         # 'f' - float, 'd' - double, 'b' - boolean
