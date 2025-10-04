@@ -25,7 +25,7 @@ class RNGEnv(Env):
 
 def test_independent_rng_per_worker():
     vec_env = SharedMemoryVecEnv([lambda: RNGEnv(), lambda: RNGEnv()], base_seed=123)
-    obs, _ = vec_env.reset()
+    obs = vec_env.reset()
     assert obs[0] != obs[1]
     vec_env.step_async(np.zeros((2,1), dtype=np.float32))
     obs2, _, _, _ = vec_env.step_wait()

@@ -23,7 +23,7 @@ class DummyEnv(Env):
 
 def test_step_returns_copies():
     vec_env = SharedMemoryVecEnv([lambda: DummyEnv()])
-    obs, _ = vec_env.reset()
+    obs = vec_env.reset()
     assert obs.base is None
     obs, rewards, dones, _ = vec_env.step(np.zeros((1,1), dtype=np.float32))
     assert obs.base is None

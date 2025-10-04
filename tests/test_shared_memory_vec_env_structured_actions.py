@@ -41,7 +41,7 @@ class DictActionEnv(Env):
 def test_dict_action_round_trip():
     vec_env = SharedMemoryVecEnv([lambda: DictActionEnv()])
     try:
-        obs, _ = vec_env.reset()
+        obs = vec_env.reset()
         assert obs.shape == (1, 1)
 
         action = {

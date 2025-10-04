@@ -307,10 +307,13 @@ class SharedMemoryVecEnv(VecEnv):
         self.barrier.wait()
         # После этого барьера self.obs_np уже содержит корректные начальные наблюдения
 
-        # Важно: очищаем очередь от сообщений info, которые пришли от первого reset.
-        # Иначе они будут ошибочно считаны при первом вызове step_wait().
+        # Сохраняем info, полученную во время первичного reset, чтобы сделать
+        # её доступной через стандартное поле VecEnv.reset_infos.
+        initial_infos = [{} for _ in range(self.num_envs)]
         for _ in range(self.num_envs):
-            self.info_queue.get()
+            rank, info = self.info_queue.get()
+            initial_infos[rank] = info
+        self.reset_infos = initial_infos
         
         # --- leak-guard: регистрируем все shm-сегменты и аварийное закрытие ---
         self._shm_arrays = [self.obs_shm, self.actions_shm, self.rewards_shm, self.dones_shm]
@@ -483,10 +486,14 @@ class SharedMemoryVecEnv(VecEnv):
             rank, info = self.info_queue.get()
             infos[rank] = info
 
-        # 6. Возвращаем новые наблюдения и инфо
+        # 6. Обновляем reset_infos и возвращаем только наблюдения (совместимо со
+        #    стандартным интерфейсом VecEnv). Информацию можно получить из
+        #    self.reset_infos сразу после вызова reset().
+        self.reset_infos = infos
+
         # Возвращаем копию наблюдений, чтобы исключить передачу указателей на
         # разделяемый буфер.
-        return self.obs_np.copy(), infos
+        return self.obs_np.copy()
 
     def close(self):
         """

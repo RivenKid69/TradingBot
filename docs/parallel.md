@@ -15,10 +15,14 @@ def make_env():
     return CartPoleEnv()
 
 vec_env = SharedMemoryVecEnv([make_env, make_env], base_seed=123)
-obs, info = vec_env.reset()
+obs = vec_env.reset()
+reset_infos = vec_env.reset_infos  # информация о каждом воркере после reset
 # ... работа со средой ...
 vec_env.close()
 ```
+
+Поле `reset_infos` хранит словари `info` для каждого воркера и обновляется при
+каждом вызове `reset()`, повторяя поведение стандартных векторных обёрток SB3.
 
 ## Передача seed и управление ГПСЧ
 
@@ -55,7 +59,7 @@ def make_env():
 def rollout(seed, steps=5):
     env = SharedMemoryVecEnv([make_env, make_env], base_seed=seed)
     obs_seq = []
-    obs, _ = env.reset()
+    obs = env.reset()
     obs_seq.append(obs.copy())
     for _ in range(steps):
         actions = np.zeros((env.num_envs, 1), dtype=np.float32)

@@ -28,7 +28,7 @@ class RNGEnv(Env):
 
 def rollout(seed, steps):
     vec_env = SharedMemoryVecEnv([lambda: RNGEnv()], base_seed=seed)
-    obs, _ = vec_env.reset()
+    obs = vec_env.reset()
     obs_seq = [obs.copy()]
     reward_seq = []
     for _ in range(steps):
