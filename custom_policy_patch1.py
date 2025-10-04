@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 import numpy as np
+from functools import partial
 from gymnasium import spaces
 from typing import Tuple, Type, Optional, Dict, Any, Callable
 
@@ -124,6 +125,10 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         # чтобы на него можно было безопасно ссылаться до сборки модели.
         self.dist_head: Optional[nn.Linear] = None
 
+        # Сохраняем lr_schedule для последующей реконфигурации оптимизатора,
+        # когда рекуррентные блоки будут полностью инициализированы.
+        self._stored_lr_schedule: Optional[Schedule] = lr_schedule
+
         super().__init__(
             observation_space,
             action_space,
@@ -161,6 +166,10 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         self.pi_lstm = self.lstm_actor
         self.vf_lstm = self.lstm_critic if self.lstm_critic is not None else self.lstm_actor
 
+        # После того как рекуррентные блоки стали доступны, переинициализируем
+        # оптимизатор, чтобы он видел новые параметры (в частности, GRU/LSTM).
+        self._configure_optimizer()
+
     @torch.no_grad()
     def update_atoms(self, v_min: float, v_max: float) -> None:
         """
@@ -196,20 +205,45 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
 
         # Перестраиваем value-голову на распределение атомов.
         self.dist_head = nn.Linear(self.lstm_output_dim, self.num_atoms)
+        if self.ortho_init:
+            self.dist_head.apply(partial(self.init_weights, gain=1.0))
         self.value_net = self.dist_head
 
-        modules: list[nn.Module] = [self.mlp_extractor, self.lstm_actor]
-        if self.lstm_critic is not None and self.lstm_critic is not self.lstm_actor:
-            modules.append(self.lstm_critic)
-        modules.extend([self.action_net, self.dist_head])
+        # Сохраняем последний lr_schedule, чтобы впоследствии корректно
+        # восстановить оптимизатор уже с рекуррентными блоками.
+        self._stored_lr_schedule = lr_schedule
+
+        # Временный оптимизатор, созданный базовым классом, больше не нужен —
+        # его параметры будут заменены позже в _configure_optimizer().
+        if hasattr(self, "optimizer_scheduler") and self.optimizer_scheduler is not None:
+            # scheduler может хранить ссылки на старый оптимизатор; сбрасываем.
+            self.optimizer_scheduler = None
+        # Старый оптимизатор больше не используется.
+        self.optimizer = None
+
+    def _configure_optimizer(self) -> None:
+        """Настраивает оптимизатор под актуальный набор параметров модели."""
+        lr_schedule = self._stored_lr_schedule
+        if lr_schedule is None:
+            raise ValueError("lr_schedule is not defined; не удалось сконфигурировать оптимизатор")
+
+        modules: list[nn.Module] = [self.mlp_extractor, self.action_net, self.dist_head]
+
+        lstm_actor = getattr(self, "pi_lstm", getattr(self, "lstm_actor", None))
+        if lstm_actor is not None:
+            modules.append(lstm_actor)
+
+        lstm_critic = getattr(self, "vf_lstm", getattr(self, "lstm_critic", None))
+        if lstm_critic is not None and lstm_critic is not lstm_actor:
+            modules.append(lstm_critic)
 
         params: list[nn.Parameter] = []
         for module in modules:
             params.extend(module.parameters())
 
-        if hasattr(self, 'log_std') and self.log_std is not None:
+        if hasattr(self, "log_std") and self.log_std is not None:
             params.append(self.log_std)
-        if hasattr(self, 'unconstrained_log_std'):
+        if hasattr(self, "unconstrained_log_std"):
             params.append(self.unconstrained_log_std)
 
         self.optimizer = self.optimizer_class(params, lr=lr_schedule(1), **self.optimizer_kwargs)
@@ -217,6 +251,7 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
             self.optimizer_scheduler = self.optimizer_scheduler_fn(self.optimizer)
         else:
             self.optimizer_scheduler = None
+
     # --- ИСПРАВЛЕНИЕ: Метод переименован с forward_rnn на _forward_recurrent ---
     def _forward_recurrent(
         self,
