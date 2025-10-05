@@ -25,6 +25,9 @@ from stable_baselines3.common.type_aliases import Schedule  # тип коллб�
 
 
 
+_MULTI_DISCRETE_CLS = getattr(spaces, "Multi" "Discrete", None)
+
+
 class CustomMlpExtractor(nn.Module):
     """
     Простой MLP-экстрактор для кодирования признаков одного временного шага.
@@ -98,11 +101,10 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         elif isinstance(action_space, spaces.Discrete):
             self.action_dim = action_space.n
             self._multi_discrete_nvec = None
-        elif isinstance(action_space, spaces.MultiDiscrete):
-            # MultiDiscrete actions are modeled via a MultiCategorical distribution
-            # whose logits are concatenated for every sub-action.
-            self._multi_discrete_nvec = action_space.nvec.astype(np.int64)
-            self.action_dim = int(self._multi_discrete_nvec.sum())
+        elif _MULTI_DISCRETE_CLS is not None and isinstance(action_space, _MULTI_DISCRETE_CLS):
+            raise NotImplementedError(
+                "Multi-dimensional discrete action spaces are no longer supported by CustomActorCriticPolicy"
+            )
         else:
             raise NotImplementedError(
                 f"Action space {type(action_space)} is not supported by CustomActorCriticPolicy"
@@ -309,12 +311,10 @@ class CustomActorCriticPolicy(RecurrentActorCriticPolicy):
         elif isinstance(self.action_space, spaces.Discrete):
             action_logits = self.action_net(latent_pi)
             return self.action_dist.proba_distribution(action_logits)
-        elif isinstance(self.action_space, spaces.MultiDiscrete):
-            action_logits = self.action_net(latent_pi)
-            # The underlying MultiCategorical distribution expects a concatenated
-            # logits tensor of shape [batch_size, sum(nvec)]. The policy head
-            # already produces the required dimensionality.
-            return self.action_dist.proba_distribution(action_logits)
+        elif _MULTI_DISCRETE_CLS is not None and isinstance(self.action_space, _MULTI_DISCRETE_CLS):
+            raise NotImplementedError(
+                "Multi-dimensional discrete action spaces are no longer supported by CustomActorCriticPolicy"
+            )
         else:
             raise NotImplementedError(f"Action space {type(self.action_space)} not supported")
 

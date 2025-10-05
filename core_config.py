@@ -555,9 +555,37 @@ class PortfolioConfig(BaseModel):
             "pro-rata. ``None`` disables the guard."
         ),
     )
+    top_n: Optional[int] = Field(
+        default=None,
+        alias="topN",
+        ge=0,
+        description="Maximum number of symbols kept after sorting by score. ``None`` disables the cap.",
+    )
+    threshold: float = Field(
+        default=0.0,
+        description="Minimum score required for a symbol to participate in the portfolio.",
+    )
+    max_weight_per_symbol: float = Field(
+        default=1.0,
+        alias="max_w_per_symbol",
+        ge=0.0,
+        description="Upper bound on individual symbol weights after normalisation.",
+    )
+    max_gross_exposure: float = Field(
+        default=1.0,
+        alias="max_gross",
+        ge=0.0,
+        description="Upper bound on the sum of absolute weights produced by the allocator.",
+    )
+    realloc_threshold: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Minimum absolute change required to adjust an existing position weight.",
+    )
 
     class Config:
         extra = "allow"
+        allow_population_by_field_name = True
 
 
 class ExecutionRuntimeConfig(BaseModel):

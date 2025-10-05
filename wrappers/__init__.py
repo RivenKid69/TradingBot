@@ -1,5 +1,4 @@
-"""Utility wrappers for adapting environment interfaces."""
+"""Compatibility exports for legacy wrappers."""
+from .action_space import IdentityActionWrapper
 
-from .action_space import DictToMultiDiscreteActionWrapper
-
-__all__ = ["DictToMultiDiscreteActionWrapper"]
+__all__ = ["IdentityActionWrapper"]
