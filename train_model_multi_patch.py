@@ -13,7 +13,7 @@ import argparse
 import json
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from core_config import TrainConfig, load_config
+from core_config import TrainConfig, load_config, load_config_from_str
 from portfolio_allocator import DeterministicPortfolioAllocator
 from scripts.offline_utils import load_offline_payload, resolve_split_bundle
 
@@ -427,6 +427,76 @@ def _should_resolve_offline_bundle(value: str | None) -> bool:
     return bool(text and text not in {"none", "null"})
 
 
+def _coerce_override_value(value: str | bool) -> Any:
+    """Convert string CLI override values to native Python scalars."""
+
+    if isinstance(value, bool):
+        return value
+    text = value.strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in {"none", "null"}:
+        return None
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return text
+    if isinstance(parsed, (dict, list)):
+        return text
+    return parsed
+
+
+def _parse_cli_overrides(tokens: Sequence[str]) -> dict[str, Any]:
+    """Parse dotted ``--section.option`` CLI overrides into a mapping."""
+
+    overrides: dict[str, Any] = {}
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if not token.startswith("--") or token == "--":
+            raise SystemExit(f"Unrecognized argument: {token}")
+        key = token[2:]
+        if not key:
+            raise SystemExit("Empty override key is not allowed")
+        value: str | bool
+        if idx + 1 < len(tokens) and not tokens[idx + 1].startswith("--"):
+            value = tokens[idx + 1]
+            idx += 2
+        else:
+            value = True
+            idx += 1
+        overrides[key] = _coerce_override_value(value)
+    return overrides
+
+
+def _apply_overrides_to_payload(payload: dict[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply dotted CLI overrides to the configuration mapping."""
+
+    for dotted_key, value in overrides.items():
+        parts = [part for part in dotted_key.split(".") if part]
+        if not parts:
+            raise SystemExit(f"Invalid override key: '{dotted_key}'")
+        cursor: Any = payload
+        for part in parts[:-1]:
+            if isinstance(cursor, MutableMapping):
+                next_item = cursor.get(part)
+                if not isinstance(next_item, Mapping):
+                    next_item = {}
+                    cursor[part] = next_item
+            else:
+                raise SystemExit(f"Cannot set '{dotted_key}': section '{part}' is not a mapping")
+            cursor = next_item
+        last_key = parts[-1]
+        if isinstance(cursor, MutableMapping):
+            cursor[last_key] = value
+        else:
+            raise SystemExit(f"Cannot set '{dotted_key}': target container is not a mapping")
+    return payload
+
+
 def main(argv: Sequence[str] | None = None):
     parser = argparse.ArgumentParser(description="Generate deterministic portfolio weights")
     parser.add_argument("--config", default="configs/config_train.yaml", help="Path to YAML config")
@@ -436,7 +506,9 @@ def main(argv: Sequence[str] | None = None):
     parser.add_argument("--dataset-split", default="val", help="Dataset split declared in the offline config")
     parser.add_argument("--offline-config", default="configs/offline.yaml", help="Offline dataset configuration")
     parser.add_argument("--liquidity-seasonality", default=None, help="Override path to liquidity seasonality coefficients")
-    args = parser.parse_args(argv)
+    parsed_args, extra_tokens = parser.parse_known_args(argv)
+    overrides = _parse_cli_overrides(extra_tokens)
+    args = parsed_args
 
     split_key = args.dataset_split or ""
     offline_bundle = None
@@ -477,7 +549,15 @@ def main(argv: Sequence[str] | None = None):
     if seasonality_hash:
         print(f"Seasonality verification hash: {seasonality_hash}")
 
-    cfg = load_config(args.config)
+    if overrides:
+        with open(args.config, "r", encoding="utf-8") as config_fh:
+            raw_payload = yaml.safe_load(config_fh) or {}
+        if not isinstance(raw_payload, dict):
+            raise SystemExit(f"Configuration root must be a mapping, got {type(raw_payload).__name__}")
+        updated_payload = _apply_overrides_to_payload(dict(raw_payload), overrides)
+        cfg = load_config_from_str(yaml.safe_dump(updated_payload))
+    else:
+        cfg = load_config(args.config)
     if not isinstance(cfg, TrainConfig):
         raise TypeError("Loaded config is not a TrainConfig; check the 'mode' field")
     if offline_split_overrides:
