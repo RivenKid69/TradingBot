@@ -11,8 +11,31 @@ import torch as th
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv
-from stable_baselines3.common.vec_env.util import is_vecenv_wrapped
 from stable_baselines3.common.vec_env.vec_monitor import VecMonitor
+
+try:  # Stable-Baselines3 < 2.0.0
+    from stable_baselines3.common.vec_env.util import is_vecenv_wrapped  # type: ignore
+except ImportError:  # pragma: no cover - compatibility shim for SB3 >= 2.0.0
+    def is_vecenv_wrapped(vec_env: VecEnv, wrapper_class: type) -> bool:
+        """Return ``True`` if any of the vectorized environments is wrapped."""
+
+        if hasattr(vec_env, "env_is_wrapped"):
+            wrapped = vec_env.env_is_wrapped(wrapper_class)
+            if isinstance(wrapped, (list, tuple)):
+                return any(wrapped)
+            return bool(wrapped)
+
+        # Fallback for custom VecEnv implementations without env_is_wrapped.
+        envs = getattr(vec_env, "envs", [])
+        for env in envs:
+            current_env = env
+            while True:
+                if isinstance(current_env, wrapper_class):
+                    return True
+                current_env = getattr(current_env, "env", None)
+                if current_env is None:
+                    break
+        return False
 
 _cy_evaluate_episode: Callable[..., tuple[list[float], list[list[float]]]] | None = None
 _cy_spec = importlib.util.find_spec("cy_eval_core")
