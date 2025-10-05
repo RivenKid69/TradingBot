@@ -21,7 +21,10 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, MutableMapping, T
 
 from pathlib import Path
 
-import requests
+try:  # ``requests`` is optional for offline-only workflows.
+    import requests  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - exercised via integration
+    requests = None  # type: ignore[assignment]
 
 from core_config import RetryConfig, TokenBucketConfig
 
@@ -165,6 +168,11 @@ class RestBudgetSession:
         checkpoint_enabled: bool | None = None,
         resume_from_checkpoint: bool | None = None,
     ) -> None:
+        if requests is None:
+            raise RuntimeError(
+                "RestBudgetSession requires the 'requests' package. "
+                "Install requests to enable REST budgeting features."
+            )
         self._cfg = cfg
         self._base_session = session or requests.Session()
         self._owns_session = session is None

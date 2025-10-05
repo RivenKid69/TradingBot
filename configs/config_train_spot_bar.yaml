@@ -1,0 +1,47 @@
+mode: train
+run_id: spot-bar-demo
+logs_dir: logs
+artifacts_dir: artifacts
+market: spot
+symbols:
+  - BTCUSDT
+
+data:
+  symbols:
+    - BTCUSDT
+  timeframe: "1m"
+  train_start_ts: 1672531200
+  train_end_ts: 1698796799
+  val_start_ts: 1698796800
+  val_end_ts: 1704067199
+
+execution:
+  mode: bar
+
+model:
+  algo: "ppo"
+  params: {}
+
+components:
+  market_data:
+    target: impl_offline_data:OfflineCSVBarSource
+    params:
+      paths:
+        - "data/train/*.csv"
+      timeframe: "1m"
+  executor:
+    target: impl_sim_executor:SimExecutor
+    params:
+      symbol: "BTCUSDT"
+  feature_pipe:
+    target: feature_pipe:FeaturePipe
+    params: {}
+  policy:
+    target: strategies.momentum:MomentumStrategy
+    params: {}
+  risk_guards:
+    target: impl_risk_basic:RiskBasicImpl
+    params: {}
+  backtest_engine:
+    target: service_backtest:ServiceBacktest
+    params: {}

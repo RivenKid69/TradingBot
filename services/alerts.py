@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 import logging
 import os
 import time
 from typing import Any, Callable, Dict, Mapping
 
-import requests
+try:  # ``requests`` is optional for offline tests.
+    import requests  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - exercised via integration
+    requests = None  # type: ignore[assignment]
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,12 @@ def send_telegram(text: str, config: Any | None = None) -> bool:
         payload.update(extra_payload)
 
     url = f"{api_base.rstrip('/')}/bot{token}/sendMessage"
+    if requests is None:
+        logger.warning(
+            "cannot send telegram alert because the 'requests' package is missing"
+        )
+        return False
+
     try:
         response = requests.post(url, json=payload, timeout=timeout)
         response.raise_for_status()

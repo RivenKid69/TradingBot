@@ -6,13 +6,25 @@ import os
 import time
 from typing import Dict, List, Optional
 
-import requests
+try:  # ``requests`` is optional for offline testing environments.
+    import requests  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - exercised in integration tests
+    requests = None  # type: ignore[assignment]
 
 
 _REQUEST_THROTTLE_SECONDS = 0.2
 _REQUEST_MAX_ATTEMPTS = 3
 _REQUEST_BACKOFF_BASE = 0.5
 _last_request_ts: float = 0.0
+
+
+def _require_requests() -> "requests":
+    if requests is None:
+        raise RuntimeError(
+            "The 'requests' package is required to refresh the Binance universe. "
+            "Install requests or populate data/universe/symbols.json manually."
+        )
+    return requests  # type: ignore[return-value]
 
 
 def _throttled_get(
@@ -22,7 +34,7 @@ def _throttled_get(
     timeout: int = 20,
     max_attempts: int = _REQUEST_MAX_ATTEMPTS,
     backoff_base: float = _REQUEST_BACKOFF_BASE,
-) -> requests.Response:
+) -> "requests.Response":
     """Perform ``requests.get`` with basic throttling and backoff."""
 
     global _last_request_ts
@@ -34,8 +46,9 @@ def _throttled_get(
         wait = _REQUEST_THROTTLE_SECONDS - (now - _last_request_ts)
         if wait > 0:
             time.sleep(wait)
+        session = _require_requests()
         try:
-            resp = requests.get(url, params=params, timeout=timeout)
+            resp = session.get(url, params=params, timeout=timeout)
             resp.raise_for_status()
         except Exception as exc:  # pragma: no cover - network dependent
             last_error = exc
@@ -125,6 +138,14 @@ def get_symbols(
     """Return cached Binance symbols list, refreshing if needed."""
 
     if force or _is_stale(out, ttl):
+        if requests is None:
+            if os.path.exists(out) and not force:
+                with open(out, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            raise RuntimeError(
+                "Unable to refresh Binance symbols because the 'requests' package "
+                "is not installed. Install requests or provide a cached universe file."
+            )
         run(out, liquidity_threshold=liquidity_threshold)
 
     with open(out, "r", encoding="utf-8") as f:
@@ -167,6 +188,9 @@ if __name__ == "__main__":  # pragma: no cover - CLI is tested via integration
 else:  # Perform a freshness check when imported
     try:  # pragma: no cover - network may be unavailable during tests
         get_symbols()
+    except RuntimeError:
+        # ``requests`` may be missing in offline environments. Best effort.
+        pass
     except Exception:
-        # The refresh is best effort; failures are surfaced on explicit call.
+        # Other failures are surfaced on explicit calls.
         pass
