@@ -54,6 +54,13 @@ model:
   algo: "ppo"
   params: {}
 
+portfolio:
+  topN: 10
+  threshold: 0.0
+  max_w_per_symbol: 0.2
+  max_gross: 1.0
+  realloc_threshold: 0.01
+
 quantizer:
   filters_path: "data/binance_filters.json"
   # strict_filters=true → строго придерживаться актуальных фильтров; false включает мягкий фолбек к кешу/легаси-логике.

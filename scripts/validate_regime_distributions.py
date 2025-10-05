@@ -1,152 +1,119 @@
+"""Diagnostic helper for the deterministic portfolio allocator.
+
+The script loads a table of model scores, evaluates the
+:class:`~portfolio_allocator.DeterministicPortfolioAllocator` for each regime
+present in the dataset and stores the resulting target weights.  No trading
+environment is instantiated and no orders are emitted – the output represents
+paper allocations useful for sanity checks.
+"""
+from __future__ import annotations
+
 import argparse
-import json
-import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Mapping
 
 import numpy as np
-from gymnasium import spaces
+import pandas as pd
 
-from wrappers.action_space import DictToMultiDiscreteActionWrapper
+ROOT = Path(__file__).resolve().parents[1]
+import sys
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-class _DummyEnv:
-    """Simple environment used when real TradingEnv is unavailable."""
-
-    def __init__(self):
-        self._rng = np.random.default_rng(0)
-        self._regime = "normal"
-        # Mean values for each regime; std is 10% of the mean
-        self._params = {
-            "normal": {"volatility": 1.0, "volume": 100.0, "spread": 0.01},
-            "choppy_flat": {"volatility": 0.5, "volume": 90.0, "spread": 0.015},
-            "strong_trend": {"volatility": 1.5, "volume": 130.0, "spread": 0.02},
-        }
-        self.action_space = type("AS", (), {"sample": lambda self: 0})()
-
-    def set_market_regime(self, regime: str = "normal", duration: int = 0):
-        self._regime = regime
-
-    def reset(self):
-        return 0
-
-    def step(self, action):
-        p = self._params[self._regime]
-        vol = self._rng.normal(p["volatility"], 0.1 * p["volatility"])
-        volume = self._rng.normal(p["volume"], 0.1 * p["volume"])
-        spread = self._rng.normal(p["spread"], 0.1 * p["spread"])
-        info = {"volatility": float(vol), "volume": float(volume), "spread": float(spread)}
-        return 0, 0.0, False, info
+from core_config import TrainConfig, load_config
+from portfolio_allocator import DeterministicPortfolioAllocator
 
 
-def _wrap_action_space_if_needed(env, bins_vol: int = 101):
-    try:
-        if isinstance(env.action_space, spaces.Dict):
-            keys = set(getattr(env.action_space, "spaces", {}).keys())
-            expected = {"price_offset_ticks", "ttl_steps", "type", "volume_frac"}
-            if expected.issubset(keys):
-                return DictToMultiDiscreteActionWrapper(env, bins_vol=bins_vol)
-    except Exception:
-        return env
-    return env
-
-
-def _set_regime(env, regime: str, duration: int):
-    if hasattr(env, "env_method"):
-        env.env_method("set_market_regime", regime=regime, duration=duration)
-    elif hasattr(env, "set_market_regime"):
-        env.set_market_regime(regime=regime, duration=duration)
+def _load_scores(path: str) -> pd.DataFrame:
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Scores file not found: {path}")
+    if file_path.suffix.lower() in {".parquet", ".pq"}:
+        df = pd.read_parquet(file_path)
     else:
-        raise AttributeError("Environment does not support regime control")
+        df = pd.read_csv(file_path)
+    if df.empty:
+        raise ValueError("Scores file is empty")
+    return df
 
 
-def _collect_stats(env, regime: str, steps: int) -> Dict[str, np.ndarray]:
-    _set_regime(env, regime, steps)
-    vol, volume, spread = [], [], []
-    obs = env.reset()
-    for _ in range(steps):
-        action = env.action_space.sample() if hasattr(env, "action_space") else None
-        result = env.step(action)
-        # Handle Gymnasium (5-tuple) and Gym (4-tuple)
-        if isinstance(result, tuple) and len(result) == 5:
-            obs, reward, terminated, truncated, info = result
-            done = terminated or truncated
-        else:
-            obs, reward, done, info = result
-        if isinstance(info, list):
-            info = info[0]
-        vol.append(info.get("volatility", 0.0))
-        volume.append(info.get("volume", 0.0))
-        spread.append(info.get("spread", 0.0))
-        if np.any(done):
-            obs = env.reset()
-    return {
-        "volatility": np.asarray(vol),
-        "volume": np.asarray(volume),
-        "spread": np.asarray(spread),
+def _latest_slice(df: pd.DataFrame, regime: str | None) -> pd.DataFrame:
+    subset = df if regime is None else df[df.get("regime") == regime]
+    if subset.empty:
+        raise ValueError(f"No score rows available for regime '{regime}'")
+    if "timestamp" in subset.columns:
+        ts = subset["timestamp"].max()
+        subset = subset[subset["timestamp"] == ts]
+    if {"symbol", "score"}.issubset(subset.columns):
+        latest = subset.groupby("symbol")[["score"]].last()["score"].astype(float)
+        return latest.to_frame().T
+    numeric_cols = [
+        c for c in subset.select_dtypes(include=["number"]).columns if c.lower() not in {"timestamp", "time", "ts"}
+    ]
+    if not numeric_cols:
+        raise ValueError("Scores frame does not contain numeric columns for allocation")
+    return subset[numeric_cols].tail(1)
+
+
+def _extract_params(cfg: TrainConfig) -> Mapping[str, float | int | None]:
+    portfolio_cfg = getattr(cfg, "portfolio", None)
+    params: dict[str, float | int | None] = {
+        "top_n": getattr(portfolio_cfg, "top_n", None) if portfolio_cfg else None,
+        "threshold": float(getattr(portfolio_cfg, "threshold", 0.0)) if portfolio_cfg else 0.0,
+        "max_weight_per_symbol": float(getattr(portfolio_cfg, "max_weight_per_symbol", 1.0)) if portfolio_cfg else 1.0,
+        "max_gross_exposure": float(getattr(portfolio_cfg, "max_gross_exposure", 1.0)) if portfolio_cfg else 1.0,
+        "realloc_threshold": float(getattr(portfolio_cfg, "realloc_threshold", 0.0)) if portfolio_cfg else 0.0,
     }
+    return params
 
 
-def compare_regime_distributions(env, reference_path: str, n_steps: int = 1000, tolerance: float = 0.1,
-                                 quantiles: Tuple[float, ...] = (0.25, 0.5, 0.75),
-                                 raise_on_fail: bool = True) -> Tuple[Dict[str, Dict[str, float]], bool]:
-    """Compare sampled regime distributions with reference quantiles.
-
-    Returns a dictionary of metrics and a boolean flag whether all metrics are within tolerance.
-    """
-    ref = json.loads(Path(reference_path).read_text())
-    metrics: Dict[str, Dict[str, float]] = {}
-    all_ok = True
-    for regime, expected in ref.items():
-        data = _collect_stats(env, regime, n_steps)
-        regime_metrics: Dict[str, float] = {}
-        for key in ("volatility", "volume", "spread"):
-            sample = data[key]
-            q_actual = np.quantile(sample, quantiles)
-            q_ref = np.array([expected[key][f"q{int(q*100)}"] for q in quantiles])
-            rel_diff = np.max(np.abs(q_actual - q_ref) / (np.abs(q_ref) + 1e-9))
-            regime_metrics[f"{key}_qdiff"] = float(rel_diff)
-            if rel_diff > tolerance:
-                all_ok = False
-        metrics[regime] = regime_metrics
-    if raise_on_fail and not all_ok:
-        raise RuntimeError("Regime distributions diverged beyond tolerance")
-    return metrics, all_ok
+def _save_weights(weights: pd.Series, output_dir: Path, regime: str | None) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    suffix = regime if regime is not None else "all"
+    path = output_dir / f"weights_{suffix}.csv"
+    weights.to_frame("weight").to_csv(path, index_label="symbol")
+    return path
 
 
-def make_env(use_dummy: bool):
-    if not use_dummy:
-        try:
-            from trading_patchnew import TradingEnv  # type: ignore
-            return _wrap_action_space_if_needed(TradingEnv())
-        except Exception:
-            print("⚠️  Falling back to dummy environment")
-    return _DummyEnv()
-
-
-def main(argv=None) -> bool:
-    parser = argparse.ArgumentParser(description="Validate regime distributions")
-    parser.add_argument("--ref", default="configs/reference_regime_distributions.json", help="Path to reference JSON")
-    parser.add_argument("--steps", type=int, default=1000, help="Number of samples per regime")
-    parser.add_argument("--tolerance", type=float, default=0.1, help="Maximum allowed relative diff")
-    parser.add_argument("--use-dummy-env", action="store_true", help="Force using dummy environment")
+def main(argv: list[str] | None = None) -> dict[str, pd.Series]:
+    parser = argparse.ArgumentParser(description="Validate deterministic portfolio allocations")
+    parser.add_argument("--config", default="configs/config_train.yaml", help="Training config with portfolio params")
+    parser.add_argument("--scores", required=True, help="Input CSV/Parquet with model scores")
+    parser.add_argument("--output-dir", default="reports/portfolio_weights", help="Directory for per-regime weight dumps")
     args = parser.parse_args(argv)
 
-    env = make_env(args.use_dummy_env or os.getenv("USE_DUMMY_ENV") == "1")
-    metrics, ok = compare_regime_distributions(env, args.ref, args.steps, args.tolerance, raise_on_fail=False)
-    for regime, vals in metrics.items():
-        print(f"Regime: {regime}")
-        for name, value in vals.items():
-            print(f"  {name}: {value:.4f}")
-    if not ok:
-        print("❌ Distribution check failed")
-    else:
-        print("✅ Distribution check passed")
-    return ok
+    cfg = load_config(args.config)
+    if not isinstance(cfg, TrainConfig):
+        raise TypeError("Expected training config with portfolio parameters")
+
+    df = _load_scores(args.scores)
+    params = _extract_params(cfg)
+    allocator = DeterministicPortfolioAllocator()
+
+    regimes = sorted(set(df["regime"].dropna().astype(str))) if "regime" in df.columns else [None]
+    results: dict[str, pd.Series] = {}
+
+    for regime in regimes:
+        slice_df = _latest_slice(df, regime)
+        weights = allocator.compute_weights(slice_df, **params)
+        path = _save_weights(weights, Path(args.output_dir), regime)
+        gross = float(weights.abs().sum())
+        limit = params["max_gross_exposure"] or 0.0
+        if limit and gross > limit + 1e-9:
+            raise AssertionError(
+                f"Gross exposure {gross:.4f} exceeds configured max_gross_exposure {limit:.4f} for regime {regime}."
+            )
+        if not weights.empty and np.any(weights.values > params["max_weight_per_symbol"] + 1e-9):
+            raise AssertionError(
+                f"Weight exceeds max_weight_per_symbol constraint for regime {regime}."
+            )
+        key = "all" if regime is None else regime
+        results[key] = weights
+        print(f"Regime '{key}': {len(weights)} symbols, gross {gross:.4f} → {path}")
+
+    return results
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI
-    import sys
-    success = main()
-    if not success:
-        sys.exit(1)
+    main()

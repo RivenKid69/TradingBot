@@ -151,6 +151,44 @@ class RewardParams:
 
 
 @dataclass
+class PortfolioParams:
+    """Параметры детерминированного аллокатора портфеля."""
+
+    topN: int | None = None
+    threshold: float = 0.0
+    max_w_per_symbol: float = 1.0
+    max_gross: float = 1.0
+    realloc_threshold: float = 0.0
+
+    @classmethod
+    def default(cls) -> "PortfolioParams":
+        return cls()
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PortfolioParams":
+        cfg = cls.default()
+        for key in ("topN", "threshold", "max_w_per_symbol", "max_gross", "realloc_threshold"):
+            if key in data and data[key] is not None:
+                setattr(cfg, key, data[key])
+        if cfg.topN is not None and cfg.topN < 0:
+            raise ValueError("topN must be non-negative")
+        if cfg.max_w_per_symbol < 0 or cfg.max_gross < 0:
+            raise ValueError("Portfolio limits must be non-negative")
+        if cfg.realloc_threshold < 0:
+            raise ValueError("realloc_threshold must be non-negative")
+        return cfg
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "topN": self.topN,
+            "threshold": self.threshold,
+            "max_w_per_symbol": self.max_w_per_symbol,
+            "max_gross": self.max_gross,
+            "realloc_threshold": self.realloc_threshold,
+        }
+
+
+@dataclass
 class ObsParams:
     """Настройки формирования наблюдений (признаков) для агента."""
 
