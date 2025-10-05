@@ -1,15 +1,24 @@
-"""Generate deterministic portfolio weights from model scores.
+"""Training and portfolio allocation utilities.
 
-This module keeps backwards-compatible helpers used in the unit tests while
-repurposing the CLI to emit target weights produced by
-:class:`~portfolio_allocator.DeterministicPortfolioAllocator`.  The workflow no
-longer depends on Gym environments or discrete action wrappers – instead the
-allocator operates directly on score tables and writes the resulting weights to
-an artifact file.
+The module provides two closely related entry points:
+
+* when ``--scores`` is supplied the CLI behaves as a thin wrapper around
+  :class:`~portfolio_allocator.DeterministicPortfolioAllocator` and produces a
+  deterministic target-weight table;
+* when ``--scores`` is omitted the CLI falls back to a lightweight training
+  helper that materialises the configured market-data bundle, applies
+  walk-forward split annotations and stores a compact dataset summary in the
+  artefacts directory.
+
+The second branch intentionally keeps the implementation simple – it is not a
+drop-in replacement for the historical Stable-Baselines training loop, but it
+restores backwards-compatible behaviour for tooling that still expects
+``train_model_multi_patch.py`` to perform basic dataset preparation.
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
@@ -497,6 +506,189 @@ def _apply_overrides_to_payload(payload: dict[str, Any], overrides: Mapping[str,
     return payload
 
 
+def _resolve_market_data_paths(cfg: TrainConfig) -> list[str]:
+    """Return a sorted list of market-data files declared in the config."""
+
+    components = getattr(cfg, "components", None)
+    if components is None:
+        return []
+    market_data = getattr(components, "market_data", None)
+    params = getattr(market_data, "params", None)
+    if not isinstance(params, Mapping):
+        return []
+
+    raw_paths = params.get("paths") or params.get("path")
+    if raw_paths is None:
+        return []
+    if isinstance(raw_paths, (str, os.PathLike)):
+        patterns = [str(raw_paths)]
+    else:
+        patterns = [str(item) for item in raw_paths if item]
+
+    resolved: list[str] = []
+    for pattern in patterns:
+        matches = [path for path in glob.glob(pattern) if Path(path).is_file()]
+        resolved.extend(matches)
+    return sorted(dict.fromkeys(resolved))
+
+
+def _detect_column(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
+    lowered = {c.lower(): c for c in columns}
+    for name in candidates:
+        key = name.lower()
+        if key in lowered:
+            return lowered[key]
+    return None
+
+
+def _load_training_frame(cfg: TrainConfig) -> pd.DataFrame:
+    """Load raw market-data bars referenced by ``cfg`` into a DataFrame."""
+
+    file_paths = _resolve_market_data_paths(cfg)
+    if not file_paths:
+        raise FileNotFoundError(
+            "Training configuration does not declare any market data files. "
+            "Provide components.market_data.params.paths in the YAML configuration."
+        )
+
+    fallback_symbol: str | None = None
+    symbols = getattr(getattr(cfg, "data", None), "symbols", None)
+    if isinstance(symbols, Sequence) and symbols:
+        fallback_symbol = str(symbols[0])
+
+    frames: list[pd.DataFrame] = []
+    timestamp_candidates = ("timestamp", "ts", "close_time", "open_time", "time", "datetime")
+    symbol_candidates = ("symbol", "ticker", "pair")
+    price_candidates = ("close", "price", "close_price", "last")
+
+    for path in file_paths:
+        suffix = Path(path).suffix.lower()
+        if suffix in {".csv", ".txt"}:
+            df = pd.read_csv(path)
+        elif suffix in {".parquet", ".pq"}:
+            df = pd.read_parquet(path)
+        else:
+            continue  # ignore unsupported extensions silently
+
+        if df.empty:
+            continue
+
+        ts_col = _detect_column(df.columns, timestamp_candidates)
+        if ts_col is None:
+            raise KeyError(
+                f"{path} is missing a timestamp column. Expected one of: {', '.join(timestamp_candidates)}"
+            )
+
+        ts_series: list[int | None] = []
+        for raw_value in df[ts_col].tolist():
+            try:
+                ts_value = _coerce_timestamp(raw_value)
+            except ValueError:
+                ts_value = None
+            ts_series.append(ts_value)
+
+        mask = pd.Series(ts_series, index=df.index).notna()
+        if not mask.any():
+            continue
+
+        trimmed = df.loc[mask].copy()
+        trimmed["timestamp"] = pd.Series(ts_series, index=df.index)[mask].astype("int64")
+
+        sym_col = _detect_column(trimmed.columns, symbol_candidates)
+        if sym_col is None and fallback_symbol is None:
+            raise KeyError(
+                f"{path} does not include a symbol column and no fallback symbol is configured."
+            )
+
+        if sym_col is None:
+            symbols_series = pd.Series([fallback_symbol] * len(trimmed), index=trimmed.index, dtype=object)
+        else:
+            symbols_series = trimmed[sym_col].astype(str).replace({"": fallback_symbol, None: fallback_symbol})
+        trimmed["symbol"] = symbols_series
+        trimmed = trimmed[trimmed["symbol"].notna()]
+
+        price_col = _detect_column(trimmed.columns, price_candidates)
+        if price_col is not None:
+            trimmed["close"] = pd.to_numeric(trimmed[price_col], errors="coerce")
+
+        frames.append(trimmed[[c for c in ("timestamp", "symbol", "close") if c in trimmed.columns]])
+
+    if not frames:
+        raise ValueError(
+            "No usable rows were loaded from the market data files specified in the configuration."
+        )
+
+    merged = pd.concat(frames, ignore_index=True)
+    merged = merged.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    return merged
+
+
+def _summarize_training_dataset(df: pd.DataFrame, role_column: str) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "rows": int(len(df)),
+        "by_role": {},
+    }
+    if df.empty:
+        return summary
+
+    counts = df[role_column].astype(str).value_counts()
+    summary["by_role"] = {role: int(counts.get(role, 0)) for role in ("train", "val", "test", "none")}
+    summary["symbols"] = sorted(df["symbol"].astype(str).unique())
+    summary["coverage"] = {
+        "start_ts": int(df["timestamp"].min()),
+        "end_ts": int(df["timestamp"].max()),
+    }
+    return summary
+
+
+def _run_training_flow(cfg: TrainConfig) -> dict[str, Any]:
+    """Execute the lightweight training routine and persist artefacts."""
+
+    data_cfg = getattr(cfg, "data", None)
+    if data_cfg is None:
+        raise ValueError("Training configuration is missing the 'data' section")
+
+    version, intervals = _load_time_splits(data_cfg)
+    raw_df = _load_training_frame(cfg)
+    timestamp_column = "timestamp"
+    role_column = "wf_role"
+    df_with_roles, inferred_test = _apply_role_column(raw_df, intervals, timestamp_column, role_column)
+    _ensure_validation_split_present({"dataset": df_with_roles}, intervals, timestamp_column, role_column)
+
+    artefacts_dir = Path(getattr(cfg, "artifacts_dir", "artifacts")).expanduser()
+    artefacts_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset_path = artefacts_dir / "training_dataset.parquet"
+    df_with_roles.to_parquet(dataset_path, index=False)
+
+    summary = _summarize_training_dataset(df_with_roles, role_column)
+    summary.update(
+        {
+            "split_version": version,
+            "inferred_test": bool(inferred_test),
+            "dataset_path": dataset_path.as_posix(),
+        }
+    )
+
+    summary_path = artefacts_dir / "training_summary.json"
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2, ensure_ascii=False)
+
+    if summary["rows"] == 0:
+        print(f"Training dataset saved to '{dataset_path}', but it is empty after filtering.")
+    else:
+        train_rows = summary["by_role"].get("train", 0)
+        val_rows = summary["by_role"].get("val", 0)
+        test_rows = summary["by_role"].get("test", 0)
+        print(
+            "Prepared training dataset → "
+            f"{dataset_path} (train={train_rows}, val={val_rows}, test={test_rows})."
+        )
+        print(f"Summary written to '{summary_path}'.")
+
+    return summary
+
+
 def main(argv: Sequence[str] | None = None):
     parser = argparse.ArgumentParser(description="Generate deterministic portfolio weights")
     parser.add_argument("--config", default="configs/config_train.yaml", help="Path to YAML config")
@@ -564,7 +756,7 @@ def main(argv: Sequence[str] | None = None):
         setattr(cfg.data, "split_overrides", offline_split_overrides)
 
     if not args.scores:
-        raise SystemExit("--scores is required to compute portfolio weights")
+        return _run_training_flow(cfg)
 
     scores_df = _load_scores_frame(args.scores)
     prev_weights = _load_prev_weights(args.prev_weights)
